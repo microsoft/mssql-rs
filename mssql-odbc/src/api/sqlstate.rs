@@ -856,8 +856,6 @@ mod tests {
 
     fn sql_error(number: u32, message: &str) -> SqlErrorInfo {
         SqlErrorInfo {
-            diagnostic_ordinal: 0,
-            parameter_set: None,
             message: message.into(),
             state: 1,
             class: 14,
@@ -865,6 +863,7 @@ mod tests {
             server_name: None,
             proc_name: None,
             line_number: None,
+            ..Default::default()
         }
     }
 
@@ -992,8 +991,6 @@ mod tests {
         let diagnostics = SqlServerDiagnostics::new(
             vec![sql_error(18456, "Login failed.")],
             vec![SqlInfoMessage {
-                diagnostic_ordinal: 0,
-                parameter_set: None,
                 message: "Changed database context to 'master'.".into(),
                 state: 1,
                 class: 10,
@@ -1001,6 +998,7 @@ mod tests {
                 server_name: Some("srv".into()),
                 proc_name: None,
                 line_number: Some(1),
+                ..Default::default()
             }],
         );
         let err = TdsError::from_sql_diagnostics(diagnostics);
@@ -1018,7 +1016,6 @@ mod tests {
 
         let error = SqlErrorInfo {
             diagnostic_ordinal: 1,
-            parameter_set: None,
             message: "unmapped server error".into(),
             state: 1,
             class: 16,
@@ -1026,10 +1023,9 @@ mod tests {
             server_name: None,
             proc_name: None,
             line_number: Some(2),
+            ..Default::default()
         };
         let info = SqlInfoMessage {
-            diagnostic_ordinal: 0,
-            parameter_set: None,
             message: "truncated value".into(),
             state: 1,
             class: 10,
@@ -1037,6 +1033,7 @@ mod tests {
             server_name: None,
             proc_name: None,
             line_number: Some(1),
+            ..Default::default()
         };
         let err =
             TdsError::from_sql_diagnostics(SqlServerDiagnostics::new(vec![error], vec![info]));
@@ -1058,8 +1055,6 @@ mod tests {
         let mut error = sql_error(207, "invalid column");
         error.diagnostic_ordinal = 1;
         let info = SqlInfoMessage {
-            diagnostic_ordinal: 0,
-            parameter_set: None,
             message: "first warning".into(),
             state: 1,
             class: 10,
@@ -1067,6 +1062,7 @@ mod tests {
             server_name: None,
             proc_name: None,
             line_number: Some(1),
+            ..Default::default()
         };
         let err =
             TdsError::from_sql_diagnostics(SqlServerDiagnostics::new(vec![error], vec![info]));
@@ -1142,8 +1138,6 @@ mod tests {
         let diagnostics = SqlServerDiagnostics::new(
             vec![],
             vec![SqlInfoMessage {
-                diagnostic_ordinal: 0,
-                parameter_set: None,
                 message: "info only".into(),
                 state: 1,
                 class: 10,
@@ -1151,6 +1145,7 @@ mod tests {
                 server_name: None,
                 proc_name: None,
                 line_number: Some(1),
+                ..Default::default()
             }],
         );
         let err = TdsError::from_sql_diagnostics(diagnostics);
@@ -1260,8 +1255,6 @@ mod tests {
         let diagnostics = SqlServerDiagnostics::new(
             vec![sql_error(911, "no such db"), sql_error(5701, "context")],
             vec![SqlInfoMessage {
-                diagnostic_ordinal: 0,
-                parameter_set: None,
                 message: "Changed database context to 'master'.".into(),
                 state: 1,
                 class: 10,
@@ -1269,6 +1262,7 @@ mod tests {
                 server_name: None,
                 proc_name: None,
                 line_number: None,
+                ..Default::default()
             }],
         );
         let records = post_as_on_dbc(&TdsError::from_sql_diagnostics(diagnostics), SQLSTATE_HY024);
@@ -1310,8 +1304,6 @@ mod tests {
         let mut s = FakeState::default();
         let messages = vec![
             SqlInfoMessage {
-                diagnostic_ordinal: 0,
-                parameter_set: None,
                 message: "Changed database context to 'master'.".into(),
                 state: 1,
                 class: 10,
@@ -1319,10 +1311,9 @@ mod tests {
                 server_name: Some("server".into()),
                 proc_name: None,
                 line_number: Some(1),
+                ..Default::default()
             },
             SqlInfoMessage {
-                diagnostic_ordinal: 0,
-                parameter_set: None,
                 message: "hello from PRINT".into(),
                 state: 1,
                 class: 0,
@@ -1330,6 +1321,7 @@ mod tests {
                 server_name: Some("server".into()),
                 proc_name: None,
                 line_number: Some(1),
+                ..Default::default()
             },
         ];
 

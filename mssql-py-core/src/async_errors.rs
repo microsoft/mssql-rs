@@ -242,8 +242,6 @@ mod tests {
     fn preserves_sql_server_diagnostics() {
         let diagnostics = SqlServerDiagnostics::new(
             vec![SqlErrorInfo {
-                diagnostic_ordinal: 0,
-                parameter_set: None,
                 message: "test failure".to_string(),
                 state: 2,
                 class: 16,
@@ -251,10 +249,9 @@ mod tests {
                 server_name: Some("server".to_string()),
                 proc_name: Some("procedure".to_string()),
                 line_number: Some(7),
+                ..Default::default()
             }],
             vec![SqlInfoMessage {
-                diagnostic_ordinal: 0,
-                parameter_set: None,
                 message: "existing info".to_string(),
                 state: 1,
                 class: 0,
@@ -262,14 +259,13 @@ mod tests {
                 server_name: Some("server".to_string()),
                 proc_name: None,
                 line_number: Some(5),
+                ..Default::default()
             }],
         );
         let error = map_tds_error(
             "PyAsyncCursor.nextset failed while advancing results",
             TdsError::SqlServerError { diagnostics },
             vec![SqlInfoMessage {
-                diagnostic_ordinal: 0,
-                parameter_set: None,
                 message: "statement info".to_string(),
                 state: 1,
                 class: 10,
@@ -277,6 +273,7 @@ mod tests {
                 server_name: Some("server".to_string()),
                 proc_name: Some("procedure".to_string()),
                 line_number: Some(6),
+                ..Default::default()
             }],
         );
 

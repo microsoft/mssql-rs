@@ -14945,8 +14945,6 @@ mod tests {
     #[test]
     fn skipped_errors_keep_a_prefix() {
         let error = |message: String| SqlErrorInfo {
-            diagnostic_ordinal: 0,
-            parameter_set: None,
             message,
             state: 1,
             class: 16,
@@ -14954,6 +14952,7 @@ mod tests {
             server_name: None,
             proc_name: None,
             line_number: None,
+            ..Default::default()
         };
         let mut skipped = SkippedErrors::default();
         skipped.keep(vec![
@@ -17256,8 +17255,6 @@ mod tests {
 
         // Stale message left over from an earlier command / login.
         client.extend_info_messages(vec![SqlInfoMessage {
-            diagnostic_ordinal: 0,
-            parameter_set: None,
             message: "stale from previous command".to_string(),
             state: 1,
             class: 10,
@@ -17265,6 +17262,7 @@ mod tests {
             server_name: None,
             proc_name: None,
             line_number: None,
+            ..Default::default()
         }]);
 
         let statement_id = client.register_prepared_handle_for_test(1);

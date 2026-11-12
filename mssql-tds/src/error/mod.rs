@@ -16,7 +16,7 @@ use tokio::time::error::Elapsed;
 /// SQL Server can return multiple errors for a single batch execution.
 /// This struct represents one error from the stream. The full collection
 /// is available via [`SqlServerDiagnostics`] inside `Error::SqlServerError`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SqlErrorInfo {
     /// Arrival order among SQL Server ERROR and INFO tokens for this command.
     pub diagnostic_ordinal: u64,
@@ -76,7 +76,7 @@ impl From<&crate::token::tokens::ErrorToken> for SqlErrorInfo {
 /// SQL Server can return multiple INFO tokens for one request. These tokens
 /// carry warning or informational messages such as PRINT output, database or
 /// language changes, and low-severity RAISERROR output.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SqlInfoMessage {
     /// Arrival order among SQL Server ERROR and INFO tokens for this command.
     pub diagnostic_ordinal: u64,
@@ -610,8 +610,6 @@ mod tests {
     #[test]
     fn test_sql_server_error_full() {
         let error = Error::from_sql_error(SqlErrorInfo {
-            diagnostic_ordinal: 0,
-            parameter_set: None,
             message: "Login failed".to_string(),
             state: 1,
             class: 14,
@@ -619,6 +617,7 @@ mod tests {
             server_name: Some("SQLSERVER01".to_string()),
             proc_name: Some("sp_login".to_string()),
             line_number: Some(42),
+            ..Default::default()
         });
         let err_str = error.to_string();
         assert!(err_str.contains("18456"));
@@ -631,8 +630,6 @@ mod tests {
     #[test]
     fn test_sql_server_error_with_none_values() {
         let error = Error::from_sql_error(SqlErrorInfo {
-            diagnostic_ordinal: 0,
-            parameter_set: None,
             message: "Error occurred".to_string(),
             state: 2,
             class: 16,
@@ -640,6 +637,7 @@ mod tests {
             server_name: None,
             proc_name: None,
             line_number: None,
+            ..Default::default()
         });
         let err_str = error.to_string();
         assert!(err_str.contains("50000"));
@@ -651,8 +649,6 @@ mod tests {
     fn test_sql_server_error_multiple() {
         let error = Error::from_sql_errors(vec![
             SqlErrorInfo {
-                diagnostic_ordinal: 0,
-                parameter_set: None,
                 message: "First error".to_string(),
                 state: 1,
                 class: 16,
@@ -660,10 +656,9 @@ mod tests {
                 server_name: Some("SRV".to_string()),
                 proc_name: None,
                 line_number: Some(1),
+                ..Default::default()
             },
             SqlErrorInfo {
-                diagnostic_ordinal: 0,
-                parameter_set: None,
                 message: "Second error".to_string(),
                 state: 1,
                 class: 16,
@@ -671,6 +666,7 @@ mod tests {
                 server_name: Some("SRV".to_string()),
                 proc_name: None,
                 line_number: Some(2),
+                ..Default::default()
             },
         ]);
         let err_str = error.to_string();
@@ -752,8 +748,6 @@ mod tests {
     fn permanent_sql_server_error_is_not_transient() {
         // 18456 = Login failed — permanent, should not retry
         let err = Error::from_sql_error(SqlErrorInfo {
-            diagnostic_ordinal: 0,
-            parameter_set: None,
             message: "Login failed".to_string(),
             state: 1,
             class: 14,
@@ -761,6 +755,7 @@ mod tests {
             server_name: None,
             proc_name: None,
             line_number: None,
+            ..Default::default()
         });
         assert!(!err.is_transient_connect_error());
     }
@@ -772,8 +767,6 @@ mod tests {
             49919, 49920,
         ] {
             let err = Error::from_sql_error(SqlErrorInfo {
-                diagnostic_ordinal: 0,
-                parameter_set: None,
                 message: "transient".to_string(),
                 state: 1,
                 class: 16,
@@ -781,6 +774,7 @@ mod tests {
                 server_name: None,
                 proc_name: None,
                 line_number: None,
+                ..Default::default()
             });
             assert!(
                 err.is_transient_connect_error(),
@@ -794,8 +788,6 @@ mod tests {
         // If any error in the batch is transient, the whole error is transient
         let err = Error::from_sql_errors(vec![
             SqlErrorInfo {
-                diagnostic_ordinal: 0,
-                parameter_set: None,
                 message: "Login failed".to_string(),
                 state: 1,
                 class: 14,
@@ -803,10 +795,9 @@ mod tests {
                 server_name: None,
                 proc_name: None,
                 line_number: None,
+                ..Default::default()
             },
             SqlErrorInfo {
-                diagnostic_ordinal: 0,
-                parameter_set: None,
                 message: "Service busy".to_string(),
                 state: 1,
                 class: 16,
@@ -814,6 +805,7 @@ mod tests {
                 server_name: None,
                 proc_name: None,
                 line_number: None,
+                ..Default::default()
             },
         ]);
         assert!(err.is_transient_connect_error());
@@ -857,8 +849,6 @@ mod tests {
 
     fn sample_error(number: u32, message: &str) -> SqlErrorInfo {
         SqlErrorInfo {
-            diagnostic_ordinal: 0,
-            parameter_set: None,
             message: message.to_string(),
             state: 1,
             class: 16,
@@ -866,13 +856,12 @@ mod tests {
             server_name: None,
             proc_name: None,
             line_number: None,
+            ..Default::default()
         }
     }
 
     fn sample_info(number: u32, message: &str) -> SqlInfoMessage {
         SqlInfoMessage {
-            diagnostic_ordinal: 0,
-            parameter_set: None,
             message: message.to_string(),
             state: 1,
             class: 10,
@@ -880,6 +869,7 @@ mod tests {
             server_name: None,
             proc_name: None,
             line_number: None,
+            ..Default::default()
         }
     }
 

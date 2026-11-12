@@ -3353,8 +3353,6 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
         let earlier = [SqlInfoMessage {
-            diagnostic_ordinal: 0,
-            parameter_set: None,
             message: "row loop message".to_string(),
             state: 1,
             class: 10,
@@ -3362,6 +3360,7 @@ mod tests {
             server_name: None,
             proc_name: None,
             line_number: None,
+            ..Default::default()
         }];
 
         assert!(

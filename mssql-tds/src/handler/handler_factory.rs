@@ -887,8 +887,6 @@ mod tests {
 
     fn info_message(server_name: Option<&str>) -> SqlInfoMessage {
         SqlInfoMessage {
-            diagnostic_ordinal: 0,
-            parameter_set: None,
             message: "Changed database context to 'master'.".to_string(),
             state: 1,
             class: 0,
@@ -896,6 +894,7 @@ mod tests {
             server_name: server_name.map(str::to_string),
             proc_name: None,
             line_number: None,
+            ..Default::default()
         }
     }
 
