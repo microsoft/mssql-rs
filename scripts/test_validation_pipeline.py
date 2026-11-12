@@ -208,6 +208,33 @@ def test_kerberos_archive_flag_matches_bash_comparison():
     assert 'if [ "$USE_ARCHIVE" = "true" ]; then' in template
 
 
+@pytest.mark.skipif(
+    any(shutil.which(tool) is None for tool in ("cargo", "cargo-nextest")),
+    reason="needs Cargo and nextest",
+)
+def test_nextest_config_works_without_driver_crate(tmp_path):
+    (tmp_path / "Cargo.toml").write_text(
+        '[workspace]\nmembers = ["mssql-tds"]\nresolver = "2"\n', encoding="utf-8"
+    )
+    crate = tmp_path / "mssql-tds"
+    (crate / "src").mkdir(parents=True)
+    (crate / "Cargo.toml").write_text(
+        '[package]\nname = "mssql-tds"\nversion = "0.1.0"\nedition = "2021"\n',
+        encoding="utf-8",
+    )
+    (crate / "src" / "lib.rs").write_text(
+        "#[test]\nfn kerberos_fixture() {}\n", encoding="utf-8"
+    )
+    (tmp_path / ".config").mkdir()
+    shutil.copyfile(_ROOT / ".config" / "nextest.toml", tmp_path / ".config" / "nextest.toml")
+    result = subprocess.run(
+        ["cargo", "nextest", "list", "--offline", "--profile", "ci"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "kerberos_fixture" in result.stdout
+
+
 # Stands in for docker against one fake container whose filesystem is
 # $FAKE_CONTAINER_ROOT. A test run fails as nextest does without the workspace.
 _FAKE_DOCKER = r"""#!/bin/bash
