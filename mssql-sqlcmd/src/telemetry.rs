@@ -3,7 +3,7 @@
 
 //! Privacy-safe Application Insights usage telemetry for native sqlcmd.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -437,29 +437,69 @@ impl HttpClient for ValidationClient {
     }
 }
 
-/// Whether the exporter accepts `connection_string` and its instrumentation key
-/// is a GUID. The exporter does not check the key's format, so a mistyped key
-/// would otherwise enable collection that the service then rejects.
+/// Whether the exporter accepts `connection_string`, its instrumentation key is
+/// a GUID and its ingestion endpoint is an HTTPS URL with a host. The exporter
+/// checks neither, so a mistyped key or endpoint would otherwise enable
+/// collection (the device ID, the server query) that can never be delivered.
 fn connection_string_is_valid(connection_string: &str) -> bool {
-    Exporter::new_from_connection_string(connection_string, ValidationClient).is_ok()
-        && instrumentation_key_is_guid(connection_string)
+    // Before the exporter parses it: for an endpoint it cannot build a URL from
+    // (`https:///path`) it panics, and a panic message would reach stderr.
+    let fields = connection_string_fields(connection_string);
+    fields
+        .get("instrumentationkey")
+        .is_some_and(|key| is_guid(key))
+        && ingestion_endpoint_is_usable(&fields)
+        && Exporter::new_from_connection_string(connection_string, ValidationClient).is_ok()
 }
 
-/// Reads the key the way the exporter does, so the key checked is the key used:
-/// names are case-insensitive, nothing is trimmed, and when a name repeats the
-/// last one wins. The exporter has already rejected any part that is not a
-/// single `name=value`.
-fn instrumentation_key_is_guid(connection_string: &str) -> bool {
+/// The fields the way the exporter reads them, so what is checked is what is
+/// used: names are case-insensitive, nothing is trimmed, and when a name repeats
+/// the last one wins. A part that is not a `name=value` is skipped here; the
+/// exporter rejects the whole string for it afterwards.
+fn connection_string_fields(connection_string: &str) -> HashMap<String, &str> {
     connection_string
         .split(';')
         .filter_map(|part| part.split_once('='))
-        .rfind(|(name, _)| name.eq_ignore_ascii_case("InstrumentationKey"))
-        .is_some_and(|(_, key)| {
-            let groups: Vec<&str> = key.split('-').collect();
-            groups.len() == 5
-                && groups.iter().zip([8, 4, 4, 4, 12]).all(|(group, len)| {
-                    group.len() == len && group.bytes().all(|b| b.is_ascii_hexdigit())
-                })
+        .map(|(name, value)| (name.to_lowercase(), value))
+        .collect()
+}
+
+fn is_guid(text: &str) -> bool {
+    let groups: Vec<&str> = text.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(group, len)| group.len() == len && group.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The endpoint the exporter would send to (as it builds it: `http://` becomes
+/// `https://`, a trailing `/` goes, and `EndpointSuffix` with an optional
+/// `Location` stands in for a missing `IngestionEndpoint`) must be an HTTPS URL
+/// with a host. The exporter accepts a bare word or another scheme, which only
+/// fails when the event is sent.
+fn ingestion_endpoint_is_usable(fields: &HashMap<String, &str>) -> bool {
+    let endpoint = if let Some(endpoint) = fields.get("ingestionendpoint") {
+        (*endpoint).to_owned()
+    } else if let Some(suffix) = fields.get("endpointsuffix") {
+        let location = fields
+            .get("location")
+            .map(|location| format!("{location}."))
+            .unwrap_or_default();
+        format!("https://{location}dc.{suffix}")
+    } else {
+        // The exporter's own default.
+        return true;
+    };
+    let mut endpoint = endpoint.trim().to_owned();
+    if !endpoint.starts_with("https://") {
+        endpoint = endpoint.replace("http://", "https://");
+    }
+    endpoint
+        .trim_end_matches('/')
+        .parse::<http::Uri>()
+        .is_ok_and(|uri| {
+            uri.scheme_str() == Some("https") && uri.host().is_some_and(|host| !host.is_empty())
         })
 }
 
@@ -1152,6 +1192,12 @@ mod tests {
             "InstrumentationKey= 00000000-0000-0000-0000-000000000000",
             "InstrumentationKey=00000000-0000-0000-0000-000000000000 ",
             "IngestionEndpoint=https://example.invalid/",
+            // A valid key with an endpoint that can never be reached.
+            "InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=localhost",
+            "InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=ftp://example.test",
+            "InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=https://",
+            "InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=https:///path",
+            "InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=https://example.test;IngestionEndpoint=localhost",
             "not a connection string",
             "   x   ",
             "",
@@ -1177,6 +1223,24 @@ mod tests {
     fn a_valid_connection_string_is_enabled() {
         let _guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
         assert!(enabled());
+    }
+
+    /// The forms the exporter itself accepts and builds an HTTPS endpoint from.
+    #[test]
+    fn the_endpoint_forms_the_exporter_builds_are_valid() {
+        const KEY: &str = "InstrumentationKey=00000000-0000-0000-0000-000000000000";
+        for valid in [
+            KEY.to_owned(),
+            format!("{KEY};IngestionEndpoint=https://example.test/"),
+            format!("{KEY};IngestionEndpoint=http://example.test"),
+            format!("{KEY};EndpointSuffix=applicationinsights.azure.cn"),
+            format!("{KEY};EndpointSuffix=applicationinsights.azure.cn;Location=chinaeast"),
+            format!(
+                "{KEY};ingestionendpoint=https://example.test;IngestionEndpoint=https://other.test"
+            ),
+        ] {
+            assert!(connection_string_is_valid(&valid), "{valid}");
+        }
     }
 
     /// What a row of the table below expects from `shutdown`.
