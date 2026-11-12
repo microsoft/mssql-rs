@@ -369,10 +369,12 @@ fn translate_partial_response(
 
     let mut seen = BTreeSet::new();
     let mut error_count = 0u64;
-    if let Some(errors) = object.get_mut("errors") {
-        let errors = errors
-            .as_array_mut()
-            .ok_or_else(|| filter_error("Application Insights response errors were not a list"))?;
+    // The exporter requires the array, even an empty one.
+    {
+        let errors = object
+            .get_mut("errors")
+            .and_then(JsonValue::as_array_mut)
+            .ok_or_else(|| filter_error("Application Insights response had no errors list"))?;
         for error in errors {
             let filtered_index = error
                 .get("index")
@@ -1816,6 +1818,8 @@ mod tests {
             r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[{"index":0},{"index":0}]}"#,
             r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[{"statusCode":429}]}"#,
             r#"{"itemsReceived":1,"itemsAccepted":0,"errors":"none"}"#,
+            r#"{"itemsReceived":1,"itemsAccepted":1}"#,
+            r#"{"itemsReceived":1,"itemsAccepted":0,"errors":null}"#,
             r#"{"itemsAccepted":0,"errors":[]}"#,
             r#"{"itemsReceived":"1","itemsAccepted":0}"#,
             r#"[]"#,
