@@ -262,8 +262,10 @@ mod registry {
     /// or the wait timing out, does not create the ID: it would race with the
     /// lock's owner, so the event goes without the property instead. (Another
     /// user could keep a first run from creating the ID by creating this
-    /// SID-qualified name first; that only omits the property.)
-    struct FirstRunLock(OwnedHandle);
+    /// SID-qualified name first; that only omits the property.) The mutex
+    /// belongs to the thread that waited on it, so the guard is `!Send`, like
+    /// `std::sync::MutexGuard`.
+    struct FirstRunLock(OwnedHandle, std::marker::PhantomData<*const ()>);
 
     impl FirstRunLock {
         fn acquire() -> Option<Self> {
@@ -284,7 +286,7 @@ mod registry {
             // Built only on success: a failed wait just closes the handle, and
             // never runs the release below for a mutex this thread does not own.
             if waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED {
-                Some(Self(handle))
+                Some(Self(handle, std::marker::PhantomData))
             } else {
                 None
             }

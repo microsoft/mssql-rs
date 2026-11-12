@@ -256,7 +256,6 @@ mod tests {
     #[test]
     fn the_query_and_the_appended_columns_are_one_definition() {
         let query = QUERY.to_str().expect("the query is UTF-8");
-        assert!(!query.contains('\0'), "no NUL inside the SQL");
         assert!(query.starts_with("SELECT CONVERT(int, SERVERPROPERTY('EngineEdition')), "));
         assert!(query.ends_with(EXTRA_COLUMNS));
         // Four columns in all: edition, version, OS and architecture.

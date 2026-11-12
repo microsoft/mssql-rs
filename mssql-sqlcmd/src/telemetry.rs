@@ -50,9 +50,6 @@ const MAX_VERSION_LEN: usize = 64;
 const MAX_EVENTS_PER_SPAN: u32 = 8;
 pub const MAX_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long the export thread may take; the process waits for it only as long as
-/// the bound `shutdown` is given.
-const EXPORT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub const KEY_VERSION: &str = "sqlcmdcli_version";
 pub const KEY_OS: &str = "sqlcmdcli_os";
@@ -219,7 +216,7 @@ where
         // shutdown does not hand the result back, so the outcome is kept here.
         // Each attempt overwrites the last, so the attempt the exporter stops on
         // decides: a 503 that a retry answers with 200 is a delivery.
-        match translate_partial_response(response, &original_indices, original_count) {
+        match check_ingestion_response(response, &original_indices, original_count) {
             Ok((response, accepted)) => {
                 self.internal_failure.store(!accepted, Ordering::Release);
                 Ok(response)
@@ -333,12 +330,12 @@ fn validate_and_sanitize_event(envelope: &mut JsonValue) -> Result<(), HttpError
     Ok(())
 }
 
-/// Translates a partial-ingestion response about the filtered request back to
-/// the exporter's original batch, and says whether the service accepted the
-/// event: a 2xx response, and for a 206 none rejected. A 4xx or 5xx rejection
-/// (403, 429, 500...) is not accepted. The response is checked against what was
-/// sent first, so a malformed one is an error and never an apparent success.
-fn translate_partial_response(
+/// Checks an ingestion response against what was sent, translates a partial
+/// one back to the exporter's original batch, and says whether the service
+/// accepted the event: a 2xx response, and for a 206 none rejected. A 4xx or
+/// 5xx rejection (403, 429, 500...) is not accepted. A malformed response is an
+/// error and never an apparent success.
+fn check_ingestion_response(
     response: Response<Bytes>,
     original_indices: &[usize],
     original_count: usize,
@@ -354,14 +351,14 @@ fn translate_partial_response(
         .as_object_mut()
         .ok_or_else(|| filter_error("Application Insights response was not an object"))?;
     let sent = original_indices.len() as u64;
-    let received = object.get("itemsReceived").and_then(JsonValue::as_u64);
-    let accepted = object.get("itemsAccepted").and_then(JsonValue::as_u64);
-    let (Some(received), Some(accepted)) = (received, accepted) else {
+    let items_received = object.get("itemsReceived").and_then(JsonValue::as_u64);
+    let items_accepted = object.get("itemsAccepted").and_then(JsonValue::as_u64);
+    let (Some(items_received), Some(items_accepted)) = (items_received, items_accepted) else {
         return Err(filter_error(
             "Application Insights response had no item counts",
         ));
     };
-    if received != sent || accepted > received {
+    if items_received != sent || items_accepted > items_received {
         return Err(filter_error(
             "Application Insights response counts do not match the request",
         ));
@@ -393,23 +390,23 @@ fn translate_partial_response(
             error["index"] = JsonValue::from(*original_index);
         }
     }
-    if accepted + error_count > received {
+    if items_accepted + error_count > items_received {
         return Err(filter_error(
             "Application Insights response counts are inconsistent",
         ));
     }
     // A 500 is a rejection even when its body parses; a 206 is one if any item
     // was rejected.
-    let delivered = status.as_u16() == 206 && error_count == 0 && accepted == received;
+    let accepted = status.as_u16() == 206 && error_count == 0 && items_accepted == items_received;
 
     let dropped_count = original_count.saturating_sub(original_indices.len()) as u64;
     object.insert("itemsReceived".to_owned(), JsonValue::from(original_count));
     object.insert(
         "itemsAccepted".to_owned(),
-        JsonValue::from(accepted + dropped_count),
+        JsonValue::from(items_accepted + dropped_count),
     );
     let body = serde_json::to_vec(&payload).map_err(filter_error)?;
-    Ok((Response::from_parts(parts, Bytes::from(body)), delivered))
+    Ok((Response::from_parts(parts, Bytes::from(body)), accepted))
 }
 
 fn filter_error(error: impl fmt::Display) -> HttpError {
@@ -641,13 +638,10 @@ fn export_once(properties: &[(&'static str, String)]) -> FlushOutcome {
         debug!("sqlcmd telemetry configuration is invalid");
         return FlushOutcome::Failed;
     };
+    // The simple exporter has already sent the event, retries included, when the
+    // span ended; shutting down only releases the provider.
     emit_usage(&provider.provider, properties, SystemTime::now());
-    if provider
-        .provider
-        .shutdown_with_timeout(EXPORT_TIMEOUT)
-        .is_err()
-        || provider.internal_failure.load(Ordering::Acquire)
-    {
+    if provider.provider.shutdown().is_err() || provider.internal_failure.load(Ordering::Acquire) {
         FlushOutcome::Failed
     } else {
         FlushOutcome::Completed
@@ -1154,8 +1148,10 @@ mod tests {
         Completed,
         /// Rejected outright, with no retry.
         Failed,
-        /// Throttled or a server error: the exporter retries with a backoff, so
-        /// a short wait ends first. Never a success.
+        /// Throttled, a server error, or any error the exporter retries (a
+        /// transport failure, a filter failure, a response that does not add
+        /// up): it retries with a backoff, so a short wait ends first. Never a
+        /// success.
         NotCompleted,
     }
 
@@ -1217,8 +1213,7 @@ mod tests {
                 .expect("valid response")
         };
         let accepted = |status: u16, body: &'static str| {
-            translate_partial_response(response(status, body), &[0], 1)
-                .map(|(_, accepted)| accepted)
+            check_ingestion_response(response(status, body), &[0], 1).map(|(_, accepted)| accepted)
         };
         assert!(accepted(200, "").expect("ok"));
         assert!(accepted(204, "").expect("ok"));
@@ -1243,6 +1238,10 @@ mod tests {
                 r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[{"index":0}]}"#
             )
             .expect("ok")
+        );
+        // ...and even when the body reports every item accepted.
+        assert!(
+            !accepted(500, r#"{"itemsReceived":1,"itemsAccepted":1,"errors":[]}"#).expect("ok")
         );
         // A malformed one is an error, not an acceptance.
         assert!(accepted(206, "[]").is_err());
@@ -1284,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn a_transport_error_after_a_rejection_or_before_a_delivery_is_decided_by_the_last() {
+    fn a_transport_error_that_a_retry_recovers_from_is_a_delivery() {
         let ok = || {
             Ok(Response::builder()
                 .status(200)
@@ -1473,7 +1472,7 @@ mod tests {
     }
 
     /// Serializes the tests that use the process-wide session and environment,
-    /// and puts both back as they were.
+    /// and clears them afterwards.
     struct TestEnv {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
@@ -1524,6 +1523,7 @@ mod tests {
             unsafe {
                 std::env::remove_var(OPTOUT_ENV);
                 std::env::remove_var(CONNECTION_STRING_ENV);
+                std::env::remove_var(caller::DECLARED_CALLER_ENV);
             }
             *SESSION
                 .lock()
@@ -1782,7 +1782,7 @@ mod tests {
             ))
             .expect("valid response");
 
-        let (translated, accepted) = translate_partial_response(
+        let (translated, accepted) = check_ingestion_response(
             response,
             &filtered.original_indices,
             filtered.original_count,
@@ -1803,7 +1803,7 @@ mod tests {
             .body(Bytes::from_static(b"not json"))
             .expect("valid response");
 
-        assert!(translate_partial_response(response, &[1], 2).is_err());
+        assert!(check_ingestion_response(response, &[1], 2).is_err());
     }
 
     #[test]
@@ -1832,7 +1832,7 @@ mod tests {
                 .body(Bytes::from(body))
                 .expect("valid response");
             assert!(
-                translate_partial_response(response, &[1], 2).is_err(),
+                check_ingestion_response(response, &[1], 2).is_err(),
                 "{body}"
             );
         }
@@ -1848,7 +1848,7 @@ mod tests {
             .expect("valid response");
 
         let (translated, accepted) =
-            translate_partial_response(response, &[1], 2).expect("consistent");
+            check_ingestion_response(response, &[1], 2).expect("consistent");
         assert!(accepted);
         let payload: JsonValue = serde_json::from_slice(translated.body()).expect("JSON");
         assert_eq!(payload["itemsReceived"], 2);

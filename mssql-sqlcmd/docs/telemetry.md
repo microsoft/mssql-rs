@@ -195,20 +195,26 @@ close) sends the event before ending the process. On Linux and macOS the signal
 handlers do not flush: an event for a run ended by a signal is lost.
 
 The event is exported at once by its own thread, using a simple exporter: the
-span ends, the event is sent on that thread, and the provider is shut down, so
-nothing waits on a batch timer in a long interactive session. A transport
-failure, a failure in the filter, a response that does not match what was sent,
-and a rejection by the service (a 4xx or 5xx status, or a partial response that
-rejected the event) are all recorded as a failure, because the SDK's shutdown
-does not hand the export result back. The exporter retries throttling and server
-errors with a backoff of up to about 35 seconds, and the last attempt decides
-the outcome, so a retry that succeeds is not reported as a failure. If shutdown
-arrives during the backoff, the bounded wait ends first and that is reported as
-a timeout, not as success. An all-filtered or malformed request is an error, not
-a synthetic success. A partial-ingestion response is checked against the request first (item counts,
-and that every error index is present, unique and in range) before its indices
-are translated back to the original batch; a response that does not add up is
-an error and is never taken as an acceptance.
+event is sent on that thread, inside the call that ends the span, and the
+provider is then shut down, so nothing waits on a batch timer in a long
+interactive session. A transport failure, a failure in the filter, a response
+that does not match what was sent, and a rejection by the service (a 4xx or 5xx
+status, or a partial response that rejected the event) are all recorded as a
+failure, because the SDK's shutdown does not hand the export result back. The
+exporter retries throttling, server errors and every error the HTTP client
+returns: a transport failure and, because the filter reports through the same
+error, a filter failure or a response that does not add up. It backs off for up
+to about 35 seconds, and the last attempt decides the outcome, so a retry that
+succeeds is not reported as a failure. Nothing bounds that thread but the
+exporter's own retries; the process waits for it only as long as the bound
+passed to shutdown. If shutdown arrives first, for example during the backoff,
+it reports a timeout, not success, and a failure that the exporter is still
+retrying is also reported as a timeout. An all-filtered or malformed request is
+an error, not a synthetic success. An ingestion response is checked against the
+request first (item counts, and that every error index is present, unique and
+in range) before a partial one's indices are translated back to the original
+batch; a response that does not add up is an error and is never taken as an
+acceptance.
 
 Recording and shutdown are ordered by one lock: a call admitted before shutdown
 is sent by it, and a call after it is not recorded. Shutdown takes that lock
