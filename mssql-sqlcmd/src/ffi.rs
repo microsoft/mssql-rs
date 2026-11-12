@@ -135,8 +135,9 @@ pub unsafe extern "C" fn mssql_sqlcmd_set_locale(locale: MssqlSqlcmdText) -> i32
 /// `command` is `MSSQL_SQLCMD_COMMAND_*` and `format` is
 /// `MSSQL_SQLCMD_FORMAT_*`; an unknown value is the "not given" case. The
 /// version is included only when it is a bounded version-like value. Does
-/// nothing unless telemetry is enabled. Best effort: a panic is caught and never
-/// crosses the ABI.
+/// nothing unless telemetry is enabled. On Windows, a first run (no device ID
+/// yet) can wait up to 500 ms here while another first run creates it. Best
+/// effort: a panic is caught and never crosses the ABI.
 ///
 /// # Safety
 /// `sqlcmd_version` must satisfy [`read_text`]'s pointer and length requirements.

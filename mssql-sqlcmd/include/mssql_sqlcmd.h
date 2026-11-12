@@ -77,7 +77,9 @@ int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_set_locale(MssqlSqlcmdText locale);
 #define MSSQL_SQLCMD_FORMAT_MISSING 3   /* given with no value */
 
 /* Records what this run is. Call once after the command line is parsed.
-   sqlcmd_version is included only when it is a bounded version-like value. */
+   sqlcmd_version is included only when it is a bounded version-like value.
+   On Windows, a first run (no device ID yet) can wait up to 500 ms here while
+   another first run creates it. */
 void MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_record_usage(
     MssqlSqlcmdText sqlcmd_version,
     int32_t command,

@@ -289,6 +289,10 @@ mod registry {
         ))
     }
 
+    /// The startup wait stated in docs/telemetry.md (Failure behavior and
+    /// latency): how long a first run waits for another first run's lock.
+    const FIRST_RUN_LOCK_WAIT_MS: u32 = 500;
+
     /// A named mutex that serializes first runs of sqlcmd for this user across
     /// all their sessions. A first run that cannot take it, because of an error
     /// or the wait timing out, does not create the ID: it would race with the
@@ -301,7 +305,7 @@ mod registry {
 
     impl FirstRunLock {
         fn acquire() -> Option<Self> {
-            Self::acquire_with(500)
+            Self::acquire_with(FIRST_RUN_LOCK_WAIT_MS)
         }
 
         fn acquire_with(wait_ms: u32) -> Option<Self> {
@@ -519,6 +523,31 @@ mod registry {
                 .join()
                 .expect("thread");
             assert!(again, "free again after release");
+        }
+
+        /// What a first run really waits is the documented bound, not another
+        /// number: `acquire` gives up after `FIRST_RUN_LOCK_WAIT_MS`.
+        #[test]
+        fn a_first_run_gives_up_on_a_held_lock_after_the_documented_wait() {
+            assert_eq!(FIRST_RUN_LOCK_WAIT_MS, 500);
+            let first = FirstRunLock::acquire_with(1000).expect("the lock is free");
+            let (acquired, elapsed) = std::thread::spawn(|| {
+                let started = std::time::Instant::now();
+                let acquired = FirstRunLock::acquire().is_some();
+                (acquired, started.elapsed())
+            })
+            .join()
+            .expect("thread");
+            drop(first);
+            assert!(!acquired, "taken while held");
+            assert!(
+                elapsed >= std::time::Duration::from_millis(400),
+                "{elapsed:?}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_millis(1_200),
+                "{elapsed:?}"
+            );
         }
     }
 }
