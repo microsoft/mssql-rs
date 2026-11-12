@@ -1047,8 +1047,12 @@ mod tests {
     }
 
     fn encrypted_param() -> RpcParameter {
+        encrypted(SqlType::Int(Some(7)))
+    }
+
+    fn encrypted(value: SqlType) -> RpcParameter {
         use super::super::parameters::rpc_parameters::RpcEncryptionMetadata;
-        let mut parameter = param(SqlType::Int(Some(7)));
+        let mut parameter = param(value);
         parameter.set_encrypted(
             Some(vec![1, 2, 3]),
             RpcEncryptionMetadata {
@@ -1914,7 +1918,14 @@ mod tests {
     /// emit the same bytes. Returns whether it took the value and whether the
     /// async path succeeded.
     fn inline_matches_async(parameter: &RpcParameter) -> (bool, bool) {
-        let collation = db_collation();
+        inline_matches_async_under(parameter, &db_collation())
+    }
+
+    fn inline_matches_async_under(
+        parameter: &RpcParameter,
+        collation: &SqlCollation,
+    ) -> (bool, bool) {
+        let collation = *collation;
         let mut mock = MockNetworkWriter::new(32767);
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
         let result = block_on(write_rpc_value(
@@ -1989,6 +2000,301 @@ mod tests {
             inline_matches_async(&param(SqlType::VarBinaryMax(Some(vec![1])))),
             (false, true)
         );
+    }
+
+    /// SQL_Latin1_General_CP1_CI_AS (cp1252), Japanese_CI_AS (CP932) and
+    /// Latin1_General_100_CI_AS_SC_UTF8.
+    fn narrow_collations() -> [SqlCollation; 3] {
+        [
+            db_collation(),
+            SqlCollation {
+                info: 0x00D0_0411,
+                lcid_language_id: 0x0411,
+                col_flags: 0x0D,
+                sort_id: 0,
+            },
+            SqlCollation {
+                info: 0x04D0_0409,
+                lcid_language_id: 0x0409,
+                col_flags: 0x4D,
+                sort_id: 0,
+            },
+        ]
+    }
+
+    fn utf8_varchar(text: &str, max_len: u16) -> SqlType {
+        use crate::datatypes::sql_string::EncodingType;
+        SqlType::Varchar(
+            Some(SqlString::new(text.as_bytes().to_vec(), EncodingType::Utf8)),
+            max_len,
+        )
+    }
+
+    /// VARCHAR(n) around n and the PLP boundary, from every source encoding,
+    /// under each narrow collation. Only non-NULL values whose wire bytes are
+    /// their source bytes and fit n are written inline; trailing-blank
+    /// fitting, 22001 and every transcode stay on the async path.
+    #[test]
+    fn varchar_inline_values_match_the_async_serializer() {
+        use crate::datatypes::sql_string::EncodingType;
+        use crate::message::parameters::rpc_parameters::StreamedSqlType;
+        let (mut inline, mut declined) = (0, 0);
+        for collation in narrow_collations() {
+            for max_len in [0u16, 1, 2, 255, 7999, 8000, 8001, u16::MAX] {
+                let n = usize::from(max_len);
+                let plp = max_len > 8000;
+                // (value, source bytes are wire bytes, length, excess is all blanks)
+                let mut cases: Vec<(SqlType, bool, usize, bool)> = Vec::new();
+                for (text, blanks) in [
+                    (String::new(), true),
+                    ("a".repeat(n.saturating_sub(1)), true),
+                    ("a".repeat(n), true),
+                    (format!("{} ", "a".repeat(n)), true),
+                    (format!("{}   ", "b".repeat(n)), true),
+                    (format!("{}c", "c".repeat(n)), false),
+                ] {
+                    let len = text.len();
+                    cases.push((utf8_varchar(&text, max_len), true, len, blanks));
+                }
+                // CP932 lead/trail bytes and cp1252 bytes the server sees as-is.
+                for raw in [vec![0x82, 0xa0].repeat(n / 2), vec![0xe9; n + 1]] {
+                    let len = raw.len();
+                    for encoding in [
+                        EncodingType::LcidBased(collation),
+                        EncodingType::LcidBased(value_collation()),
+                        EncodingType::DelayedSet,
+                    ] {
+                        let value =
+                            SqlType::Varchar(Some(SqlString::new(raw.clone(), encoding)), max_len);
+                        cases.push((value, true, len, false));
+                    }
+                }
+                for text in ["é", "日本", "a\u{1F600}"] {
+                    cases.push((utf8_varchar(text, max_len), false, 0, false));
+                }
+                cases.push((
+                    SqlType::Varchar(Some(utf16("abc")), max_len),
+                    false,
+                    0,
+                    false,
+                ));
+                cases.push((SqlType::Varchar(None, max_len), false, 0, false));
+
+                for (value, transparent, len, blanks) in cases {
+                    let over = !plp && len > n;
+                    let expected = transparent && !plp && !over;
+                    for parameter in [
+                        param(value.clone()),
+                        RpcParameter::new(None, StatusFlags::BY_REF_VALUE, value.clone()),
+                    ] {
+                        let (fast, async_ok) = inline_matches_async_under(&parameter, &collation);
+                        assert_eq!(fast, expected, "{collation:?} {value:?}");
+                        if transparent {
+                            assert_eq!(async_ok, !over || blanks, "{collation:?} {value:?}");
+                        }
+                        if fast {
+                            inline += 1;
+                        } else {
+                            declined += 1;
+                        }
+                    }
+                    if !expected {
+                        continue;
+                    }
+                    let mut limited = value.clone();
+                    if let SqlType::Varchar(Some(string), _) = &mut limited {
+                        string.set_narrow_string_byte_limit(n + 8);
+                    }
+                    for parameter in [
+                        param(limited),
+                        param(value.clone()).with_narrow_string_byte_limit(n + 8),
+                        encrypted(value.clone()),
+                    ] {
+                        assert_eq!(parameter.positional_inline_len(), None, "{value:?}");
+                        let (fast, async_ok) = inline_matches_async_under(&parameter, &collation);
+                        assert!(!fast && async_ok, "{value:?}");
+                    }
+                }
+            }
+        }
+        assert!(inline > 100 && declined > 100, "{inline} {declined}");
+        let streamed =
+            RpcParameter::data_at_exec(None, StatusFlags::NONE, StreamedSqlType::VarcharMax);
+        assert_eq!(streamed.positional_inline_len(), None);
+        assert_eq!(
+            param(utf8_varchar("ab", 10)).positional_inline_len(),
+            Some(2 + 8 + 2 + 2)
+        );
+    }
+
+    /// Every ASCII byte is its own wire byte under every collation the
+    /// serializer resolves, including OEM sort IDs and the Latin-1 fallback.
+    #[test]
+    fn ascii_varchar_inline_matches_the_async_serializer_under_every_collation() {
+        let ascii: String = (0u8..0x80).map(char::from).collect();
+        let lcids = [
+            0x0409u32,
+            0x0411,
+            0x0804,
+            0x0412,
+            0x0404,
+            0x041E,
+            0x0405,
+            0x0419,
+            0x0408,
+            0x041F,
+            0x040D,
+            0x0401,
+            0x0425,
+            0x042A,
+            0x0001_0000,
+            0x0007_FFFF,
+        ];
+        let mut collations: Vec<SqlCollation> = (0..=u8::MAX)
+            .map(|sort_id| SqlCollation {
+                info: 0x00D0_0409,
+                lcid_language_id: 0x0409,
+                col_flags: 0x0D,
+                sort_id,
+            })
+            .collect();
+        for lcid in lcids {
+            for col_flags in [0x0Du8, 0x4D] {
+                collations.push(SqlCollation {
+                    info: (u32::from(col_flags) << 20) | lcid,
+                    lcid_language_id: i32::try_from(lcid).unwrap(),
+                    col_flags,
+                    sort_id: 0,
+                });
+            }
+        }
+        for collation in collations {
+            for max_len in [128u16, 8000] {
+                let parameter = param(utf8_varchar(&ascii, max_len));
+                assert_eq!(
+                    inline_matches_async_under(&parameter, &collation),
+                    (true, true),
+                    "{collation:?}"
+                );
+            }
+        }
+    }
+
+    /// An insert row shaped like mssql-python's `executemany`: the handle,
+    /// narrow text, a number and more text. Some rows carry a non-ASCII value
+    /// the fast path declines after writing the earlier ones, so the whole
+    /// command rewinds.
+    fn varchar_row(index: usize) -> (Vec<RpcParameter>, bool) {
+        use crate::datatypes::sql_string::EncodingType;
+        let mut row = vec![
+            param(SqlType::Int(Some(42))),
+            param(utf8_varchar(&format!("customer-{index:06}"), 50)),
+            param(SqlType::SmallInt(Some(
+                i16::try_from(index % 1000).unwrap(),
+            ))),
+            param(SqlType::Varchar(
+                Some(SqlString::new(
+                    vec![0x82, 0xa0].repeat(index % 7),
+                    EncodingType::LcidBased(value_collation()),
+                )),
+                20,
+            )),
+            param(utf8_varchar(&"x".repeat(index % 23), 30)),
+        ];
+        let eligible = index % 17 != 0;
+        if !eligible {
+            row.push(param(utf8_varchar("é", 10)));
+        }
+        (row, eligible)
+    }
+
+    #[test]
+    fn varchar_batch_matches_async_wire_across_packet_boundaries() {
+        for packet_size in [512u32, 4096, 16192] {
+            let max_payload = usize::try_from(packet_size).unwrap() - 8;
+            let (rows, eligible): (Vec<_>, Vec<_>) =
+                (1..=2 * max_payload / 50).map(varchar_row).unzip();
+            let lengths: Vec<_> = rows.iter().map(|row| command_len(row, false)).collect();
+            let mut boundary_ends = std::collections::BTreeSet::new();
+            let (mut fast_hits, mut commands) = (0usize, 0usize);
+            for collation in narrow_collations() {
+                for shift in 0..=40 {
+                    let mut batch = vec![shift_row(shift)];
+                    batch.extend(rows.iter().cloned());
+                    let slow = run_batch(packet_size, &collation, &batch, false);
+                    let fast = run_batch(packet_size, &collation, &batch, true);
+                    assert_eq!(slow.result, "Ok(())");
+                    assert_eq!(fast.result, slow.result);
+                    assert_eq!(fast.wire, slow.wire, "packet {packet_size}, shift {shift}");
+                    for (index, &(position, took_fast_path)) in
+                        fast.commands.iter().enumerate().skip(1)
+                    {
+                        assert_eq!(position, slow.commands[index].0);
+                        let end = position + lengths[index - 1];
+                        let row_eligible = eligible[index - 1];
+                        assert_eq!(
+                            took_fast_path,
+                            row_eligible && end < max_payload,
+                            "packet {packet_size}, shift {shift}, command {index} ends at {end}"
+                        );
+                        if row_eligible && (max_payload - 2..=max_payload + 1).contains(&end) {
+                            boundary_ends.insert(end + 2 - max_payload);
+                        }
+                        fast_hits += usize::from(took_fast_path);
+                        commands += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                boundary_ends.into_iter().collect::<Vec<_>>(),
+                [0, 1, 2, 3],
+                "commands must end at max-2, max-1 (fast) and max, max+1 (fallback)"
+            );
+            assert!(
+                fast_hits * 10 > commands * 6,
+                "packet {packet_size}: only {fast_hits} of {commands} commands took the fast path"
+            );
+        }
+    }
+
+    /// The last VARCHAR command ends at max-2 .. max+1, so `finalize` decides
+    /// between one final packet and a header-only EOM after an exact fill.
+    #[test]
+    fn varchar_batch_matches_trailing_eom_at_exact_fill() {
+        let final_row = |bytes: usize| {
+            let mut row = vec![param(SqlType::Int(Some(42)))];
+            for part in 0..3 {
+                let part_bytes = bytes.saturating_sub(part * 8000).min(8000);
+                row.push(param(utf8_varchar(&"q".repeat(part_bytes), 8000)));
+            }
+            row
+        };
+        for collation in narrow_collations() {
+            for packet_size in [512u32, 4096, 16192] {
+                let max_payload = usize::try_from(packet_size).unwrap() - 8;
+                let base = command_len(&shift_row(0), true);
+                let empty = command_len(&final_row(0), false);
+                for offset in -2isize..=1 {
+                    let bytes = (max_payload as isize + offset) as usize - base - empty;
+                    let batch = vec![shift_row(0), final_row(bytes)];
+                    assert_eq!(command_len(&batch[1], false), empty + bytes);
+                    let slow = run_batch(packet_size, &collation, &batch, false);
+                    let fast = run_batch(packet_size, &collation, &batch, true);
+                    assert_eq!(fast.commands[1].0, base);
+                    assert_eq!(slow.result, "Ok(())");
+                    assert_eq!(fast.result, slow.result);
+                    assert_eq!(
+                        fast.wire, slow.wire,
+                        "packet {packet_size}, offset {offset}"
+                    );
+                    assert_eq!(
+                        fast.commands[1].1,
+                        offset < 0,
+                        "packet {packet_size} {offset}"
+                    );
+                }
+            }
+        }
     }
 
     /// The `sp_execute` handle, then a pad that shifts every value by one byte
