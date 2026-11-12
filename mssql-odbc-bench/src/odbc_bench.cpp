@@ -2704,7 +2704,6 @@ public:
             add_integer("ref", references);
         }
         add_text("name", names);
-        expect("SUM(CAST(SUBSTRING([name], 10, 6) AS BIGINT))", sum(ids));
         if (ten_columns) {
             add_text("city", cities);
             add_text("note", notes);
@@ -2781,16 +2780,16 @@ private:
         return std::string(text, static_cast<std::size_t>(written));
     }
 
-    static std::int64_t sum(const std::vector<std::int64_t>& values) {
-        std::int64_t total = 0;
-        for (const auto value : values) {
-            total += value;
-        }
-        return total;
-    }
+    // One projected validation column and its expected value for every row, in
+    // `id` order. Exactly one of the vectors is filled.
+    struct Check {
+        std::string expression;
+        std::vector<std::int64_t> numbers;
+        std::vector<std::string> texts;
+    };
 
-    void expect(std::string expression, std::int64_t value) {
-        expected_.emplace_back(std::move(expression), value);
+    void expect_numbers(std::string expression, std::vector<std::int64_t> values) {
+        checks_.push_back({std::move(expression), std::move(values), {}});
     }
 
     Column& add_column(const char* name, SQLSMALLINT c_type, SQLSMALLINT sql_type,
@@ -2849,7 +2848,7 @@ private:
                 store(*column, row, &value, sizeof(value), 0);
             }
         }
-        expect("SUM(CAST([" + std::string(name) + "] AS BIGINT))", sum(values));
+        expect_numbers("CAST([" + std::string(name) + "] AS BIGINT)", values);
     }
 
     // An ASCII `str` column binds SQL_C_CHAR -> SQL_VARCHAR sized to the longest
@@ -2875,23 +2874,21 @@ private:
 
     void add_text(const char* name, const std::vector<std::string>& values) {
         add_varchar(name, values);
-        std::int64_t total_length = 0;
-        for (const auto& value : values) {
-            total_length += static_cast<std::int64_t>(value.size());
-        }
-        expect("SUM(CAST(LEN([" + std::string(name) + "]) AS BIGINT))", total_length);
+        checks_.push_back({"[" + std::string(name) + "]", {}, values});
     }
 
     // executemany string-binds money-range Decimal values as VARCHAR (GH-503).
     void add_decimal_text(const char* name, const std::vector<std::string>& values) {
         add_varchar(name, values);
-        std::int64_t scaled = 0;
+        std::vector<std::int64_t> scaled;
+        scaled.reserve(values.size());
         for (const auto& value : values) {
             const auto point = value.find('.');
-            scaled += std::stoll(value.substr(0, point)) * 10000 +
-                      std::stoll(value.substr(point + 1));
+            scaled.push_back(std::stoll(value.substr(0, point)) * 10000 +
+                             std::stoll(value.substr(point + 1)));
         }
-        expect("SUM(CAST([" + std::string(name) + "] * 10000 AS BIGINT))", scaled);
+        expect_numbers("CAST([" + std::string(name) + "] * 10000 AS BIGINT)",
+                       std::move(scaled));
     }
 
     // A naive `datetime.datetime` binds SQL_C_TYPE_TIMESTAMP -> SQL_TYPE_TIMESTAMP(26, 6).
@@ -2899,70 +2896,82 @@ private:
         auto& column = add_column(name, SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIMESTAMP, 26, 6,
                                   sizeof(SQL_TIMESTAMP_STRUCT),
                                   sizeof(SQL_TIMESTAMP_STRUCT));
-        std::int64_t total = 0;
+        std::vector<std::int64_t> micros;
+        micros.reserve(values.size());
         for (std::size_t row = 0; row < values.size(); ++row) {
             store(column, row, &values[row].value, sizeof(SQL_TIMESTAMP_STRUCT), 0);
-            total += values[row].micros_since_2026;
+            micros.push_back(values[row].micros_since_2026);
         }
-        expect("SUM(DATEDIFF_BIG(MICROSECOND, CAST('2026-01-01' AS DATETIME2(6)), [" +
-                   std::string(name) + "]))",
-               total);
+        expect_numbers("DATEDIFF_BIG(MICROSECOND, CAST('2026-01-01' AS DATETIME2(6)), [" +
+                           std::string(name) + "])",
+                       std::move(micros));
     }
 
+    // Compares every written cell with the value generated for that row. Ordering
+    // by `id` (the first check) ties each column to its row, so a parameter array
+    // delivered with values attached to the wrong rows fails here.
     void validate_written_rows() {
         const SQLHSTMT validation_stmt = session_.admin_statement();
-        std::string select = "SELECT COUNT_BIG(*)";
-        for (const auto& [expression, value] : expected_) {
-            (void)value;
-            select += ", " + expression;
+        std::string select;
+        for (const auto& check : checks_) {
+            select += (select.empty() ? "SELECT " : ", ") + check.expression;
         }
-        auto query = to_sql_string(select + " FROM " + target_.table);
-        std::vector<SQLBIGINT> actual(expected_.size() + 1, -1);
-        std::vector<SQLLEN> indicators(actual.size(), kIndicatorSentinel);
+        auto query = to_sql_string(select + " FROM " + target_.table + " ORDER BY [id]");
+        std::array<char, 256> text = {};
         try {
             require_exact_success(SQLExecDirect(validation_stmt, query.data(), SQL_NTS),
                                   "SQLExecDirect(executemany validation)", SQL_HANDLE_STMT,
                                   validation_stmt);
-            for (std::size_t column = 0; column < actual.size(); ++column) {
-                require_exact_success(
-                    SQLBindCol(validation_stmt, static_cast<SQLUSMALLINT>(column + 1),
-                               SQL_C_SBIGINT, &actual[column], sizeof(SQLBIGINT),
-                               &indicators[column]),
-                    "SQLBindCol(executemany validation)", SQL_HANDLE_STMT, validation_stmt);
+            for (std::size_t row = 0; row < kExecuteManyRows; ++row) {
+                const SQLRETURN fetched = SQLFetch(validation_stmt);
+                if (fetched == SQL_NO_DATA) {
+                    throw std::runtime_error(std::string(name()) + " wrote only " +
+                                             std::to_string(row) + " rows");
+                }
+                require_exact_success(fetched, "SQLFetch(executemany validation)",
+                                      SQL_HANDLE_STMT, validation_stmt);
+                for (std::size_t index = 0; index < checks_.size(); ++index) {
+                    const auto& check = checks_[index];
+                    const auto ordinal = static_cast<SQLUSMALLINT>(index + 1);
+                    SQLLEN indicator = kIndicatorSentinel;
+                    bool matches = false;
+                    if (check.texts.empty()) {
+                        SQLBIGINT actual = 0;
+                        require_exact_success(
+                            SQLGetData(validation_stmt, ordinal, SQL_C_SBIGINT, &actual,
+                                       sizeof(actual), &indicator),
+                            "SQLGetData(executemany validation)", SQL_HANDLE_STMT,
+                            validation_stmt);
+                        matches = indicator == static_cast<SQLLEN>(sizeof(actual)) &&
+                                  actual == check.numbers[row];
+                    } else {
+                        require_exact_success(
+                            SQLGetData(validation_stmt, ordinal, SQL_C_CHAR, text.data(),
+                                       static_cast<SQLLEN>(text.size()), &indicator),
+                            "SQLGetData(executemany validation)", SQL_HANDLE_STMT,
+                            validation_stmt);
+                        const auto& expected = check.texts[row];
+                        matches = indicator == static_cast<SQLLEN>(expected.size()) &&
+                                  expected.compare(0, expected.size(), text.data(),
+                                                   expected.size()) == 0;
+                    }
+                    if (!matches) {
+                        throw std::runtime_error(std::string(name()) +
+                                                 " correctness check failed: " +
+                                                 check.expression + " in row " +
+                                                 std::to_string(row + 1));
+                    }
+                }
             }
-            require_exact_success(SQLFetch(validation_stmt), "SQLFetch(executemany validation)",
-                                  SQL_HANDLE_STMT, validation_stmt);
             if (SQLFetch(validation_stmt) != SQL_NO_DATA) {
-                throw std::runtime_error("executemany validation returned more than one row");
+                throw std::runtime_error(std::string(name()) + " wrote extra rows");
             }
             require_exact_success(SQLCloseCursor(validation_stmt),
                                   "SQLCloseCursor(executemany validation)", SQL_HANDLE_STMT,
                                   validation_stmt);
-            require_exact_success(SQLFreeStmt(validation_stmt, SQL_UNBIND),
-                                  "SQLFreeStmt(SQL_UNBIND executemany validation)",
-                                  SQL_HANDLE_STMT, validation_stmt);
         } catch (...) {
             SQLFreeStmt(validation_stmt, SQL_CLOSE);
-            SQLFreeStmt(validation_stmt, SQL_UNBIND);
             throw;
-        }
-
-        std::ostringstream mismatches;
-        for (std::size_t column = 0; column < actual.size(); ++column) {
-            const auto& expression = column == 0 ? std::string("COUNT_BIG(*)")
-                                                 : expected_[column - 1].first;
-            const std::int64_t expected = column == 0
-                                              ? static_cast<std::int64_t>(kExecuteManyRows)
-                                              : expected_[column - 1].second;
-            if (indicators[column] != static_cast<SQLLEN>(sizeof(SQLBIGINT)) ||
-                actual[column] != expected) {
-                mismatches << ' ' << expression << '=' << actual[column] << " (expected "
-                           << expected << ')';
-            }
-        }
-        if (!mismatches.str().empty()) {
-            throw std::runtime_error(std::string(name()) +
-                                     " correctness check failed:" + mismatches.str());
         }
     }
 
@@ -3057,7 +3066,7 @@ private:
     OdbcSession& session_;
     const ExecuteManyTarget& target_;
     std::vector<Column> columns_;
-    std::vector<std::pair<std::string, std::int64_t>> expected_;
+    std::vector<Check> checks_;
     // mssql-python calls the wide entry points; the ANSI ones would measure a
     // different Driver Manager path on non-UNICODE builds.
     std::basic_string<SQLWCHAR> insert_sql_;

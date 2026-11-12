@@ -264,9 +264,10 @@ Python-side type detection and conversion are not measured.
 
 `ODBC_BENCH_WRITE_MODE` does not apply, so every driver leg, including the
 pinned baseline, runs this sequence. Preflight and every sample check the row
-and result-column counts and the absence of diagnostics, then verify per-column
-integer sums of the written rows: values, text lengths, the digits embedded in
-`name`, decimals scaled by 10,000, and datetimes as microseconds from 2026-01-01.
+and result-column counts and the absence of diagnostics, then read the written
+rows back in `id` order and compare every cell with the value generated for that
+row: integers, exact text, decimals scaled by 10,000, and datetimes as
+microseconds from 2026-01-01. A value attached to the wrong row fails the run.
 
 ## Measurement boundaries
 
