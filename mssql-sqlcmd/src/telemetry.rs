@@ -972,10 +972,7 @@ mod tests {
         assert_eq!(properties[KEY_COMMAND], "diagnose");
         assert_eq!(properties[KEY_FORMAT], "json");
         assert_eq!(properties[KEY_DEVICE_ID], TEST_DEVICE_ID);
-        assert!(matches!(
-            properties[KEY_CALLER_TYPE].as_str(),
-            "agent" | "pipeline" | "unknown"
-        ));
+        assert_eq!(properties[KEY_CALLER_TYPE], "pipeline");
         assert_eq!(properties[server_info::KEY_ENGINE_EDITION], "2");
         assert_eq!(properties[server_info::KEY_SERVER_OS], "windows");
         assert_eq!(properties[server_info::KEY_SERVER_PLATFORM], "NT x64");
@@ -1492,6 +1489,9 @@ mod tests {
             // the telemetry module.
             unsafe {
                 std::env::remove_var(OPTOUT_ENV);
+                // A declaration wins over every environment marker, so the
+                // caller type does not depend on where the tests run.
+                std::env::set_var(caller::DECLARED_CALLER_ENV, "pipeline");
                 match connection_string {
                     Some(value) => std::env::set_var(CONNECTION_STRING_ENV, value),
                     None => std::env::remove_var(CONNECTION_STRING_ENV),
