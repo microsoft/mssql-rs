@@ -100,23 +100,7 @@ pub fn arrow_value_to_column_value(array: &dyn Array, idx: usize) -> Result<Colu
         )));
     }
     if array.is_null(idx) {
-        // Null column-value is encoded by the writer based on the destination
-        // column's type, not the source. The streaming writer accepts a typed
-        // ColumnValues null marker; we use a dummy variant the writer treats
-        // as null. The simplest universally-handled marker is an empty Bytes
-        // null is not directly representable — instead emit a sentinel that
-        // the writer's null-bit handling recognizes. mssql-tds treats any
-        // ColumnValues passed against a nullable destination via the
-        // streaming writer correctly; for nulls we emit a zero-length Bytes
-        // which the writer translates to NULL only for binary columns.
-        //
-        // To support nulls for any column type, mssql-tds currently requires
-        // the caller to know the destination type. Until we can resolve the
-        // destination metadata up-front, we emit a typed "best-guess" null
-        // based on the SOURCE Arrow type — which works because the writer
-        // honours the variant for typing decisions but suppresses payload
-        // when the value is a typed null marker.
-        return Ok(null_for_arrow_type(array.data_type()));
+        return Ok(ColumnValues::Null);
     }
 
     Ok(match array.data_type() {
@@ -219,31 +203,30 @@ pub fn arrow_value_to_column_value(array: &dyn Array, idx: usize) -> Result<Colu
                 return Err(usage("Time64 value must be less than one day"));
             }
             ColumnValues::Time(SqlTime {
-                time_nanoseconds: nanos,
+                time_nanoseconds: nanos / 100,
                 scale: DEFAULT_VARTIME_SCALE,
             })
         }
         DataType::Timestamp(unit, _tz) => {
-            let nanos_since_unix: i64 = match unit {
+            let nanos_since_unix: i128 = match unit {
                 TimeUnit::Second => {
                     let a = downcast::<TimestampSecondArray>(array, "Timestamp(s)")?;
-                    a.value(idx).saturating_mul(1_000_000_000)
+                    i128::from(a.value(idx)) * 1_000_000_000
                 }
                 TimeUnit::Millisecond => {
                     let a = downcast::<TimestampMillisecondArray>(array, "Timestamp(ms)")?;
-                    a.value(idx).saturating_mul(1_000_000)
+                    i128::from(a.value(idx)) * 1_000_000
                 }
                 TimeUnit::Microsecond => {
                     let a = downcast::<TimestampMicrosecondArray>(array, "Timestamp(µs)")?;
-                    a.value(idx).saturating_mul(1_000)
+                    i128::from(a.value(idx)) * 1_000
                 }
                 TimeUnit::Nanosecond => {
                     let a = downcast::<TimestampNanosecondArray>(array, "Timestamp(ns)")?;
-                    a.value(idx)
+                    i128::from(a.value(idx))
                 }
             };
-            // Split into days-since-1970 and intra-day nanos, then shift to TDS epoch.
-            let nanos_per_day: i64 = 86_400 * 1_000_000_000;
+            let nanos_per_day: i128 = 86_400 * 1_000_000_000;
             let days_unix = nanos_since_unix.div_euclid(nanos_per_day);
             let intraday =
                 u64::try_from(nanos_since_unix.rem_euclid(nanos_per_day)).map_err(|error| {
@@ -251,18 +234,17 @@ pub fn arrow_value_to_column_value(array: &dyn Array, idx: usize) -> Result<Colu
                         "Timestamp has invalid intraday nanoseconds: {error}"
                     ))
                 })?;
-            let days_tds = days_unix
-                .checked_add(i64::from(ARROW_EPOCH_OFFSET_DAYS))
-                .ok_or_else(|| usage("Timestamp overflow translating to TDS DATETIME2"))?;
+            let days_tds = days_unix + i128::from(ARROW_EPOCH_OFFSET_DAYS);
             let days_tds = u32::try_from(days_tds).map_err(|error| {
                 usage(format!(
-                    "Timestamp predates SQL Server DATETIME2 epoch (0001-01-01): {error}"
+                    "Timestamp is outside the SQL Server DATETIME2 date range: {error}"
                 ))
             })?;
+            SqlDate::create(days_tds).map_err(Error::Tds)?;
             ColumnValues::DateTime2(SqlDateTime2 {
                 days: days_tds,
                 time: SqlTime {
-                    time_nanoseconds: intraday,
+                    time_nanoseconds: intraday / 100,
                     scale: DEFAULT_VARTIME_SCALE,
                 },
             })
@@ -285,30 +267,6 @@ pub fn arrow_value_to_column_value(array: &dyn Array, idx: usize) -> Result<Colu
             )));
         }
     })
-}
-
-fn null_for_arrow_type(dt: &DataType) -> ColumnValues {
-    // Use a typed null variant that the writer can consume. mssql-tds treats
-    // a `Bit(false)` etc. *paired with* the null-bitmap as null only when the
-    // bitmap says null; here we never emit this path because is_null short-
-    // circuits in the caller. The function exists to keep the conversion
-    // total in case downstream code wants to inspect the "null" mapping.
-    match dt {
-        DataType::Boolean => ColumnValues::Bit(false),
-        DataType::Int8 | DataType::Int16 => ColumnValues::SmallInt(0),
-        DataType::Int32 | DataType::UInt16 => ColumnValues::Int(0),
-        DataType::Int64 | DataType::UInt32 => ColumnValues::BigInt(0),
-        DataType::UInt8 => ColumnValues::TinyInt(0),
-        DataType::Float32 => ColumnValues::Real(0.0),
-        DataType::Float64 => ColumnValues::Float(0.0),
-        DataType::Utf8 | DataType::LargeUtf8 => {
-            ColumnValues::String(SqlString::from_utf8_string(String::new()))
-        }
-        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
-            ColumnValues::Bytes(Vec::new())
-        }
-        _ => ColumnValues::Bytes(Vec::new()),
-    }
 }
 
 fn downcast<'a, T: Array + 'static>(array: &'a dyn Array, label: &str) -> Result<&'a T> {
@@ -523,11 +481,10 @@ mod tests {
     }
 
     #[test]
-    fn null_value_returns_typed_null_marker() {
+    fn null_value_returns_null_marker() {
         let s = StringArray::from(vec![None::<&str>]);
         let v = arrow_value_to_column_value(&s, 0).expect("null string conversion should succeed");
-        // Conversion succeeds; the actual NULL emission happens in the writer.
-        assert!(matches!(v, ColumnValues::String(_)));
+        assert!(matches!(v, ColumnValues::Null));
     }
 
     #[test]
@@ -661,11 +618,11 @@ mod tests {
         let us = Time64MicrosecondArray::from(vec![123_456_i64]);
         let ns = Time64NanosecondArray::from(vec![123_456_789_i64]);
         match arrow_value_to_column_value(&us, 0)? {
-            ColumnValues::Time(t) if t.time_nanoseconds == 123_456_000 => {}
+            ColumnValues::Time(t) if t.time_nanoseconds == 1_234_560 => {}
             v => return Err(usage(format!("expected Time(123456000ns), got {v:?}"))),
         }
         match arrow_value_to_column_value(&ns, 0)? {
-            ColumnValues::Time(t) if t.time_nanoseconds == 123_456_789 => {}
+            ColumnValues::Time(t) if t.time_nanoseconds == 1_234_567 => {}
             v => return Err(usage(format!("expected Time(123456789ns), got {v:?}"))),
         }
         Ok(())
@@ -690,7 +647,7 @@ mod tests {
             match arrow_value_to_column_value(a, 0)? {
                 ColumnValues::DateTime2(dt)
                     if i64::from(dt.days) == i64::from(ARROW_EPOCH_OFFSET_DAYS)
-                        && dt.time.time_nanoseconds == 1_000_000_000 => {}
+                        && dt.time.time_nanoseconds == 10_000_000 => {}
                 v => {
                     return Err(usage(format!(
                         "expected DateTime2 at Unix epoch + 1s for unit {label}, got {v:?}"
@@ -699,6 +656,63 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn timestamp_wide_dates_and_bounds() {
+        use arrow_array::{TimestampMillisecondArray, TimestampSecondArray};
+        use chrono::Datelike;
+
+        let seconds = |year, month, day| {
+            chrono::NaiveDate::from_ymd_opt(year, month, day)
+                .expect("valid date")
+                .and_hms_opt(0, 0, 0)
+                .expect("valid time")
+                .and_utc()
+                .timestamp()
+        };
+        let min = seconds(1, 1, 1);
+        let max = seconds(9999, 12, 31);
+        let wide = seconds(2500, 1, 1);
+        let seconds_values =
+            TimestampSecondArray::from(vec![min, wide, max, min - 1, max + 86400, i64::MAX]);
+        let millis = TimestampMillisecondArray::from(vec![wide * 1000]);
+        let micros = TimestampMicrosecondArray::from(vec![wide * 1_000_000]);
+        let expected_days = u32::try_from(
+            chrono::NaiveDate::from_ymd_opt(2500, 1, 1)
+                .expect("valid date")
+                .num_days_from_ce()
+                - 1,
+        )
+        .expect("date is after SQL epoch");
+        for (array, index) in [
+            (&seconds_values as &dyn Array, 1),
+            (&millis as &dyn Array, 0),
+            (&micros as &dyn Array, 0),
+        ] {
+            assert!(matches!(
+                arrow_value_to_column_value(array, index),
+                Ok(ColumnValues::DateTime2(dt))
+                    if dt.days == expected_days && dt.time.time_nanoseconds == 0
+            ));
+        }
+        assert!(
+            matches!(arrow_value_to_column_value(&seconds_values, 0), Ok(ColumnValues::DateTime2(dt)) if dt.days == 0)
+        );
+        assert!(
+            matches!(arrow_value_to_column_value(&seconds_values, 2), Ok(ColumnValues::DateTime2(dt)) if dt.days == 3_652_058)
+        );
+        for index in 3..6 {
+            arrow_value_to_column_value(&seconds_values, index)
+                .expect_err("date is outside SQL range");
+        }
+        let before_epoch = TimestampNanosecondArray::from(vec![-1]);
+        assert!(matches!(
+            arrow_value_to_column_value(&before_epoch, 0),
+            Ok(ColumnValues::DateTime2(dt))
+                if dt.days == (ARROW_EPOCH_OFFSET_DAYS - 1) as u32
+                    && dt.time.time_nanoseconds == 863_999_999_999
+        ));
     }
 
     #[test]
@@ -713,8 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn null_for_arrow_type_covers_each_branch() {
-        // Drive every arm of null_for_arrow_type via real null arrays.
+    fn null_arrays_convert_to_null() {
         use arrow_array::{
             BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
             Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
@@ -743,9 +756,10 @@ mod tests {
             ),
         ];
         for arr in &cases {
-            // Should not error and should return a typed marker; we don't care
-            // which variant — only that the null path executed.
-            arrow_value_to_column_value(arr.as_ref(), 0).expect("null conversion errored");
+            assert!(matches!(
+                arrow_value_to_column_value(arr.as_ref(), 0).expect("null conversion errored"),
+                ColumnValues::Null
+            ));
         }
     }
 

@@ -202,8 +202,8 @@ impl futures_core::Stream for RowStream {
 /// | `i64` | `bigint` |
 /// | `f32` | `real` |
 /// | `f64` | `float` |
-/// | `&str` | `nvarchar(4000)` |
-/// | `String` | `nvarchar(4000)` |
+/// | `&str` | `nvarchar(4000)` or `nvarchar(max)` |
+/// | `String` | `nvarchar(4000)` or `nvarchar(max)` |
 /// | `uuid::Uuid` | `uniqueidentifier` |
 /// | `Option<T>` | Nullable version of inner type |
 pub trait ToSql: Send + Sync {
@@ -307,12 +307,18 @@ impl ToSql for f64 {
     }
 }
 
+pub(crate) fn nvarchar_from_string(value: Option<String>) -> SqlType {
+    match value {
+        Some(value) if value.encode_utf16().count() > 4000 => {
+            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(value)))
+        }
+        value => SqlType::NVarchar(value.map(SqlString::from_utf8_string), 4000),
+    }
+}
+
 impl ToSql for &str {
     fn to_sql(&self) -> SqlType {
-        SqlType::NVarchar(
-            Some(SqlString::from_utf8_string(self.to_string())),
-            4000, // default max length
-        )
+        nvarchar_from_string(Some(self.to_string()))
     }
 
     fn debug_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -322,7 +328,7 @@ impl ToSql for &str {
 
 impl ToSql for String {
     fn to_sql(&self) -> SqlType {
-        SqlType::NVarchar(Some(SqlString::from_utf8_string(self.clone())), 4000)
+        nvarchar_from_string(Some(self.clone()))
     }
 
     fn debug_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -448,11 +454,9 @@ impl ToSql for serde_json::Value {
                     SqlType::Float(Some(f64::NAN))
                 }
             }
-            serde_json::Value::String(value) => {
-                SqlType::NVarchar(Some(SqlString::from_utf8_string(value.clone())), 4000)
-            }
+            serde_json::Value::String(value) => nvarchar_from_string(Some(value.clone())),
             serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-                SqlType::NVarchar(Some(SqlString::from_utf8_string(self.to_string())), 4000)
+                nvarchar_from_string(Some(self.to_string()))
             }
         }
     }
@@ -1324,6 +1328,49 @@ mod tests {
     fn string_parameter_encoding_defaults_to_nvarchar() {
         let ty = encode_string_parameters("hello".to_sql(), true);
         assert!(matches!(ty, SqlType::NVarchar(_, 4000)));
+    }
+
+    #[test]
+    fn native_string_and_json_parameters_use_utf16_length() -> TestResult {
+        for (text, max) in [
+            ("a".repeat(4000), false),
+            ("a".repeat(4001), true),
+            ("😀".repeat(2000), false),
+            ("😀".repeat(2001), true),
+        ] {
+            for value in [text.as_str().to_sql(), text.to_sql(), json!(text).to_sql()] {
+                match value {
+                    SqlType::NVarchar(Some(value), 4000) if !max => {
+                        ensure_equal(value.to_utf8_string().as_str(), text.as_str())?;
+                    }
+                    SqlType::NVarcharMax(Some(value)) if max => {
+                        ensure_equal(value.to_utf8_string().as_str(), text.as_str())?;
+                    }
+                    _ => {
+                        return Err(format!(
+                            "incorrect nvarchar type for UTF-16 length {}",
+                            text.encode_utf16().count()
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        for count in [3996, 3997] {
+            let value = json!(["a".repeat(count)]);
+            let expected = value.to_string();
+            ensure_equal(expected.encode_utf16().count(), count + 4)?;
+            match value.to_sql() {
+                SqlType::NVarchar(Some(actual), 4000) if count == 3996 => {
+                    ensure_equal(actual.to_utf8_string(), expected)?;
+                }
+                SqlType::NVarcharMax(Some(actual)) if count == 3997 => {
+                    ensure_equal(actual.to_utf8_string(), expected)?;
+                }
+                _ => return Err("incorrect nvarchar type for JSON".into()),
+            }
+        }
+        Ok(())
     }
 
     #[test]

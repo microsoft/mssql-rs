@@ -337,15 +337,9 @@ impl NativeToSql for ColumnData<'_> {
             ColumnData::I64(value) => SqlType::BigInt(value),
             ColumnData::F32(value) => SqlType::Real(value),
             ColumnData::F64(value) => SqlType::Float(value),
-            ColumnData::String(value) => match value {
-                Some(value) if value.encode_utf16().count() > 4000 => {
-                    SqlType::NVarcharMax(Some(SqlString::from_utf8_string(value.into_owned())))
-                }
-                value => SqlType::NVarchar(
-                    value.map(|value| SqlString::from_utf8_string(value.into_owned())),
-                    4000,
-                ),
-            },
+            ColumnData::String(value) => {
+                crate::query::nvarchar_from_string(value.map(Cow::into_owned))
+            }
             ColumnData::Guid(value) => SqlType::Uuid(value),
             ColumnData::Binary(value) => {
                 SqlType::VarBinaryMax(value.map(|value| value.into_owned()))

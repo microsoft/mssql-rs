@@ -14,8 +14,9 @@ use std::sync::Arc;
 
 use arrow_array::{
     BooleanArray, Decimal128Array, Float64Array, Int32Array, RecordBatch, StringArray,
+    Time64NanosecondArray, TimestampMicrosecondArray,
 };
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use mssql_rs::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -130,4 +131,77 @@ async fn bulk_insert_send_arrow_batches() {
         .expect("send_arrow_batches failed");
 
     assert_eq!(result.rows_affected, 300);
+}
+
+#[tokio::test]
+async fn bulk_insert_arrow_null_and_temporal_values() {
+    let cfg = common::live_config_or_exit();
+    let mut client = Client::connect(&cfg).await.expect("connect failed");
+    client
+        .execute(
+            "CREATE TABLE #DriverArrowValues (n INT NULL, s NVARCHAR(20) NULL, t TIME(7) NULL, d DATETIME2(7) NULL)",
+            &[],
+        )
+        .await
+        .expect("create table failed");
+    let wide = chrono::NaiveDate::from_ymd_opt(2500, 1, 1)
+        .expect("valid date")
+        .and_hms_opt(0, 0, 0)
+        .expect("valid time")
+        .and_utc()
+        .timestamp_micros();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("n", DataType::Int32, true),
+        Field::new("s", DataType::Utf8, true),
+        Field::new("t", DataType::Time64(TimeUnit::Nanosecond), true),
+        Field::new("d", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![None, Some(0)])),
+            Arc::new(StringArray::from(vec![None, Some("")])),
+            Arc::new(Time64NanosecondArray::from(vec![None, Some(123_456_789)])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                None,
+                Some(wide + 123_456),
+            ])),
+        ],
+    )
+    .expect("valid batch");
+    client
+        .bulk_insert("#DriverArrowValues")
+        .keep_nulls(true)
+        .send_arrow(batch)
+        .await
+        .expect("bulk load failed");
+    let rows = client
+        .simple_query("SELECT n, s, t, d FROM #DriverArrowValues ORDER BY CASE WHEN n IS NULL THEN 0 ELSE 1 END")
+        .await
+        .expect("query failed")
+        .into_first_result();
+    assert_eq!(rows.len(), 2);
+    let null_row = rows.first().expect("expected null row");
+    let value_row = rows.get(1).expect("expected non-null row");
+    assert_eq!(null_row.get::<Option<i32>, _>("n"), Some(None));
+    assert_eq!(null_row.get::<Option<&str>, _>("s"), Some(None));
+    assert_eq!(
+        null_row.get::<Option<chrono::NaiveTime>, _>("t"),
+        Some(None)
+    );
+    assert_eq!(
+        null_row.get::<Option<chrono::NaiveDateTime>, _>("d"),
+        Some(None)
+    );
+    assert_eq!(value_row.get::<i32, _>("n"), Some(0));
+    assert_eq!(value_row.get::<&str, _>("s"), Some(""));
+    assert_eq!(
+        value_row.get::<chrono::NaiveTime, _>("t"),
+        chrono::NaiveTime::from_hms_nano_opt(0, 0, 0, 123_456_700)
+    );
+    assert_eq!(
+        value_row.get::<chrono::NaiveDateTime, _>("d"),
+        chrono::NaiveDate::from_ymd_opt(2500, 1, 1)
+            .and_then(|date| date.and_hms_micro_opt(0, 0, 0, 123_456))
+    );
 }

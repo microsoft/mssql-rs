@@ -10,6 +10,26 @@ pub mod common;
 use mssql_rs::{Client, TdsManager};
 
 #[tokio::test]
+async fn long_native_string_and_json_parameters_roundtrip() {
+    let cfg = common::live_config_or_exit();
+    let mut client = Client::connect(&cfg).await.expect("connect failed");
+    let text = "😀".repeat(2001);
+    let json = serde_json::json!([text]);
+    let expected_json = json.to_string();
+    let rows = client
+        .query(
+            "SELECT @P1 AS text_value, @P2 AS json_value",
+            &[&text, &json],
+        )
+        .await
+        .expect("query failed")
+        .into_first_result();
+    let row = rows.first().expect("expected result row");
+    assert_eq!(row.get::<String, _>("text_value"), Some(text));
+    assert_eq!(row.get::<String, _>("json_value"), Some(expected_json));
+}
+
+#[tokio::test]
 async fn connect_and_select_one() {
     let cfg = common::live_config_or_exit();
     let mut client = Client::connect(&cfg).await.expect("connect failed");

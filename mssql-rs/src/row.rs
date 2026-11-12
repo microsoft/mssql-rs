@@ -402,14 +402,14 @@ impl<'a, T: FromSql<'a>> FromSql<'a> for Option<T> {
     fn from_sql(val: &'a ColumnValues) -> Option<Self> {
         match val {
             ColumnValues::Null => Some(None),
-            _ => Some(T::from_sql(val)),
+            _ => T::from_sql(val).map(Some),
         }
     }
 
     fn from_sql_with_str(val: &'a ColumnValues, decoded: Option<&'a str>) -> Option<Self> {
         match val {
             ColumnValues::Null => Some(None),
-            _ => Some(T::from_sql_with_str(val, decoded)),
+            _ => T::from_sql_with_str(val, decoded).map(Some),
         }
     }
 }
@@ -601,9 +601,9 @@ impl<'a> FromSql<'a> for chrono::NaiveDateTime {
                 let base = chrono::NaiveDate::from_ymd_opt(1900, 1, 1)?;
                 let date = base.checked_add_signed(chrono::Duration::days(dt.days as i64))?;
                 // datetime ticks: 1/300th of a second
-                let total_ms = (dt.time as u64) * 10 / 3;
-                let secs = (total_ms / 1000) as u32;
-                let nanos = ((total_ms % 1000) * 1_000_000) as u32;
+                let total_nanos = (u64::from(dt.time) * 1_000_000_000 + 150) / 300;
+                let secs = (total_nanos / 1_000_000_000) as u32;
+                let nanos = (total_nanos % 1_000_000_000) as u32;
                 let time = chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)?;
                 Some(chrono::NaiveDateTime::new(date, time))
             }
@@ -1378,6 +1378,51 @@ mod tests {
         ensure_equal(row.try_get::<i32, _>("small")?, None)?;
         ensure_equal(row.try_get::<Option<i32>, _>("small")?, Some(None))?;
         Ok(())
+    }
+
+    #[test]
+    fn optional_conversion_distinguishes_null_from_incompatible_values() {
+        let row = make_row(
+            &["null", "number", "text"],
+            vec![
+                ColumnValues::Null,
+                ColumnValues::Int(42),
+                ColumnValues::String(SqlString::from_utf8_string("text".into())),
+            ],
+        );
+        assert_eq!(row.get::<Option<i32>, _>("null"), Some(None));
+        assert_eq!(row.get::<Option<i32>, _>("number"), Some(Some(42)));
+        assert_eq!(row.get::<Option<i32>, _>("text"), None);
+        assert_eq!(Option::<i32>::from_sql(&ColumnValues::Null), Some(None));
+        assert_eq!(
+            Option::<i32>::from_sql(&ColumnValues::Int(42)),
+            Some(Some(42))
+        );
+        assert_eq!(Option::<i32>::from_sql(&ColumnValues::Bit(true)), None);
+    }
+
+    #[test]
+    fn legacy_datetime_preserves_fractional_ticks() {
+        use mssql_tds::datatypes::column_values::SqlDateTime;
+        let base = chrono::NaiveDate::from_ymd_opt(1900, 1, 1)
+            .expect("valid date")
+            .and_hms_opt(0, 0, 0)
+            .expect("valid time");
+        for (ticks, nanos) in [
+            (0, 0),
+            (1, 3_333_333),
+            (2, 6_666_667),
+            (299, 996_666_667),
+            (300, 1_000_000_000),
+            (25_919_999, 86_399_996_666_667),
+        ] {
+            let value = ColumnValues::DateTime(SqlDateTime {
+                days: -1,
+                time: ticks,
+            });
+            let expected = base - chrono::Duration::days(1) + chrono::Duration::nanoseconds(nanos);
+            assert_eq!(chrono::NaiveDateTime::from_sql(&value), Some(expected));
+        }
     }
 
     #[test]
