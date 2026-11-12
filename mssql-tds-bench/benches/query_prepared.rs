@@ -9,8 +9,14 @@
 //! - `prepared_execute`  — prepare once, execute many via `sp_execute`.
 //! - `prepared_prepexec` — one-shot prepare+execute via `sp_prepexec`.
 //! - `batched_statements` — three statements in one round-trip.
+//! - `prepared_params/*` — repeat executes of one prepared statement with 1000
+//!   bound values (`sp_prepexec` once, then `sp_execute` with the values bound
+//!   by ordinal), as an ODBC application's `SQLExecute` loop sends them.
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use mssql_tds::connection::tds_client::{PreparedStatement, ResultSet, TdsClient};
+use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::datatypes::sql_string::SqlString;
 use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
 use mssql_tds_bench::{bench_env, connect, criterion_config, drain, runtime, try_connect};
@@ -127,12 +133,120 @@ fn batched_statements(c: &mut Criterion) {
     });
 }
 
+/// One `prepared_params` workload: `count` values of one type, checked
+/// through an aggregate that returns one INT.
+struct ParamWorkload {
+    name: &'static str,
+    count: usize,
+    aggregate: &'static str,
+    value: fn(usize) -> SqlType,
+    expected: i32,
+}
+
+const PARAM_WORKLOADS: [ParamWorkload; 3] = [
+    ParamWorkload {
+        name: "int_1000",
+        count: 1000,
+        aggregate: "SUM(v)",
+        value: |index| SqlType::Int(Some(index as i32 + 1)),
+        expected: 500_500,
+    },
+    ParamWorkload {
+        name: "nvarchar_1000",
+        count: 1000,
+        aggregate: "SUM(LEN(v))",
+        value: |index| {
+            SqlType::NVarchar(
+                Some(SqlString::from_utf8_string(format!("value-{index:014}"))),
+                20,
+            )
+        },
+        expected: 20_000,
+    },
+    ParamWorkload {
+        name: "float_1000",
+        count: 1000,
+        aggregate: "CAST(SUM(v) AS INT)",
+        value: |index| SqlType::Float(Some(index as f64 + 1.0)),
+        expected: 500_500,
+    },
+];
+
+async fn execute_params(
+    client: &mut TdsClient,
+    statement: &mut PreparedStatement,
+    params: Vec<RpcParameter>,
+) {
+    let mut orphaned = None;
+    client
+        .execute_prepared(statement, params, &mut orphaned, ())
+        .await
+        .expect("execute_prepared failed");
+}
+
+fn prepared_params(c: &mut Criterion) {
+    let rt = runtime();
+    if try_connect(&rt, "prepared_params").is_none() {
+        return;
+    }
+    let env = bench_env().expect("env present after successful probe");
+    let mut client = rt.block_on(connect(&env));
+
+    let mut group = c.benchmark_group("prepared_params");
+    for workload in &PARAM_WORKLOADS {
+        let markers: Vec<String> = (1..=workload.count).map(|i| format!("(@P{i})")).collect();
+        let mut statement = PreparedStatement::new(format!(
+            "SELECT {} FROM (VALUES {}) AS t(v)",
+            workload.aggregate,
+            markers.join(", ")
+        ));
+        let params: Vec<RpcParameter> = (0..workload.count)
+            .map(|index| {
+                RpcParameter::new(
+                    Some(format!("@P{}", index + 1)),
+                    StatusFlags::NONE,
+                    (workload.value)(index),
+                )
+            })
+            .collect();
+
+        // Prepare (`sp_prepexec`) and check the result once, un-measured, so
+        // every measured call is an `sp_execute`.
+        rt.block_on(async {
+            execute_params(&mut client, &mut statement, params.clone()).await;
+            let row = client.next_row().await.expect("next_row failed");
+            assert!(
+                matches!(row.as_deref(), Some([ColumnValues::Int(v)]) if *v == workload.expected),
+                "{}: {row:?}",
+                workload.name
+            );
+            drain(&mut client).await;
+        });
+
+        // Building the parameter list is the caller's cost, not the driver's.
+        group.bench_function(workload.name, |b| {
+            b.iter_batched(
+                || params.clone(),
+                |params| {
+                    rt.block_on(async {
+                        execute_params(&mut client, &mut statement, params).await;
+                        drain(&mut client).await;
+                    });
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = criterion_config();
     targets =
         prepared_execute,
         prepared_prepexec,
-        batched_statements
+        batched_statements,
+        prepared_params
 }
 criterion_main!(benches);
