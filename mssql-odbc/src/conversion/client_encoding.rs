@@ -188,7 +188,7 @@ mod tests {
             ClientEncoding::e2e_test_override(Some(OsStr::new("65001"))),
             Ok(Some(ClientEncoding::UTF8))
         );
-        for value in ["", "utf8", "-1", "4294967296"] {
+        for value in ["", "utf8", "-1", "4294967296", "99999"] {
             assert!(
                 ClientEncoding::e2e_test_override(Some(OsStr::new(value))).is_err(),
                 "{value:?}"

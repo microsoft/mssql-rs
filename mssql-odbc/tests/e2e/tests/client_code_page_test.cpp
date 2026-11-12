@@ -29,31 +29,34 @@ const ServerText kServerText[] = {
     {1251, "Cyrillic_General_100_CI_AS", "NCHAR(1046)", "\xD0\x96", {0x0416}},
 };
 
-struct ServerCollation {
-    SQLINTEGER code_page;
-    const char* name;
+// Each value's server bytes decode to different text under Windows-1252, and
+// overlapping pages also disagree (0x9D is CP437 yen but CP850 O-slash; Big5 A4A4
+// is a different GBK/UHC character), so a wrong decoder changes the fetched text.
+const ServerText kServerCollations[] = {
+    {0, "Assamese_100_BIN", nullptr, nullptr, {}},
+    {437, "SQL_Latin1_General_CP437_BIN", "NCHAR(165)", "\xC2\xA5", {0x00A5}},
+    {850, "SQL_1xCompat_CP850_CI_AS", "NCHAR(216)", "\xC3\x98", {0x00D8}},
+    {874, "Thai_100_BIN", "NCHAR(3585)", "\xE0\xB8\x81", {0x0E01}},
+    {932, "Japanese_90_BIN", "NCHAR(12354)", "\xE3\x81\x82", {0x3042}},
+    {936, "Chinese_PRC_90_BIN", "NCHAR(20320)", "\xE4\xBD\xA0", {0x4F60}},
+    {949, "Korean_100_BIN", "NCHAR(54620)", "\xED\x95\x9C", {0xD55C}},
+    {950, "Chinese_Hong_Kong_Stroke_90_BIN", "NCHAR(20013)", "\xE4\xB8\xAD", {0x4E2D}},
+    {1250, "Albanian_100_CI_AS", "NCHAR(321)", "\xC5\x81", {0x0141}},
+    {1251, "Cyrillic_General_100_CI_AS", "NCHAR(1071)", "\xD0\xAF", {0x042F}},
+    {1252, "Latin1_General_100_CI_AS", "NCHAR(8364)", "\xE2\x82\xAC", {0x20AC}},
+    {1253, "Greek_100_CI_AS", "NCHAR(937)", "\xCE\xA9", {0x03A9}},
+    {1254, "Turkish_100_CI_AS", "NCHAR(351)", "\xC5\x9F", {0x015F}},
+    {1255, "Hebrew_100_CI_AS", "NCHAR(1488)", "\xD7\x90", {0x05D0}},
+    {1256, "Arabic_100_CI_AS", "NCHAR(1576)", "\xD8\xA8", {0x0628}},
+    {1257, "Estonian_100_CI_AS", "NCHAR(257)", "\xC4\x81", {0x0101}},
+    {1258, "Vietnamese_100_CI_AS", "NCHAR(272)", "\xC4\x90", {0x0110}},
+    {65001, "Latin1_General_100_CI_AS_SC_UTF8", "NCHAR(8364)", "\xE2\x82\xAC", {0x20AC}},
 };
 
-const ServerCollation kServerCollations[] = {
-    {0, "Assamese_100_BIN"},
-    {437, "SQL_Latin1_General_CP437_BIN"},
-    {850, "SQL_1xCompat_CP850_CI_AS"},
-    {874, "Thai_100_BIN"},
-    {932, "Japanese_90_BIN"},
-    {936, "Chinese_PRC_90_BIN"},
-    {949, "Korean_100_BIN"},
-    {950, "Chinese_Hong_Kong_Stroke_90_BIN"},
-    {1250, "Albanian_100_CI_AS"},
-    {1251, "Cyrillic_General_100_CI_AS"},
-    {1252, "Latin1_General_100_CI_AS"},
-    {1253, "Greek_100_CI_AS"},
-    {1254, "Turkish_100_CI_AS"},
-    {1255, "Hebrew_100_CI_AS"},
-    {1256, "Arabic_100_CI_AS"},
-    {1257, "Estonian_100_CI_AS"},
-    {1258, "Vietnamese_100_CI_AS"},
-    {65001, "Latin1_General_100_CI_AS_SC_UTF8"},
-};
+std::string VarcharQuery(const ServerText& text) {
+    return "SELECT CAST((" + std::string(text.expression) + ") COLLATE " + text.collation +
+           " AS varchar(max))";
+}
 
 class ClientCodePageTest : public ODBCTest {
 protected:
@@ -104,68 +107,21 @@ protected:
         ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
     }
 
-    unsigned client_code_page_ = 0;
-
-    SQLRETURN Execute(const std::string& sql) {
-        SqlTString text = ODBCTestUtils::ToSqlTStr(sql);
-        return SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(text.c_str()), SQL_NTS);
-    }
-};
-
-std::string VarcharQuery(const ServerText& text) {
-    return "SELECT CAST((" + std::string(text.expression) + ") COLLATE " + text.collation +
-           " AS varchar(max))";
-}
-
-const ServerText& TextForCodePage(unsigned code_page) {
-    const auto found = std::find_if(std::begin(kServerText), std::end(kServerText),
-                                    [code_page](const ServerText& text) {
-                                        return text.code_page == code_page;
-                                    });
-    if (found == std::end(kServerText)) {
-        throw std::invalid_argument("unsupported test code page");
-    }
-    return *found;
-}
-
-}  // namespace
-
-// Benefits-from-mock-tds: a scripted TDS response could assert the exact
-// collation metadata independently of SQL Server's COLLATE conversion.
-ODBC_TEST_F(ClientCodePageTest, NativeNarrowFetchTranscodesAcrossCollations) {
-    for (const auto& collation : kServerCollations) {
-        SCOPED_TRACE(collation.name);
-        const std::string property =
-            "SELECT CONVERT(int, COLLATIONPROPERTY('" + std::string(collation.name) +
-            "', 'CodePage'))";
-        ASSERT_EQ(SQL_SUCCESS, Execute(property));
-        ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
-        SQLINTEGER server_code_page = -1;
-        ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_SLONG, &server_code_page,
-                                          sizeof(server_code_page), nullptr));
-        EXPECT_EQ(collation.code_page, server_code_page);
-        ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
-
-        if (collation.code_page != 0) {
-            const std::string query =
-                "SELECT CAST(N'A' COLLATE " + std::string(collation.name) +
-                " AS varchar(max))";
-            ASSERT_NO_FATAL_FAILURE(CheckNarrow(query, "A"));
-        }
-    }
-
-    for (const auto& text : kServerText) {
+    void CheckServerText(const ServerText& text) {
         SCOPED_TRACE(text.collation);
         const std::string property =
             "SELECT CONVERT(int, COLLATIONPROPERTY('" + std::string(text.collation) +
             "', 'CodePage'))";
         ASSERT_EQ(SQL_SUCCESS, Execute(property));
         ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
-        SQLINTEGER server_code_page = 0;
+        SQLINTEGER server_code_page = -1;
         ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_SLONG, &server_code_page,
                                           sizeof(server_code_page), nullptr));
         EXPECT_EQ(static_cast<SQLINTEGER>(text.code_page), server_code_page);
         ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+        if (text.code_page == 0) {
+            return;
+        }
 
         const std::string expected =
             ODBCTestUtils::Utf8ToCodePage(text.utf8, client_code_page_);
@@ -184,6 +140,37 @@ ODBC_TEST_F(ClientCodePageTest, NativeNarrowFetchTranscodesAcrossCollations) {
         EXPECT_TRUE(std::equal(text.utf16.begin(), text.utf16.end(), output.begin()));
         EXPECT_EQ(0, output.back());
         ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+
+    unsigned client_code_page_ = 0;
+
+    SQLRETURN Execute(const std::string& sql) {
+        SqlTString text = ODBCTestUtils::ToSqlTStr(sql);
+        return SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(text.c_str()), SQL_NTS);
+    }
+};
+
+const ServerText& TextForCodePage(unsigned code_page) {
+    const auto found = std::find_if(std::begin(kServerText), std::end(kServerText),
+                                    [code_page](const ServerText& text) {
+                                        return text.code_page == code_page;
+                                    });
+    if (found == std::end(kServerText)) {
+        throw std::invalid_argument("unsupported test code page");
+    }
+    return *found;
+}
+
+}  // namespace
+
+// Benefits-from-mock-tds: a scripted TDS response could assert the exact
+// collation metadata independently of SQL Server's COLLATE conversion.
+ODBC_TEST_F(ClientCodePageTest, NativeNarrowFetchTranscodesAcrossCollations) {
+    for (const auto& text : kServerCollations) {
+        ASSERT_NO_FATAL_FAILURE(CheckServerText(text));
+    }
+    for (const auto& text : kServerText) {
+        ASSERT_NO_FATAL_FAILURE(CheckServerText(text));
     }
 }
 
