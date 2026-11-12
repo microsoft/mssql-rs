@@ -114,13 +114,17 @@ steps:
   # No -Coverage here: the x64 Windows leg already publishes
   # CoberturaCoverageOdbcE2E_Windows, and a second artifact under the same name
   # would collide. This leg exists to prove the ARM64 driver binary works through
-  # the Windows Driver Manager.
+  # the Windows Driver Manager. Tests use the x64 leg's worker bound because the
+  # SQL host is shared with other consumers.
   - pwsh: |
       $env:ODBC_TEST_SERVER     = "$($env:DB_HOST),$($env:DB_PORT)"
       $env:ODBC_TEST_UID        = 'sa'
       $env:ODBC_TEST_PWD        = $env:SQL_PASSWORD
       $env:ODBC_TEST_TRUST_CERT = 'Yes'
-      ./mssql-odbc/tests/e2e/run_e2e.ps1 -Retries ${{ parameters.retries }}
+      $buildJobs = [Environment]::ProcessorCount
+      $testJobs = [Math]::Min(4, [Environment]::ProcessorCount)
+      ./mssql-odbc/tests/e2e/run_e2e.ps1 -Retries ${{ parameters.retries }} `
+        -BuildJobs $buildJobs -TestJobs $testJobs
     displayName: 'Run ODBC C++ e2e tests'
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
     env:

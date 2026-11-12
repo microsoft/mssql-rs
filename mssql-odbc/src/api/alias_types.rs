@@ -212,7 +212,7 @@ fn publish(
         return;
     }
     if let Some(client) = client {
-        state.wire.restore(client, LeaseReturn::Release);
+        dbc.restore_lease(&mut state, client, LeaseReturn::Release);
     }
     match lookup {
         Ok(cache) => state.alias_types = Some(cache),

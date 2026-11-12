@@ -309,6 +309,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // `query_timeout` (already deducted above) bounds the whole call,
             // including any reconnect charged above; `0` means unlimited, matching
             // the ODBC default.
+            let pending = super::ird::clear_for_send(stmt, &client);
             let exec_result = dbc.runtime.block_on(
                 client.execute_prepared(
                     &mut prepared.stmt,
@@ -330,6 +331,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
 
             if let Err(e) = exec_result {
                 error!(%e, "SQLExecute: prepared execution failed");
+                pending.restore_if_unsent(stmt, &client);
                 return fail_with_tds(dbc, stmt, statement_handle, client, &e);
             }
 
@@ -561,6 +563,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 failures: Vec::new(),
                 truncated_rows: Vec::new(),
             };
+            let pending = super::ird::clear_for_send(stmt, &client);
             let batch_result = dbc.runtime.block_on(
                 client.begin_execute_prepared_batch(
                     &mut prepared.stmt,
@@ -608,10 +611,13 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                     write_params_processed(outputs.params_processed_ptr, outputs.paramset_size);
                 }
                 return_client_idle(dbc, statement_handle, client);
+                #[cfg(test)]
+                super::txn::test_hooks::after_unsent_array_release();
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
                     stmt_state.clear_exhaustion_state();
                     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
                 }
+                pending.restore(stmt);
                 return SQL_ERROR;
             }
 
@@ -619,6 +625,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 Ok(result) => result,
                 Err(error) => {
                     error!(%error, "SQLExecute: parameter-array execution failed");
+                    pending.restore_if_unsent(stmt, &client);
                     return fail_with_tds(dbc, stmt, statement_handle, client, &error);
                 }
             };
@@ -671,6 +678,7 @@ fn finish_parameter_array(
     mut batch: BatchClientResults,
 ) -> SqlReturn {
     let metadata = client.get_metadata().clone();
+    let data_classification = super::data_classification::capture(&client);
     // Like a scalar execute, wait for the first row or the end of an empty
     // first set. msodbcsql's SQLExecute reads an empty set through its DONE
     // (OnDone), reporting that set's status and any error now (measured on
@@ -724,7 +732,7 @@ fn finish_parameter_array(
     if !dbc.return_lease(client, lease_return) {
         return SQL_ERROR;
     }
-    let ird_ok = super::ird::populate_ird(stmt, &metadata).is_ok();
+    let ird_ok = super::ird::populate_ird(stmt, &metadata, data_classification).is_ok();
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         return SQL_ERROR;
     };
@@ -777,7 +785,7 @@ fn finish_parameter_array(
         rc = SQL_ERROR;
     }
     drop(stmt_state);
-    if error_result && super::ird::populate_ird(stmt, &[]).is_err() {
+    if error_result && super::ird::populate_ird(stmt, &[], None).is_err() {
         return SQL_ERROR;
     }
     rc

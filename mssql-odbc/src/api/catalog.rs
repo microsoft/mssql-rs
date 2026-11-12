@@ -629,6 +629,7 @@ fn run_catalog_operation(
     };
 
     let (positional, named) = build_params(false);
+    let pending = super::ird::clear_for_send(stmt, &client);
     let mut exec_result = dbc.runtime.block_on(
         client.execute_stored_procedure(
             qualified_proc_name(catalog, proc),
@@ -698,6 +699,7 @@ fn run_catalog_operation(
 
     if let Err(e) = exec_result {
         error!(%e, "{name}: execution failed");
+        pending.restore_if_unsent(stmt, &client);
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 

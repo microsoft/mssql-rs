@@ -16,5 +16,4 @@ mkdir -p /workspace/target/nextest/ci
 cargo llvm-cov nextest "$@" --frozen --no-report --all-targets --package mssql-tds --package mssql-rs --package mssqlodbc --package mssql-sqlcmd --features mssql-rs/arrow,mssql-rs/jiff,mssql-rs/serde,mssql-rs/time --no-fail-fast --profile ci --success-output immediate
 
 echo '==> Generating coverage report...'
-cargo llvm-cov report --package mssql-tds --package mssql-rs --package mssqlodbc --package mssql-sqlcmd --lcov --output-path /workspace/target/lcov.info
 cargo llvm-cov report --package mssql-tds --package mssql-rs --package mssqlodbc --package mssql-sqlcmd --cobertura --output-path /workspace/target/cobertura.xml

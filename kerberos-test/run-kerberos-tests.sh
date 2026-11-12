@@ -152,12 +152,56 @@ echo "✓ Kerberos ticket acquired"
 # Create workspace directory
 docker exec "$CONTAINER_NAME" mkdir -p /workspace
 
+# Both modes need the workspace at /workspace: source mode compiles it, and
+# archive mode's --workspace-remap requires its Cargo.toml and reads the `ci`
+# profile from .config/nextest.toml.
+copy_workspace() {
+    # Cargo.lock is gitignored, so CI checkouts have none.
+    local paths=(Cargo.toml .config mssql-tds mssql-tds-cli mssql-mock-tds)
+    if [ -f "$REPO_ROOT/Cargo.lock" ]; then
+        paths+=(Cargo.lock)
+    fi
+
+    # Copy source code (excluding target, .git, and other build artifacts).
+    # pipefail (scoped to this subshell) makes a failed tar fail the run instead
+    # of being masked by the extracting docker exec.
+    (
+        set -o pipefail
+        tar -C "$REPO_ROOT" \
+            --exclude='target' \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='mssql-js' \
+            --exclude='mssql-mock-tds-py' \
+            --exclude='mssql-py-core' \
+            -cf - "${paths[@]}" \
+            | docker exec -i "$CONTAINER_NAME" tar -xf - -C /workspace
+    )
+
+    # Create simplified workspace Cargo.toml (excludes mssql-js which isn't copied).
+    # Must include [workspace.lints] since member crates use lints.workspace = true.
+    docker exec -i "$CONTAINER_NAME" bash -c "cat > /workspace/Cargo.toml" << 'OUTER_EOF'
+[workspace]
+members = [
+    "mssql-tds",
+    "mssql-tds-cli",
+    "mssql-mock-tds",
+]
+resolver = "2"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(feature, values("sspi", "gssapi", "integrated-auth"))'] }
+OUTER_EOF
+}
+
 if [ "$ARCHIVE_MODE" = true ]; then
     # ============================================================
     # ARCHIVE MODE: Use pre-built nextest archive (fastest)
     # ============================================================
     echo ""
-    echo "Step 3: Copy nextest archive to container..."
+    echo "Step 3: Copy workspace and nextest archive to container..."
     echo "----------------------------------------------"
     
     # Archive should be in repo root (downloaded by CI)
@@ -168,6 +212,9 @@ if [ "$ARCHIVE_MODE" = true ]; then
         echo "For local: run 'cargo nextest archive --archive-file $ARCHIVE_NAME' first"
         exit 1
     fi
+
+    copy_workspace
+    echo "✓ Workspace copied"
     
     docker cp "$ARCHIVE_PATH" "$CONTAINER_NAME:/workspace/$ARCHIVE_NAME"
     echo "✓ Archive copied: $ARCHIVE_NAME"
@@ -228,41 +275,8 @@ else
     echo ""
     echo "Step 3: Copy source code to container..."
     echo "----------------------------------------------"
-    
-    # Copy source code (excluding target, .git, and other build artifacts)
-    cd "$REPO_ROOT"
-    tar --exclude='target' \
-        --exclude='.git' \
-        --exclude='node_modules' \
-        --exclude='__pycache__' \
-        --exclude='*.pyc' \
-        --exclude='mssql-js' \
-        --exclude='mssql-mock-tds-py' \
-        --exclude='mssql-py-core' \
-        -cf - \
-        Cargo.toml \
-        Cargo.lock \
-        .config \
-        mssql-tds \
-        mssql-tds-cli \
-        mssql-mock-tds \
-        | docker exec -i "$CONTAINER_NAME" tar -xf - -C /workspace
-    
-    # Create simplified workspace Cargo.toml (excludes mssql-js which isn't copied).
-    # Must include [workspace.lints] since member crates use lints.workspace = true.
-    docker exec -i "$CONTAINER_NAME" bash -c "cat > /workspace/Cargo.toml" << 'OUTER_EOF'
-[workspace]
-members = [
-    "mssql-tds",
-    "mssql-tds-cli",
-    "mssql-mock-tds",
-]
-resolver = "2"
 
-[workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(feature, values("sspi", "gssapi", "integrated-auth"))'] }
-OUTER_EOF
-    
+    copy_workspace
     echo "✓ Source code copied"
     
     # In CI mode, install cargo-nextest

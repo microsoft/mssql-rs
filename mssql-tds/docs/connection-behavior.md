@@ -227,11 +227,14 @@ stack use for synchronous adapters such as ODBC on musl's small worker stacks,
 without moving execution to another thread or changing cancellation and timeout
 handling.
 
-Connection establishment boxes the action-chain future once per connection.
-This keeps transport attempts, TLS/login, and client construction out of the
-caller's future, leaving room for the Driver Manager and native TLS on small
-application stacks. The connection is still polled on the calling thread with
-the same cancellation and login deadline; no worker-thread handoff is introduced.
+Connection establishment boxes the action-chain body once per connection,
+inside the cancellation wrapper. This keeps transport attempts, TLS/login, and
+client construction out of the caller's future, leaving room for the Driver
+Manager and native TLS on small application stacks. Boxing inside the wrapper,
+rather than around it, means the wrapper only moves a pointer: when LTO kept the
+wrapper's poll out of line, moving the unboxed body cost a ~14 KB stack
+temporary. The connection is still polled on the calling thread with the same
+cancellation and login deadline; no worker-thread handoff is introduced.
 
 ## SQL string decoding
 

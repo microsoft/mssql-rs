@@ -26,6 +26,7 @@ use mssql_tds::connection::client_context::{ClientContext, DriverVersion, IPAddr
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
 use mssql_tds::message::login_options::ApplicationIntent;
+use mssql_tds::token::data_classification::DataClassificationVersion;
 use std::{path::PathBuf, sync::OnceLock};
 
 use super::util::read_utf16;
@@ -170,14 +171,13 @@ pub(crate) fn sql_driver_connect_w_safe(
     );
 
     // Transition to Connecting state under lock - prevents concurrent connect race.
-    // 08002 (already connected) is DM-enforced, so we debug_assert only.
-    debug_assert_ne!(
-        state.connection_state,
-        ConnectionState::Connected,
-        "SQLDriverConnectW: DM should reject connect on already-connected handle (08002)"
-    );
+    // Without a Driver Manager's 08002 check a second connect lands here; fail
+    // it without touching the live connection.
     if state.connection_state != ConnectionState::Disconnected {
-        error!("SQLDriverConnectW: connection attempt already in progress");
+        error!(
+            state = ?state.connection_state,
+            "SQLDriverConnectW: connection already open or in progress"
+        );
         post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
         return SQL_ERROR;
     }
@@ -287,6 +287,12 @@ fn effective_vendor_settings(
         multi_subnet_failover: Some(u32::from(multi_subnet_failover)),
         long_as_max: Some(params.long_as_max.unwrap_or(0)),
     }
+}
+
+/// Maps the stored `SQL_COPT_SS_DATACLASSIFICATION_VERSION` (already validated
+/// to `1..=2` by the setter) to the LOGIN7 request.
+fn requested_data_classification_version(version: u8) -> Option<DataClassificationVersion> {
+    DataClassificationVersion::try_from(version).ok()
 }
 
 fn initial_database(database_keyword: &str, current_catalog: Option<&str>) -> String {
@@ -438,6 +444,8 @@ fn do_connect(
     if let Some(secs) = state.login_timeout {
         context.login_timeout = Some(secs);
     }
+    context.requested_data_classification_version =
+        requested_data_classification_version(state.data_classification_version);
 
     if let Err(UnsupportedAuth(method)) = configure_auth(&mut context, resolved, &params.server) {
         error!(
@@ -520,6 +528,7 @@ fn do_connect(
         client.is_encrypted(),
         network_policy.enabled,
     ));
+    dbc.publish_data_classification_version(client.negotiated_data_classification_version());
     state.identity = ConnectionIdentity {
         client_connection_id: Some(std::sync::Arc::clone(&dbc.trace)),
         data_source_name: params.dsn.clone(),
@@ -1164,6 +1173,37 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_INVALID_HANDLE);
+    }
+
+    /// The losing call of two racing connects on one DBC, when no Driver
+    /// Manager turns it away first: it fails, and the winner's connection
+    /// survives (no panic under the DBC lock, which would poison it).
+    #[test]
+    fn connect_on_connected_dbc_fails_without_poisoning_it() {
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let conn_str: Vec<u16> = cs("Server=host;UID=u;<PW>=p")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let ret = unsafe {
+            sql_driver_connect_w(
+                h.dbc,
+                std::ptr::null_mut(),
+                conn_str.as_ptr(),
+                SQL_NTS,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                SQL_DRIVER_NOPROMPT,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(unsafe { diag_sqlstate(h.dbc, 1) }, "HY010");
+        let state = dbc.inner.lock().expect("DBC mutex must not be poisoned");
+        assert_eq!(state.connection_state, ConnectionState::Connected);
     }
 
     #[test]

@@ -44,6 +44,8 @@ pub(crate) mod test_utils {
         position: usize,
         data_classification_version:
             Option<crate::token::data_classification::DataClassificationVersion>,
+        buffered: bool,
+        uint16_reads: usize,
     }
 
     impl MockReader {
@@ -52,7 +54,16 @@ pub(crate) mod test_utils {
                 data,
                 position: 0,
                 data_classification_version: None,
+                buffered: false,
+                uint16_reads: 0,
             }
+        }
+
+        /// Serves [`TdsPacketReader::try_read_slice`] from the data, as a
+        /// reader whose bytes are already resident does.
+        pub(crate) fn buffered(mut self) -> Self {
+            self.buffered = true;
+            self
         }
 
         /// Simulates a connection that negotiated Data Classification at login.
@@ -62,6 +73,11 @@ pub(crate) mod test_utils {
         ) -> Self {
             self.data_classification_version = Some(version);
             self
+        }
+
+        /// How many times [`TdsPacketReader::read_uint16`] was called.
+        pub(crate) fn uint16_reads(&self) -> usize {
+            self.uint16_reads
         }
 
         pub(crate) fn remaining(&self) -> usize {
@@ -87,6 +103,16 @@ pub(crate) mod test_utils {
     }
 
     impl TdsPacketReader for MockReader {
+        fn try_read_slice(&mut self, length: usize) -> Option<&[u8]> {
+            if !self.buffered {
+                return None;
+            }
+            let end = self.position.checked_add(length)?;
+            let slice = self.data.get(self.position..end)?;
+            self.position = end;
+            Some(slice)
+        }
+
         fn negotiated_data_classification_version(
             &self,
         ) -> Option<crate::token::data_classification::DataClassificationVersion> {
@@ -114,6 +140,7 @@ pub(crate) mod test_utils {
         }
 
         async fn read_uint16(&mut self) -> TdsResult<u16> {
+            self.uint16_reads += 1;
             let mut buf = [0u8; 2];
             for item in &mut buf {
                 *item = self.read_byte().await?;

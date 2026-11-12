@@ -97,6 +97,51 @@ An already-executed prepared statement retains its server-side declaration
 when the option changes; prepare it again to select a new declaration. DAE
 parameters remain chunked in both modes.
 
+## Data Classification
+
+Every connection requests SQL Server Data Classification version 1, as
+msodbcsql does. Set `SQL_COPT_SS_DATACLASSIFICATION_VERSION` (1400) to `2` to
+also receive sensitivity ranks; values outside `1..=2` return `HY024`. The
+attribute can be set while connected, and the new value is requested at the
+next login. unixODBC frees the driver's connection at `SQLDisconnect` and
+replays only attributes set before connecting, so there set it before
+`SQLDriverConnect`.
+
+A result set's classification is read from its IRD header (`RecNumber` 0):
+
+- `SQL_CA_SS_DATA_CLASSIFICATION_VERSION` (1238) is the version the server
+  acknowledged for the session, or `0` when it did not enable the feature.
+- `SQL_CA_SS_DATA_CLASSIFICATION` (1237) is the DATACLASSIFICATION token
+  payload in the [MS-TDS] layout, byte-identical to msodbcsql's for
+  well-formed names shorter than 128 UTF-16 units. A 128-unit name, the
+  longest SQL Server accepts, is returned where msodbcsql 18.07.0001 times
+  out, and an unpaired UTF-16 surrogate is returned as U+FFFD (see
+  [parity deviation 42](parity-deviations.md)). A block cursor
+  (`SQL_ATTR_ROW_ARRAY_SIZE` above 1) also reports it, where msodbcsql's
+  server cursor reports none (same entry). A short
+  buffer receives a prefix with `01004` (msodbcsql reports `HY004`; see
+  [parity deviation 41](parity-deviations.md)), and a result set
+  without classification returns `HY091`.
+
+`SQLColAttribute` does not answer either field. Each result set reports only
+its own classification: as in msodbcsql, it is dropped when a statement is
+prepared, when the request that runs a statement is sent to the server
+(whether it then succeeds or fails), when a row read is cancelled, at the end
+of the batch, and when a statement that is not prepared is closed, cancelled,
+or swept by `SQLEndTran`. Ending a started transaction, with `SQLEndTran` or
+by turning autocommit back on, also drops it from a prepared statement whose
+cursor was already closed or has no rows left to read: after `SQL_NO_DATA`, or
+on an empty result. A call that sends nothing
+keeps it, as in msodbcsql, so `SQL_ERROR` alone does not mean it was cleared:
+a parameter that fails conversion (`22018`), a connection busy with another
+statement's results, a dead connection that session recovery cannot
+reconnect, a parameter array whose every set is ignored or
+fails conversion, and a data-at-execution `SQLExecute` or `SQLExecDirect`
+before its last `SQLParamData` (including one cancelled at `SQL_NEED_DATA` or
+between parameters). A server error that a fetch reports after rows were
+delivered also keeps it. Closing the statement afterwards follows the rules
+above.
+
 ## Integer connection-attribute getters
 
 Supported integer getters accept NULL value and length pointers independently.

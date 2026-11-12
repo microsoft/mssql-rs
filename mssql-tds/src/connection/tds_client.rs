@@ -631,6 +631,8 @@ pub struct TdsClient {
     current_decryptor: Option<MemoizedCellDecryptor>,
     buffered_row_support: Option<Box<BufferedRowSupport>>,
     count_map: HashMap<CurrentCommand, u64>,
+    /// See [`requests_admitted`](Self::requests_admitted).
+    requests_admitted: u64,
     /// Rows affected by the most recent statement; see [`last_rows_affected`](Self::last_rows_affected).
     last_rows_affected: i64,
     /// Per-statement affected-row counts captured (in order) from every counted
@@ -853,6 +855,7 @@ impl TdsClient {
             current_decryptor: None,
             buffered_row_support: None,
             count_map: HashMap::new(),
+            requests_admitted: 0,
             last_rows_affected: -1,
             dml_result_counts: Vec::new(),
             prepared_batch: None,
@@ -1531,6 +1534,17 @@ impl TdsClient {
         self.transport.mark_known_dead();
     }
 
+    /// How many requests have passed the pre-send connection check, which
+    /// recovers a dead connection or rejects the request before any of it is
+    /// written. Statement requests (SQL batches, RPCs including cursor RPCs, and
+    /// bulk loads) and transaction begins run that check; other
+    /// transaction-manager requests skip it and are not counted. A statement
+    /// request that fails with this count unchanged sent nothing, so a caller
+    /// can keep state the request would otherwise have replaced.
+    pub fn requests_admitted(&self) -> u64 {
+        self.requests_admitted
+    }
+
     pub(crate) fn get_current_metadata(&self) -> Option<&ColMetadataToken> {
         self.current_metadata.as_deref()
     }
@@ -1650,7 +1664,7 @@ impl TdsClient {
 
         #[cfg(test)]
         if let Some(elapsed) = self.reconnect_elapsed_for_test.take() {
-            return Ok(elapsed);
+            return Ok(self.admit(elapsed));
         }
 
         let connect_retry_count = self
@@ -1675,17 +1689,17 @@ impl TdsClient {
         // Only attempt recovery when session recovery was negotiated and
         // the server supports retry (connect_retry_count > 0).
         if !self.recovery_context.session_recovery_negotiated {
-            return Ok(Duration::ZERO);
+            return Ok(self.admit(Duration::ZERO));
         }
         if connect_retry_count == 0 {
-            return Ok(Duration::ZERO);
+            return Ok(self.admit(Duration::ZERO));
         }
 
         // Non-blocking poll — returns immediately. Skipped once the verdict is
         // already in: a session retired by a fatal ERROR token or a failed drain
         // stays unusable however healthy its socket still looks.
         if !known_dead && !self.transport.is_connection_dead() {
-            return Ok(Duration::ZERO);
+            return Ok(self.admit(Duration::ZERO));
         }
 
         // Connection is dead. Check if recovery is possible.
@@ -1717,7 +1731,14 @@ impl TdsClient {
         // Keep the login/recovery state out of every command's future. Allocate
         // only after detecting a dead connection, not on the healthy hot path.
         Box::pin(self.reconnect(reconnect_timeout, cancel_handle)).await?;
-        Ok(start.elapsed())
+        Ok(self.admit(start.elapsed()))
+    }
+
+    /// Counts a request [`check_and_reconnect`](Self::check_and_reconnect)
+    /// lets through; see [`requests_admitted`](Self::requests_admitted).
+    fn admit(&mut self, elapsed: Duration) -> Duration {
+        self.requests_admitted = self.requests_admitted.wrapping_add(1);
+        elapsed
     }
 
     #[cfg(any(test, feature = "test-util"))]
@@ -4326,10 +4347,10 @@ impl TdsClient {
     /// server handle should be released: its drop is piggybacked onto the
     /// `sp_prepexec` `@handle` argument when the handle is still live in this
     /// session, and skipped when the map no longer holds it (a reconnect already
-    /// discarded it server-side). The id is cleared from `orphaned` only once the
-    /// drop crosses the serialization boundary, so callers retain it across
-    /// reconnect, validation, parameter-building, and encryption failures that
-    /// precede the send and can retry its release.
+    /// discarded it server-side). The id is cleared from `orphaned` only once a
+    /// send is attempted, so callers retain it across reconnect, validation,
+    /// parameter-building, and encryption failures, and across a cancellation or
+    /// timeout that prevents any send, and can retry its release.
     ///
     /// Returns positioned on the first result; drain rows with
     /// [`next_row`](ResultSet::next_row) / [`advance`](Self::advance).
@@ -4799,10 +4820,12 @@ impl TdsClient {
     ///   input so the server drops that plan while preparing the new one,
     ///   saving a separate `sp_unprepare` round trip; `None`, or an id with
     ///   no live handle, sends NULL and prepares fresh. On return it reports
-    ///   ownership: still `Some` if the call failed before serialization (the
-    ///   caller may retry the release), `None` once the drop crossed that
-    ///   boundary - past which the server may have consumed it even if the call
-    ///   then fails after the dropping of orphan.
+    ///   ownership: still `Some`, with its handle and parameter-encryption
+    ///   metadata still cached, if no send was attempted - the call failed
+    ///   while building the request, or was cancelled or timed out before the
+    ///   first packet - so the caller may retry the release. It is `None` once
+    ///   a send was attempted, including when this future is dropped mid-send:
+    ///   the server may have consumed the drop even if the call then fails.
     ///
     /// - `command_started` - `true` when the caller already opened the command
     ///   boundary via `begin_command` (as
@@ -4901,13 +4924,12 @@ impl TdsClient {
         // The by-reference `@handle`: NULL input prepares fresh; a `Some(h)`
         // input tells the server to drop prepared statement `h` before
         // preparing. The new handle comes back as the `@handle` RETURNVALUE captured during drain.
-        // From this point onward, serialization or response failures are
-        // ambiguous: the server may have consumed the piggybacked drop, so the
-        // orphan is released and its entries evicted either way.
-        let drop_handle = orphan.take().and_then(|orphan_id| {
-            self.prepared_param_encryption.remove(&orphan_id);
-            self.prepared_handles.remove(&orphan_id)
-        });
+        // The orphan and its entries stay with the caller until a send is
+        // attempted; only then may the server have consumed the piggybacked drop.
+        if orphan.is_some_and(|id| !self.prepared_handles.contains_key(&id)) {
+            *orphan = None;
+        }
+        let drop_handle = orphan.and_then(|id| self.prepared_handles.get(&id).copied());
         let handle_value = SqlType::Int(drop_handle);
 
         let handle_parameter = RpcParameter::new(None, StatusFlags::BY_REF_VALUE, handle_value);
@@ -4934,11 +4956,31 @@ impl TdsClient {
         let issued_id = self.issue_statement_id();
         self.pending_capture = Some(issued_id);
 
+        // Taken before serializing: `serialize` is pending only after a send was
+        // attempted, so a future dropped mid-send leaves the drop consumed.
+        let released = orphan.take().map(|id| {
+            (
+                id,
+                self.prepared_handles.remove(&id),
+                self.prepared_param_encryption.remove(&id),
+            )
+        });
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         let serialize_result = rpc.serialize(&mut packet_writer).await;
         let message = packet_writer.suspend();
         drop(rpc);
+        if !message.send_attempted()
+            && let Some((orphan_id, handle, encryption)) = released
+        {
+            *orphan = Some(orphan_id);
+            if let Some(handle) = handle {
+                self.prepared_handles.insert(orphan_id, handle);
+            }
+            if let Some(encryption) = encryption {
+                self.prepared_param_encryption.insert(orphan_id, encryption);
+            }
+        }
         if let Err(e) = self.finish_send(serialize_result, message).await {
             self.report_issued_id(issued_id, statement_id);
             return Err(e);
@@ -16838,6 +16880,7 @@ mod tests {
         // Should return Ok(Duration::ZERO) even though transport is "dead"
         let elapsed = client.check_and_reconnect(Some(5), None).await.unwrap();
         assert_eq!(elapsed, Duration::ZERO);
+        assert_eq!(client.requests_admitted(), 1);
     }
 
     #[tokio::test]
@@ -16867,6 +16910,7 @@ mod tests {
         // Should skip even with dead transport because retry count is 0
         let elapsed = client.check_and_reconnect(Some(5), None).await.unwrap();
         assert_eq!(elapsed, Duration::ZERO);
+        assert_eq!(client.requests_admitted(), 1);
     }
 
     #[tokio::test]
@@ -16884,6 +16928,7 @@ mod tests {
             err.to_string().contains("Connection is dead"),
             "Expected ConnectionClosed, got: {err}"
         );
+        assert_eq!(client.requests_admitted(), 0);
     }
 
     #[tokio::test]
@@ -16902,6 +16947,7 @@ mod tests {
             err.to_string().contains("Session recovery failed"),
             "Expected reconnect attempt resulting in SessionRecoveryFailed, got: {err}"
         );
+        assert_eq!(client.requests_admitted(), 0);
     }
 
     #[tokio::test]
@@ -18619,6 +18665,329 @@ mod tests {
         assert!(
             !client.prepared_handles.contains_key(&orphan_id),
             "once the drop crosses the send boundary the orphan's entry is dead"
+        );
+    }
+
+    /// Registers a live server handle and Always Encrypted metadata for a fresh
+    /// statement, returning the id and the metadata for identity checks.
+    fn seed_prepared_orphan(
+        client: &mut TdsClient,
+        handle: i32,
+    ) -> (
+        StatementId,
+        Arc<crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult>,
+    ) {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        let id = client.issue_statement_id();
+        client.prepared_handles.insert(id, handle);
+        let metadata = Arc::new(DescribeParameterEncryptionResult::new());
+        client
+            .prepared_param_encryption
+            .insert(id, Arc::clone(&metadata));
+        (id, metadata)
+    }
+
+    fn captured_handle_return(handle: i32) -> Tokens {
+        Tokens::ReturnValue(ae_return_value_token(
+            "@handle",
+            ColumnValues::Int(handle),
+            None,
+        ))
+    }
+
+    // The by-reference `@handle` input carrying handle 0x5152_5354.
+    const ORPHAN_HANDLE_INPUT: [u8; 9] = [0x00, 0x01, 0x26, 0x04, 0x04, 0x54, 0x53, 0x52, 0x51];
+    const ORPHAN_HANDLE: i32 = 0x5152_5354;
+
+    #[tokio::test]
+    async fn execute_sp_prepexec_retains_orphan_when_cancelled_before_send() {
+        let cancel = CancelHandle::new();
+        let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+        transport.cancel_on_writer_creation = Some(cancel.cancel_token.clone());
+        let sent = Arc::clone(&transport.sent);
+        let mut client = create_test_client_with_transport(transport);
+        let (orphan_id, metadata) = seed_prepared_orphan(&mut client, ORPHAN_HANDLE);
+        let mut orphan = Some(orphan_id);
+        let mut statement_id = None;
+
+        let error = client
+            .execute_sp_prepexec(
+                "SELECT 1".to_string(),
+                Vec::new(),
+                &mut statement_id,
+                &mut orphan,
+                false,
+                ExecuteOptions::new().cancel(&cancel),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "nothing reached the server"
+        );
+        assert_eq!(orphan, Some(orphan_id));
+        assert_eq!(
+            client.prepared_handles.get(&orphan_id),
+            Some(&ORPHAN_HANDLE)
+        );
+        assert!(Arc::ptr_eq(
+            client.prepared_param_encryption.get(&orphan_id).unwrap(),
+            &metadata
+        ));
+        assert_eq!(statement_id, None);
+        assert!(client.pending_capture.is_none());
+        assert!(!client.is_connection_dead());
+        assert!(!client.has_open_batch());
+    }
+
+    #[tokio::test]
+    async fn execute_sp_prepexec_retry_after_unsent_cancel_releases_orphan_once() {
+        let cancel = CancelHandle::new();
+        let mut transport =
+            TestTransport::with_tokens(vec![captured_handle_return(78), done_no_more()]);
+        transport.cancel_on_writer_creation = Some(cancel.cancel_token.clone());
+        let sent = Arc::clone(&transport.sent);
+        let mut client = create_test_client_with_transport(transport);
+        let (orphan_id, _metadata) = seed_prepared_orphan(&mut client, ORPHAN_HANDLE);
+        let mut orphan = Some(orphan_id);
+        let mut statement_id = None;
+
+        client
+            .execute_sp_prepexec(
+                "SELECT 1".to_string(),
+                Vec::new(),
+                &mut statement_id,
+                &mut orphan,
+                false,
+                ExecuteOptions::new().cancel(&cancel),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(orphan, Some(orphan_id));
+
+        let (new_id, _result) = client
+            .execute_sp_prepexec_for_test("SELECT 1".to_string(), Vec::new(), &mut orphan, ())
+            .await
+            .unwrap();
+
+        let bytes = sent.lock().unwrap().clone();
+        assert_eq!(
+            bytes
+                .windows(ORPHAN_HANDLE_INPUT.len())
+                .filter(|w| *w == ORPHAN_HANDLE_INPUT)
+                .count(),
+            1,
+            "only the retry reaches the server, carrying the orphan's handle"
+        );
+        assert_eq!(orphan, None);
+        assert!(!client.prepared_handles.contains_key(&orphan_id));
+        assert!(!client.prepared_param_encryption.contains_key(&orphan_id));
+        assert_eq!(client.prepared_handles.get(&new_id), Some(&78));
+    }
+
+    #[tokio::test]
+    async fn execute_sp_prepexec_retains_orphan_when_serialization_fails_before_send() {
+        let transport = TestTransport::with_tokens(vec![done_no_more()]);
+        let sent = Arc::clone(&transport.sent);
+        let mut client = create_test_client_with_transport(transport);
+        let (orphan_id, metadata) = seed_prepared_orphan(&mut client, ORPHAN_HANDLE);
+        let mut orphan = Some(orphan_id);
+        let mut statement_id = None;
+        // Past the one-byte name bound, so validation rejects it before any
+        // byte is written.
+        let overlong_name = RpcParameter::new(
+            Some(format!("@{}", "p".repeat(300))),
+            StatusFlags::NONE,
+            SqlType::Int(Some(1)),
+        );
+
+        let error = client
+            .execute_sp_prepexec(
+                "SELECT 1".to_string(),
+                vec![overlong_name],
+                &mut statement_id,
+                &mut orphan,
+                false,
+                (),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, crate::error::Error::UsageError(_)),
+            "{error:?}"
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "nothing reached the server"
+        );
+        assert_eq!(orphan, Some(orphan_id));
+        assert_eq!(
+            client.prepared_handles.get(&orphan_id),
+            Some(&ORPHAN_HANDLE)
+        );
+        assert!(Arc::ptr_eq(
+            client.prepared_param_encryption.get(&orphan_id).unwrap(),
+            &metadata
+        ));
+        assert_eq!(statement_id, None);
+        assert!(client.pending_capture.is_none());
+        assert!(!client.is_connection_dead());
+        assert!(!client.has_open_batch());
+    }
+
+    #[tokio::test]
+    async fn execute_sp_prepexec_interrupted_send_consumes_orphan() {
+        for prior_packet in [false, true] {
+            let cancel = CancelHandle::new();
+            let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+            transport.cancel_during_send = Some(cancel.cancel_token.clone());
+            transport.sends_before_cancel = usize::from(prior_packet);
+            let sent = Arc::clone(&transport.sent);
+            let attentions = Arc::clone(&transport.attentions);
+            let close_calls = Arc::clone(&transport.close_calls);
+            let mut client = create_test_client_with_transport(transport);
+            let (orphan_id, _metadata) = seed_prepared_orphan(&mut client, ORPHAN_HANDLE);
+            let mut orphan = Some(orphan_id);
+            let mut statement_id = None;
+            // Larger than one packet, so the first send completes and the
+            // second is the interrupted one.
+            let sql = if prior_packet {
+                "x".repeat(10_000)
+            } else {
+                "SELECT 1".to_string()
+            };
+
+            let error = tokio::time::timeout(
+                Duration::from_secs(1),
+                client.execute_sp_prepexec(
+                    sql,
+                    Vec::new(),
+                    &mut statement_id,
+                    &mut orphan,
+                    false,
+                    ExecuteOptions::new().cancel(&cancel),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+
+            assert!(matches!(
+                error,
+                crate::error::Error::OperationCancelledError(_)
+            ));
+            assert!(
+                client.is_connection_dead(),
+                "an interrupted packet cannot be retracted"
+            );
+            assert_eq!(
+                sent.lock().unwrap().len(),
+                if prior_packet { 4096 + 8 } else { 8 },
+                "no IGNORE after a partial packet"
+            );
+            assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(
+                close_calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "TLS shutdown must not write after interruption"
+            );
+            assert_eq!(orphan, None, "the server may have consumed the drop");
+            assert!(!client.prepared_handles.contains_key(&orphan_id));
+            assert!(!client.prepared_param_encryption.contains_key(&orphan_id));
+            assert_eq!(statement_id, None);
+            assert!(client.pending_capture.is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn execute_sp_prepexec_dropped_mid_send_consumes_orphan() {
+        let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+        transport
+            .send_should_hang
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        transport.send_prefix_before_hang = true;
+        let sent = Arc::clone(&transport.sent);
+        let mut client = create_test_client_with_transport(transport);
+        let (orphan_id, _metadata) = seed_prepared_orphan(&mut client, ORPHAN_HANDLE);
+        let mut orphan = Some(orphan_id);
+        let mut statement_id = None;
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            client.execute_sp_prepexec(
+                "SELECT 1".to_string(),
+                Vec::new(),
+                &mut statement_id,
+                &mut orphan,
+                false,
+                (),
+            ),
+        )
+        .await
+        .expect_err("the stalled send never completes, so the future is dropped");
+
+        assert_eq!(sent.lock().unwrap().len(), 8, "dropped inside the packet");
+        assert_eq!(orphan, None, "the server may have consumed the drop");
+        assert!(!client.prepared_handles.contains_key(&orphan_id));
+        assert!(!client.prepared_param_encryption.contains_key(&orphan_id));
+    }
+
+    #[tokio::test]
+    async fn execute_sp_prepexec_piggyback_releases_orphan_and_captures_new_handle() {
+        let (mut client, sent) =
+            create_capturing_client(vec![captured_handle_return(78), done_no_more()]);
+        let (orphan_id, _metadata) = seed_prepared_orphan(&mut client, ORPHAN_HANDLE);
+        let mut orphan = Some(orphan_id);
+
+        let (new_id, _result) = client
+            .execute_sp_prepexec_for_test("SELECT 1".to_string(), Vec::new(), &mut orphan, ())
+            .await
+            .unwrap();
+
+        let bytes = sent.lock().unwrap().clone();
+        assert!(
+            bytes
+                .windows(ORPHAN_HANDLE_INPUT.len())
+                .any(|w| w == ORPHAN_HANDLE_INPUT),
+            "the orphan's handle rides the by-reference @handle input"
+        );
+        assert_eq!(orphan, None);
+        assert!(!client.prepared_handles.contains_key(&orphan_id));
+        assert!(!client.prepared_param_encryption.contains_key(&orphan_id));
+        assert_eq!(client.prepared_handles.get(&new_id), Some(&78));
+    }
+
+    #[tokio::test]
+    async fn execute_sp_prepexec_clears_stale_orphan_when_cancelled_before_send() {
+        let cancel = CancelHandle::new();
+        let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+        transport.cancel_on_writer_creation = Some(cancel.cancel_token.clone());
+        let mut client = create_test_client_with_transport(transport);
+        let mut orphan = Some(client.issue_statement_id());
+        let mut statement_id = None;
+
+        client
+            .execute_sp_prepexec(
+                "SELECT 1".to_string(),
+                Vec::new(),
+                &mut statement_id,
+                &mut orphan,
+                false,
+                ExecuteOptions::new().cancel(&cancel),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            orphan, None,
+            "an id with no live handle has nothing to retry"
         );
     }
 
