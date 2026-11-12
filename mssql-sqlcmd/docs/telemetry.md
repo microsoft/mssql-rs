@@ -149,7 +149,10 @@ The ID is the shared Microsoft DeveloperTools device ID: on Windows the
 macOS `~/Library/Application Support/Microsoft/DeveloperTools/deviceid`; on
 Linux `$XDG_CACHE_HOME/Microsoft/DeveloperTools/deviceid` when `XDG_CACHE_HOME`
 is set to an absolute path (it works without `HOME`, for services and
-containers), else `~/.cache/Microsoft/DeveloperTools/deviceid`. An existing
+containers), else `~/.cache/Microsoft/DeveloperTools/deviceid`. The file is read
+only if it is a regular file of at most 256 bytes; anything else at that path
+(a directory, a FIFO, a large file) is treated as unreadable and left alone. An
+existing
 recognized ID is reused; a missing one is generated (a random version 4 UUID)
 and stored. A value that is present but unreadable or unrecognized is never
 overwritten. If it cannot be read or stored, the property is omitted. When telemetry is off, the ID is not

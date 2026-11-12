@@ -75,13 +75,37 @@ pub struct FileStore {
     pub path: std::path::PathBuf,
 }
 
+/// The most the ID file is read for. An ID is 36 characters; a byte order mark
+/// and a line ending fit well within this, and anything longer is not an ID.
+const MAX_FILE_BYTES: u64 = 256;
+
 impl Store for FileStore {
+    /// Reads a regular file of at most [`MAX_FILE_BYTES`]. Anything else at the
+    /// path (a directory, a FIFO or device that could block, a huge file) is an
+    /// error: nothing is read from it and nothing replaces it.
     fn read(&self) -> io::Result<Option<String>> {
-        match std::fs::read_to_string(&self.path) {
-            Ok(text) => Ok(Some(text)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
+        use std::io::Read;
+        let invalid = |reason| io::Error::new(io::ErrorKind::InvalidData, reason);
+        // Checked before opening: opening a FIFO for reading waits for a writer.
+        match std::fs::metadata(&self.path) {
+            Ok(metadata) if !metadata.is_file() => return Err(invalid("not a regular file")),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
         }
+        let file = match std::fs::File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut bytes = Vec::new();
+        file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_FILE_BYTES {
+            return Err(invalid("too long to be a device ID"));
+        }
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| invalid("not text"))
     }
 
     /// The ID is written to a file of its own and then linked into place, which
@@ -99,7 +123,11 @@ impl Store for FileStore {
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         ));
-        std::fs::write(&staged, id)?;
+        // A failed write (a full disk) must not leave the staged file behind.
+        if let Err(error) = std::fs::write(&staged, id) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error);
+        }
         let linked = std::fs::hard_link(&staged, &self.path);
         let _ = std::fs::remove_file(&staged);
         match linked {
@@ -745,6 +773,53 @@ mod tests {
             get_or_create_in(&store, || panic!("reuse")).as_deref(),
             Some(ID)
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Only a small regular file is read: a huge file, a directory or a
+    /// non-text file at the path is an error, and the ID is not replaced.
+    #[test]
+    fn the_file_store_reads_only_a_small_regular_text_file() {
+        let dir = std::env::temp_dir().join(format!("sqlcmd-deviceid-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("deviceid");
+        let store = FileStore { path: path.clone() };
+
+        std::fs::write(&path, format!("\u{feff}{ID}\r\n")).expect("write");
+        assert!(store.read().expect("a normal file").is_some());
+
+        std::fs::write(&path, vec![b'a'; 1024 * 1024]).expect("write");
+        assert!(store.read().is_err(), "a large file is not read");
+
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).expect("write");
+        assert!(store.read().is_err(), "not text");
+
+        std::fs::remove_file(&path).expect("remove");
+        std::fs::create_dir(&path).expect("a directory at the path");
+        assert!(store.read().is_err(), "a directory is not an ID");
+        assert_eq!(get_or_create_in(&store, || ID.to_string()), None);
+        assert!(path.is_dir(), "nothing replaced it");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A create that fails does not leave its staged file in the ID directory.
+    /// (Here it fails at the link; a failed write takes the same cleanup.)
+    #[test]
+    fn a_failed_create_leaves_no_staged_file() {
+        let dir =
+            std::env::temp_dir().join(format!("sqlcmd-deviceid-stage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        // The ID path is a directory, so linking the staged file there fails.
+        let path = dir.join("deviceid");
+        std::fs::create_dir(&path).expect("directory at the ID path");
+        let store = FileStore { path };
+        assert!(store.create_if_absent(ID).is_err());
+        let staged = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(staged, 0, "no staged file is left");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
