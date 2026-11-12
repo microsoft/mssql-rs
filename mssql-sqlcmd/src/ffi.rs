@@ -227,7 +227,7 @@ pub unsafe extern "C" fn mssql_sqlcmd_telemetry_record_connection(
     }
 }
 
-/// Flushes and shuts down telemetry within `timeout_ms`, capped at one second.
+/// Flushes and shuts down telemetry within `timeout_ms`, capped at half a second.
 #[unsafe(no_mangle)]
 pub extern "C" fn mssql_sqlcmd_telemetry_shutdown(timeout_ms: u32) -> i32 {
     match catch_unwind(AssertUnwindSafe(|| {

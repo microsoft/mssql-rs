@@ -63,7 +63,10 @@ const APPLICATION_INSIGHTS_EVENT_ENVELOPE: &str = "Microsoft.ApplicationInsights
 const MAX_VERSION_LEN: usize = 64;
 /// The event is one span with one span event; a little room beyond that.
 const MAX_EVENTS_PER_SPAN: u32 = 8;
-pub const MAX_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+/// The longest the process waits for the event at exit, whatever the caller
+/// asks for. Half a second keeps a short run (`sqlcmd -Q "SELECT 1"`) from being
+/// held up by a cold send; an event that is not delivered by then is dropped.
+pub const MAX_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub const KEY_VERSION: &str = "sqlcmdcli_version";
@@ -1621,6 +1624,29 @@ mod tests {
 
         assert_eq!(outcome, FlushOutcome::TimedOut);
         assert!(started.elapsed() < Duration::from_millis(1_500));
+    }
+
+    /// A caller that asks for a longer wait still gets half a second: the
+    /// library's cap, not the caller's request, bounds the delay at exit.
+    #[test]
+    fn shutdown_waits_no_longer_than_the_cap_whatever_is_asked() {
+        assert_eq!(MAX_FLUSH_TIMEOUT, Duration::from_millis(500));
+        let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
+        let _requests = guard.capture_requests();
+        *ABI_TEST_DELAY.lock().expect("delay lock") = Duration::from_secs(3);
+        record_usage(Invocation {
+            version: Some("18.5"),
+            command: Command::Unspecified,
+            format: FormatUse::Absent,
+        });
+        let started = std::time::Instant::now();
+
+        let outcome = shutdown(Duration::from_secs(60));
+        *ABI_TEST_DELAY.lock().expect("delay lock") = Duration::ZERO;
+
+        assert_eq!(outcome, FlushOutcome::TimedOut);
+        assert!(started.elapsed() >= Duration::from_millis(400));
+        assert!(started.elapsed() < Duration::from_millis(1_200));
     }
 
     #[test]

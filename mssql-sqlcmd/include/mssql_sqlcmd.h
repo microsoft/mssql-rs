@@ -108,7 +108,7 @@ int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_record_connection(
     const MssqlSqlcmdServerInfo* info);
 
 /* Sends the event if it has not been sent, and waits for it for timeout_ms,
-   capped at 1000. Returns 0 when completed, off, or already started; 6 on
+   capped at 500. Returns 0 when completed, off, or already started; 6 on
    timeout; or 3 on failure or panic. */
 int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_shutdown(uint32_t timeout_ms);
 

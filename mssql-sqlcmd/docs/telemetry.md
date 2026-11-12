@@ -67,7 +67,7 @@ flowchart LR
    sqlcmd does next.
 3. At exit (`mssql_sqlcmd_telemetry_shutdown`) the library sends the event if it
    was not sent yet (a run that never connected), and waits for it for at most
-   one second.
+   half a second.
 
 The Rust `sqlcmd diagnose` path records its server row from its own session
 probe, with the same functions.
@@ -203,11 +203,18 @@ collects or exports:
 
 Every step is best effort; failures are only debug tracing and never write to
 sqlcmd's output. Rust panics are caught at the C boundary. The HTTP client uses
-two-second connect and request timeouts, and the process waits at most one
-second at exit. When the destination is unreachable, a run therefore ends up to
-one second later than it would without telemetry, which is the worst case a
-firewalled or offline machine sees; when the event is sent early enough, the wait
-is hidden behind the work sqlcmd does after connecting.
+two-second connect and request timeouts, and the process waits at most half a
+second at exit. A run therefore ends up to half a second later than it would
+without telemetry, which is the worst case a firewalled or offline machine
+sees; when the event is sent early enough, the wait is hidden behind the work
+sqlcmd does after connecting.
+
+The bound is short on purpose: a cold send (DNS, TCP, TLS and the POST) takes
+from about 0.2 s on a nearby network to about a second from a distant one, and a
+short run such as `sqlcmd -Q "SELECT 1"` has no other work to hide it behind.
+An event that is not delivered when the bound passes is dropped; nothing is
+stored for a later run. So very short runs on slow networks are undercounted,
+and the usage numbers are a lower bound.
 
 On Windows the console control handler (Ctrl+C in non-interactive mode, console
 close) sends the event before ending the process. On Linux and macOS the signal
