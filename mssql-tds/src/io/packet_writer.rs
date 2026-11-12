@@ -522,9 +522,12 @@ impl<'a> PacketWriter<'a> {
                 "Timeout expired".to_string(),
             )));
         }
-        let elapsed = async {
-            match deadline {
-                Some(deadline) => tokio::time::sleep_until(deadline).await,
+        // Boxed so the common no-deadline send does not carry an inline `Sleep`
+        // in the state of every async write that can reach this flush.
+        let sleep = deadline.map(|deadline| Box::pin(tokio::time::sleep_until(deadline)));
+        let elapsed = async move {
+            match sleep {
+                Some(sleep) => sleep.await,
                 None => std::future::pending::<()>().await,
             }
         };
@@ -1004,6 +1007,10 @@ pub(crate) mod tests {
         pub(crate) reset_mode: ResetConnectionMode,
         pub(crate) reset_dispatched: bool,
         blocking_send: Option<Duration>,
+        send_delay: Option<Duration>,
+        /// Writes this many bytes of the packet, then never completes.
+        hang_after: Option<usize>,
+        cancel_during_send: Option<tokio_util::sync::CancellationToken>,
     }
 
     impl MockNetworkWriter {
@@ -1014,6 +1021,9 @@ pub(crate) mod tests {
                 reset_mode: ResetConnectionMode::None,
                 reset_dispatched: false,
                 blocking_send: None,
+                send_delay: None,
+                hang_after: None,
+                cancel_during_send: None,
             }
         }
     }
@@ -1024,6 +1034,17 @@ pub(crate) mod tests {
         async fn send(&mut self, _data: &[u8]) -> TdsResult<()> {
             if let Some(duration) = self.blocking_send {
                 std::thread::sleep(duration);
+            }
+            if let Some(token) = &self.cancel_during_send {
+                token.cancel();
+            }
+            if let Some(prefix) = self.hang_after {
+                self.data
+                    .extend_from_slice(&_data[..prefix.min(_data.len())]);
+                std::future::pending::<()>().await;
+            }
+            if let Some(delay) = self.send_delay {
+                tokio::time::sleep(delay).await;
             }
             self.data.extend_from_slice(_data);
             Ok(())
@@ -2150,6 +2171,183 @@ pub(crate) mod tests {
             "the first-packet flag is still set on this path"
         );
         assert!(message.nothing_sent());
+    }
+
+    fn is_timeout(result: &TdsResult<()>) -> bool {
+        matches!(result, Err(TimeoutError(TimeoutErrorType::String(message))) if message == "Timeout expired")
+    }
+
+    fn is_cancelled(result: &TdsResult<()>, expected: &str) -> bool {
+        matches!(result, Err(OperationCancelledError(message)) if message == expected)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unlimited_write_timeout_never_bounds_a_send() {
+        for timeout in [None, Some(0)] {
+            for with_settlement in [false, true] {
+                let mut cancel = CancelHandle::new();
+                cancel.set_cancel_timeout_secs(1);
+                let mut mock = MockNetworkWriter::new(16);
+                mock.send_delay = Some(Duration::from_secs(3600));
+                let started = Instant::now();
+                let mut writer = PacketWriter::new(
+                    PacketType::RpcRequest,
+                    &mut mock,
+                    timeout,
+                    with_settlement.then_some(&cancel),
+                );
+                writer.write_async(&[0xAB; 9]).await.unwrap();
+                writer.finalize().await.unwrap();
+                let message = writer.suspend();
+                assert!(!message.send_incomplete());
+                assert!(message.message_complete());
+                assert_eq!(started.elapsed(), Duration::from_secs(7200));
+                assert_eq!(reassemble_payload(&mock.data), vec![0xAB; 9]);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_deadline_retires_a_stalled_or_partial_send() {
+        for prefix in [0, 3] {
+            for with_settlement in [false, true] {
+                let mut cancel = CancelHandle::new();
+                cancel.set_cancel_timeout_secs(3);
+                let mut mock = MockNetworkWriter::new(16);
+                mock.hang_after = Some(prefix);
+                let started = Instant::now();
+                let mut writer = PacketWriter::new(
+                    PacketType::RpcRequest,
+                    &mut mock,
+                    Some(1),
+                    with_settlement.then_some(&cancel),
+                );
+                let result = writer.write_async(&[0xAB; 9]).await;
+                let message = writer.suspend();
+                assert!(is_timeout(&result), "{result:?}");
+                assert_eq!(started.elapsed(), Duration::from_secs(1));
+                assert!(message.send_attempted());
+                assert!(message.send_incomplete());
+                assert!(!message.message_complete());
+                assert_eq!(mock.data.len(), prefix);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sends_of_one_message_share_its_write_deadline() {
+        for with_settlement in [false, true] {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(3);
+            let mut mock = MockNetworkWriter::new(16);
+            mock.send_delay = Some(Duration::from_millis(400));
+            let started = Instant::now();
+            let mut writer = PacketWriter::new(
+                PacketType::RpcRequest,
+                &mut mock,
+                Some(1),
+                with_settlement.then_some(&cancel),
+            );
+            let result = writer.write_async(&[0xAB; 40]).await;
+            let message = writer.suspend();
+            assert!(is_timeout(&result), "{result:?}");
+            assert_eq!(started.elapsed(), Duration::from_secs(1));
+            assert!(message.send_incomplete());
+            assert_eq!(mock.data.len(), 32, "two packets fit in the budget");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_finishes_the_packet_in_flight() {
+        for timeout in [None, Some(5)] {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(3);
+            let mut mock = MockNetworkWriter::new(16);
+            mock.send_delay = Some(Duration::from_millis(500));
+            mock.cancel_during_send = Some(cancel.cancel_token.clone());
+            let started = Instant::now();
+            let mut writer =
+                PacketWriter::new(PacketType::RpcRequest, &mut mock, timeout, Some(&cancel));
+            let result = writer.write_async(&[0xAB; 9]).await;
+            let message = writer.suspend();
+            assert!(is_cancelled(&result, "Request was cancelled"), "{result:?}");
+            assert_eq!(started.elapsed(), Duration::from_millis(500));
+            assert!(message.send_attempted());
+            assert!(!message.send_incomplete(), "the transport stays usable");
+            assert_eq!(mock.data.len(), 16);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unfinished_cancellation_retires_the_transport() {
+        for (timeout, cancel_secs, expected) in [(None, 2, 2), (Some(5), 2, 2), (Some(1), 3, 1)] {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(cancel_secs);
+            let mut mock = MockNetworkWriter::new(16);
+            mock.send_delay = Some(Duration::from_secs(10));
+            mock.cancel_during_send = Some(cancel.cancel_token.clone());
+            let started = Instant::now();
+            let mut writer =
+                PacketWriter::new(PacketType::RpcRequest, &mut mock, timeout, Some(&cancel));
+            let result = writer.write_async(&[0xAB; 9]).await;
+            let message = writer.suspend();
+            assert!(
+                is_cancelled(
+                    &result,
+                    "Cancellation timed out completing the current packet"
+                ),
+                "{result:?}"
+            );
+            assert_eq!(started.elapsed(), Duration::from_secs(expected));
+            assert!(message.send_incomplete());
+            assert!(mock.data.is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_message_starts_its_own_write_deadline() {
+        for with_settlement in [false, true] {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(3);
+            let mut mock = MockNetworkWriter::new(16);
+            mock.send_delay = Some(Duration::from_millis(800));
+            let started = Instant::now();
+            for _ in 0..2 {
+                let mut writer = PacketWriter::new(
+                    PacketType::RpcRequest,
+                    &mut mock,
+                    Some(1),
+                    with_settlement.then_some(&cancel),
+                );
+                writer.write_async(&[0xAB; 4]).await.unwrap();
+                writer.finalize().await.unwrap();
+            }
+            assert_eq!(started.elapsed(), Duration::from_millis(1600));
+            assert_eq!(mock.data.len(), 24);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resumed_message_gets_a_fresh_write_deadline() {
+        for with_settlement in [false, true] {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(3);
+            let mut mock = MockNetworkWriter::new(16);
+            mock.send_delay = Some(Duration::from_millis(800));
+            let mut writer = PacketWriter::new(
+                PacketType::RpcRequest,
+                &mut mock,
+                Some(1),
+                with_settlement.then_some(&cancel),
+            );
+            writer.write_async(&[0xAB; 9]).await.unwrap();
+            let suspended = writer.suspend();
+            tokio::time::advance(Duration::from_secs(5)).await;
+            let mut writer = PacketWriter::resume(suspended, &mut mock);
+            writer.finalize().await.unwrap();
+            assert!(writer.suspend().message_complete());
+            assert_eq!(reassemble_payload(&mock.data), vec![0xAB; 9]);
+        }
     }
 
     /// The per-unit encoder `write_string_unicode_async` replaced, kept as its
