@@ -205,10 +205,9 @@ collects or exports:
 Every step is best effort; failures are only debug tracing and never write to
 sqlcmd's output. Rust panics are caught at the C boundary. The HTTP client uses
 two-second connect and request timeouts, but the process never waits that long
-for it: the wait at exit is at most half a second. The wait at exit therefore
-adds at most half a second, which is what a firewalled or offline machine sees;
-when the event is sent early enough, the wait is hidden behind the work sqlcmd
-does after connecting.
+for it: the wait at exit is at most half a second, which is what a firewalled or
+offline machine sees; when the event is sent early enough, the wait is hidden
+behind the work sqlcmd does after connecting.
 
 There is one other wait, at startup, on Windows only: a first run, the one that
 has to create the device ID, takes a named mutex, and if another first run holds
