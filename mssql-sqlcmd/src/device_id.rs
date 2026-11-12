@@ -166,8 +166,9 @@ struct RegistryStore;
 mod registry {
     use super::{RegistryStore, Store};
     use std::io;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, HANDLE, LocalFree,
+        ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, HANDLE, LocalFree,
         WAIT_ABANDONED, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
@@ -192,16 +193,6 @@ mod registry {
         io::Error::from_raw_os_error(code as i32)
     }
 
-    /// An open handle, closed when it goes out of scope.
-    struct OwnedHandle(HANDLE);
-
-    impl Drop for OwnedHandle {
-        fn drop(&mut self) {
-            // SAFETY: the handle is open and closed once, here.
-            unsafe { CloseHandle(self.0) };
-        }
-    }
-
     /// The current user's SID as text (`S-1-5-21-...`), or `None` when it cannot
     /// be read.
     fn user_sid_string() -> Option<String> {
@@ -210,10 +201,13 @@ mod registry {
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
             return None;
         }
-        let token = OwnedHandle(token);
+        // SAFETY: the call succeeded, so `token` is an open handle that nothing
+        // else owns.
+        let token_guard = unsafe { OwnedHandle::from_raw_handle(token) };
+        let token = token_guard.as_raw_handle();
         let mut needed = 0u32;
         // SAFETY: a null buffer of length 0 asks for the size.
-        unsafe { GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
         if needed == 0 || needed > 4096 {
             return None;
         }
@@ -222,7 +216,7 @@ mod registry {
         // SAFETY: `buffer` holds at least `needed` bytes.
         let ok = unsafe {
             GetTokenInformation(
-                token.0,
+                token,
                 TokenUser,
                 buffer.as_mut_ptr().cast(),
                 (buffer.len() * 8) as u32,
@@ -283,17 +277,24 @@ mod registry {
             if handle.is_null() {
                 return None;
             }
-            let handle = OwnedHandle(handle);
-            // SAFETY: `handle` is a mutex handle owned by this function.
-            let waited = unsafe { WaitForSingleObject(handle.0, wait_ms) };
-            (waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED).then_some(Self(handle))
+            // SAFETY: `handle` is a new, open mutex handle that nothing else owns.
+            let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+            // SAFETY: the handle is open for the duration of the call.
+            let waited = unsafe { WaitForSingleObject(handle.as_raw_handle(), wait_ms) };
+            // Built only on success: a failed wait just closes the handle, and
+            // never runs the release below for a mutex this thread does not own.
+            if waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED {
+                Some(Self(handle))
+            } else {
+                None
+            }
         }
     }
 
     impl Drop for FirstRunLock {
         fn drop(&mut self) {
             // SAFETY: the mutex is owned by this thread; the handle closes after.
-            unsafe { ReleaseMutex((self.0).0) };
+            unsafe { ReleaseMutex(self.0.as_raw_handle()) };
         }
     }
 

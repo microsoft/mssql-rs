@@ -125,14 +125,14 @@ Without a declaration, detection uses DacFx's AI-agent environment markers, so
 a caller DacFx or SqlPackage sees as an agent is one here. Any one of them is
 enough:
 
-1. `AI_AGENT=github_copilot_vscode_agent`
-2. `CLAUDE_CODE_CHILD_SESSION=1`
-3. `CODEX_THREAD_ID` or `CODEX_SESSION_ID` set
-4. `GEMINI_CLI=1`
-5. `CLAUDECODE=1`
-6. `COPILOT_AGENT=1`
+- `AI_AGENT=github_copilot_vscode_agent`
+- `CLAUDE_CODE_CHILD_SESSION=1`
+- `CODEX_THREAD_ID` or `CODEX_SESSION_ID` set
+- `GEMINI_CLI=1`
+- `CLAUDECODE=1`
+- `COPILOT_AGENT=1`
 
-Any of these makes `agent`. Otherwise one of DacFx's CI markers (`TF_BUILD`,
+That makes `agent`. Otherwise one of DacFx's CI markers (`TF_BUILD`,
 `AGENT_JOBNAME`, `SYSTEM_COLLECTIONURI`, `GITHUB_ACTION`, `GITHUB_ACTIONS`,
 `GITLAB_CI`, `JENKINS_URL`, `CIRCLECI`, `CODEBUILD_BUILD_ID`) makes `pipeline`,
 and anything else is `unknown`. DacFx also counts `AWS_REGION` and
@@ -150,10 +150,9 @@ macOS `~/Library/Application Support/Microsoft/DeveloperTools/deviceid`; on
 Linux `$XDG_CACHE_HOME/Microsoft/DeveloperTools/deviceid` when `XDG_CACHE_HOME`
 is set to an absolute path (it works without `HOME`, for services and
 containers), else `~/.cache/Microsoft/DeveloperTools/deviceid`. An existing
-recognized ID is reused;
-a missing one is generated (a random version 4 UUID) and stored. A value that is
-present but unreadable or unrecognized is never overwritten. If it cannot be
-read or stored, the property is omitted. When telemetry is off, the ID is not
+recognized ID is reused; a missing one is generated (a random version 4 UUID)
+and stored. A value that is present but unreadable or unrecognized is never
+overwritten. If it cannot be read or stored, the property is omitted. When telemetry is off, the ID is not
 touched. Two first runs at the same moment end up with the same ID: on macOS and
 Linux the ID is written to a file of its own and linked into place, which fails
 if the ID file exists, and the loser reads the winner's; on Windows first runs
@@ -163,8 +162,7 @@ read back after it is written. A first run that cannot take the mutex within two
 seconds, or cannot read the user's SID, does not create the ID, and the event
 goes without it. Another user can keep a first run from creating the ID only by
 creating that SID-qualified name first, which just omits the property. A tool
-that
-writes the shared ID without that mutex can still race on Windows; the
+that writes the shared ID without that mutex can still race on Windows; the
 read-back reports the value that survives. The ID is end-user pseudonymized
 information and is sent as the GUID, not hashed.
 
@@ -203,10 +201,11 @@ failure, a failure in the filter, a response that does not match what was sent,
 and a rejection by the service (a 4xx or 5xx status, or a partial response that
 rejected the event) are all recorded as a failure, because the SDK's shutdown
 does not hand the export result back. The exporter retries throttling and server
-errors with a backoff; the bounded wait then ends first, and that is reported as
+errors with a backoff of up to about 35 seconds, and the last attempt decides
+the outcome, so a retry that succeeds is not reported as a failure. If shutdown
+arrives during the backoff, the bounded wait ends first and that is reported as
 a timeout, not as success. An all-filtered or malformed request is an error, not
-a synthetic success. A
-partial-ingestion response is checked against the request first (item counts,
+a synthetic success. A partial-ingestion response is checked against the request first (item counts,
 and that every error index is present, unique and in range) before its indices
 are translated back to the original batch; a response that does not add up is
 an error and is never taken as an acceptance.

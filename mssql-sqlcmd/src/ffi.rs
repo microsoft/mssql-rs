@@ -176,7 +176,7 @@ pub extern "C" fn mssql_sqlcmd_telemetry_enabled() -> i32 {
 /// columns come from too.
 #[unsafe(no_mangle)]
 pub extern "C" fn mssql_sqlcmd_telemetry_server_info_query() -> *const std::ffi::c_char {
-    crate::server_info::QUERY.as_ptr().cast()
+    crate::server_info::QUERY.as_ptr()
 }
 
 /// The row [`mssql_sqlcmd_telemetry_server_info_query`] returns, as native sqlcmd
@@ -2343,10 +2343,7 @@ mod tests {
         // SAFETY: the function returns a pointer to a static NUL-terminated string.
         let exported =
             unsafe { std::ffi::CStr::from_ptr(mssql_sqlcmd_telemetry_server_info_query()) };
-        assert_eq!(
-            exported.to_str().expect("UTF-8"),
-            crate::server_info::QUERY.trim_end_matches('\0')
-        );
+        assert_eq!(exported, crate::server_info::QUERY);
     }
 
     /// The header declares exactly the functions this module exports, and its

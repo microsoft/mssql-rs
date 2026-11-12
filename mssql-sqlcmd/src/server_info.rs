@@ -35,12 +35,19 @@ macro_rules! server_info_columns {
 /// What a query that already selects the engine edition appends.
 pub const EXTRA_COLUMNS: &str = server_info_columns!();
 
-/// The whole query for native sqlcmd, NUL-terminated for the C ABI.
-pub const QUERY: &str = concat!(
-    "SELECT CONVERT(int, SERVERPROPERTY('EngineEdition')), ",
-    server_info_columns!(),
-    "\0"
-);
+/// The whole query for native sqlcmd, as a C string, so that the NUL the C ABI
+/// needs is part of the type and never sent to a server as SQL.
+pub const QUERY: &std::ffi::CStr = match std::ffi::CStr::from_bytes_with_nul(
+    concat!(
+        "SELECT CONVERT(int, SERVERPROPERTY('EngineEdition')), ",
+        server_info_columns!(),
+        "\0"
+    )
+    .as_bytes(),
+) {
+    Ok(query) => query,
+    Err(_) => panic!("QUERY must end in exactly one NUL"),
+};
 
 pub const KEY_ENGINE_EDITION: &str = "sqlcmdcli_engine_edition";
 pub const KEY_SERVER_VERSION: &str = "sqlcmdcli_server_version";
@@ -248,8 +255,8 @@ mod tests {
 
     #[test]
     fn the_query_and_the_appended_columns_are_one_definition() {
-        assert!(QUERY.ends_with('\0'));
-        let query = QUERY.trim_end_matches('\0');
+        let query = QUERY.to_str().expect("the query is UTF-8");
+        assert!(!query.contains('\0'), "no NUL inside the SQL");
         assert!(query.starts_with("SELECT CONVERT(int, SERVERPROPERTY('EngineEdition')), "));
         assert!(query.ends_with(EXTRA_COLUMNS));
         // Four columns in all: edition, version, OS and architecture.

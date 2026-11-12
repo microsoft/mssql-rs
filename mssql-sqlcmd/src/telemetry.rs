@@ -215,13 +215,15 @@ where
                 return Err(error);
             }
         };
-        // The exporter retries or drops a rejected batch on its own, and its
-        // shutdown does not hand the result back, so a rejection is recorded here.
-        if !ingestion_accepted(&response) {
-            self.internal_failure.store(true, Ordering::Release);
-        }
+        // The exporter retries throttling and server errors itself, and its
+        // shutdown does not hand the result back, so the outcome is kept here.
+        // Each attempt overwrites the last, so the attempt the exporter stops on
+        // decides: a 503 that a retry answers with 200 is a delivery.
         match translate_partial_response(response, &original_indices, original_count) {
-            Ok(response) => Ok(response),
+            Ok((response, accepted)) => {
+                self.internal_failure.store(!accepted, Ordering::Release);
+                Ok(response)
+            }
             Err(error) => {
                 self.internal_failure.store(true, Ordering::Release);
                 Err(error)
@@ -331,41 +333,21 @@ fn validate_and_sanitize_event(envelope: &mut JsonValue) -> Result<(), HttpError
     Ok(())
 }
 
-/// Whether the service accepted the event: a 2xx response, and for a 206
-/// partial response none rejected. A 4xx or 5xx rejection (403, 429, 500...) is
-/// not accepted.
-fn ingestion_accepted(response: &Response<Bytes>) -> bool {
-    match response.status().as_u16() {
-        206 => serde_json::from_slice::<JsonValue>(response.body())
-            .ok()
-            .is_some_and(|payload| {
-                let counts = (
-                    payload.get("itemsReceived").and_then(JsonValue::as_u64),
-                    payload.get("itemsAccepted").and_then(JsonValue::as_u64),
-                );
-                let no_errors = payload
-                    .get("errors")
-                    .and_then(JsonValue::as_array)
-                    .is_none_or(Vec::is_empty);
-                no_errors
-                    && matches!(counts, (Some(received), Some(accepted)) if received == accepted)
-            }),
-        status => (200..300).contains(&status),
-    }
-}
-
 /// Translates a partial-ingestion response about the filtered request back to
-/// the exporter's original batch. The response is checked against what was
+/// the exporter's original batch, and says whether the service accepted the
+/// event: a 2xx response, and for a 206 none rejected. A 4xx or 5xx rejection
+/// (403, 429, 500...) is not accepted. The response is checked against what was
 /// sent first, so a malformed one is an error and never an apparent success.
 fn translate_partial_response(
     response: Response<Bytes>,
     original_indices: &[usize],
     original_count: usize,
-) -> Result<Response<Bytes>, HttpError> {
-    if !matches!(response.status().as_u16(), 206 | 500) {
-        return Ok(response);
+) -> Result<(Response<Bytes>, bool), HttpError> {
+    let status = response.status();
+    if !matches!(status.as_u16(), 206 | 500) {
+        let accepted = status.is_success();
+        return Ok((response, accepted));
     }
-
     let (parts, body) = response.into_parts();
     let mut payload: JsonValue = serde_json::from_slice(&body).map_err(filter_error)?;
     let object = payload
@@ -414,6 +396,9 @@ fn translate_partial_response(
             "Application Insights response counts are inconsistent",
         ));
     }
+    // A 500 is a rejection even when its body parses; a 206 is one if any item
+    // was rejected.
+    let delivered = status.as_u16() == 206 && error_count == 0 && accepted == received;
 
     let dropped_count = original_count.saturating_sub(original_indices.len()) as u64;
     object.insert("itemsReceived".to_owned(), JsonValue::from(original_count));
@@ -422,7 +407,7 @@ fn translate_partial_response(
         JsonValue::from(accepted + dropped_count),
     );
     let body = serde_json::to_vec(&payload).map_err(filter_error)?;
-    Ok(Response::from_parts(parts, Bytes::from(body)))
+    Ok((Response::from_parts(parts, Bytes::from(body)), delivered))
 }
 
 fn filter_error(error: impl fmt::Display) -> HttpError {
@@ -458,13 +443,24 @@ fn connection_string_is_valid(connection_string: &str) -> bool {
 }
 
 /// The destination this run would send to, and only if the exporter accepts it.
-/// The built-in connection string is used only when the variable is absent: a
-/// variable that is set, even to an empty or invalid value (or one that is not
-/// valid text), turns telemetry off and does not fall back.
 fn destination() -> Option<String> {
-    let candidate = match std::env::var(CONNECTION_STRING_ENV) {
+    destination_from(
+        std::env::var(CONNECTION_STRING_ENV),
+        BUILT_IN_CONNECTION_STRING,
+    )
+}
+
+/// [`destination`] with the variable and the built-in connection string given.
+/// The built-in one is used only when the variable is absent: a variable that is
+/// set, even to an empty or invalid value (or one that is not valid text), turns
+/// telemetry off and does not fall back.
+fn destination_from(
+    variable: Result<String, std::env::VarError>,
+    built_in: Option<&str>,
+) -> Option<String> {
+    let candidate = match variable {
         Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => BUILT_IN_CONNECTION_STRING?.to_owned(),
+        Err(std::env::VarError::NotPresent) => built_in?.to_owned(),
         Err(std::env::VarError::NotUnicode(_)) => return None,
     };
     connection_string_is_valid(&candidate).then_some(candidate)
@@ -614,8 +610,8 @@ pub fn record_server_info(raw: &RawServerInfo) {
 
 /// Starts sending the event on its own thread, once.
 ///
-/// The thread sends the one event and shuts its own provider down, so nothing is
-/// queued behind a timer: the batch processor's schedule delay never fires.
+/// The thread exports the one event when its span ends, then shuts its provider
+/// down, so nothing waits on a timer.
 fn start_export(session: &mut Session) {
     if session.export.is_some() {
         return;
@@ -1058,18 +1054,51 @@ mod tests {
     }
 
     #[test]
-    fn a_compiled_in_destination_is_used_only_when_the_variable_is_absent() {
-        let _guard = TestEnv::new(None);
-        let built_in = BUILT_IN_CONNECTION_STRING.is_some_and(connection_string_is_valid);
-        assert_eq!(enabled(), built_in);
+    fn the_built_in_destination_is_used_only_when_the_variable_is_absent() {
+        use std::env::VarError;
+        use std::ffi::OsString;
+        let other = "InstrumentationKey=11111111-1111-1111-1111-111111111111;\
+                     IngestionEndpoint=https://other.test";
+        let built_in = Some(TEST_CONNECTION_STRING);
+
+        // Absent: the built-in one, if there is one.
+        assert_eq!(
+            destination_from(Err(VarError::NotPresent), built_in).as_deref(),
+            built_in
+        );
+        assert_eq!(destination_from(Err(VarError::NotPresent), None), None);
+
+        // A valid variable replaces it.
+        assert_eq!(
+            destination_from(Ok(other.to_owned()), built_in).as_deref(),
+            Some(other)
+        );
 
         // A variable that is set, even to nothing, is an override: it does not
         // fall back to the built-in destination.
         for explicit in ["", "   ", "\t", "not a connection string"] {
-            // SAFETY: serialized by the test environment lock.
-            unsafe { std::env::set_var(CONNECTION_STRING_ENV, explicit) };
-            assert!(!enabled(), "{explicit:?}");
+            assert_eq!(
+                destination_from(Ok(explicit.to_owned()), built_in),
+                None,
+                "{explicit:?}"
+            );
         }
+        assert_eq!(
+            destination_from(Err(VarError::NotUnicode(OsString::from("x"))), built_in),
+            None
+        );
+    }
+
+    #[test]
+    fn this_builds_destination_follows_the_environment() {
+        let _guard = TestEnv::new(None);
+        assert_eq!(
+            enabled(),
+            BUILT_IN_CONNECTION_STRING.is_some_and(connection_string_is_valid)
+        );
+        // SAFETY: serialized by the test environment lock.
+        unsafe { std::env::set_var(CONNECTION_STRING_ENV, "") };
+        assert!(!enabled());
     }
 
     #[test]
@@ -1119,31 +1148,41 @@ mod tests {
         assert!(enabled());
     }
 
+    /// What a row of the table below expects from `shutdown`.
+    #[derive(Clone, Copy, Debug)]
+    enum Expect {
+        /// The service accepted the event.
+        Completed,
+        /// Rejected outright, with no retry.
+        Failed,
+        /// Throttled or a server error: the exporter retries with a backoff, so
+        /// a short wait ends first. Never a success.
+        NotCompleted,
+    }
+
     /// The service's answer decides the outcome the C ABI reports: a rejection is
     /// a failure even though the SDK's shutdown does not hand the result back.
     #[test]
     fn a_rejected_event_is_reported_as_a_failure() {
-        // The exporter retries throttling and server errors with a backoff, so
-        // for those the bounded wait may end first: not a success either way.
-        let accepted = FlushOutcome::Completed;
-        for (status, body, rejected_outright) in [
-            (200, "", false),
+        use Expect::{Completed, Failed, NotCompleted};
+        for (status, body, expect) in [
+            (200, "", Completed),
             (
                 206,
                 r#"{"itemsReceived":1,"itemsAccepted":1,"errors":[]}"#,
-                false,
+                Completed,
             ),
-            (403, "", true),
-            (400, r#"{"errors":[]}"#, true),
-            (429, "", false),
-            (500, "", false),
-            (503, "", false),
+            (403, "", Failed),
+            (400, r#"{"errors":[]}"#, Failed),
+            (429, "", NotCompleted),
+            (500, "", NotCompleted),
+            (503, "", NotCompleted),
             (
                 206,
                 r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[{"index":0,"statusCode":429}]}"#,
-                false,
+                NotCompleted,
             ),
-            (206, "not json", false),
+            (206, "not json", NotCompleted),
         ] {
             let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
             let requests = guard.capture_requests();
@@ -1154,47 +1193,115 @@ mod tests {
                 format: FormatUse::Absent,
             });
 
-            // A retried rejection is still backing off when a short wait ends.
-            let wait = if rejected_outright || status == 200 {
-                Duration::from_secs(1)
-            } else {
-                Duration::from_millis(300)
+            let wait = match expect {
+                NotCompleted => Duration::from_millis(300),
+                Completed | Failed => Duration::from_secs(1),
             };
             let outcome = shutdown(wait);
 
             assert!(requests.try_recv().is_ok(), "the event was sent: {status}");
-            let is_success = matches!(status, 200) || body.contains(r#""itemsAccepted":1"#);
-            if is_success {
-                assert_eq!(outcome, accepted, "{status} {body}");
-            } else if rejected_outright {
-                assert_eq!(outcome, FlushOutcome::Failed, "{status} {body}");
-            } else {
-                assert_ne!(outcome, accepted, "{status} {body}");
+            match expect {
+                Completed => assert_eq!(outcome, FlushOutcome::Completed, "{status} {body}"),
+                Failed => assert_eq!(outcome, FlushOutcome::Failed, "{status} {body}"),
+                NotCompleted => assert_ne!(outcome, FlushOutcome::Completed, "{status} {body}"),
             }
         }
     }
 
+    /// The same decision at the level of one response: which are accepted.
     #[test]
-    fn ingestion_is_accepted_only_for_a_success_status() {
+    fn a_response_is_accepted_only_if_the_service_took_the_event() {
         let response = |status: u16, body: &'static str| {
             Response::builder()
                 .status(status)
                 .body(Bytes::from_static(body.as_bytes()))
                 .expect("valid response")
         };
-        assert!(ingestion_accepted(&response(200, "")));
-        assert!(ingestion_accepted(&response(
-            206,
-            r#"{"itemsReceived":2,"itemsAccepted":2,"errors":[]}"#
-        )));
-        for rejected in [301, 400, 401, 403, 408, 429, 500, 503] {
-            assert!(!ingestion_accepted(&response(rejected, "")), "{rejected}");
+        let accepted = |status: u16, body: &'static str| {
+            translate_partial_response(response(status, body), &[0], 1)
+                .map(|(_, accepted)| accepted)
+        };
+        assert!(accepted(200, "").expect("ok"));
+        assert!(accepted(204, "").expect("ok"));
+        assert!(accepted(206, r#"{"itemsReceived":1,"itemsAccepted":1,"errors":[]}"#).expect("ok"));
+        for rejected in [301, 400, 401, 403, 408, 429, 503] {
+            assert!(
+                !accepted(rejected, "").expect("passed through"),
+                "{rejected}"
+            );
         }
-        assert!(!ingestion_accepted(&response(
-            206,
-            r#"{"itemsReceived":2,"itemsAccepted":1,"errors":[{"index":1}]}"#
-        )));
-        assert!(!ingestion_accepted(&response(206, "[]")));
+        assert!(
+            !accepted(
+                206,
+                r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[{"index":0}]}"#
+            )
+            .expect("ok")
+        );
+        // A 500 is a rejection even with a well-formed body.
+        assert!(
+            !accepted(
+                500,
+                r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[{"index":0}]}"#
+            )
+            .expect("ok")
+        );
+        // A malformed one is an error, not an acceptance.
+        assert!(accepted(206, "[]").is_err());
+    }
+
+    /// The exporter retries, so the attempt it stops on decides: a rejection that
+    /// a retry turns into a delivery is not a failure, and the reverse is.
+    #[test]
+    fn the_last_attempt_decides_the_outcome() {
+        let reply = |status: u16| {
+            Ok(Response::builder()
+                .status(status)
+                .body(Bytes::new())
+                .expect("valid response"))
+        };
+        for (attempts, failed) in [
+            (vec![503, 200], false),
+            (vec![429, 429, 200], false),
+            (vec![200, 503], true),
+            (vec![503, 503], true),
+            (vec![403], true),
+            (vec![200], false),
+        ] {
+            let inner = InMemoryClient::succeeding();
+            *inner.0.responses.lock().expect("response lock") =
+                attempts.iter().map(|status| reply(*status)).collect();
+            let internal_failure = Arc::new(AtomicBool::new(false));
+            let client = EventOnlyClient::new(inner, Arc::clone(&internal_failure));
+            for _ in &attempts {
+                let request = track_request(&[event_envelope()]);
+                poll_ready(client.send_bytes(request)).expect("the response is passed on");
+            }
+            assert_eq!(
+                internal_failure.load(Ordering::Acquire),
+                failed,
+                "{attempts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_transport_error_after_a_rejection_or_before_a_delivery_is_decided_by_the_last() {
+        let ok = || {
+            Ok(Response::builder()
+                .status(200)
+                .body(Bytes::new())
+                .expect("valid response"))
+        };
+        // An error that a retry recovers from is a delivery.
+        let inner = InMemoryClient::succeeding();
+        *inner.0.responses.lock().expect("response lock") =
+            VecDeque::from([Err(filter_error("connection reset")), ok()]);
+        let internal_failure = Arc::new(AtomicBool::new(false));
+        let client = EventOnlyClient::new(inner, Arc::clone(&internal_failure));
+        assert!(poll_ready(client.send_bytes(track_request(&[event_envelope()]))).is_err());
+        assert!(internal_failure.load(Ordering::Acquire));
+        assert!(poll_ready(client.send_bytes(track_request(&[event_envelope()]))).is_ok());
+        assert!(!internal_failure.load(Ordering::Acquire));
     }
 
     /// A call that is admitted before shutdown is sent by it, and one that comes
@@ -1673,12 +1780,13 @@ mod tests {
             ))
             .expect("valid response");
 
-        let translated = translate_partial_response(
+        let (translated, accepted) = translate_partial_response(
             response,
             &filtered.original_indices,
             filtered.original_count,
         )
         .expect("translation succeeds");
+        assert!(!accepted, "the one retained event was rejected");
         let payload: JsonValue =
             serde_json::from_slice(translated.body()).expect("translated JSON");
         assert_eq!(payload["itemsReceived"], 2);
@@ -1735,7 +1843,9 @@ mod tests {
             ))
             .expect("valid response");
 
-        let translated = translate_partial_response(response, &[1], 2).expect("consistent");
+        let (translated, accepted) =
+            translate_partial_response(response, &[1], 2).expect("consistent");
+        assert!(accepted);
         let payload: JsonValue = serde_json::from_slice(translated.body()).expect("JSON");
         assert_eq!(payload["itemsReceived"], 2);
         assert_eq!(payload["itemsAccepted"], 2);
