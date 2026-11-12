@@ -301,7 +301,7 @@ mod registry {
 
     impl FirstRunLock {
         fn acquire() -> Option<Self> {
-            Self::acquire_with(2000)
+            Self::acquire_with(500)
         }
 
         fn acquire_with(wait_ms: u32) -> Option<Self> {

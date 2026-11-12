@@ -177,7 +177,7 @@ own and linked into place, which fails if the ID file exists, and the loser
 reads the winner's; on Windows first runs take a named mutex that spans all of
 the user's logon sessions (`Global\` plus the user's SID, as the HKCU value is
 shared across sessions), and the value is read back after it is written. A
-first run that cannot take the mutex within two seconds, or cannot read the
+first run that cannot take the mutex within half a second, or cannot read the
 user's SID, does not create the ID, and the event goes without it. Another user
 can keep a first run from creating the ID only by creating that SID-qualified
 name first, which just omits the property. A tool that writes the shared ID
@@ -203,11 +203,17 @@ collects or exports:
 
 Every step is best effort; failures are only debug tracing and never write to
 sqlcmd's output. Rust panics are caught at the C boundary. The HTTP client uses
-two-second connect and request timeouts, and the process waits at most half a
-second at exit. A run therefore ends up to half a second later than it would
-without telemetry, which is the worst case a firewalled or offline machine
-sees; when the event is sent early enough, the wait is hidden behind the work
-sqlcmd does after connecting.
+two-second connect and request timeouts, but the process never waits that long
+for it: the wait at exit is at most half a second. A run therefore ends up to
+half a second later than it would without telemetry, which is the worst case a
+firewalled or offline machine sees; when the event is sent early enough, the
+wait is hidden behind the work sqlcmd does after connecting.
+
+There is one other wait, at startup, on Windows only: a first run, the one that
+has to create the device ID, takes a named mutex, and if another first run holds
+it, waits for it for at most half a second. Once the ID exists nothing waits
+there. So the worst case for any run is half a second at startup (a contended
+first run only) plus half a second at exit.
 
 The bound is short on purpose: a cold send (DNS, TCP, TLS and the POST) takes
 from about 0.2 s on a nearby network to about a second from a distant one, and a
