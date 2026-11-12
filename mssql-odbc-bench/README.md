@@ -252,9 +252,11 @@ smallest type that fits and binds ASCII `str` and money-range `Decimal` as
 | `price`, `total` (c10) | money-range `Decimal` | `SQL_C_CHAR` → `SQL_VARCHAR` (longest `format(d, "f")`, 0) |
 
 The timed region is the whole call: `SQLFreeHandle` of the previous call's
-statement and `SQLAllocHandle` (`_reset_cursor`), `SQLPrepare`, one column-wise
-`SQLBindParameter` per column, `SQL_ATTR_PARAMSET_SIZE`, one `SQLExecute`,
-`SQLGetDiagRec`, `SQLRowCount`, `SQLNumResultCols`, and `SQLRowCount` again.
+statement and `SQLAllocHandle` (`_reset_cursor`), `SQLPrepareW`, one column-wise
+`SQLBindParameter` per column, `SQLSetStmtAttrW(SQL_ATTR_PARAMSET_SIZE)`, one
+`SQLExecute`, `SQLGetDiagRecW`, `SQLRowCount`, `SQLNumResultCols`, and `SQLRowCount`
+again. The wide entry points are called explicitly, as `mssql-python` does, on
+every platform.
 `execute_ms` reports `SQLExecute` alone. As in `mssql-python`, no status array,
 processed pointer, or bind type is set, and every call binds different buffer
 addresses. Autocommit is off. Truncation, commit, and validation are untimed;

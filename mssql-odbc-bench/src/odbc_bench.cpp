@@ -2722,8 +2722,9 @@ public:
             column_list += (column_list.empty() ? "[" : ", [") + column.name + "]";
             markers += markers.empty() ? "?" : ", ?";
         }
-        insert_sql_ = to_sql_string("INSERT INTO " + std::string(target_.table) + " (" +
-                                    column_list + ") VALUES (" + markers + ")");
+        const std::string insert = "INSERT INTO " + std::string(target_.table) + " (" +
+                                   column_list + ") VALUES (" + markers + ")";
+        insert_sql_.assign(insert.begin(), insert.end());
     }
 
     ~Impl() {
@@ -2985,8 +2986,8 @@ private:
                 SQLAllocHandle(SQL_HANDLE_STMT, session_.connection(), &stmt_),
                 "SQLAllocHandle(executemany statement)", SQL_HANDLE_DBC,
                 session_.connection());
-            require_exact_success(SQLPrepare(stmt_, insert_sql_.data(), SQL_NTS),
-                                  "SQLPrepare(executemany)", SQL_HANDLE_STMT, stmt_);
+            require_exact_success(SQLPrepareW(stmt_, insert_sql_.data(), SQL_NTS),
+                                  "SQLPrepareW(executemany)", SQL_HANDLE_STMT, stmt_);
             for (std::size_t index = 0; index < columns_.size(); ++index) {
                 auto& column = columns_[index];
                 require_exact_success(
@@ -2998,21 +2999,21 @@ private:
                     "SQLBindParameter(executemany)", SQL_HANDLE_STMT, stmt_);
             }
             require_exact_success(
-                SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE,
-                               attribute_value(kExecuteManyRows), 0),
-                "SQLSetStmtAttr(SQL_ATTR_PARAMSET_SIZE)", SQL_HANDLE_STMT, stmt_);
+                SQLSetStmtAttrW(stmt_, SQL_ATTR_PARAMSET_SIZE,
+                                attribute_value(kExecuteManyRows), 0),
+                "SQLSetStmtAttrW(SQL_ATTR_PARAMSET_SIZE)", SQL_HANDLE_STMT, stmt_);
             const auto execute_start = std::chrono::steady_clock::now();
             require_exact_success(SQLExecute(stmt_), "SQLExecute(executemany)",
                                   SQL_HANDLE_STMT, stmt_);
             const auto execute_end = std::chrono::steady_clock::now();
 
-            SQLTCHAR state[8] = {};
+            SQLWCHAR state[8] = {};
             SQLINTEGER native_error = 0;
-            SQLTCHAR message[512] = {};
+            SQLWCHAR message[512] = {};
             SQLSMALLINT message_length = 0;
             const SQLRETURN diagnostic =
-                SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 1, state, &native_error, message,
-                              static_cast<SQLSMALLINT>(std::size(message)), &message_length);
+                SQLGetDiagRecW(SQL_HANDLE_STMT, stmt_, 1, state, &native_error, message,
+                               static_cast<SQLSMALLINT>(std::size(message)), &message_length);
             if (diagnostic != SQL_NO_DATA) {
                 throw std::runtime_error("executemany produced unexpected diagnostics: " +
                                          diagnostics(SQL_HANDLE_STMT, stmt_));
@@ -3057,7 +3058,9 @@ private:
     const ExecuteManyTarget& target_;
     std::vector<Column> columns_;
     std::vector<std::pair<std::string, std::int64_t>> expected_;
-    SqlString insert_sql_;
+    // mssql-python calls the wide entry points; the ANSI ones would measure a
+    // different Driver Manager path on non-UNICODE builds.
+    std::basic_string<SQLWCHAR> insert_sql_;
     // Both buffer sets hold identical values, so this counts one set.
     std::uint64_t logical_bytes_ = 0;
     std::size_t buffer_set_ = 0;
