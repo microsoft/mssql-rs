@@ -1420,13 +1420,14 @@ mod tests {
             inline(SqlType::NVarchar(Some(utf16(&"a".repeat(4000))), 4000)),
             Some(8012)
         );
+        assert_eq!(inline(SqlType::Varchar(None, 10)), Some(12));
         for ineligible in [
             SqlType::NVarchar(None, 4001),
             SqlType::NVarchar(Some(utf16("abc")), 2),
             SqlType::NVarchar(Some(SqlString::new(b"ab".to_vec(), EncodingType::Utf8)), 10),
             SqlType::NVarchar(Some(SqlString::new(vec![1], EncodingType::DelayedSet)), 10),
             SqlType::NVarcharMax(None),
-            SqlType::Varchar(None, 10),
+            SqlType::Varchar(None, 8001),
             SqlType::VarBinary(Some(vec![1; 11]), 10),
             SqlType::VarBinary(Some(vec![1]), 8001),
             SqlType::VarBinaryMax(Some(vec![1])),
@@ -2057,7 +2058,7 @@ mod tests {
                     cases.push((utf8_varchar(&text, max_len), true, len, blanks));
                 }
                 // CP932 lead/trail bytes and cp1252 bytes the server sees as-is.
-                for raw in [vec![0x82, 0xa0].repeat(n / 2), vec![0xe9; n + 1]] {
+                for raw in [[0x82, 0xa0].repeat(n / 2), vec![0xe9; n + 1]] {
                     let len = raw.len();
                     for encoding in [
                         EncodingType::LcidBased(collation),
@@ -2078,7 +2079,7 @@ mod tests {
                     0,
                     false,
                 ));
-                cases.push((SqlType::Varchar(None, max_len), false, 0, false));
+                cases.push((SqlType::Varchar(None, max_len), true, 0, true));
 
                 for (value, transparent, len, blanks) in cases {
                     let over = !plp && len > n;
@@ -2101,15 +2102,16 @@ mod tests {
                     if !expected {
                         continue;
                     }
-                    let mut limited = value.clone();
-                    if let SqlType::Varchar(Some(string), _) = &mut limited {
-                        string.set_narrow_string_byte_limit(n + 8);
-                    }
-                    for parameter in [
-                        param(limited),
+                    let mut excluded = vec![
                         param(value.clone()).with_narrow_string_byte_limit(n + 8),
                         encrypted(value.clone()),
-                    ] {
+                    ];
+                    if let SqlType::Varchar(Some(string), _) = &value {
+                        let mut string = string.clone();
+                        string.set_narrow_string_byte_limit(n + 8);
+                        excluded.push(param(SqlType::Varchar(Some(string), max_len)));
+                    }
+                    for parameter in excluded {
                         assert_eq!(parameter.positional_inline_len(), None, "{value:?}");
                         let (fast, async_ok) = inline_matches_async_under(&parameter, &collation);
                         assert!(!fast && async_ok, "{value:?}");
@@ -2181,9 +2183,9 @@ mod tests {
     }
 
     /// An insert row shaped like mssql-python's `executemany`: the handle,
-    /// narrow text, a number and more text. Some rows carry a non-ASCII value
-    /// the fast path declines after writing the earlier ones, so the whole
-    /// command rewinds.
+    /// narrow text, a number, more text and a NULL. Some rows carry a
+    /// non-ASCII value the fast path declines after writing the earlier ones,
+    /// so the whole command rewinds.
     fn varchar_row(index: usize) -> (Vec<RpcParameter>, bool) {
         use crate::datatypes::sql_string::EncodingType;
         let mut row = vec![
@@ -2194,14 +2196,15 @@ mod tests {
             ))),
             param(SqlType::Varchar(
                 Some(SqlString::new(
-                    vec![0x82, 0xa0].repeat(index % 7),
+                    [0x82, 0xa0].repeat(index % 7),
                     EncodingType::LcidBased(value_collation()),
                 )),
                 20,
             )),
             param(utf8_varchar(&"x".repeat(index % 23), 30)),
+            param(SqlType::Varchar(None, [1, 255, 8000][index % 3])),
         ];
-        let eligible = index % 17 != 0;
+        let eligible = !index.is_multiple_of(17);
         if !eligible {
             row.push(param(utf8_varchar("é", 10)));
         }
@@ -2262,11 +2265,15 @@ mod tests {
     #[test]
     fn varchar_batch_matches_trailing_eom_at_exact_fill() {
         let final_row = |bytes: usize| {
-            let mut row = vec![param(SqlType::Int(Some(42)))];
+            let mut row = vec![
+                param(SqlType::Int(Some(42))),
+                param(SqlType::Varchar(None, 8000)),
+            ];
             for part in 0..3 {
                 let part_bytes = bytes.saturating_sub(part * 8000).min(8000);
                 row.push(param(utf8_varchar(&"q".repeat(part_bytes), 8000)));
             }
+            row.push(param(SqlType::Varchar(None, 1)));
             row
         };
         for collation in narrow_collations() {

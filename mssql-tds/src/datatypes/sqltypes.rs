@@ -205,9 +205,12 @@ pub(crate) enum RpcInlineValue<'a> {
         max_len: u16,
         value: Option<&'a [u8]>,
     },
-    /// Non-NULL `VARCHAR(max_len)`, `max_len <= 8000`, whose wire bytes are
-    /// its source bytes and fit `max_len`.
-    Varchar { max_len: u16, value: &'a [u8] },
+    /// `VARCHAR(max_len)`, `max_len <= 8000`, whose wire bytes are its source
+    /// bytes and fit `max_len`.
+    Varchar {
+        max_len: u16,
+        value: Option<&'a [u8]>,
+    },
 }
 
 impl RpcInlineValue<'_> {
@@ -216,7 +219,7 @@ impl RpcInlineValue<'_> {
             Self::Fixed { len, .. } => usize::from(*len),
             Self::NVarchar { value, .. } => 8 + 2 + value.map_or(0, <[u8]>::len),
             Self::VarBinary { value, .. } => 3 + 2 + value.map_or(0, <[u8]>::len),
-            Self::Varchar { value, .. } => 8 + 2 + value.len(),
+            Self::Varchar { value, .. } => 8 + 2 + value.map_or(0, <[u8]>::len),
         }
     }
 
@@ -272,9 +275,15 @@ impl RpcInlineValue<'_> {
                     max_len,
                     db_collation,
                 ));
-                // Cannot truncate: `rpc_inline` bounds the value by `max_len`.
-                packet_writer.write_bytes_within_packet(&(value.len() as u16).to_le_bytes());
-                packet_writer.write_bytes_within_packet(value);
+                match value {
+                    // Cannot truncate: `rpc_inline` bounds the value by `max_len`.
+                    Some(bytes) => {
+                        packet_writer
+                            .write_bytes_within_packet(&(bytes.len() as u16).to_le_bytes());
+                        packet_writer.write_bytes_within_packet(bytes);
+                    }
+                    None => packet_writer.write_bytes_within_packet(&VARNULL.to_le_bytes()),
+                }
             }
         }
     }
@@ -944,8 +953,8 @@ impl SqlType {
     /// serialization is plain buffer writes that cannot fail. `None` keeps the
     /// value on [`Self::serialize_with_narrow_string_byte_limit`], which owns
     /// every error: transcoding, odd UTF-16 length, over-length values, an
-    /// invalid time scale, over-length VARBINARY data, NULL or byte-limited
-    /// VARCHAR and all other variable-length types. `type_metadata` is the
+    /// invalid time scale, over-length VARBINARY data, byte-limited VARCHAR
+    /// and all other variable-length types. `type_metadata` is the
     /// parameter's, which that path passes to `write_type_info`.
     pub(crate) fn rpc_inline(
         &self,
@@ -984,31 +993,40 @@ impl SqlType {
             });
         }
         if let SqlType::Varchar(value, max_len) = self {
-            // NULL, PLP, a value byte limit and over-length values (trailing
-            // blank fitting, 22001) stay on the async path.
-            let value = value.as_ref()?;
-            if *max_len > VAR_TDS_MAX_LENGTH || value.narrow_string_byte_limit().is_some() {
+            // PLP, a value byte limit and over-length values (trailing blank
+            // fitting, 22001) stay on the async path.
+            if *max_len > VAR_TDS_MAX_LENGTH {
                 return None;
             }
-            // `narrow_string_wire_bytes` sends raw bytes unchanged, and ASCII
-            // encodes to itself in every narrow encoding it can resolve to.
-            let bytes = match value.as_raw_wire_bytes() {
-                Some(bytes) => bytes,
-                None if matches!(
-                    value.encoding_type(),
-                    crate::datatypes::sql_string::EncodingType::Utf8
-                ) && value.bytes.is_ascii() =>
-                {
-                    &value.bytes
+            let value = match value {
+                Some(value) => {
+                    if value.narrow_string_byte_limit().is_some() {
+                        return None;
+                    }
+                    // `narrow_string_wire_bytes` sends raw bytes unchanged, and
+                    // ASCII encodes to itself in every narrow encoding it can
+                    // resolve to.
+                    let bytes = match value.as_raw_wire_bytes() {
+                        Some(bytes) => bytes,
+                        None if matches!(
+                            value.encoding_type(),
+                            crate::datatypes::sql_string::EncodingType::Utf8
+                        ) && value.bytes.is_ascii() =>
+                        {
+                            &value.bytes
+                        }
+                        None => return None,
+                    };
+                    if bytes.len() > usize::from(*max_len) {
+                        return None;
+                    }
+                    Some(bytes)
                 }
-                None => return None,
+                None => None,
             };
-            if bytes.len() > usize::from(*max_len) {
-                return None;
-            }
             return Some(RpcInlineValue::Varchar {
                 max_len: *max_len,
-                value: bytes,
+                value,
             });
         }
         let (type_info, type_info_len) = self.fixed_type_info(
