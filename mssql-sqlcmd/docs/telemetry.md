@@ -194,6 +194,11 @@ On Windows the console control handler (Ctrl+C in non-interactive mode, console
 close) sends the event before ending the process. On Linux and macOS the signal
 handlers do not flush: an event for a run ended by a signal is lost.
 
+On 64-bit Linux the HTTP client needs OpenSSL, which `openssl_runtime` loads on
+first use and reports on stderr when it is missing. Telemetry checks for it
+silently first, and without OpenSSL it sends nothing and prints nothing; only a
+TLS connection the user asked for reports the missing library.
+
 The event is exported at once by its own thread, using a simple exporter: the
 event is sent on that thread, inside the call that ends the span, and the
 provider is then shut down, so nothing waits on a batch timer in a long

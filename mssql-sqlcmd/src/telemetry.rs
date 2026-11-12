@@ -722,6 +722,14 @@ fn production_provider(
         return provider_with_client(connection_string, AbiTestClient(client));
     }
 
+    // The native-TLS client below loads OpenSSL, and `openssl_runtime` reports
+    // a missing one on stderr. Telemetry must add no output of its own, so it
+    // does not try to send without OpenSSL.
+    #[cfg(all(target_pointer_width = "64", target_os = "linux"))]
+    if !crate::openssl_runtime::is_available() {
+        return Err("OpenSSL is not available".into());
+    }
+
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(HTTP_TIMEOUT)
         .timeout(HTTP_TIMEOUT)

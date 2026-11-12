@@ -33,14 +33,14 @@ use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, Once, OnceLock, PoisonError};
 
 /// The libraries tried, in order: OpenSSL 4, 3, then 1.1.
 const LIBRARIES: [&CStr; 3] = [c"libssl.so.4", c"libssl.so.3", c"libssl.so.1.1"];
 
 /// The loaded `libssl` (its dependency `libcrypto` comes with it), or null when
-/// neither is installed.
-fn library() -> *mut c_void {
+/// neither is installed. Silent: see [`library`] for the report.
+fn load() -> *mut c_void {
     static HANDLE: OnceLock<usize> = OnceLock::new();
     *HANDLE.get_or_init(|| {
         for name in LIBRARIES {
@@ -53,9 +53,26 @@ fn library() -> *mut c_void {
                 return handle as usize;
             }
         }
-        eprintln!("mssql-sqlcmd: {}", not_found_message());
         0
     }) as *mut c_void
+}
+
+/// The loaded `libssl`, or null when none is installed, in which case the
+/// reason is written to stderr, once, because a caller that needs OpenSSL is
+/// about to fail.
+fn library() -> *mut c_void {
+    let handle = load();
+    if handle.is_null() {
+        static REPORTED: Once = Once::new();
+        REPORTED.call_once(|| eprintln!("mssql-sqlcmd: {}", not_found_message()));
+    }
+    handle
+}
+
+/// Whether an OpenSSL is installed, without the report [`library`] writes, for
+/// callers that can do without it and must not add output of their own.
+pub(crate) fn is_available() -> bool {
+    !load().is_null()
 }
 
 /// Why TLS is unavailable when no OpenSSL is installed, in the user's language.
@@ -371,6 +388,12 @@ mod tests {
             ),
             "{stderr}"
         );
+    }
+
+    /// The silent check agrees with the loading one, and writes nothing.
+    #[test]
+    fn availability_follows_the_loaded_library() {
+        assert_eq!(is_available(), !load().is_null());
     }
 
     /// The messages come from the localization catalog, with the library and
