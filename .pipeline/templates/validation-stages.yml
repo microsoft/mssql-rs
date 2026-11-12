@@ -137,9 +137,6 @@ stages:
       name: ${{ parameters.poolName }}
       demands:
         - imageOverride -equals RUST-W22-SQL25
-        # PR #839 only: select 21.0.0 without changing the shared image override.
-        - ${{ if and(eq(variables['System.TeamProject'], 'public'), eq(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/pull/839/merge')) }}:
-          - ImageVersionOverride -equals 21.0.0
     variables:
       # For details on this CARGO_TARGET_DIR setting, see https://eng.ms/docs/more/rust/topics/onebranch-workaround
       CARGO_TARGET_DIR: C:\cargo_target_dir
