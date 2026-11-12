@@ -31,3 +31,9 @@ test-group = "tls-tests"
 [[profile.ci.overrides]]
 filter = "test(mock_server_tls_tests::)"
 test-group = "tls-tests"
+
+# Compile fixtures rebuild dependencies on cold runners.
+[[profile.ci.overrides]]
+filter = "package(mssql-rs) & binary(data_api_compile)"
+slow-timeout = { period = "60s", terminate-after = 20 }
+retries = 1
