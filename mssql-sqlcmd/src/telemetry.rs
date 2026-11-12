@@ -1607,46 +1607,37 @@ mod tests {
         assert!(!provider.internal_failure.load(Ordering::Acquire));
     }
 
-    #[test]
-    fn shutdown_times_out_while_the_http_request_is_still_running() {
-        let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
-        let _requests = guard.capture_requests();
-        *ABI_TEST_DELAY.lock().expect("delay lock") = Duration::from_secs(2);
-        record_usage(Invocation {
-            version: Some("18.5"),
-            command: Command::Unspecified,
-            format: FormatUse::Absent,
-        });
-        let started = std::time::Instant::now();
-
-        let outcome = shutdown(MAX_FLUSH_TIMEOUT);
-        *ABI_TEST_DELAY.lock().expect("delay lock") = Duration::ZERO;
-
-        assert_eq!(outcome, FlushOutcome::TimedOut);
-        assert!(started.elapsed() < Duration::from_millis(1_500));
-    }
-
-    /// A caller that asks for a longer wait still gets half a second: the
-    /// library's cap, not the caller's request, bounds the delay at exit.
+    /// A send slower than the cap is cut off at the cap, whatever the caller
+    /// asks for: the library's cap, not the request, bounds the delay at exit.
+    /// Both the cap itself and a much longer request give `TimedOut` in about
+    /// half a second.
     #[test]
     fn shutdown_waits_no_longer_than_the_cap_whatever_is_asked() {
         assert_eq!(MAX_FLUSH_TIMEOUT, Duration::from_millis(500));
-        let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
-        let _requests = guard.capture_requests();
-        *ABI_TEST_DELAY.lock().expect("delay lock") = Duration::from_secs(3);
-        record_usage(Invocation {
-            version: Some("18.5"),
-            command: Command::Unspecified,
-            format: FormatUse::Absent,
-        });
-        let started = std::time::Instant::now();
+        for requested in [MAX_FLUSH_TIMEOUT, Duration::from_secs(60)] {
+            let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
+            let _requests = guard.capture_requests();
+            *ABI_TEST_DELAY.lock().expect("delay lock") = Duration::from_secs(3);
+            record_usage(Invocation {
+                version: Some("18.5"),
+                command: Command::Unspecified,
+                format: FormatUse::Absent,
+            });
+            let started = std::time::Instant::now();
 
-        let outcome = shutdown(Duration::from_secs(60));
-        *ABI_TEST_DELAY.lock().expect("delay lock") = Duration::ZERO;
+            let outcome = shutdown(requested);
+            *ABI_TEST_DELAY.lock().expect("delay lock") = Duration::ZERO;
 
-        assert_eq!(outcome, FlushOutcome::TimedOut);
-        assert!(started.elapsed() >= Duration::from_millis(400));
-        assert!(started.elapsed() < Duration::from_millis(1_200));
+            assert_eq!(outcome, FlushOutcome::TimedOut, "{requested:?}");
+            assert!(
+                started.elapsed() >= Duration::from_millis(400),
+                "{requested:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(1_200),
+                "{requested:?}"
+            );
+        }
     }
 
     #[test]

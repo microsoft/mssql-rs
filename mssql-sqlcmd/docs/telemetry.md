@@ -105,7 +105,8 @@ or no `os` and `arch`, and removes the exporter's automatic tags.
 
 There is no completion event, duration, or outcome, and nothing is sent about
 the connection's success. A run that never connects still reports the
-invocation properties.
+invocation properties, but its send starts only at exit, so it is delivered only
+if the half-second exit window is enough (see Failure behavior and latency).
 
 ### Server properties
 
@@ -216,11 +217,23 @@ there. So the worst case for any run is half a second at startup (a contended
 first run only) plus half a second at exit.
 
 The bound is short on purpose: a cold send (DNS, TCP, TLS and the POST) takes
-from about 0.2 s on a nearby network to about a second from a distant one, and a
-short run such as `sqlcmd -Q "SELECT 1"` has no other work to hide it behind.
+from about 0.2 s on a nearby network to about a second from a distant one.
 An event that is not delivered when the bound passes is dropped; nothing is
-stored for a later run. So very short runs on slow networks are undercounted,
-and the usage numbers are a lower bound.
+stored for a later run.
+
+Which events that drops: the send starts at the first successful connection
+(`mssql_sqlcmd_telemetry_record_connection`) or, for a run that never records
+one, only at exit. A run that never connects therefore gets just the half-second
+window, however long it ran: every failed connection, and every `sqlcmd
+diagnose` that does not end with a successful session probe (a failed attempt, a
+failed or timed-out probe, a depth below session validation, or a DAC lookup).
+From a distant network, where a cold send takes about a second, most of those
+events are dropped. The counts are skewed against failed runs and failing
+`diagnose` runs from distant regions, not only low, and they are a lower bound.
+Warming the connection at the start of the run, so that a run that never
+connects can still deliver within the bound, would close the gap; it is not done
+because it adds a request to every run, and is to be decided with the first real
+delivery numbers.
 
 On Windows the console control handler (Ctrl+C in non-interactive mode, console
 close) sends the event before ending the process. On Linux and macOS the signal
