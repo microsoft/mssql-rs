@@ -63,10 +63,10 @@ typedef struct MssqlSqlcmdText {
 int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_set_locale(MssqlSqlcmdText locale);
 
 /* Product usage telemetry: one privacy-safe Application Insights event per run.
-   Off unless a destination is configured (the build's default, or
-   SQLCMD_TELEMETRY_CONNECTION_STRING) and SQLCMD_TELEMETRY_OPTOUT is not 1,
-   true or yes. Every function here is fail-open: failures are ignored and never
-   affect sqlcmd. */
+   On by default (the destination is built in); off when SQLCMD_TELEMETRY_OPTOUT
+   is 1, true or yes, or when SQLCMD_TELEMETRY_CONNECTION_STRING is set to
+   something that is not a valid connection string. Every function here is
+   fail-open: failures are ignored and never affect sqlcmd. */
 
 /* mssql_sqlcmd_telemetry_record_usage's command and format arguments. */
 #define MSSQL_SQLCMD_COMMAND_NONE 0     /* not a command that is measured by name */

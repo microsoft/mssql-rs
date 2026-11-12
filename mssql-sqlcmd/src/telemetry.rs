@@ -34,13 +34,28 @@ use crate::server_info::{self, RawServerInfo, ServerInfo};
 
 pub const USAGE_EVENT_NAME: &str = "sqlcmdcli_usage";
 /// The Application Insights connection string for the sqlcmd telemetry
-/// resource. A build can embed one in `SQLCMD_TELEMETRY_CONNECTION_STRING_DEFAULT`;
-/// this variable overrides it. Telemetry is off when there is neither.
+/// resource. `SQLCMD_TELEMETRY_CONNECTION_STRING` overrides the built-in one
+/// (for testing, or to send somewhere else), and an override that is empty or
+/// invalid turns telemetry off.
 pub const CONNECTION_STRING_ENV: &str = "SQLCMD_TELEMETRY_CONNECTION_STRING";
 /// Set to `1`, `true` or `yes` to turn telemetry off.
 pub const OPTOUT_ENV: &str = "SQLCMD_TELEMETRY_OPTOUT";
-const BUILT_IN_CONNECTION_STRING: Option<&str> =
-    option_env!("SQLCMD_TELEMETRY_CONNECTION_STRING_DEFAULT");
+
+/// The destination every build sends to unless the variable above says
+/// otherwise: the SQLCMD resource DataX created for this product. An
+/// instrumentation key can only send events, never read them, and client tools
+/// ship it for that reason; it is not a secret. Only the key and the ingestion
+/// endpoint are kept, since the exporter needs nothing else.
+const DEFAULT_CONNECTION_STRING: &str = "InstrumentationKey=0e88a50a-3564-4c2b-9b20-9e9b0e8af3d4;\
+     IngestionEndpoint=https://centralus-2.in.applicationinsights.azure.com/";
+
+/// What telemetry uses when the variable is absent. Unit tests have none, so
+/// that no test can send to the real resource; each test that needs a
+/// destination sets the variable or passes one in.
+#[cfg(not(test))]
+const BUILT_IN_CONNECTION_STRING: Option<&str> = Some(DEFAULT_CONNECTION_STRING);
+#[cfg(test)]
+const BUILT_IN_CONNECTION_STRING: Option<&str> = None;
 
 const CUSTOM_EVENT_OTEL_NAME: &str = "ai.custom";
 const CUSTOM_EVENT_NAME_ATTRIBUTE: &str = "ai.customEvent.name";
@@ -1118,13 +1133,8 @@ mod tests {
                 // SAFETY: serialized by the test environment lock.
                 unsafe { std::env::set_var(OPTOUT_ENV, "1") };
             }
-            // A build with a compiled-in destination keeps it when the variable
-            // is not set, so there the "missing destination" case is enabled.
-            let built_in = BUILT_IN_CONNECTION_STRING.is_some_and(connection_string_is_valid);
-            if !opt_out && built_in {
-                assert!(enabled());
-                continue;
-            }
+            // Unit tests have no built-in destination (see
+            // BUILT_IN_CONNECTION_STRING), so with no variable it is off.
             assert!(!enabled());
             record_usage(Invocation {
                 version: Some("18.5"),
@@ -1175,13 +1185,36 @@ mod tests {
         );
     }
 
+    /// Telemetry is on without any configuration: the destination built into
+    /// every release is a valid one, and it is what is used when the variable is
+    /// absent.
     #[test]
-    fn this_builds_destination_follows_the_environment() {
-        let _guard = TestEnv::new(None);
+    fn the_shipped_default_destination_is_valid_and_used_when_no_variable_is_set() {
+        use std::env::VarError;
+        assert!(connection_string_is_valid(DEFAULT_CONNECTION_STRING));
         assert_eq!(
-            enabled(),
-            BUILT_IN_CONNECTION_STRING.is_some_and(connection_string_is_valid)
+            destination_from(Err(VarError::NotPresent), Some(DEFAULT_CONNECTION_STRING)).as_deref(),
+            Some(DEFAULT_CONNECTION_STRING)
         );
+        // The shipped string is only what the exporter needs, and is not one of
+        // the test fixtures.
+        assert_ne!(DEFAULT_CONNECTION_STRING, TEST_CONNECTION_STRING);
+        assert!(!DEFAULT_CONNECTION_STRING.contains("LiveEndpoint"));
+    }
+
+    /// The opt-out wins over the built-in destination.
+    #[test]
+    fn opting_out_turns_the_default_destination_off() {
+        let _guard = TestEnv::new(None);
+        // SAFETY: serialized by the test environment lock.
+        unsafe { std::env::set_var(OPTOUT_ENV, "1") };
+        assert!(!enabled());
+    }
+
+    #[test]
+    fn without_a_variable_a_test_has_no_destination() {
+        let _guard = TestEnv::new(None);
+        assert!(!enabled());
         // SAFETY: serialized by the test environment lock.
         unsafe { std::env::set_var(CONNECTION_STRING_ENV, "") };
         assert!(!enabled());

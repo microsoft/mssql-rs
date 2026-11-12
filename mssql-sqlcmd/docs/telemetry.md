@@ -3,21 +3,37 @@
 ## Status
 
 `mssql-sqlcmd` sends one privacy-safe `sqlcmdcli_usage` event per sqlcmd run to
-Application Insights. Telemetry is off unless a destination exists and the user
-has not opted out. It never changes sqlcmd's output, exit code, or the
-connection's session settings, and it fails open: every error is ignored.
+Application Insights. Telemetry is on by default: every build carries the
+destination, and a user turns it off with `SQLCMD_TELEMETRY_OPTOUT`. It never
+changes sqlcmd's output, exit code, or the connection's session settings, and it
+fails open: every error is ignored.
 
 The field list is the one proposed to the privacy review. Nothing is final until
 that review, notice and opt-out controls, retention, and the dependency approval
 below are done.
+
+## Notice
+
+sqlcmd collects usage data to help Microsoft improve it. The data includes the
+sqlcmd version, the operating system and architecture where it runs, the command
+and output format used, whether it appears to be run by a person, an AI agent or
+a pipeline, a random device identifier shared with other Microsoft developer
+tools, and the edition, version, operating system family and platform of the SQL
+Server it connects to. It does not include queries, results, server, database or
+user names, connection strings, credentials or file paths. To turn it off, set
+the environment variable `SQLCMD_TELEMETRY_OPTOUT=1`. See the
+[Microsoft Privacy Statement](https://privacy.microsoft.com/privacystatement).
+
+This text is the proposal for the privacy review; the final wording is theirs.
+sqlcmd prints nothing about telemetry at run time, so scripts and output are
+unchanged.
 
 ## Controls
 
 | Setting | Effect |
 |---|---|
 | `SQLCMD_TELEMETRY_OPTOUT=1` (or `true`, `yes`) | No event, no server query, and the device ID is neither read nor created. |
-| `SQLCMD_TELEMETRY_CONNECTION_STRING` | The Application Insights connection string. Overrides the built-in one, which is used only when the variable is absent. A variable that is set to an empty, invalid (including an instrumentation key that is not a GUID, or an ingestion endpoint that is not an HTTPS URL with a host once a lowercase `http://` is rewritten to `https://`, as the exporter does) or non-text value turns telemetry off; it does not fall back to the built-in one, and nothing else (the device ID, the server query) runs. |
-| `SQLCMD_TELEMETRY_CONNECTION_STRING_DEFAULT` (build time) | A connection string compiled into the library. Without it, and without the variable, telemetry is off. |
+| `SQLCMD_TELEMETRY_CONNECTION_STRING` | An override for testing or another destination, not something users need. The built-in connection string (the SQLCMD resource, in `telemetry.rs`) is used only when the variable is absent. A variable that is set to an empty, invalid (including an instrumentation key that is not a GUID, or an ingestion endpoint that is not an HTTPS URL with a host once a lowercase `http://` is rewritten to `https://`, as the exporter does) or non-text value turns telemetry off; it does not fall back to the built-in one, and nothing else (the device ID, the server query) runs. |
 | `SQLCMD_CALLER_TYPE` | The caller declares itself: `human`, `agent`, `pipeline` or `other_automation`. Not a telemetry switch; it only sets the caller category. |
 
 `APPLICATIONINSIGHTS_CONNECTION_STRING` is deliberately not read: Azure App
