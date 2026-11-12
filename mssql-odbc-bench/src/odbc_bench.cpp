@@ -50,9 +50,8 @@ constexpr char kParameterArrayBenchmark[] = "write/insert_2000_c3/executemany";
 constexpr std::size_t kExecuteManyRows = 1000;
 
 // Insert targets of the pywrite scenario. Columns use ordinary application types
-// (INT, NVARCHAR, DATETIME2, DECIMAL) rather than the narrowed parameter types,
-// as tables written by mssql-python do; the implied server-side conversion is
-// identical on every driver leg.
+// (INT, NVARCHAR, DATETIME2, DECIMAL), not the narrowed parameter types, so the
+// server converts some values; that conversion is identical on every driver leg.
 struct ExecuteManyTarget {
     const char* table;
     const char* benchmark;

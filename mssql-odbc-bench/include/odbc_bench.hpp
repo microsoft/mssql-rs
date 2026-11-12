@@ -290,9 +290,9 @@ enum class ExecuteManyShape {
 /// The existing `write` workload binds INT/NVARCHAR/BIGINT, which is not what
 /// `mssql-python` sends: its Python-side type detection narrows integers to the
 /// smallest fitting type and binds ASCII `str` and money-range `Decimal` as
-/// `SQL_C_CHAR`/`SQL_VARCHAR`. Every leg, including the pinned baseline, runs the
-/// same parameter-array call sequence, so this scenario ignores
-/// `ODBC_BENCH_WRITE_MODE`.
+/// `SQL_C_CHAR`/`SQL_VARCHAR`. This scenario ignores `ODBC_BENCH_WRITE_MODE`, so
+/// every leg, including the pinned baseline, runs the same parameter-array call
+/// sequence.
 class ExecuteManyWriteRunner {
 public:
     ExecuteManyWriteRunner(OdbcSession& session, ExecuteManyShape shape);

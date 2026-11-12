@@ -236,12 +236,11 @@ claim that the pinned baseline executed a parameter array.
 - `write/insert_1000_c10_pyshape/executemany`
 
 Each sample replays one `mssql-python` `Cursor.executemany` call on a 1,000-row
-batch, using the ODBC calls and bindings that `cursor.py` and `BindParameterArray`
-in `ddbc_bindings.cpp` produce. `write` binds `INT`, `NVARCHAR` as `SQL_C_WCHAR`,
-and `BIGINT`, which is not what `mssql-python` sends. Its type detection narrows
-each integer column to the smallest type that fits its min/max, and binds ASCII
-`str` and money-range `Decimal` as `SQL_C_CHAR` → `SQL_VARCHAR`. Those are
-different driver encode paths, so `write` does not measure them.
+batch, with the ODBC calls and bindings of `cursor.py` and `BindParameterArray`
+in `ddbc_bindings.cpp`. Unlike `write`, which binds `INT`, `NVARCHAR` as
+`SQL_C_WCHAR`, and `BIGINT`, `mssql-python` narrows each integer column to the
+smallest type that fits and binds ASCII `str` and money-range `Decimal` as
+`SQL_C_CHAR` → `SQL_VARCHAR`, a different driver encode path.
 
 | Column | Python value | C type → SQL type (size, digits) |
 |---|---|---|
@@ -258,16 +257,14 @@ statement and `SQLAllocHandle` (`_reset_cursor`), `SQLPrepare`, one column-wise
 `SQLGetDiagRec`, `SQLRowCount`, `SQLNumResultCols`, and `SQLRowCount` again.
 `execute_ms` reports `SQLExecute` alone. As in `mssql-python`, no status array,
 processed pointer, or bind type is set, and every call binds different buffer
-addresses. Autocommit is off. Truncation before the call, and the commit and
-validation after it, are outside the timed region. Python-side type detection and
-value conversion are not part of the measurement.
+addresses. Autocommit is off. Truncation, commit, and validation are untimed;
+Python-side type detection and conversion are not measured.
 
-Every driver leg, including the pinned baseline, runs this sequence;
-`ODBC_BENCH_WRITE_MODE` does not apply. Preflight and every sample check the
-row count, the result-column count, and the absence of diagnostics, then verify
-the written row count and per-column integer sums: the values, text lengths, the
-digits embedded in `name`, the decimals scaled by 10,000, and the datetimes as
-microseconds from 2026-01-01.
+`ODBC_BENCH_WRITE_MODE` does not apply, so every driver leg, including the
+pinned baseline, runs this sequence. Preflight and every sample check the row
+and result-column counts and the absence of diagnostics, then verify per-column
+integer sums of the written rows: values, text lengths, the digits embedded in
+`name`, decimals scaled by 10,000, and datetimes as microseconds from 2026-01-01.
 
 ## Measurement boundaries
 
@@ -282,7 +279,7 @@ access shape:
 | `bound_rowset_*` | `SQLExecDirect`, `SQLNumResultCols`, every `SQLDescribeCol`, every `SQLBindCol`, all `SQLFetchScroll` calls |
 | `bind_cycle_*` | the same, but describe + bind + row-array set + fetch + row-array reset + `SQLFreeStmt(SQL_UNBIND)` repeated once per rowset |
 | `getdata/*` | `SQLExecDirect`, the initial describe, then per row: `SQLFetch`, and per column a `SQLDescribeCol` plus its `SQLGetData` calls (including LOB continuations and the variant probe/`SQLColAttribute` pair) |
-| `write/*` | one parameter-array `SQLExecute`, or 2,000 sequential `SQLExecute` calls on the pinned Rust baseline |
+| `write/insert_2000_c3/*` | one parameter-array `SQLExecute`, or 2,000 sequential `SQLExecute` calls on the pinned Rust baseline |
 | `write/*_pyshape/*` | the whole `executemany` call: statement free and allocate, prepare, bind, one parameter-array `SQLExecute`, diagnostics, and row/column counts |
 
 The per-cell `SQLDescribeCol` in the row-at-a-time shape is not an accident: it
