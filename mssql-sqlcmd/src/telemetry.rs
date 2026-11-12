@@ -557,7 +557,15 @@ fn destination_from(
 /// ID, the server query) waits for this, so an invalid configuration, or a host
 /// that cannot send, is a no-op.
 pub fn enabled() -> bool {
-    !opted_out() && destination().is_some() && transport_available()
+    enabled_with(BUILT_IN_CONNECTION_STRING)
+}
+
+/// [`enabled`] with the built-in destination given, so a test can run the whole
+/// gate with the shipped string without it ever entering the environment.
+fn enabled_with(built_in: Option<&str>) -> bool {
+    !opted_out()
+        && destination_from(std::env::var(CONNECTION_STRING_ENV), built_in).is_some()
+        && transport_available()
 }
 
 /// The HTTP client needs OpenSSL on 64-bit Linux. Checked without the report
@@ -1182,30 +1190,25 @@ mod tests {
         );
     }
 
-    /// Telemetry is on without any configuration: the destination built into
-    /// every release is a valid one, and it is what is used when the variable is
-    /// absent.
+    /// The destination built into every release is a valid one.
     #[test]
-    fn the_shipped_default_destination_is_valid_and_used_when_no_variable_is_set() {
-        use std::env::VarError;
+    fn the_shipped_default_destination_is_valid() {
         assert!(connection_string_is_valid(DEFAULT_CONNECTION_STRING));
-        assert_eq!(
-            destination_from(Err(VarError::NotPresent), Some(DEFAULT_CONNECTION_STRING)).as_deref(),
-            Some(DEFAULT_CONNECTION_STRING)
-        );
         // The shipped string is only what the exporter needs, and is not one of
         // the test fixtures.
         assert_ne!(DEFAULT_CONNECTION_STRING, TEST_CONNECTION_STRING);
         assert!(!DEFAULT_CONNECTION_STRING.contains("LiveEndpoint"));
     }
 
-    /// The opt-out wins over the built-in destination.
+    /// The opt-out wins over the built-in destination: the whole gate runs with
+    /// the shipped string, and nothing is sent.
     #[test]
     fn opting_out_turns_the_default_destination_off() {
         let _guard = TestEnv::new(None);
+        assert!(enabled_with(Some(DEFAULT_CONNECTION_STRING)));
         // SAFETY: serialized by the test environment lock.
         unsafe { std::env::set_var(OPTOUT_ENV, "1") };
-        assert!(!enabled());
+        assert!(!enabled_with(Some(DEFAULT_CONNECTION_STRING)));
     }
 
     #[test]
