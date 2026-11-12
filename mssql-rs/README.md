@@ -103,6 +103,7 @@ examples and timeout configuration. `deadpool` still owns capacity and checkout;
 Explicit bulk mappings must use consecutive source ordinals starting at zero in
 destination column order. Streaming rows cannot reorder or skip source values,
 and source-name mappings are unsupported; unsupported mappings return an error.
+Arrow batch iterators are consumed lazily, without buffering a wrapper per row.
 
 ## Cancellation and timeouts
 

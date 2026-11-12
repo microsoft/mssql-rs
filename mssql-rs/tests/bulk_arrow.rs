@@ -10,10 +10,13 @@
 
 pub mod common;
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use arrow_array::{
-    BooleanArray, Decimal128Array, Float64Array, Int32Array, RecordBatch, StringArray,
+    BooleanArray, Date64Array, Decimal128Array, Float64Array, Int32Array, RecordBatch, StringArray,
     Time64NanosecondArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -131,6 +134,30 @@ async fn bulk_insert_send_arrow_batches() {
         .expect("send_arrow_batches failed");
 
     assert_eq!(result.rows_affected, 300);
+}
+
+#[tokio::test]
+async fn bulk_arrow_stops_consuming_batches_after_row_error() {
+    let cfg = common::live_config_or_exit();
+    let mut client = Client::connect(&cfg).await.expect("connect failed");
+    client
+        .execute("CREATE TABLE #DriverArrowLazy (n INT NULL)", &[])
+        .await
+        .expect("create table failed");
+    let batch = RecordBatch::try_from_iter([("n", Arc::new(Date64Array::from(vec![0])) as _)])
+        .expect("valid batch");
+    let consumed = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&consumed);
+    let batches = [batch.clone(), batch].into_iter().inspect(move |_| {
+        counter.fetch_add(1, Ordering::SeqCst);
+    });
+    let error = client
+        .bulk_insert("#DriverArrowLazy")
+        .send_arrow_batches(batches)
+        .await
+        .expect_err("Date64 must be rejected");
+    assert!(error.to_string().contains("unsupported"));
+    assert_eq!(consumed.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

@@ -71,6 +71,18 @@ struct ArrowBulkRow {
     row_idx: usize,
 }
 
+fn arrow_rows(
+    batches: impl IntoIterator<Item = RecordBatch>,
+) -> impl Iterator<Item = ArrowBulkRow> {
+    batches.into_iter().flat_map(|batch| {
+        let batch = Arc::new(batch);
+        (0..batch.num_rows()).map(move |row_idx| ArrowBulkRow {
+            batch: Arc::clone(&batch),
+            row_idx,
+        })
+    })
+}
+
 #[async_trait]
 impl BulkLoadRow for ArrowBulkRow {
     async fn write_to_packet(
@@ -334,18 +346,7 @@ impl<'a> BulkInsert<'a> {
     where
         I: IntoIterator<Item = RecordBatch>,
     {
-        let mut rows: Vec<ArrowBulkRow> = Vec::new();
-        for batch in batches {
-            let arc = Arc::new(batch);
-            let n = arc.num_rows();
-            for row_idx in 0..n {
-                rows.push(ArrowBulkRow {
-                    batch: arc.clone(),
-                    row_idx,
-                });
-            }
-        }
-        self.send(rows).await
+        self.send(arrow_rows(batches)).await
     }
 }
 
@@ -763,12 +764,35 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn send_arrow_batches_empty_iterator_is_zero_rows() {
-        // Cover the send_arrow_batches Vec<ArrowBulkRow> = empty path. We
-        // can't actually send (no live client), but we *can* exercise the
-        // pre-send loop by directly building it.
-        let rows: Vec<ArrowBulkRow> = Vec::new();
-        assert_eq!(rows.len(), 0);
+    #[test]
+    fn arrow_rows_consume_batches_lazily_and_skip_empty_batches() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let make_batch = |values: Vec<i32>| {
+            RecordBatch::try_from_iter([("n", Arc::new(Int32Array::from(values)) as _)])
+                .expect("valid batch")
+        };
+        let consumed = Rc::new(Cell::new(0));
+        let counter = Rc::clone(&consumed);
+        let batches = [
+            make_batch(vec![1, 2]),
+            make_batch(vec![]),
+            make_batch(vec![3]),
+        ]
+        .into_iter()
+        .inspect(move |_| counter.set(counter.get() + 1));
+        let mut rows = arrow_rows(batches);
+        assert_eq!(consumed.get(), 0);
+        for (value, batch_count) in [(1, 1), (2, 1), (3, 3)] {
+            let row = rows.next().expect("expected row");
+            let array = row.batch.column(0);
+            assert!(matches!(
+                arrow_value_to_column_value(array.as_ref(), row.row_idx),
+                Ok(ColumnValues::Int(actual)) if actual == value
+            ));
+            assert_eq!(consumed.get(), batch_count);
+        }
+        assert!(rows.next().is_none());
     }
 }
