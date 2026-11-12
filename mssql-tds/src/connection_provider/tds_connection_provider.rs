@@ -215,11 +215,8 @@ impl TdsConnectionProvider {
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<TdsClient> {
         let action_chain = Self::action_chain(&mut context, datasource)?;
-
-        // ODBC polls this on the application's stack. Keep the connection
-        // state out of its block_on frames, leaving room for native TLS and
-        // client construction on musl's 128 KiB threads.
-        Box::pin(self.execute_action_chain(&context, action_chain, cancel_handle, None)).await
+        self.execute_action_chain(&context, action_chain, cancel_handle, None)
+            .await
     }
 
     /// [`create_client`](Self::create_client) for connection diagnostics: the
@@ -265,9 +262,9 @@ impl TdsConnectionProvider {
         }
         let diagnosis = Diagnosis::new(stop_after);
         let bound_ms = u64::from(context.connect_timeout) * 1000;
-        let result =
-            Box::pin(self.execute_action_chain(&context, action_chain, None, Some(&diagnosis)))
-                .await;
+        let result = self
+            .execute_action_chain(&context, action_chain, None, Some(&diagnosis))
+            .await;
         diagnosis.finish_extra_connects(bound_ms).await;
         if diagnosis.stopped() {
             return Ok(None);
@@ -313,7 +310,11 @@ impl TdsConnectionProvider {
         cancel_handle: Option<&CancelHandle>,
         diagnosis: Option<&Diagnosis>,
     ) -> TdsResult<TdsClient> {
-        CancelHandle::run_until_cancelled(cancel_handle, async move {
+        // ODBC polls connections on the application's stack (128 KiB on musl).
+        // Box the body before the cancellation wrapper so an outlined wrapper
+        // poll cannot copy the in-flight transport/TLS/login state through a
+        // stack temporary; this must not depend on LTO inlining decisions.
+        CancelHandle::run_until_cancelled(cancel_handle, Box::pin(async move {
             // Resolve SSRP (SQL Browser) if the action chain requires it.
             // Check the instance cache first to avoid a redundant UDP round-trip.
             let mut exec_context = ExecutionContext::new();
@@ -593,7 +594,7 @@ impl TdsConnectionProvider {
                     "All connection attempts from action chain failed.".to_string(),
                 )
             }))
-        })
+        }))
         .await
     }
 
@@ -942,6 +943,87 @@ mod tests {
         assert!(
             size <= MAX,
             "create_client future is {size} B, expected <= {MAX} B"
+        );
+    }
+
+    // The cancellation wrapper moves the future it is given. An unboxed connect
+    // body made that move a stack temporary the size of the body once LTO
+    // stopped inlining the wrapper's poll (small_stack_connect_test overflow).
+    // The future's size is static, so one measurement covers both cancel-handle
+    // arms of the wrapper's `Either`.
+    #[test]
+    fn cancellation_wrapper_moves_only_a_boxed_connect_body() {
+        const MAX: usize = 1024;
+        let provider = TdsConnectionProvider::new();
+        let mut context = ClientContext::default();
+        let chain = TdsConnectionProvider::action_chain(&mut context, "localhost").unwrap();
+        let size =
+            std::mem::size_of_val(&provider.execute_action_chain(&context, chain, None, None));
+        assert!(
+            size <= MAX,
+            "execute_action_chain future is {size} B, expected <= {MAX} B"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_pending_connect_closes_its_transport() {
+        use tokio::io::AsyncReadExt;
+
+        // The listener accepts and never answers PRELOGIN, so the connect stays
+        // pending until it is cancelled.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let context = context_for_retry_test("127.0.0.1", port, 30, 0, 0);
+        let cancel = CancelHandle::new();
+        let provider = TdsConnectionProvider;
+        let datasource = format!("tcp:127.0.0.1,{port}");
+
+        let server = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            cancel.cancel_token.cancel();
+            let mut buf = [0u8; 512];
+            loop {
+                match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        };
+        let (result, closed) = tokio::join!(
+            provider.create_client(context, &datasource, Some(&cancel)),
+            tokio::time::timeout(Duration::from_secs(10), server),
+        );
+
+        assert!(
+            matches!(result, Err(OperationCancelledError(_))),
+            "expected cancellation, got {:?}",
+            result.err()
+        );
+        closed.expect("cancelled connect must drop its transport and close the socket");
+    }
+
+    #[tokio::test]
+    async fn connect_with_a_cancelled_handle_opens_no_transport() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let context = context_for_retry_test("127.0.0.1", port, 30, 0, 0);
+        let cancel = CancelHandle::new();
+        cancel.cancel_token.cancel();
+
+        let result = TdsConnectionProvider
+            .create_client(context, &format!("tcp:127.0.0.1,{port}"), Some(&cancel))
+            .await;
+
+        assert!(
+            matches!(result, Err(OperationCancelledError(_))),
+            "expected cancellation, got {:?}",
+            result.err()
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "a cancelled connect must not reach the server"
         );
     }
 
