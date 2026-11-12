@@ -98,6 +98,12 @@ See [connection pooling](https://github.com/microsoft/mssql-rs/blob/main/mssql-r
 examples and timeout configuration. `deadpool` still owns capacity and checkout;
 `mssql-tds` provides the native reset and health primitives.
 
+### Bulk column mappings
+
+Explicit bulk mappings must use consecutive source ordinals starting at zero in
+destination column order. Streaming rows cannot reorder or skip source values,
+and source-name mappings are unsupported; unsupported mappings return an error.
+
 ## Cancellation and timeouts
 
 Dropping an in-flight driver operation with `tokio::time::timeout`, `select!`,

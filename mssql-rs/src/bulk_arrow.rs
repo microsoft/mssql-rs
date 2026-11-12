@@ -313,8 +313,8 @@ impl<'a> BulkInsert<'a> {
     ///
     /// Column matching follows the same rules as [`Self::send`]: by ordinal
     /// unless explicit [`ColumnMapping`](crate::bulk::ColumnMapping)s have
-    /// been added (e.g. via [`Client::bulk_insert_with_columns`](crate::Client::bulk_insert_with_columns)
-    /// or [`Self::map_column`]).
+    /// been added (e.g. via [`Client::bulk_insert_with_columns`](crate::Client::bulk_insert_with_columns)).
+    /// Explicit source ordinals must be consecutive in destination order.
     ///
     /// See [the module example](self) for end-to-end usage.
     ///

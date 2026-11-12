@@ -450,7 +450,8 @@ impl Client {
     /// Equivalent to calling [`Client::bulk_insert`] and then
     /// [`map_column_by_ordinal`](crate::bulk::BulkInsert::map_column_by_ordinal)
     /// for each column in order, so source row column 0 lands in `columns[0]`,
-    /// row column 1 in `columns[1]`, etc.
+    /// row column 1 in `columns[1]`, etc. Names must appear in destination
+    /// table order; reordered mappings return an error when sending.
     pub fn bulk_insert_with_columns<'a>(
         &'a mut self,
         table: impl Into<String>,

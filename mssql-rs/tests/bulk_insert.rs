@@ -45,6 +45,102 @@ impl BulkLoadRow for Person {
     }
 }
 
+struct IntRow(Vec<i32>);
+
+#[async_trait]
+impl BulkLoadRow for IntRow {
+    async fn write_to_packet(
+        &self,
+        writer: &mut StreamingBulkLoadWriter<'_>,
+        column_index: &mut usize,
+    ) -> TdsResult<()> {
+        for value in &self.0 {
+            writer
+                .write_column_value(*column_index, &ColumnValues::Int(*value))
+                .await?;
+            *column_index += 1;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn bulk_column_mappings_reject_unsafe_source_order() {
+    let cfg = common::live_config_or_exit();
+    let mut client = Client::connect(&cfg).await.expect("connect failed");
+    client
+        .execute(
+            "CREATE TABLE #DriverBulkMapping (a INT NULL, b INT NULL)",
+            &[],
+        )
+        .await
+        .expect("create table failed");
+
+    let error = client
+        .bulk_insert("#DriverBulkMapping")
+        .map_column_by_ordinal(1, "a")
+        .map_column_by_ordinal(0, "b")
+        .send([IntRow(vec![11, 22])])
+        .await
+        .expect_err("reordered source columns must fail");
+    assert!(matches!(
+        error,
+        mssql_rs::Error::Tds(mssql_tds::error::Error::UsageError(_))
+    ));
+    let error = client
+        .bulk_insert("#DriverBulkMapping")
+        .map_column_by_ordinal(1, "b")
+        .send([IntRow(vec![11, 22])])
+        .await
+        .expect_err("skipped source columns must fail");
+    assert!(matches!(
+        error,
+        mssql_rs::Error::Tds(mssql_tds::error::Error::UsageError(_))
+    ));
+    let error = client
+        .bulk_insert("#DriverBulkMapping")
+        .map_column_by_ordinal(0, "a")
+        .map_column_by_ordinal(0, "b")
+        .send([IntRow(vec![11])])
+        .await
+        .expect_err("duplicate source columns must fail");
+    assert!(matches!(
+        error,
+        mssql_rs::Error::Tds(mssql_tds::error::Error::UsageError(_))
+    ));
+
+    let rows = client
+        .simple_query("SELECT COUNT(*) AS n FROM #DriverBulkMapping")
+        .await
+        .expect("query after rejected mappings failed")
+        .into_first_result();
+    assert_eq!(rows.first().expect("count row").get::<i32, _>("n"), Some(0));
+    client
+        .bulk_insert("#DriverBulkMapping")
+        .map_column_by_ordinal(1, "b")
+        .map_column_by_ordinal(0, "a")
+        .send([IntRow(vec![11, 22])])
+        .await
+        .expect("consecutive source columns should succeed");
+    client
+        .bulk_insert("#DriverBulkMapping")
+        .map_column_by_ordinal(0, "b")
+        .send([IntRow(vec![33])])
+        .await
+        .expect("destination subset should succeed");
+    let rows = client
+        .simple_query("SELECT a, b FROM #DriverBulkMapping ORDER BY b")
+        .await
+        .expect("select values failed")
+        .into_first_result();
+    let first = rows.first().expect("first row");
+    let second = rows.get(1).expect("second row");
+    assert_eq!(first.get::<i32, _>("a"), Some(11));
+    assert_eq!(first.get::<i32, _>("b"), Some(22));
+    assert_eq!(second.get::<Option<i32>, _>("a"), Some(None));
+    assert_eq!(second.get::<i32, _>("b"), Some(33));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bulk_insert_thousand_rows() {
     let cfg = common::live_config_or_exit();

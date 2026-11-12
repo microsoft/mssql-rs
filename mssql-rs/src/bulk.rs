@@ -60,10 +60,9 @@
 //!
 //! By default, source row columns map to the destination table by ordinal
 //! (skipping identity columns unless [`BulkInsert::keep_identity`] is set).
-//! For named mapping, use [`BulkInsert::add_column_mapping`] /
-//! [`BulkInsert::map_column`] / [`BulkInsert::map_column_by_ordinal`], or pass
-//! the explicit destination column list to
-//! [`Client::bulk_insert_with_columns`](crate::Client::bulk_insert_with_columns).
+//! Explicit ordinal mappings must follow destination column order, with source
+//! ordinals starting at zero and no gaps. The streaming row interface cannot
+//! reorder or skip source values. Name-based source mappings are unsupported.
 //!
 //! # Options
 //!
@@ -403,18 +402,22 @@ impl<'a> BulkInsert<'a> {
     /// Add an explicit source → destination column mapping.
     ///
     /// When any mapping is added, ordinal auto-mapping is disabled and only
-    /// the listed mappings apply.
+    /// the listed mappings apply. In destination order, source ordinals must
+    /// start at zero and be consecutive; streaming rows cannot be reordered.
+    /// Name-based source mappings are unsupported.
     pub fn add_column_mapping(mut self, mapping: ColumnMapping) -> Self {
         self.column_mappings.push(mapping);
         self
     }
 
-    /// Convenience: map source column `source_name` to destination column `dest_name`.
+    /// Create a name-based mapping. Streaming rows do not expose source names,
+    /// so sending with this mapping returns an error.
     pub fn map_column(self, source_name: impl Into<String>, dest_name: impl Into<String>) -> Self {
         self.add_column_mapping(ColumnMapping::by_name(source_name, dest_name))
     }
 
-    /// Convenience: map source ordinal `source_ord` (0-based) to destination column `dest_name`.
+    /// Map source ordinal `source_ord` (0-based) to destination column `dest_name`.
+    /// Source ordinals must be consecutive in destination order.
     pub fn map_column_by_ordinal(self, source_ord: usize, dest_name: impl Into<String>) -> Self {
         self.add_column_mapping(ColumnMapping::by_ordinal(source_ord, dest_name))
     }
@@ -438,7 +441,7 @@ impl<'a> BulkInsert<'a> {
         R: BulkLoadRow,
     {
         let mut operation = Operation::new(self.client)?;
-        let result = {
+        let result = async {
             let mut bulk = TdsBulkCopy::new(&mut operation, self.table_name)
                 .batch_size(self.options.batch_size)
                 .check_constraints(self.options.check_constraints)
@@ -451,13 +454,27 @@ impl<'a> BulkInsert<'a> {
             if let Some(timeout) = self.timeout {
                 bulk = bulk.timeout(timeout);
             }
+            let has_mappings = !self.column_mappings.is_empty();
             for mapping in self.column_mappings {
                 bulk = bulk.add_column_mapping(mapping);
+            }
+            if has_mappings {
+                let mappings = bulk.get_resolved_mappings().await.map_err(Error::Tds)?;
+                if mappings
+                    .iter()
+                    .enumerate()
+                    .any(|(index, mapping)| mapping.source_index != index)
+                {
+                    return Err(Error::Tds(mssql_tds::error::Error::UsageError(
+                        "Bulk source ordinals must start at zero and be consecutive in destination column order; streaming rows cannot be reordered or skip values".to_string(),
+                    )));
+                }
             }
             bulk.write_to_server_zerocopy(rows)
                 .await
                 .map_err(Error::Tds)
-        };
+        }
+        .await;
         operation.complete(result)
     }
 }
