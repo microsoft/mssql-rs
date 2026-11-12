@@ -1761,7 +1761,7 @@ impl Diagnosis {
     /// nothing and connects to nothing itself. The depth sets where the
     /// attempt stops.
     async fn execute(&mut self) {
-        let Some(target) = self.connection_input() else {
+        let Some(target) = self.connection_input().await else {
             return;
         };
         if !self.wants(Depth::EndpointResolution) {
@@ -3427,7 +3427,7 @@ impl Diagnosis {
             }
         }
     }
-    fn connection_input(&mut self) -> Option<Target> {
+    async fn connection_input(&mut self) -> Option<Target> {
         let started = Instant::now();
         if let Some(dsn) = self.request.dsn.clone() {
             match dsn.status {
@@ -3484,7 +3484,18 @@ impl Diagnosis {
                     ));
                 }
                 if let Authentication::EntraAccessToken { file } = &self.request.authentication {
-                    match entra::read_access_token(std::path::Path::new(file)) {
+                    // Read on a thread of its own within the time limit: the
+                    // path may name a pipe no one writes to, or a share that
+                    // does not answer, and a cancel is seen meanwhile.
+                    let path = std::path::PathBuf::from(file);
+                    let read = within(self.request.timeout(), move || {
+                        entra::read_access_token(&path)
+                    })
+                    .await
+                    .unwrap_or(Err(entra::TokenFileError::TimedOut));
+                    check.duration_ms = Some(millis(started));
+                    check.deadline_ms = Some(self.request.timeout_ms());
+                    match read {
                         Ok(token) => self.access_token = Some(token),
                         Err(error) => {
                             self.access_token_file_unusable(check, &error);
@@ -3674,39 +3685,43 @@ impl Diagnosis {
     }
 
     /// Connection input for an access token file (`-G -P`, without `-U`) that
-    /// sqlcmd could not send: there is no token to log in with, and the checks
-    /// after connection input are skipped. The file is not named: its path is
-    /// the user's.
+    /// sqlcmd could not send, or that was not read within the time limit:
+    /// there is no token to log in with, and the checks after connection
+    /// input are skipped. The file is not named: its path is the user's.
     fn access_token_file_unusable(&mut self, mut check: Check, error: &entra::TokenFileError) {
         let code = error.code();
-        check.coverage = Coverage::Diagnosed;
+        // A file not read in time is not known to be wrong.
+        check.coverage = match error {
+            entra::TokenFileError::TimedOut => Coverage::Inconclusive,
+            _ => Coverage::Diagnosed,
+        };
         check.fields.push(Field::plain("error", code));
         check.domain = Some(Domain::specific("client.inputConfiguration"));
         self.checks.push(check);
         let mut record = ErrorRecord::new("sqlcmd", CheckId::ConnectionInput, "");
         record.code = Some(code.to_string());
         let (text, quotes) = match error {
+            entra::TokenFileError::NotFound(io) => {
+                record.os_error = io.raw_os_error();
+                (
+                    LocalizedText::new(
+                        "diagnose.finding.access_token_file_not_found",
+                        "The access token file given with -P was not found.",
+                        vec![],
+                    ),
+                    false,
+                )
+            }
             entra::TokenFileError::Unreadable(io) => {
                 record.os_error = io.raw_os_error();
-                if io.kind() == std::io::ErrorKind::NotFound {
-                    (
-                        LocalizedText::new(
-                            "diagnose.finding.access_token_file_not_found",
-                            "The access token file given with -P was not found.",
-                            vec![],
-                        ),
-                        false,
-                    )
-                } else {
-                    (
-                        LocalizedText::new(
-                            "diagnose.finding.access_token_file_unreadable",
-                            format!("The access token file given with -P could not be read: {io}"),
-                            vec![("error", io.to_string())],
-                        ),
-                        true,
-                    )
-                }
+                (
+                    LocalizedText::new(
+                        "diagnose.finding.access_token_file_unreadable",
+                        format!("The access token file given with -P could not be read: {io}"),
+                        vec![("error", io.to_string())],
+                    ),
+                    true,
+                )
             }
             entra::TokenFileError::TooLarge(size) => {
                 let max = entra::ACCESS_TOKEN_FILE_MAX;
@@ -3729,6 +3744,19 @@ impl Diagnosis {
                 ),
                 false,
             ),
+            entra::TokenFileError::TimedOut => {
+                let seconds = self.request.timeout().as_secs();
+                (
+                    LocalizedText::new(
+                        "diagnose.finding.access_token_file_time_limit",
+                        format!(
+                            "The access token file given with -P was not read within the {seconds} s time limit."
+                        ),
+                        vec![("seconds", seconds.to_string())],
+                    ),
+                    false,
+                )
+            }
         };
         record.message = text.clone();
         self.errors.push(record);
@@ -3780,7 +3808,7 @@ impl Diagnosis {
         );
     }
 
-    fn client_context(&self) -> ClientContext {
+    fn client_context(&mut self) -> ClientContext {
         let request = &self.request;
         let mut context = ClientContext::default();
         // sqlcmd connects without MultiSubnetFailover unless -M, and diagnose
@@ -3797,10 +3825,8 @@ impl Diagnosis {
             }
             Authentication::EntraAccessToken { .. } => {
                 context.tds_authentication_method = TdsAuthenticationMethod::AccessToken;
-                context.access_token = self
-                    .access_token
-                    .clone()
-                    .map(entra::AccessToken::into_inner);
+                // Moved, not copied: the client holds the only copy.
+                context.access_token = self.access_token.take().map(entra::AccessToken::into_inner);
             }
             // A credential provider would acquire the token: the client goes
             // as far as the server's request for it. Neither the login nor its
@@ -7744,13 +7770,22 @@ pub(crate) mod tests {
         observe_ended(diagnosis, stages, &ended, 10)
     }
 
+    /// [`Diagnosis::connection_input`], run to completion.
+    fn input(diagnosis: &mut Diagnosis) -> Option<Target> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(diagnosis.connection_input())
+    }
+
     fn observe_ended(
         mut diagnosis: Diagnosis,
         stages: Stages,
         ended: &Ended,
         attempt_ms: u64,
     ) -> Report {
-        let target = diagnosis.connection_input().unwrap();
+        let target = input(&mut diagnosis).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -9570,7 +9605,7 @@ pub(crate) mod tests {
     /// SQL Server Browser has its own.
     #[test]
     fn the_client_makes_one_attempt_in_the_time_limit() {
-        let diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::ConnectionAttempt));
+        let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::ConnectionAttempt));
         let context = diagnosis.client_context();
         assert_eq!(context.connect_retry_count, 0);
         assert_eq!(context.connect_timeout, 3);
@@ -9583,7 +9618,7 @@ pub(crate) mod tests {
     fn canceled_with(request: Request, stages: Stages) -> Report {
         let mut diagnosis = Diagnosis::new(request);
         diagnosis.windows = true;
-        diagnosis.connection_input().unwrap();
+        input(&mut diagnosis).unwrap();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -11600,7 +11635,7 @@ pub(crate) mod tests {
     fn a_failed_session_query_is_flagged_for_review() {
         let failed = |error: Option<Error>| {
             let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::SessionValidation));
-            diagnosis.connection_input().unwrap();
+            input(&mut diagnosis).unwrap();
             diagnosis.session_failed(
                 Check::new(CheckId::SessionValidation, Coverage::Passed),
                 error,
@@ -11673,7 +11708,7 @@ pub(crate) mod tests {
     fn a_failed_session_query_is_classified_by_its_error() {
         let failed = |error: Option<Error>| {
             let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::SessionValidation));
-            diagnosis.connection_input().unwrap();
+            input(&mut diagnosis).unwrap();
             diagnosis.session_failed(
                 Check::new(CheckId::SessionValidation, Coverage::Passed),
                 error,
@@ -11790,13 +11825,11 @@ pub(crate) mod tests {
     #[test]
     fn an_access_token_file_sqlcmd_cannot_send_is_a_connection_input_issue() {
         let odd = entra::testing::file_with(b"abc");
+        let max = usize::try_from(entra::ACCESS_TOKEN_FILE_MAX).unwrap();
+        let large = entra::testing::file_with(&vec![0x41; max + 2]);
         let missing = std::env::temp_dir().join("mssql-sqlcmd-no-such-token-file");
         // A directory is a file sqlcmd cannot read.
-        let directory = std::env::temp_dir().join(format!(
-            "mssql-sqlcmd-token-directory-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = entra::testing::directory();
         let cases = [
             (
                 missing,
@@ -11810,7 +11843,13 @@ pub(crate) mod tests {
                  sqlcmd passes the token to the driver.",
             ),
             (
-                directory.clone(),
+                large.0.clone(),
+                "accessTokenFileTooLarge",
+                "The access token file given with -P is 1048578 bytes, more than the 1048576 \
+                 bytes sqlcmd reads.",
+            ),
+            (
+                directory.0.clone(),
                 "accessTokenFileUnreadable",
                 "The access token file given with -P could not be read: ",
             ),
@@ -11846,7 +11885,86 @@ pub(crate) mod tests {
             assert!(!json.contains(&name), "{json}");
             assert!(!report::text(&report).contains(&name));
         }
-        let _ = std::fs::remove_dir(&directory);
+    }
+
+    /// [`run_until`] on a thread of its own, canceled once `cancel_after` has
+    /// passed: the report and the time it took. A run that blocks fails the
+    /// test after ten seconds instead of hanging it.
+    #[cfg(unix)]
+    fn run_on_a_thread(request: Request, cancel_after: Option<Duration>) -> (Report, Duration) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let report = run_until(request, &|| {
+                cancel_after.is_some_and(|after| started.elapsed() > after)
+            });
+            let _ = sender.send((report, started.elapsed()));
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the run did not end within 10 s")
+    }
+
+    /// An access token file that does not give its token (here a pipe no one
+    /// writes to; or a share that does not answer) gets the check's time
+    /// limit, which its time counts: connection input is inconclusive, and
+    /// nothing after it runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_token_file_that_does_not_answer_gets_the_time_limit() {
+        let fifo = entra::testing::Fifo::new();
+        let mut entra = request("tcp:db01,1433", Depth::SessionValidation);
+        entra.authentication = Authentication::EntraAccessToken {
+            file: fifo.0.to_string_lossy().into_owned(),
+        };
+        entra.login_timeout_seconds = 1;
+        let (report, took) = run_on_a_thread(entra, None);
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        let input = checked(&report, CheckId::ConnectionInput);
+        assert_eq!(input.coverage, Coverage::Inconclusive, "{report:#?}");
+        assert_eq!(input.field("error"), Some("accessTokenFileTimedOut"));
+        assert_eq!(input.deadline_ms, Some(1000));
+        assert!(input.duration_ms.is_some_and(|ms| ms >= 1000), "{input:#?}");
+        assert!(
+            report.checks[1..]
+                .iter()
+                .all(|c| c.skip == Some(Skip::BlockedBy(CheckId::ConnectionInput))),
+            "{:#?}",
+            report.checks
+        );
+        assert_eq!(
+            report.findings[0].text.render("en-US"),
+            "The access token file given with -P was not read within the 1 s time limit."
+        );
+        assert_eq!(
+            report.errors[0].code.as_deref(),
+            Some("accessTokenFileTimedOut")
+        );
+        assert_eq!(report.outcome, DiagnosticOutcome::Inconclusive);
+        assert_eq!(report.exit_code(), 2);
+        let name = fifo.0.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(!report::json(&report, "v").unwrap().contains(&name));
+    }
+
+    /// A cancel is seen while the access token file is read.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancel_is_seen_while_the_token_file_is_read() {
+        let fifo = entra::testing::Fifo::new();
+        let mut entra = request("tcp:db01,1433", Depth::SessionValidation);
+        entra.authentication = Authentication::EntraAccessToken {
+            file: fifo.0.to_string_lossy().into_owned(),
+        };
+        entra.login_timeout_seconds = 60;
+        let (report, took) = run_on_a_thread(entra, Some(Duration::from_millis(200)));
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        assert_eq!(report.execution_status, ExecutionStatus::Canceled);
+        assert_eq!(
+            checked(&report, CheckId::ConnectionInput).skip,
+            Some(Skip::Canceled),
+            "{report:#?}"
+        );
+        assert_eq!(report.exit_code(), 4);
     }
 
     fn entra_attempt_stages() -> Stages {

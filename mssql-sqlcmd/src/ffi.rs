@@ -653,6 +653,58 @@ pub const MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN: i32 = 3;
 // when the server's pre-login answer does not require Microsoft Entra, which
 // diagnose does not model.
 
+/// The `authentication` of a [`MssqlSqlcmdDiagnosticsRequest`], read once from
+/// its `MSSQL_SQLCMD_AUTH_*` value. Each use matches every kind, so a kind added
+/// later does not compile until every use handles it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthKind {
+    SqlPassword,
+    Integrated,
+    EntraPassword,
+    EntraAccessToken,
+}
+
+impl AuthKind {
+    /// The kind an `MSSQL_SQLCMD_AUTH_*` value names, or `None` for any other
+    /// value.
+    fn from_c(value: i32) -> Option<Self> {
+        Some(match value {
+            MSSQL_SQLCMD_AUTH_SQL_PASSWORD => Self::SqlPassword,
+            MSSQL_SQLCMD_AUTH_INTEGRATED => Self::Integrated,
+            MSSQL_SQLCMD_AUTH_ENTRA_PASSWORD => Self::EntraPassword,
+            MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN => Self::EntraAccessToken,
+            _ => return None,
+        })
+    }
+
+    /// Whether a login of this kind needs `user`.
+    fn needs_user(self) -> bool {
+        match self {
+            Self::SqlPassword | Self::EntraPassword => true,
+            Self::Integrated | Self::EntraAccessToken => false,
+        }
+    }
+
+    /// Whether a login of this kind needs `password`: an empty password is a
+    /// value, and an access token's is the file `-P` names.
+    fn needs_password(self) -> bool {
+        match self {
+            Self::SqlPassword | Self::EntraPassword | Self::EntraAccessToken => true,
+            Self::Integrated => false,
+        }
+    }
+
+    /// The option that selects this kind on sqlcmd's command line.
+    #[cfg(target_pointer_width = "64")]
+    fn command_name(self) -> &'static str {
+        match self {
+            Self::SqlPassword => "-U",
+            Self::Integrated => "-E",
+            Self::EntraPassword | Self::EntraAccessToken => "-G",
+        }
+    }
+}
+
 /// `encrypt` of [`MssqlSqlcmdDiagnosticsRequest`], as sqlcmd's `-N` sets it.
 pub const MSSQL_SQLCMD_ENCRYPT_OPTIONAL: i32 = 0;
 pub const MSSQL_SQLCMD_ENCRYPT_MANDATORY: i32 = 1;
@@ -806,13 +858,10 @@ pub unsafe extern "C" fn mssql_sqlcmd_diagnostics_run(
         request.host_name_in_certificate_source,
         request.login_timeout_source,
     ];
+    let Some(authentication) = AuthKind::from_c(request.authentication) else {
+        return MSSQL_SQLCMD_INVALID_ARGUMENT;
+    };
     let valid = matches!(
-        request.authentication,
-        MSSQL_SQLCMD_AUTH_SQL_PASSWORD
-            | MSSQL_SQLCMD_AUTH_INTEGRATED
-            | MSSQL_SQLCMD_AUTH_ENTRA_PASSWORD
-            | MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN
-    ) && matches!(
         request.encrypt,
         MSSQL_SQLCMD_ENCRYPT_OPTIONAL
             | MSSQL_SQLCMD_ENCRYPT_MANDATORY
@@ -851,26 +900,16 @@ pub unsafe extern "C" fn mssql_sqlcmd_diagnostics_run(
         };
         let user = read_text(request.user);
         let password = read_text(request.password);
-        // A login that will run needs both; an empty password is a value. An
-        // access token needs its file.
-        let needs_login = matches!(
-            request.authentication,
-            MSSQL_SQLCMD_AUTH_SQL_PASSWORD | MSSQL_SQLCMD_AUTH_ENTRA_PASSWORD
-        );
+        // A login that will run has what its kind needs.
         if invalid_reason.is_none()
             && !dsn_unusable
-            && ((needs_login && (user.is_none() || password.is_none()))
-                || (request.authentication == MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN
-                    && password.is_none()))
+            && ((authentication.needs_user() && user.is_none())
+                || (authentication.needs_password() && password.is_none()))
         {
             return MSSQL_SQLCMD_NULL_ARGUMENT;
         }
         #[cfg(target_pointer_width = "64")]
-        let authentication_command_name = match request.authentication {
-            MSSQL_SQLCMD_AUTH_SQL_PASSWORD => "-U",
-            MSSQL_SQLCMD_AUTH_INTEGRATED => "-E",
-            _ => "-G",
-        };
+        let authentication_command_name = authentication.command_name();
         #[cfg(target_pointer_width = "64")]
         let dsn_name = dsn.as_deref();
         #[cfg(target_pointer_width = "64")]
@@ -935,7 +974,7 @@ pub unsafe extern "C" fn mssql_sqlcmd_diagnostics_run(
         DiagnosticsInput {
             server,
             database: read_optional_text(request.database),
-            authentication: request.authentication,
+            authentication,
             user: user.unwrap_or_default(),
             password: password.unwrap_or_default(),
             encrypt: request.encrypt,
@@ -976,8 +1015,7 @@ pub unsafe extern "C" fn mssql_sqlcmd_diagnostics_run(
 struct DiagnosticsInput {
     server: String,
     database: Option<String>,
-    /// An `MSSQL_SQLCMD_AUTH_*` value.
-    authentication: i32,
+    authentication: AuthKind,
     user: String,
     password: String,
     encrypt: i32,
@@ -1004,17 +1042,17 @@ fn diagnose(input: DiagnosticsInput) -> Option<(String, i32)> {
         server: input.server,
         database: input.database,
         authentication: match input.authentication {
-            MSSQL_SQLCMD_AUTH_INTEGRATED => Authentication::Integrated,
-            MSSQL_SQLCMD_AUTH_ENTRA_PASSWORD => Authentication::EntraPassword {
+            AuthKind::SqlPassword => Authentication::SqlPassword {
                 user: input.user,
                 password: input.password,
             },
-            MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN => Authentication::EntraAccessToken {
+            AuthKind::Integrated => Authentication::Integrated,
+            AuthKind::EntraPassword => Authentication::EntraPassword {
+                user: input.user,
+                password: input.password,
+            },
+            AuthKind::EntraAccessToken => Authentication::EntraAccessToken {
                 file: input.password,
-            },
-            _ => Authentication::SqlPassword {
-                user: input.user,
-                password: input.password,
             },
         },
         encrypt: match input.encrypt {

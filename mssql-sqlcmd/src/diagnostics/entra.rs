@@ -23,8 +23,8 @@ use mssql_tds::error::Error;
 pub const ACCESS_TOKEN_FILE_MAX: u64 = 1_048_576;
 
 /// An access token, as sqlcmd reads it from the file `-P` names. Its `Debug`
-/// output never shows it.
-#[derive(Clone)]
+/// output never shows it, and it cannot be copied: the one value moves to the
+/// client.
 pub struct AccessToken(String);
 
 impl std::fmt::Debug for AccessToken {
@@ -44,6 +44,8 @@ impl AccessToken {
 /// sends it.
 #[derive(Debug)]
 pub enum TokenFileError {
+    /// There is no file at the path.
+    NotFound(std::io::Error),
     /// The file could not be read.
     Unreadable(std::io::Error),
     /// The file is larger than sqlcmd reads ([`ACCESS_TOKEN_FILE_MAX`]).
@@ -51,18 +53,20 @@ pub enum TokenFileError {
     /// The file is not UTF-16LE text (an odd number of bytes, or an unpaired
     /// surrogate), the form in which sqlcmd passes the token to the driver.
     NotUtf16,
+    /// The file was not read within the time limit: a pipe no one writes to,
+    /// or a share that does not answer.
+    TimedOut,
 }
 
 impl TokenFileError {
     /// The error code connection input reports.
     pub fn code(&self) -> &'static str {
         match self {
-            TokenFileError::Unreadable(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                "accessTokenFileNotFound"
-            }
+            TokenFileError::NotFound(_) => "accessTokenFileNotFound",
             TokenFileError::Unreadable(_) => "accessTokenFileUnreadable",
             TokenFileError::TooLarge(_) => "accessTokenFileTooLarge",
             TokenFileError::NotUtf16 => "accessTokenFileNotUtf16",
+            TokenFileError::TimedOut => "accessTokenFileTimedOut",
         }
     }
 }
@@ -75,14 +79,18 @@ pub fn read_access_token(path: &Path) -> Result<AccessToken, TokenFileError> {
     use std::io::Read;
     // Opened first, as sqlcmd opens it: what cannot be opened (a directory,
     // on Windows) cannot be read, whatever its size.
-    let mut file = std::fs::File::open(path).map_err(TokenFileError::Unreadable)?;
+    let mut file = std::fs::File::open(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => TokenFileError::NotFound(error),
+        _ => TokenFileError::Unreadable(error),
+    })?;
     let size = file.metadata().map_err(TokenFileError::Unreadable)?.len();
     if size > ACCESS_TOKEN_FILE_MAX {
         return Err(TokenFileError::TooLarge(size));
     }
     // At most one byte more than sqlcmd reads: a file that grew since is
-    // still too large.
-    let mut bytes = Vec::new();
+    // still too large. The buffer takes the file's size at once; a pipe or a
+    // device reports none.
+    let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
     file.by_ref()
         .take(ACCESS_TOKEN_FILE_MAX + 1)
         .read_to_end(&mut bytes)
@@ -94,13 +102,14 @@ pub fn read_access_token(path: &Path) -> Result<AccessToken, TokenFileError> {
     if bytes.len() % 2 != 0 {
         return Err(TokenFileError::NotUtf16);
     }
-    let units: Vec<u16> = bytes
+    let units = bytes
         .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect();
-    String::from_utf16(&units)
-        .map(AccessToken)
-        .map_err(|_| TokenFileError::NotUtf16)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+    let mut token = String::with_capacity(bytes.len() / 2);
+    for c in char::decode_utf16(units) {
+        token.push(c.map_err(|_| TokenFileError::NotUtf16)?);
+    }
+    Ok(AccessToken(token))
 }
 
 /// Stands in for the credential provider of a method that needs one: it
@@ -143,10 +152,21 @@ impl EntraIdTokenFactory for TokenRequest {
 /// Token files for tests.
 #[cfg(test)]
 pub(crate) mod testing {
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    /// A new path in the temporary directory, for a file of `kind`.
+    fn temp_path(kind: &str) -> PathBuf {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        std::env::temp_dir().join(format!(
+            "mssql-sqlcmd-{kind}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ))
+    }
+
     /// A file in the temporary directory, removed when dropped.
-    pub(crate) struct TempFile(pub(crate) std::path::PathBuf);
+    pub(crate) struct TempFile(pub(crate) PathBuf);
 
     impl Drop for TempFile {
         fn drop(&mut self) {
@@ -156,14 +176,61 @@ pub(crate) mod testing {
 
     /// A new temporary file holding `bytes`.
     pub(crate) fn file_with(bytes: &[u8]) -> TempFile {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "mssql-sqlcmd-token-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::SeqCst)
-        ));
+        let path = temp_path("token");
         std::fs::write(&path, bytes).unwrap();
         TempFile(path)
+    }
+
+    /// An empty directory in the temporary directory, removed when dropped.
+    pub(crate) struct TempDirectory(pub(crate) PathBuf);
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+
+    /// A new empty temporary directory: a path sqlcmd cannot read a token
+    /// from. Its path has no trailing separator, which Windows would report
+    /// as not found.
+    pub(crate) fn directory() -> TempDirectory {
+        let path = temp_path("token-directory");
+        std::fs::create_dir(&path).unwrap();
+        TempDirectory(path)
+    }
+
+    /// A FIFO in the temporary directory that no one writes to: a reader's
+    /// open waits for a writer. Dropped, it lets a reader still waiting go
+    /// (to an empty read) and is removed.
+    #[cfg(unix)]
+    pub(crate) struct Fifo(pub(crate) PathBuf);
+
+    #[cfg(unix)]
+    impl Fifo {
+        pub(crate) fn new() -> Self {
+            use std::os::unix::ffi::OsStrExt;
+            let path = temp_path("token-fifo");
+            let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `c_path` is a valid NUL-terminated path.
+            let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+            assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+            Fifo(path)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Fifo {
+        fn drop(&mut self) {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Without blocking: with no reader waiting this just fails.
+            drop(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&self.0),
+            );
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
 
     /// `text` as UTF-16LE bytes, the form sqlcmd's token files take.
@@ -174,7 +241,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{file_with, utf16le};
+    use super::testing::{directory, file_with, utf16le};
     use super::*;
 
     #[test]
@@ -219,6 +286,23 @@ mod tests {
         // As large as sqlcmd reads is not too large.
         let largest = file_with(&vec![0x41; max]);
         assert!(read_access_token(&largest.0).is_ok());
+        // A directory is not a file to read.
+        let directory = directory();
+        assert_eq!(
+            read_access_token(&directory.0).unwrap_err().code(),
+            "accessTokenFileUnreadable"
+        );
+    }
+
+    /// A device or a pipe reports no size, so the size check passes it: what
+    /// it gives is still read only up to one byte more than sqlcmd reads.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_with_no_size_is_still_read_only_up_to_the_limit() {
+        match read_access_token(Path::new("/dev/zero")) {
+            Err(TokenFileError::TooLarge(read)) => assert_eq!(read, ACCESS_TOKEN_FILE_MAX + 1),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[tokio::test]

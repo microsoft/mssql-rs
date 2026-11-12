@@ -3046,6 +3046,21 @@
           "expr": "skip"
         }
       ]
+    },
+    {
+      "id": "diagnose.finding.access_token_file_time_limit",
+      "message": "The access token file given with -P was not read within the {seconds} s time limit.",
+      "translation": "The access token file given with -P was not read within the {seconds} s time limit.",
+      "placeholders": [
+        {
+          "id": "seconds",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "seconds"
+        }
+      ]
     }
   ]
 }

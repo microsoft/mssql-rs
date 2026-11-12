@@ -36,14 +36,19 @@ as the token: a file that is missing (`accessTokenFileNotFound`), cannot be
 read (`accessTokenFileUnreadable`), is too large (`accessTokenFileTooLarge`)
 or is not UTF-16LE text (`accessTokenFileNotUtf16`), the form in which sqlcmd
 passes the token to the driver, is `diagnosed` with
-`client.inputConfiguration`, and the file is not named. The server's rejection
-of an Entra login is `diagnosed` with `security.authentication.entra` and
-`"entraStage": "serverRejection"`. diagnose does not acquire Entra tokens yet:
-with `ActiveDirectoryPassword` the client goes as far as the server's request
-for a token, after pre-login and TLS; the connection attempt is then `skipped`
-(`notSupported`), with an informational finding that the server asked for a
-token, the authentication outcome is `notEvaluated`, and the run is
-`partial`. No token, password or authority the server names is reported.
+`client.inputConfiguration`, and the file is not named. The file is read on a
+thread of its own within the time limit (`-l`), which connection input then
+reports as its `deadlineMs`, its `durationMs` counting the read: a file not
+read in time, such as a pipe no one writes to, is `inconclusive`
+(`accessTokenFileTimedOut`), and a cancel is seen during the read. The
+server's rejection of an Entra login is `diagnosed` with
+`security.authentication.entra` and `"entraStage": "serverRejection"`.
+diagnose does not acquire Entra tokens yet: with `ActiveDirectoryPassword` the
+client goes as far as the server's request for a token, after pre-login and
+TLS; the connection attempt is then `skipped` (`notSupported`), with an
+informational finding that the server asked for a token, the authentication
+outcome is `notEvaluated`, and the run is `partial`. No token, password or
+authority the server names is reported.
 
 With `-D` (Linux and macOS; sqlcmd on Windows treats `-D` as obsolete), `-S`
 names an ODBC data source (DSN). Native sqlcmd reads the DSN from the user and
