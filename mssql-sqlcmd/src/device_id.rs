@@ -55,19 +55,16 @@ pub fn get_or_create_in(store: &dyn Store, generate: impl FnOnce() -> String) ->
 /// A leading byte order mark and surrounding whitespace are ignored.
 pub fn normalize(text: &str) -> Option<String> {
     let text = text.trim_start_matches('\u{feff}').trim();
-    if text.len() != 36 {
-        return None;
-    }
-    for (index, byte) in text.bytes().enumerate() {
-        let ok = match index {
+    is_hyphenated_guid(text).then(|| text.to_ascii_lowercase())
+}
+
+/// Whether `text`, as it is, is a `8-4-4-4-12` hexadecimal GUID.
+pub(crate) fn is_hyphenated_guid(text: &str) -> bool {
+    text.len() == 36
+        && text.bytes().enumerate().all(|(index, byte)| match index {
             8 | 13 | 18 | 23 => byte == b'-',
             _ => byte.is_ascii_hexdigit(),
-        };
-        if !ok {
-            return None;
-        }
-    }
-    Some(text.to_ascii_lowercase())
+        })
 }
 
 /// The ID in a file, as on macOS and Linux.
@@ -118,23 +115,30 @@ impl Store for FileStore {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
         std::fs::create_dir_all(parent)?;
-        let staged = parent.join(format!(
+        let staged = StagedFile(parent.join(format!(
             ".deviceid.{}.{}.tmp",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
-        ));
-        // A failed write (a full disk) must not leave the staged file behind.
-        if let Err(error) = std::fs::write(&staged, id) {
-            let _ = std::fs::remove_file(&staged);
-            return Err(error);
-        }
-        let linked = std::fs::hard_link(&staged, &self.path);
-        let _ = std::fs::remove_file(&staged);
+        )));
+        std::fs::write(&staged.0, id)?;
+        let linked = std::fs::hard_link(&staged.0, &self.path);
+        // Gone before the winner's file is read below.
+        drop(staged);
         match linked {
             Ok(()) => Ok(id.to_owned()),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => self.read()?.ok_or(error),
             Err(error) => Err(error),
         }
+    }
+}
+
+/// A staged ID file, removed however `create_if_absent` exits: a failed write
+/// (a full disk) or link as well as a success.
+struct StagedFile(std::path::PathBuf);
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -802,8 +806,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A create that fails does not leave its staged file in the ID directory.
-    /// (Here it fails at the link; a failed write takes the same cleanup.)
+    /// The staged file goes whenever the guard does, which is what a failed
+    /// write (not reproducible here) relies on.
+    #[test]
+    fn a_staged_file_is_removed_when_its_guard_drops() {
+        let path =
+            std::env::temp_dir().join(format!("sqlcmd-deviceid-guard-{}", std::process::id()));
+        std::fs::write(&path, ID).expect("write");
+        drop(StagedFile(path.clone()));
+        assert!(!path.exists());
+    }
+
+    /// A create that fails does not leave its staged file in the ID directory:
+    /// here it fails at the link.
     #[test]
     fn a_failed_create_leaves_no_staged_file() {
         let dir =

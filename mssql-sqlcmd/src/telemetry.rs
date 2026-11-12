@@ -442,20 +442,24 @@ impl HttpClient for ValidationClient {
 /// checks neither, so a mistyped key or endpoint would otherwise enable
 /// collection (the device ID, the server query) that can never be delivered.
 fn connection_string_is_valid(connection_string: &str) -> bool {
-    // Before the exporter parses it: for an endpoint it cannot build a URL from
-    // (`https:///path`) it panics, and a panic message would reach stderr.
+    // Before the exporter parses it: a bare authority (`localhost`, or
+    // `https://`, which loses its trailing `/` and becomes `https:`) parses as a
+    // URI with no scheme, and the exporter then panics appending `/v2/track`;
+    // the panic message would reach stderr. The `localhost` and `https://` rows
+    // of the invalid-configuration test pin this order.
     let fields = connection_string_fields(connection_string);
     fields
         .get("instrumentationkey")
-        .is_some_and(|key| is_guid(key))
+        .is_some_and(|key| device_id::is_hyphenated_guid(key))
         && ingestion_endpoint_is_usable(&fields)
         && Exporter::new_from_connection_string(connection_string, ValidationClient).is_ok()
 }
 
 /// The fields the way the exporter reads them, so what is checked is what is
-/// used: names are case-insensitive, nothing is trimmed, and when a name repeats
-/// the last one wins. A part that is not a `name=value` is skipped here; the
-/// exporter rejects the whole string for it afterwards.
+/// used: names are folded with `str::to_lowercase` as the exporter does, nothing
+/// is trimmed, and when a name repeats the last one wins. A part that is not a
+/// `name=value` is skipped here; the exporter rejects the whole string for it
+/// afterwards.
 fn connection_string_fields(connection_string: &str) -> HashMap<String, &str> {
     connection_string
         .split(';')
@@ -464,20 +468,13 @@ fn connection_string_fields(connection_string: &str) -> HashMap<String, &str> {
         .collect()
 }
 
-fn is_guid(text: &str) -> bool {
-    let groups: Vec<&str> = text.split('-').collect();
-    groups.len() == 5
-        && groups
-            .iter()
-            .zip([8, 4, 4, 4, 12])
-            .all(|(group, len)| group.len() == len && group.bytes().all(|b| b.is_ascii_hexdigit()))
-}
-
-/// The endpoint the exporter would send to (as it builds it: `http://` becomes
-/// `https://`, a trailing `/` goes, and `EndpointSuffix` with an optional
-/// `Location` stands in for a missing `IngestionEndpoint`) must be an HTTPS URL
-/// with a host. The exporter accepts a bare word or another scheme, which only
-/// fails when the event is sent.
+/// The endpoint the exporter would send to (as it builds it: a lowercase
+/// `http://` becomes `https://`, a trailing `/` goes, and `EndpointSuffix` with
+/// an optional `Location` stands in for a missing `IngestionEndpoint`) must be
+/// an HTTPS URL with a host, and the exporter's request URL (`v2/track`
+/// appended, which it `expect`s to parse) must parse. The exporter accepts
+/// another scheme, which only fails when the event is sent, and panics on a
+/// bare host.
 fn ingestion_endpoint_is_usable(fields: &HashMap<String, &str>) -> bool {
     let endpoint = if let Some(endpoint) = fields.get("ingestionendpoint") {
         (*endpoint).to_owned()
@@ -495,12 +492,19 @@ fn ingestion_endpoint_is_usable(fields: &HashMap<String, &str>) -> bool {
     if !endpoint.starts_with("https://") {
         endpoint = endpoint.replace("http://", "https://");
     }
-    endpoint
-        .trim_end_matches('/')
-        .parse::<http::Uri>()
-        .is_ok_and(|uri| {
-            uri.scheme_str() == Some("https") && uri.host().is_some_and(|host| !host.is_empty())
-        })
+    let Ok(uri) = endpoint.trim_end_matches('/').parse::<http::Uri>() else {
+        return false;
+    };
+    // What the exporter's `append_v2_track` builds and `expect`s to parse; a
+    // URI near `http`'s length limit parses but not with the path appended.
+    let mut track = uri.to_string();
+    if !track.ends_with('/') {
+        track.push('/');
+    }
+    track.push_str("v2/track");
+    uri.scheme_str() == Some("https")
+        && uri.host().is_some_and(|host| !host.is_empty())
+        && track.parse::<http::Uri>().is_ok()
 }
 
 /// The destination this run would send to, and only if the exporter accepts it.
@@ -527,11 +531,24 @@ fn destination_from(
     connection_string_is_valid(&candidate).then_some(candidate)
 }
 
-/// Whether this run reports telemetry: not opted out, and a valid destination
-/// exists. Everything with a side effect (the device ID, the server query) waits
-/// for this, so an invalid configuration is a no-op.
+/// Whether this run reports telemetry: not opted out, a valid destination
+/// exists, and the transport can run. Everything with a side effect (the device
+/// ID, the server query) waits for this, so an invalid configuration, or a host
+/// that cannot send, is a no-op.
 pub fn enabled() -> bool {
-    !opted_out() && destination().is_some()
+    !opted_out() && destination().is_some() && transport_available()
+}
+
+/// The HTTP client needs OpenSSL on 64-bit Linux. Checked without the report
+/// `openssl_runtime` writes, so telemetry adds no output of its own, and after
+/// the destination, so that a run with telemetry off never loads it. Tests send
+/// through their own client.
+fn transport_available() -> bool {
+    #[cfg(all(not(test), target_pointer_width = "64", target_os = "linux"))]
+    if !crate::openssl_runtime::is_available() {
+        return false;
+    }
+    true
 }
 
 fn os_value() -> &'static str {
@@ -760,14 +777,6 @@ fn production_provider(
         .clone()
     {
         return provider_with_client(connection_string, AbiTestClient(client));
-    }
-
-    // The native-TLS client below loads OpenSSL, and `openssl_runtime` reports
-    // a missing one on stderr. Telemetry must add no output of its own, so it
-    // does not try to send without OpenSSL.
-    #[cfg(all(target_pointer_width = "64", target_os = "linux"))]
-    if !crate::openssl_runtime::is_available() {
-        return Err("OpenSSL is not available".into());
     }
 
     let client = reqwest::blocking::Client::builder()
@@ -1189,10 +1198,15 @@ mod tests {
             "InstrumentationKey=00000000-0000-0000-0000-00000000000g",
             // The exporter uses the last key and does not trim it.
             "InstrumentationKey=00000000-0000-0000-0000-000000000000;InstrumentationKey=broken",
+            // `str::to_lowercase` folds U+212A (Kelvin sign) to `k`, so the
+            // exporter reads this as a second InstrumentationKey, the last.
+            "InstrumentationKey=00000000-0000-0000-0000-000000000000;Instrumentation\u{212A}ey=broken",
             "InstrumentationKey= 00000000-0000-0000-0000-000000000000",
             "InstrumentationKey=00000000-0000-0000-0000-000000000000 ",
             "IngestionEndpoint=https://example.invalid/",
-            // A valid key with an endpoint that can never be reached.
+            // A valid key with an endpoint that can never be reached. The
+            // `localhost` and `https://` rows panic in the exporter if it parses
+            // them first, so they pin the order of the checks.
             "InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=localhost",
             "InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=ftp://example.test",
             "InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=https://",
@@ -1217,6 +1231,19 @@ mod tests {
             assert_eq!(shutdown(Duration::from_secs(1)), FlushOutcome::Completed);
             assert!(requests.try_recv().is_err());
         }
+    }
+
+    /// The endpoint is checked as the exporter will use it, with `v2/track`
+    /// appended: one near the length limit of a URI parses alone and not then,
+    /// and the exporter panics on it. Called directly: an environment value this
+    /// long does not fit on Windows.
+    #[test]
+    fn an_endpoint_too_long_for_the_request_url_is_invalid() {
+        const KEY: &str = "InstrumentationKey=00000000-0000-0000-0000-000000000000";
+        let too_long = format!("{KEY};IngestionEndpoint=https://{}", "a".repeat(65_520));
+        assert!(!connection_string_is_valid(&too_long));
+        let fits = format!("{KEY};IngestionEndpoint=https://{}", "a".repeat(1_000));
+        assert!(connection_string_is_valid(&fits));
     }
 
     #[test]

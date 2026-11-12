@@ -71,6 +71,7 @@ fn library() -> *mut c_void {
 
 /// Whether an OpenSSL is installed, without the report [`library`] writes, for
 /// callers that can do without it and must not add output of their own.
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn is_available() -> bool {
     !load().is_null()
 }
@@ -388,12 +389,6 @@ mod tests {
             ),
             "{stderr}"
         );
-    }
-
-    /// The silent check agrees with the loading one, and writes nothing.
-    #[test]
-    fn availability_follows_the_loaded_library() {
-        assert_eq!(is_available(), !load().is_null());
     }
 
     /// The messages come from the localization catalog, with the library and

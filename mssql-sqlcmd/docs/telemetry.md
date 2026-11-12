@@ -16,7 +16,7 @@ below are done.
 | Setting | Effect |
 |---|---|
 | `SQLCMD_TELEMETRY_OPTOUT=1` (or `true`, `yes`) | No event, no server query, and the device ID is neither read nor created. |
-| `SQLCMD_TELEMETRY_CONNECTION_STRING` | The Application Insights connection string. Overrides the built-in one, which is used only when the variable is absent. A variable that is set to an empty, invalid (including an instrumentation key that is not a GUID, or an ingestion endpoint that is not an HTTPS URL with a host) or non-text value turns telemetry off; it does not fall back to the built-in one, and nothing else (the device ID, the server query) runs. |
+| `SQLCMD_TELEMETRY_CONNECTION_STRING` | The Application Insights connection string. Overrides the built-in one, which is used only when the variable is absent. A variable that is set to an empty, invalid (including an instrumentation key that is not a GUID, or an ingestion endpoint that is not an HTTPS URL with a host once a lowercase `http://` is rewritten to `https://`, as the exporter does) or non-text value turns telemetry off; it does not fall back to the built-in one, and nothing else (the device ID, the server query) runs. |
 | `SQLCMD_TELEMETRY_CONNECTION_STRING_DEFAULT` (build time) | A connection string compiled into the library. Without it, and without the variable, telemetry is off. |
 | `SQLCMD_CALLER_TYPE` | The caller declares itself: `human`, `agent`, `pipeline` or `other_automation`. Not a telemetry switch; it only sets the caller category. |
 
@@ -152,11 +152,11 @@ is set to an absolute path (it works without `HOME`, for services and
 containers), else `~/.cache/Microsoft/DeveloperTools/deviceid`. The file is read
 only if it is a regular file of at most 256 bytes; anything else at that path
 (a directory, a FIFO, a large file) is treated as unreadable and left alone. An
-existing
-recognized ID is reused; a missing one is generated (a random version 4 UUID)
-and stored. A value that is present but unreadable or unrecognized is never
-overwritten. If it cannot be read or stored, the property is omitted. When telemetry is off, the ID is not
-touched. Two first runs at the same moment end up with the same ID: on macOS and
+existing recognized ID is reused; a missing one is generated (a random version
+4 UUID) and stored. A value that is present but unreadable or unrecognized is
+never overwritten. If it cannot be read or stored, the property is omitted.
+When telemetry is off, the ID is not touched. Two first runs at the same moment
+end up with the same ID: on macOS and
 Linux the ID is written to a file of its own and linked into place, which fails
 if the ID file exists, and the loser reads the winner's; on Windows first runs
 take a named mutex that spans all of the user's logon sessions (`Global\` plus
@@ -199,16 +199,18 @@ handlers do not flush: an event for a run ended by a signal is lost.
 
 On 64-bit Linux the HTTP client needs OpenSSL, which `openssl_runtime` loads on
 first use and reports on stderr when it is missing. Telemetry checks for it
-silently first, and without OpenSSL it sends nothing and prints nothing; only a
-TLS connection the user asked for reports the missing library.
+silently, after the destination, so without OpenSSL telemetry is off: no device
+ID, no server query, nothing sent or printed. Only a TLS connection the user
+asked for reports the missing library.
 
 The event is exported at once by its own thread, using a simple exporter: the
 event is sent on that thread, inside the call that ends the span, and the
 provider is then shut down, so nothing waits on a batch timer in a long
 interactive session. A transport failure, a failure in the filter, a response
 that does not match what was sent, and a rejection by the service (any status
-other than 200, such as a 204 or a 4xx or 5xx, or a partial response that
-rejected the event) are all recorded as a failure, because the SDK's shutdown does not hand the export result back. The
+but a 200 or a fully accepted 206: a 204, a 4xx or 5xx, or a 206 that rejected
+the event) are all recorded as a failure, because the SDK's shutdown does not
+hand the export result back. The
 exporter retries throttling, server errors and every error the HTTP client
 returns: a transport failure and, because the filter reports through the same
 error, a filter failure or a response that does not add up. It backs off for up
