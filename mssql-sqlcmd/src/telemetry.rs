@@ -563,12 +563,16 @@ pub fn enabled() -> bool {
 /// The HTTP client needs OpenSSL on 64-bit Linux. Checked without the report
 /// `openssl_runtime` writes, so telemetry adds no output of its own, and after
 /// the destination, so that a run with telemetry off never loads it. Tests send
-/// through their own client, and `TRANSPORT_MISSING` stands in for a host
-/// without OpenSSL.
+/// through their own client; `TRANSPORT_MISSING` stands in for a host without
+/// OpenSSL and `TRANSPORT_CHECKS` counts the calls, so a test can see that a run
+/// with telemetry off never gets here.
 fn transport_available() -> bool {
     #[cfg(test)]
-    if TRANSPORT_MISSING.load(Ordering::Acquire) {
-        return false;
+    {
+        TRANSPORT_CHECKS.fetch_add(1, Ordering::AcqRel);
+        if TRANSPORT_MISSING.load(Ordering::Acquire) {
+            return false;
+        }
     }
     #[cfg(all(not(test), target_pointer_width = "64", target_os = "linux"))]
     if !crate::openssl_runtime::is_available() {
@@ -579,6 +583,9 @@ fn transport_available() -> bool {
 
 #[cfg(test)]
 static TRANSPORT_MISSING: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+static TRANSPORT_CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn os_value() -> &'static str {
     match std::env::consts::OS {
@@ -1128,24 +1135,14 @@ mod tests {
     fn opt_out_and_a_missing_destination_send_nothing_and_read_no_device_id() {
         for (connection_string, opt_out) in [(Some(TEST_CONNECTION_STRING), true), (None, false)] {
             let guard = TestEnv::new(connection_string);
-            let requests = guard.capture_requests();
             if opt_out {
                 // SAFETY: serialized by the test environment lock.
                 unsafe { std::env::set_var(OPTOUT_ENV, "1") };
             }
             // Unit tests have no built-in destination (see
             // BUILT_IN_CONNECTION_STRING), so with no variable it is off.
-            assert!(!enabled());
-            record_usage(Invocation {
-                version: Some("18.5"),
-                command: Command::Diagnose,
-                format: FormatUse::Json,
-            });
-            record_server_info(&server_info_fixture().parsed);
-            assert!(SESSION.lock().expect("session lock").is_none());
-            assert_eq!(shutdown(Duration::from_secs(1)), FlushOutcome::Completed);
-            assert!(requests.try_recv().is_err());
-            assert_eq!(DEVICE_ID_READS.load(Ordering::Acquire), 0);
+            guard.assert_run_is_a_no_op(&format!("opt_out={opt_out}"));
+            assert_eq!(TRANSPORT_CHECKS.load(Ordering::Acquire), 0);
         }
     }
 
@@ -1265,18 +1262,10 @@ mod tests {
             "   ",
         ] {
             let guard = TestEnv::new(Some(invalid));
-            let requests = guard.capture_requests();
-            assert!(!enabled(), "{invalid:?}");
-            record_usage(Invocation {
-                version: Some("18.5"),
-                command: Command::Diagnose,
-                format: FormatUse::Json,
-            });
-            record_server_info(&server_info_fixture().parsed);
-            assert!(SESSION.lock().expect("session lock").is_none());
-            assert_eq!(DEVICE_ID_READS.load(Ordering::Acquire), 0, "{invalid:?}");
-            assert_eq!(shutdown(Duration::from_secs(1)), FlushOutcome::Completed);
-            assert!(requests.try_recv().is_err());
+            guard.assert_run_is_a_no_op(&format!("{invalid:?}"));
+            // Off before the transport: a run with telemetry off never loads
+            // OpenSSL, so moving the check ahead of the destination fails this.
+            assert_eq!(TRANSPORT_CHECKS.load(Ordering::Acquire), 0, "{invalid:?}");
         }
     }
 
@@ -1299,19 +1288,10 @@ mod tests {
     #[test]
     fn a_host_that_cannot_send_is_a_no_op_with_no_side_effects() {
         let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
-        let requests = guard.capture_requests();
         TRANSPORT_MISSING.store(true, Ordering::Release);
-        assert!(!enabled());
-        record_usage(Invocation {
-            version: Some("18.5"),
-            command: Command::Diagnose,
-            format: FormatUse::Json,
-        });
-        record_server_info(&server_info_fixture().parsed);
-        assert!(SESSION.lock().expect("session lock").is_none());
-        assert_eq!(DEVICE_ID_READS.load(Ordering::Acquire), 0);
-        assert_eq!(shutdown(Duration::from_secs(1)), FlushOutcome::Completed);
-        assert!(requests.try_recv().is_err());
+        guard.assert_run_is_a_no_op("no transport");
+        // The destination is valid here, so the transport is what was asked.
+        assert!(TRANSPORT_CHECKS.load(Ordering::Acquire) > 0);
     }
 
     #[test]
@@ -1699,6 +1679,7 @@ mod tests {
             SHUTDOWN_STARTED.store(false, Ordering::Release);
             DEVICE_ID_READS.store(0, Ordering::Release);
             TRANSPORT_MISSING.store(false, Ordering::Release);
+            TRANSPORT_CHECKS.store(0, Ordering::Release);
             *ABI_TEST_DELAY.lock().expect("delay lock") = Duration::ZERO;
             *ABI_TEST_RESPONSE.lock().expect("response lock") = (200, "");
             Self { _lock: lock }
@@ -1714,6 +1695,28 @@ mod tests {
         /// What the service answers with, for the next requests.
         fn respond_with(&self, status: u16, body: &'static str) {
             *ABI_TEST_RESPONSE.lock().expect("response lock") = (status, body);
+        }
+
+        /// A run with telemetry off records nothing, reads no device ID and
+        /// sends nothing, so shutdown has nothing to wait for. One definition of
+        /// that contract: a side effect added to it later is asserted here once.
+        fn assert_run_is_a_no_op(&self, case: &str) {
+            let requests = self.capture_requests();
+            assert!(!enabled(), "{case}");
+            record_usage(Invocation {
+                version: Some("18.5"),
+                command: Command::Diagnose,
+                format: FormatUse::Json,
+            });
+            record_server_info(&server_info_fixture().parsed);
+            assert!(SESSION.lock().expect("session lock").is_none(), "{case}");
+            assert_eq!(DEVICE_ID_READS.load(Ordering::Acquire), 0, "{case}");
+            assert_eq!(
+                shutdown(Duration::from_secs(1)),
+                FlushOutcome::Completed,
+                "{case}"
+            );
+            assert!(requests.try_recv().is_err(), "{case}");
         }
     }
 
