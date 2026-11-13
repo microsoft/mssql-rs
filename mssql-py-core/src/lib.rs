@@ -10,6 +10,8 @@ mod arrow_bulkcopy;
 mod async_connection;
 mod async_cursor;
 mod async_description;
+mod async_entra_credentials;
+mod async_entra_token_factory;
 mod async_errors;
 mod async_execute;
 mod async_fetch;
@@ -132,6 +134,10 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Python tests. Underscore-prefixed to mark as internal/test-only.
     m.add_function(wrap_pyfunction!(
         python_entra_token_factory::invoke_entra_id_token_factory,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        async_entra_token_factory::_invoke_async_entra_id_token_factory,
         m
     )?)?;
     #[cfg(debug_assertions)]

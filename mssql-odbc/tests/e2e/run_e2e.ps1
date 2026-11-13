@@ -15,11 +15,14 @@
 # Requires: Administrator privileges (writes to HKLM).
 # Usage: .\run_e2e.ps1 [-Release] [-Retries N] [-Coverage] [-CoverageOutput PATH]
 #                      [-CompareWithMsodbcsql] [-MsodbcsqlDll PATH]
-#                      [-FilterTests REGEX] [-MtProfile pr|nightly|weekly]
+#                      [-FilterTests REGEX] [-MtProfile pr|weekly]
 #                      [-MtDumpDir PATH]
-#                      [-BuildJobs N] [-BuildOnly -OutDir PATH | -SkipBuild]
+#                      [-BuildJobs N] [-TestJobs N]
+#                      [-BuildOnly -OutDir PATH | -SkipBuild]
 #
 # -BuildJobs bounds parallel C++ build processes (default: 1).
+# -TestJobs bounds parallel CTest entries per driver leg (default: 1).
+# The driver legs remain sequential; CTest enforces shared-resource exclusions.
 # -BuildOnly -OutDir PATH stages a relocatable build/ drop without running tests
 # or registering drivers. Download its contents into this directory and run
 # -SkipBuild to reuse the driver and tests without Cargo or a C++ compiler.
@@ -27,15 +30,16 @@
 # -MtProfile selects how the ODBC_TEST_F concurrent variants run (ctest
 # registers them as a separate <name>_mt entry per converted executable), as in
 # run_e2e.sh --mt-profile:
-#   pr       (default) every ctest entry; concurrent variants in /SharedDbc only,
-#            at the harness default of 2 threads x 1 iteration. The other modes
-#            cost more PR time than they catch at that size.
-#   nightly  only the <name>_mt entries, 8 x 20, every mode.
-#   weekly   only the <name>_mt entries, 16 x 50, every mode.
-# nightly and weekly ignore -Retries (an intermittent failure is what they look
-# for) and leave evidence in -MtDumpDir (default build\mt-dumps): a minidump from
+#   pr       (default) every ctest entry except those labelled mt_weekly;
+#            concurrent variants in /SharedDbc only, at the harness default of
+#            2 threads x 1 iteration. The other modes cost more PR time than
+#            they catch at that size.
+#   weekly   only the <name>_mt entries, 16 x 25, every mode; the only profile
+#            that runs mt_weekly entries.
+# weekly ignores -Retries (an intermittent failure is what it looks for) and
+# leaves evidence in -MtDumpDir (default build\mt-dumps): a minidump from
 # the watchdog for a hang, and from the test process itself for a crash or
-# abort(). Crashes end the process there because these profiles set
+# abort(). Crashes end the process there because the profile sets
 # GTEST_CATCH_EXCEPTIONS=0. With
 # -CompareWithMsodbcsql the msodbcsql leg runs at 2 x 1: it checks that the tests
 # suit the modes, not msodbcsql's thread safety. Unlike on unixODBC, /SharedStmt
@@ -89,11 +93,13 @@ param(
     # driver gaps tracked in AB#46973 (get_type_info_test, driver_connect_test) are
     # fixed, so the full suite runs on Windows. Pass -ExcludeTests '<regex>' to skip.
     [string]$ExcludeTests = '',
-    [ValidateSet('pr', 'nightly', 'weekly')]
+    [ValidateSet('pr', 'weekly')]
     [string]$MtProfile = 'pr',
     [string]$MtDumpDir = '',
     [ValidateRange(1, 64)]
     [int]$BuildJobs = 1,
+    [ValidateRange(1, 64)]
+    [int]$TestJobs = 1,
     [switch]$BuildOnly,
     [string]$OutDir = '',
     [switch]$SkipBuild
@@ -366,9 +372,8 @@ function Set-MtProfile {
         $env:MSSQL_ODBC_MT_SKIP_MODES = 'CrossThread,SharedEnv,SharedStmt'
     }
     if ($script:MtStress) {
-        $threads, $iters = if ($MtProfile -eq 'nightly') { 8, 20 } else { 16, 50 }
-        if (-not $env:MSSQL_ODBC_MT_THREADS) { $env:MSSQL_ODBC_MT_THREADS = "$threads" }
-        if (-not $env:MSSQL_ODBC_MT_ITERS) { $env:MSSQL_ODBC_MT_ITERS = "$iters" }
+        if (-not $env:MSSQL_ODBC_MT_THREADS) { $env:MSSQL_ODBC_MT_THREADS = '16' }
+        if (-not $env:MSSQL_ODBC_MT_ITERS) { $env:MSSQL_ODBC_MT_ITERS = '25' }
         if (-not $script:MtDumpDir) { $script:MtDumpDir = Join-Path $ScriptDir 'build\mt-dumps' }
         New-Item -ItemType Directory -Force -Path $script:MtDumpDir | Out-Null
         $script:MtDumpDir = (Resolve-Path $script:MtDumpDir).Path
@@ -396,8 +401,9 @@ function Restore-MtProfile {
 
 # A minidump names no binaries, so once the agent is gone it cannot be read
 # without the exact builds that produced it. When a stress run left dumps, copy
-# the Rust driver and every <name>_mt executable, each with its PDB, into
-# <dump dir>\symbols (msodbcsql's symbols come from the public symbol server).
+# the Rust driver and every executable an <name>_mt entry runs, each with its
+# PDB, into <dump dir>\symbols (msodbcsql's symbols come from the public symbol
+# server).
 function Save-MtSymbols([string]$DriverDll) {
     if (-not $script:MtStress -or -not (Test-Path $script:MtDumpDir)) { return }
     if (-not (Get-ChildItem -Path $script:MtDumpDir -Filter '*.dmp' -File -ErrorAction SilentlyContinue)) { return }
@@ -409,13 +415,14 @@ function Save-MtSymbols([string]$DriverDll) {
     if (Test-Path $buildDir) {
         Push-Location $buildDir
         try {
-            $entries = ctest -N -L mt -C Debug 2>$null | Select-String 'Test\s+#\d+:\s+(\S+)_mt\s*$'
+            # Take each executable from its CTest command: several entries can
+            # share one binary whose name differs from the test name.
+            $tests = (ctest --show-only=json-v1 -L mt -C Debug 2>$null | Out-String | ConvertFrom-Json).tests
         } finally {
             Pop-Location
         }
-        foreach ($entry in $entries) {
-            $binaries += Join-Path $buildDir "Debug\$($entry.Matches[0].Groups[1].Value).exe"
-        }
+        $binaries += @($tests | Where-Object { $_.command } | ForEach-Object { $_.command[0] }) |
+            Select-Object -Unique
     }
     foreach ($binary in $binaries) {
         foreach ($file in @($binary, [IO.Path]::ChangeExtension($binary, '.pdb'))) {
@@ -445,14 +452,18 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
         Write-Host "Leg environment: $(($LegEnv.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ')"
     }
     try {
-        $ctestArgs = @('--output-on-failure', '-C', 'Debug', '--output-junit', $JunitName)
+        $ctestArgs = @('--output-on-failure', '-C', 'Debug', '--parallel', "$TestJobs",
+                       '--output-junit', $JunitName)
         if ($script:MtStress) {
             # The watchdog ends a hung phase after MSSQL_ODBC_MT_TIMEOUT_SECONDS;
             # this only bounds an entry whose many phases all progress slowly.
-            $ctestArgs += @('-L', 'mt', '--timeout', '3600')
+            $ctestArgs += @('-L', 'mt', '--timeout', '10800')
             # Set-MtProfile created it, but a dump directory inside build\ is gone
             # if Remove-IncompatibleCMakeBuildTree deleted the tree since.
             New-Item -ItemType Directory -Force -Path $script:MtDumpDir | Out-Null
+        }
+        if ($MtProfile -ne 'weekly') {
+            $ctestArgs += @('-LE', 'mt_weekly')
         }
         if ($FilterTests) {
             $ctestArgs += @('-R', $FilterTests)
@@ -845,9 +856,13 @@ try {
         Push-Location $OdbcCrateDir
         try {
             if ($Release) {
-                Invoke-Checked "cargo build --release" { cargo build --release }
+                Invoke-Checked "cargo build --release --features e2e-test-client-code-page" {
+                    cargo build --release --features e2e-test-client-code-page
+                }
             } else {
-                Invoke-Checked "cargo build" { cargo build }
+                Invoke-Checked "cargo build --features e2e-test-client-code-page" {
+                    cargo build --features e2e-test-client-code-page
+                }
             }
         } finally {
             Pop-Location

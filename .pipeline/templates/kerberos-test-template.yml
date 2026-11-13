@@ -303,7 +303,7 @@ jobs:
         workingDirectory: '$(Build.SourcesDirectory)'
         env:
           KERBEROS_TEST: '1'
-          USE_ARCHIVE: '${{ parameters.useArchive }}'
+          USE_ARCHIVE: '${{ lower(parameters.useArchive) }}'
 
       # Publish test results for each profile
       - ${{ each profile in parameters.profiles }}:

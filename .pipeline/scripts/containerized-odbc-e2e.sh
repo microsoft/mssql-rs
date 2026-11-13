@@ -11,6 +11,7 @@
 #
 # Connection details are passed via ODBC_TEST_* env vars by the caller.
 # ODBC_E2E_RETRIES controls the ctest until-pass retry count (default 3).
+# ODBC_E2E_TEST_JOBS bounds parallel ctest entries per driver leg (default 1).
 # ODBC_E2E_COVERAGE=1 builds the driver instrumented and emits a Cobertura
 # report (x64 Linux PR builds only).
 # ODBC_E2E_COMPARE=1 additionally installs the Microsoft ODBC Driver 18 and
@@ -58,4 +59,5 @@ case "$(printf '%s' "${ODBC_E2E_COVERAGE:-0}" | tr '[:upper:]' '[:lower:]')" in
 esac
 
 exec /workspace/mssql-odbc/tests/e2e/run_e2e.sh --retries="${ODBC_E2E_RETRIES:-3}" \
+    --test-jobs="${ODBC_E2E_TEST_JOBS:-1}" \
     "${coverage_args[@]}" "${compare_args[@]}"

@@ -1157,3 +1157,133 @@ pub(crate) mod byte_stream {
         )
     }
 }
+
+/// Parses a DATACLASSIFICATION payload, the bytes after the `0xA3` token id,
+/// from memory at `version`.
+///
+/// With `resident`, the reader hands out runs of bytes it already holds, as
+/// the network reader does inside a received packet. Without it every value is
+/// read on its own, as when a string straddles two packets, which is also how
+/// every string was read before the parser took resident runs whole. Lets a
+/// benchmark time the two paths against each other.
+pub async fn parse_data_classification(
+    bytes: &[u8],
+    version: crate::token::data_classification::DataClassificationVersion,
+    resident: bool,
+) -> TdsResult<crate::token::data_classification::DataClassificationMetadata> {
+    crate::token::parsers::data_classification_parser::DataClassificationTokenParser
+        .parse_with_version(
+            &mut InMemoryReader {
+                bytes,
+                position: 0,
+                resident,
+            },
+            version,
+        )
+        .await
+}
+
+struct InMemoryReader<'a> {
+    bytes: &'a [u8],
+    position: usize,
+    resident: bool,
+}
+
+impl InMemoryReader<'_> {
+    fn take<const N: usize>(&mut self) -> TdsResult<[u8; N]> {
+        let end = self.position + N;
+        let taken = self.bytes.get(self.position..end).ok_or_else(|| {
+            crate::error::Error::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+        })?;
+        let mut value = [0; N];
+        value.copy_from_slice(taken);
+        self.position = end;
+        Ok(value)
+    }
+
+    fn unused<T>() -> TdsResult<T> {
+        Err(crate::error::Error::ImplementationError(
+            "not read by the DATACLASSIFICATION parser".to_string(),
+        ))
+    }
+}
+
+impl crate::io::packet_reader::TdsPacketReader for InMemoryReader<'_> {
+    fn try_read_slice(&mut self, length: usize) -> Option<&[u8]> {
+        if !self.resident {
+            return None;
+        }
+        let end = self.position.checked_add(length)?;
+        let slice = self.bytes.get(self.position..end)?;
+        self.position = end;
+        Some(slice)
+    }
+
+    async fn read_byte(&mut self) -> TdsResult<u8> {
+        self.take::<1>().map(|[byte]| byte)
+    }
+    async fn read_uint16(&mut self) -> TdsResult<u16> {
+        self.take().map(u16::from_le_bytes)
+    }
+    async fn read_int32(&mut self) -> TdsResult<i32> {
+        self.take().map(i32::from_le_bytes)
+    }
+    async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
+        Self::unused()
+    }
+    async fn read_int32_big_endian(&mut self) -> TdsResult<i32> {
+        Self::unused()
+    }
+    async fn read_uint40(&mut self) -> TdsResult<u64> {
+        Self::unused()
+    }
+    async fn read_float32(&mut self) -> TdsResult<f32> {
+        Self::unused()
+    }
+    async fn read_float64(&mut self) -> TdsResult<f64> {
+        Self::unused()
+    }
+    async fn read_int16(&mut self) -> TdsResult<i16> {
+        Self::unused()
+    }
+    async fn read_uint24(&mut self) -> TdsResult<u32> {
+        Self::unused()
+    }
+    async fn read_uint32(&mut self) -> TdsResult<u32> {
+        Self::unused()
+    }
+    async fn read_int64(&mut self) -> TdsResult<i64> {
+        Self::unused()
+    }
+    async fn read_uint64(&mut self) -> TdsResult<u64> {
+        Self::unused()
+    }
+    async fn read_bytes(&mut self, _buffer: &mut [u8]) -> TdsResult<usize> {
+        Self::unused()
+    }
+    async fn read_u8_varbyte(&mut self) -> TdsResult<Vec<u8>> {
+        Self::unused()
+    }
+    async fn read_u16_varbyte(&mut self) -> TdsResult<Vec<u8>> {
+        Self::unused()
+    }
+    async fn read_varchar_u16_length(&mut self) -> TdsResult<Option<String>> {
+        Self::unused()
+    }
+    async fn read_varchar_u8_length(&mut self) -> TdsResult<String> {
+        Self::unused()
+    }
+    async fn read_unicode(&mut self, _string_length: usize) -> TdsResult<String> {
+        Self::unused()
+    }
+    async fn read_unicode_with_byte_length(&mut self, _byte_length: usize) -> TdsResult<String> {
+        Self::unused()
+    }
+    async fn skip_bytes(&mut self, _skip_count: usize) -> TdsResult<()> {
+        Self::unused()
+    }
+    async fn cancel_read_stream(&mut self) -> TdsResult<()> {
+        Self::unused()
+    }
+    fn reset_reader(&mut self) {}
+}

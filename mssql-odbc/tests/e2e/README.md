@@ -84,7 +84,8 @@ MSSQL_TDS_TRACE_LEVEL="warn,mssqlodbc=trace" ./run_e2e.sh --verbose
 ### Small-stack connection regression
 
 On POSIX platforms, `small_stack_connect_test` connects and fetches a row through
-the Driver Manager on an explicitly sized pthread. Its separate executable also
+the Driver Manager on an explicitly sized pthread, and checks that a rejected
+login reports `28000` on the same stack. Its separate executable also
 covers cold driver/TLS initialization. The native stack size of the existing
 `ODBC_TEST_F` workers is unchanged.
 
@@ -156,6 +157,24 @@ their separate reference-driver skips.
 The DBCS text-to-binary continuation regression requires an ASCII-compatible
 client encoding: its binary continuation returns wire bytes, not UTF-32LE
 converted carry.
+
+`client_code_page_test` adds four isolated client-code-page runs (1252, 65001,
+932, and 1251) for collation transcoding, narrow `SQLGetData` chunking, UTF-16
+surrogate streaming, and PLP/bound-column lengths. `run_e2e.ps1`, `run_e2e.sh`,
+and `build_e2e.sh` build the driver with the private
+`e2e-test-client-code-page` feature; release driver builds do not enable it.
+CTest sets `MSSQL_ODBC_TEST_CLIENT_CODE_PAGE` before each process starts. An
+invalid value fails `SQLAllocHandle(SQL_HANDLE_DBC)` with `HY000`, and the
+override does not change the default system-locale path when the variable is
+absent. On the msodbcsql comparison leg,
+which has no override, a run executes only on Windows when its code page matches
+`GetACP()`; the other runs skip.
+`NativeNarrowFetchTranscodesAcrossCollations` and
+`NarrowChunksFillBufferAndReassemble` build their expected bytes with the host
+iconv and skip when it cannot convert the run's code page (musl before 1.2.5, as
+on Alpine 3.18, has no `cp932`; RHEL needs `glibc-gconv-extra` for CP932 and
+CP1251). The other cases still run, so the entry passes instead of reporting
+CTest skip code 77.
 
 ### Intentional divergence: `SKIP_IF_COMPARING_MSODBCSQL()`
 
@@ -556,14 +575,18 @@ single-threaded tests and `<name>_mt` (label `mt`) the concurrent variants, so
 a concurrency failure never hides a parity verdict. Nothing to add in
 `CMakeLists.txt`; reconfigure after converting a file. Both entries pass
 `--gtest_filter`, which overrides a `GTEST_FILTER` environment variable.
+Scenarios with no single-threaded form, such as `handle_lifecycle_test`, live
+in `tests/multithreaded_tests/` and register with `add_odbc_mt_only_test`,
+which creates only the `<name>_mt` entry, labelled `mt_weekly`: only the weekly
+profile runs it.
 
 ```bash
 ctest --test-dir build -L mt                            # every concurrent variant, 2 x 1
-./run_e2e.sh --mt-profile=nightly                       # 8 x 20, only <name>_mt, gdb stacks
+./run_e2e.sh --mt-profile=weekly                        # 16 x 25, only <name>_mt, gdb stacks
 ```
 
 ```powershell
-.\run_e2e.ps1 -MtProfile weekly -CompareWithMsodbcsql   # 16 x 50, minidumps in build\mt-dumps
+.\run_e2e.ps1 -MtProfile weekly -CompareWithMsodbcsql   # 16 x 25, minidumps in build\mt-dumps
 ```
 
 ```bash
@@ -628,7 +651,7 @@ Compilation and execution have separate job budgets.
 ```powershell
 pwsh -File .\mssql-odbc\tests\e2e\run_e2e.ps1 -BuildOnly -OutDir C:\artifacts\odbc-e2e
 # Download/copy the drop's build\ directory into the consumer's tests\e2e\.
-.\mssql-odbc\tests\e2e\run_e2e.ps1 -SkipBuild -MtProfile nightly -CompareWithMsodbcsql
+.\mssql-odbc\tests\e2e\run_e2e.ps1 -SkipBuild -MtProfile weekly -CompareWithMsodbcsql
 ```
 
 `-BuildOnly` requires PowerShell 7 or later (`pwsh`) and rejects Windows
@@ -637,9 +660,27 @@ the current PowerShell location. `-BuildOnly -Release` is rejected: the drop
 requires a debug driver with symbols.
 
 `-BuildJobs N` bounds parallel C++ build processes. The stress producer selects
-the smaller of four and the logical CPU count; other runner invocations retain
-the serial default of one. Test concurrency is unchanged. Measure build duration
-and memory use before increasing the limit.
+the smaller of four and the logical CPU count. Windows PR validation builds with
+every logical CPU because compilation does not compete with test SQL traffic,
+and bounds `-TestJobs` separately; other runner invocations retain the serial
+default of one. Measure build duration and memory use before increasing a limit.
+
+`-TestJobs N` bounds parallel CTest entries within each driver leg, independently
+of the threads inside an `_mt` entry. The Rust and msodbcsql legs remain
+sequential, preserving coverage and parity reporting. CTest resource locks keep
+an executable's single-threaded and `_mt` entries from overlapping. The
+`col_attribute_test` entries run exclusively because alias-type name lookups can
+deadlock with concurrent schema changes. Keep shared-resource restrictions in
+`CMakeLists.txt`, not runner-specific filters, so retries and manual CTest runs
+honor them too. The longest `_mt` entries carry CTest `COST` hints so fresh
+agents, which have no cost history, start them first instead of leaving them as
+the tail of a parallel run.
+
+`run_e2e.sh --test-jobs=N` applies the same per-leg bound on Linux and macOS
+(default 1). PR validation uses the smaller of four and the CPU count for the
+macOS leg and the x64 Linux parity leg; Windows ARM passes the same bound to
+`-TestJobs`. Linux ARM and the distro test matrices stay serial because they
+share remote SQL hosts across concurrent jobs.
 
 The drop includes the driver, test binaries, and PDBs. Its generated CTest
 registration resolves executable paths relative to the downloaded drop, so
