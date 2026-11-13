@@ -32,6 +32,7 @@ deadpool = { version = "=0.13.1", default-features = false, features = ["managed
 # Unit tests link a standalone binary, so they need libpython and an
 # initialized interpreter. Resolver v2 keeps this out of the cdylib/wheel build.
 [dev-dependencies]
+dotenv = "0.15"
 mssql-tds = { path = "../mssql-tds", features = ["test-util"] }
 pyo3 = { version = "0.29.0", features = ["auto-initialize"] }
 tokio = { version = "1", features = ["test-util"] }
