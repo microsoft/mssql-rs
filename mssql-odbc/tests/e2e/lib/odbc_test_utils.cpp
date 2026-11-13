@@ -141,6 +141,18 @@ std::string ConvertNativeTestText(const std::string& utf8, const std::string& en
     }
 }
 
+std::string CodePageIconvName(unsigned codePage) {
+    if (codePage != 1252 && codePage != 1251 && codePage != 932) {
+        throw std::invalid_argument("unsupported test code page " +
+                                    std::to_string(codePage));
+    }
+    std::string encoding = "CP" + std::to_string(codePage);
+#if defined(__GLIBC__) || defined(__APPLE__)
+    encoding += "//TRANSLIT";
+#endif
+    return encoding;
+}
+
 }  // namespace
 #endif
 
@@ -371,15 +383,22 @@ std::string ODBCTestUtils::Utf8ToCodePage(const std::string& utf8, unsigned code
     if (codePage == 65001) {
         return validated;
     }
-
-    if (codePage != 1252 && codePage != 1251 && codePage != 932) {
-        throw std::invalid_argument("unsupported test code page " +
-                                    std::to_string(codePage));
-    }
-    std::string encoding = "CP" + std::to_string(codePage);
-#if defined(__GLIBC__) || defined(__APPLE__)
-    encoding += "//TRANSLIT";
+    return ConvertNativeTestText(validated, CodePageIconvName(codePage), true, usedDefault);
 #endif
-    return ConvertNativeTestText(validated, encoding, true, usedDefault);
+}
+
+bool ODBCTestUtils::HasCodePageConverter(unsigned codePage) {
+#ifdef _WIN32
+    return IsValidCodePage(codePage) != FALSE;
+#else
+    if (codePage == 65001) {
+        return true;
+    }
+    const iconv_t converter = iconv_open(CodePageIconvName(codePage).c_str(), "UTF-8");
+    if (converter == reinterpret_cast<iconv_t>(-1)) {
+        return false;
+    }
+    iconv_close(converter);
+    return true;
 #endif
 }
