@@ -549,6 +549,14 @@ on; these guarantees were verified against msodbcsql's behavior.
   the first of the three reasons the macro is admissible; see §2.1 for the other
   two and for the preference against skipping when the test exists solely to pin
   one registered divergence.
+- The Linux distro-container e2e legs (Alpine, Debian, Azure Linux, RHEL 8) run
+  only on post-merge builds (`ne(variables['Build.Reason'], 'PullRequest')` in
+  `.pipeline/templates/validation-stages.yml`), so PR validation cannot catch a
+  host-libc dependency in a test. Probe such a dependency and `GTEST_SKIP()`
+  naming the gap, as `client_code_page_test` does through
+  `ODBCTestUtils::HasCodePageConverter`, and install what the leg can supply in
+  `scripts/dockerentry/odbc-e2e-*.sh`. Before merging, replay the affected leg
+  locally in its image against the CI build artifact.
 - Write new behavioral e2e tests with `ODBC_TEST_F` (from
   `odbc_concurrent_test.h`) instead of `TEST_F`. The body is unchanged; the macro
   also runs it across threads (`/CrossThread`, `/SharedEnv`, `/SharedStmt`), so
