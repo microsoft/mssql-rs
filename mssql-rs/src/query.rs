@@ -12,6 +12,7 @@ use mssql_tds::datatypes::sql_string::SqlString;
 use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
 
+use crate::error::{Error, Result};
 use crate::row::Row;
 
 pub use crate::compat::Query;
@@ -209,12 +210,12 @@ impl futures_core::Stream for RowStream {
 pub trait ToSql: Send + Sync {
     /// Convert this value into an mssql-tds `SqlType` for parameter binding.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Date-bearing temporal implementations panic if the stored date is outside
-    /// SQL Server's range (0001-01-01 through 9999-12-31). For offset datetimes,
-    /// this range applies to the UTC date.
-    fn to_sql(&self) -> SqlType;
+    /// Date-bearing values outside SQL Server's range (0001-01-01 through
+    /// 9999-12-31) return a conversion error. For offset datetimes, this range
+    /// applies to the UTC date.
+    fn to_sql(&self) -> Result<SqlType>;
 
     fn debug_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "<sql param>")
@@ -238,8 +239,8 @@ impl std::fmt::Debug for DebugParams<'_> {
 }
 
 impl ToSql for bool {
-    fn to_sql(&self) -> SqlType {
-        SqlType::Bit(Some(*self))
+    fn to_sql(&self) -> Result<SqlType> {
+        Ok(SqlType::Bit(Some(*self)))
     }
 
     fn debug_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -248,8 +249,8 @@ impl ToSql for bool {
 }
 
 impl ToSql for u8 {
-    fn to_sql(&self) -> SqlType {
-        SqlType::TinyInt(Some(*self))
+    fn to_sql(&self) -> Result<SqlType> {
+        Ok(SqlType::TinyInt(Some(*self)))
     }
 
     fn debug_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -258,8 +259,8 @@ impl ToSql for u8 {
 }
 
 impl ToSql for i16 {
-    fn to_sql(&self) -> SqlType {
-        SqlType::SmallInt(Some(*self))
+    fn to_sql(&self) -> Result<SqlType> {
+        Ok(SqlType::SmallInt(Some(*self)))
     }
 
     fn debug_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -268,8 +269,8 @@ impl ToSql for i16 {
 }
 
 impl ToSql for i32 {
-    fn to_sql(&self) -> SqlType {
-        SqlType::Int(Some(*self))
+    fn to_sql(&self) -> Result<SqlType> {
+        Ok(SqlType::Int(Some(*self)))
     }
 
     fn debug_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -278,8 +279,8 @@ impl ToSql for i32 {
 }
 
 impl ToSql for i64 {
-    fn to_sql(&self) -> SqlType {
-        SqlType::BigInt(Some(*self))
+    fn to_sql(&self) -> Result<SqlType> {
+        Ok(SqlType::BigInt(Some(*self)))
     }
 
     fn debug_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -288,8 +289,8 @@ impl ToSql for i64 {
 }
 
 impl ToSql for f32 {
-    fn to_sql(&self) -> SqlType {
-        SqlType::Real(Some(*self))
+    fn to_sql(&self) -> Result<SqlType> {
+        Ok(SqlType::Real(Some(*self)))
     }
 
     fn debug_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -298,8 +299,8 @@ impl ToSql for f32 {
 }
 
 impl ToSql for f64 {
-    fn to_sql(&self) -> SqlType {
-        SqlType::Float(Some(*self))
+    fn to_sql(&self) -> Result<SqlType> {
+        Ok(SqlType::Float(Some(*self)))
     }
 
     fn debug_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -317,8 +318,8 @@ pub(crate) fn nvarchar_from_string(value: Option<String>) -> SqlType {
 }
 
 impl ToSql for &str {
-    fn to_sql(&self) -> SqlType {
-        nvarchar_from_string(Some(self.to_string()))
+    fn to_sql(&self) -> Result<SqlType> {
+        Ok(nvarchar_from_string(Some(self.to_string())))
     }
 
     fn debug_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -327,8 +328,8 @@ impl ToSql for &str {
 }
 
 impl ToSql for String {
-    fn to_sql(&self) -> SqlType {
-        nvarchar_from_string(Some(self.clone()))
+    fn to_sql(&self) -> Result<SqlType> {
+        Ok(nvarchar_from_string(Some(self.clone())))
     }
 
     fn debug_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -337,8 +338,8 @@ impl ToSql for String {
 }
 
 impl ToSql for uuid::Uuid {
-    fn to_sql(&self) -> SqlType {
-        SqlType::Uuid(Some(*self))
+    fn to_sql(&self) -> Result<SqlType> {
+        Ok(SqlType::Uuid(Some(*self)))
     }
 }
 
@@ -361,16 +362,17 @@ fn decimal_to_sql_type(decimal_str: &str, precision: u8, scale: u8) -> SqlType {
 }
 
 impl ToSql for rust_decimal::Decimal {
-    fn to_sql(&self) -> SqlType {
+    fn to_sql(&self) -> Result<SqlType> {
         let decimal_str = self.to_string();
         let scale = self.scale() as u8;
 
         let digits = self.mantissa().unsigned_abs().checked_ilog10().unwrap_or(0) + 1;
-        let precision = u8::try_from(digits).expect("a decimal mantissa has at most 29 digits");
+        let precision =
+            u8::try_from(digits).map_err(|error| Error::Conversion(error.to_string()))?;
 
         let precision = precision.max(scale);
 
-        decimal_to_sql_type(&decimal_str, precision, scale)
+        Ok(decimal_to_sql_type(&decimal_str, precision, scale))
     }
 
     fn debug_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -421,10 +423,10 @@ fn into_typed_null(value: SqlType) -> SqlType {
 
 // Option<T>: None becomes the SQL NULL of the same type.
 impl<T: ToSql + Default> ToSql for Option<T> {
-    fn to_sql(&self) -> SqlType {
+    fn to_sql(&self) -> Result<SqlType> {
         match self {
             Some(v) => v.to_sql(),
-            None => into_typed_null(T::default().to_sql()),
+            None => T::default().to_sql().map(into_typed_null),
         }
     }
 
@@ -441,8 +443,8 @@ impl<T: ToSql + Default> ToSql for Option<T> {
 }
 
 impl ToSql for serde_json::Value {
-    fn to_sql(&self) -> SqlType {
-        match self {
+    fn to_sql(&self) -> Result<SqlType> {
+        Ok(match self {
             serde_json::Value::Null => SqlType::NVarchar(None, 4000),
             serde_json::Value::Bool(value) => SqlType::Bit(Some(*value)),
             serde_json::Value::Number(number) => {
@@ -458,7 +460,7 @@ impl ToSql for serde_json::Value {
             serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
                 nvarchar_from_string(Some(self.to_string()))
             }
-        }
+        })
     }
 }
 
@@ -467,14 +469,14 @@ impl ToSql for serde_json::Value {
 // ---------------------------------------------------------------------------
 
 impl ToSql for Vec<u8> {
-    fn to_sql(&self) -> SqlType {
-        SqlType::VarBinaryMax(Some(self.clone()))
+    fn to_sql(&self) -> Result<SqlType> {
+        Ok(SqlType::VarBinaryMax(Some(self.clone())))
     }
 }
 
 impl ToSql for &[u8] {
-    fn to_sql(&self) -> SqlType {
-        SqlType::VarBinaryMax(Some(self.to_vec()))
+    fn to_sql(&self) -> Result<SqlType> {
+        Ok(SqlType::VarBinaryMax(Some(self.to_vec())))
     }
 }
 
@@ -485,7 +487,7 @@ impl ToSql for &[u8] {
 // chrono is an unconditional dep of the driver; FromSql for these types
 // already lives in `row.rs`, so the ToSql side is provided unconditionally too.
 mod chrono_to_sql {
-    use super::{SqlType, ToSql};
+    use super::{Error, Result, SqlType, ToSql};
     use chrono::{
         DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc,
     };
@@ -493,12 +495,15 @@ mod chrono_to_sql {
         DEFAULT_VARTIME_SCALE, SqlDate, SqlDateTime2, SqlDateTimeOffset, SqlTime,
     };
 
-    fn naive_date_to_sql(d: &NaiveDate) -> SqlDate {
+    pub(super) fn date_range_error() -> Error {
+        Error::Conversion("date out of SQL Server DATE range (0001-01-01..=9999-12-31)".into())
+    }
+
+    pub(super) fn naive_date_to_sql(d: &NaiveDate) -> Result<SqlDate> {
         // SqlDate stores days where 0 = 0001-01-01; chrono's num_days_from_ce
         // counts 0001-01-01 as day 1.
-        let days = u32::try_from(d.num_days_from_ce() - 1)
-            .expect("date out of SQL Server DATE range (0001-01-01..=9999-12-31)");
-        SqlDate::create(days).expect("date out of SQL Server DATE range (0001-01-01..=9999-12-31)")
+        let days = u32::try_from(d.num_days_from_ce() - 1).map_err(|_error| date_range_error())?;
+        SqlDate::create(days).map_err(|_error| date_range_error())
     }
 
     fn naive_time_to_sql(t: &NaiveTime) -> SqlTime {
@@ -512,68 +517,68 @@ mod chrono_to_sql {
         }
     }
 
-    fn naive_dt_to_sql(dt: &NaiveDateTime) -> SqlDateTime2 {
-        SqlDateTime2 {
-            days: naive_date_to_sql(&dt.date()).get_days(),
+    fn naive_dt_to_sql(dt: &NaiveDateTime) -> Result<SqlDateTime2> {
+        Ok(SqlDateTime2 {
+            days: naive_date_to_sql(&dt.date())?.get_days(),
             time: naive_time_to_sql(&dt.time()),
-        }
+        })
     }
 
     impl ToSql for NaiveDate {
-        fn to_sql(&self) -> SqlType {
-            SqlType::Date(Some(naive_date_to_sql(self)))
+        fn to_sql(&self) -> Result<SqlType> {
+            Ok(SqlType::Date(Some(naive_date_to_sql(self)?)))
         }
     }
 
     impl ToSql for NaiveTime {
-        fn to_sql(&self) -> SqlType {
-            SqlType::Time(Some(naive_time_to_sql(self)))
+        fn to_sql(&self) -> Result<SqlType> {
+            Ok(SqlType::Time(Some(naive_time_to_sql(self))))
         }
     }
 
     impl ToSql for NaiveDateTime {
-        fn to_sql(&self) -> SqlType {
-            SqlType::DateTime2(Some(naive_dt_to_sql(self)))
+        fn to_sql(&self) -> Result<SqlType> {
+            Ok(SqlType::DateTime2(Some(naive_dt_to_sql(self)?)))
         }
     }
 
     impl ToSql for DateTime<FixedOffset> {
-        fn to_sql(&self) -> SqlType {
+        fn to_sql(&self) -> Result<SqlType> {
             // Storage matches FromSql: dt2 holds the UTC components, offset is
             // the original tz offset in minutes.
-            let datetime2 = naive_dt_to_sql(&self.naive_utc());
+            let datetime2 = naive_dt_to_sql(&self.naive_utc())?;
             let offset = (self.offset().local_minus_utc() / 60) as i16;
-            SqlType::DateTimeOffset(Some(SqlDateTimeOffset { datetime2, offset }))
+            Ok(SqlType::DateTimeOffset(Some(SqlDateTimeOffset {
+                datetime2,
+                offset,
+            })))
         }
     }
 
     impl ToSql for DateTime<Utc> {
-        fn to_sql(&self) -> SqlType {
-            let datetime2 = naive_dt_to_sql(&self.naive_utc());
-            SqlType::DateTimeOffset(Some(SqlDateTimeOffset {
+        fn to_sql(&self) -> Result<SqlType> {
+            let datetime2 = naive_dt_to_sql(&self.naive_utc())?;
+            Ok(SqlType::DateTimeOffset(Some(SqlDateTimeOffset {
                 datetime2,
                 offset: 0,
-            }))
+            })))
         }
     }
 }
 
 #[cfg(feature = "time")]
 mod time_to_sql {
-    use super::{SqlType, ToSql};
-    use chrono::Datelike;
+    use super::{Result, SqlType, ToSql, chrono_to_sql};
     use mssql_tds::datatypes::column_values::{
         DEFAULT_VARTIME_SCALE, SqlDate, SqlDateTime2, SqlDateTimeOffset, SqlTime,
     };
     use time::{Date, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
 
-    fn date_to_sql(d: Date) -> SqlDate {
+    fn date_to_sql(d: Date) -> Result<SqlDate> {
         let chrono_date =
             chrono::NaiveDate::from_ymd_opt(d.year(), u8::from(d.month()) as u32, d.day() as u32)
-                .expect("date out of SQL Server DATE range (0001-01-01..=9999-12-31)");
-        let days = u32::try_from(chrono_date.num_days_from_ce() - 1)
-            .expect("date out of SQL Server DATE range (0001-01-01..=9999-12-31)");
-        SqlDate::create(days).expect("date out of SQL Server DATE range (0001-01-01..=9999-12-31)")
+                .ok_or_else(chrono_to_sql::date_range_error)?;
+        chrono_to_sql::naive_date_to_sql(&chrono_date)
     }
 
     fn time_to_sql(t: Time) -> SqlTime {
@@ -587,62 +592,61 @@ mod time_to_sql {
         }
     }
 
-    fn primitive_dt_to_sql(dt: PrimitiveDateTime) -> SqlDateTime2 {
-        SqlDateTime2 {
-            days: date_to_sql(dt.date()).get_days(),
+    fn primitive_dt_to_sql(dt: PrimitiveDateTime) -> Result<SqlDateTime2> {
+        Ok(SqlDateTime2 {
+            days: date_to_sql(dt.date())?.get_days(),
             time: time_to_sql(dt.time()),
-        }
+        })
     }
 
     impl ToSql for Date {
-        fn to_sql(&self) -> SqlType {
-            SqlType::Date(Some(date_to_sql(*self)))
+        fn to_sql(&self) -> Result<SqlType> {
+            Ok(SqlType::Date(Some(date_to_sql(*self)?)))
         }
     }
 
     impl ToSql for Time {
-        fn to_sql(&self) -> SqlType {
-            SqlType::Time(Some(time_to_sql(*self)))
+        fn to_sql(&self) -> Result<SqlType> {
+            Ok(SqlType::Time(Some(time_to_sql(*self))))
         }
     }
 
     impl ToSql for PrimitiveDateTime {
-        fn to_sql(&self) -> SqlType {
-            SqlType::DateTime2(Some(primitive_dt_to_sql(*self)))
+        fn to_sql(&self) -> Result<SqlType> {
+            Ok(SqlType::DateTime2(Some(primitive_dt_to_sql(*self)?)))
         }
     }
 
     impl ToSql for OffsetDateTime {
-        fn to_sql(&self) -> SqlType {
+        fn to_sql(&self) -> Result<SqlType> {
             let offset = self.offset();
-            let utc = self.to_offset(UtcOffset::UTC);
-            SqlType::DateTimeOffset(Some(SqlDateTimeOffset {
-                datetime2: primitive_dt_to_sql(PrimitiveDateTime::new(utc.date(), utc.time())),
+            let utc = self
+                .checked_to_offset(UtcOffset::UTC)
+                .ok_or_else(chrono_to_sql::date_range_error)?;
+            Ok(SqlType::DateTimeOffset(Some(SqlDateTimeOffset {
+                datetime2: primitive_dt_to_sql(PrimitiveDateTime::new(utc.date(), utc.time()))?,
                 offset: (offset.whole_seconds() / 60) as i16,
-            }))
+            })))
         }
     }
 }
 
 #[cfg(feature = "jiff")]
 mod jiff_to_sql {
-    use super::{SqlType, ToSql};
-    use chrono::Datelike;
+    use super::{Result, SqlType, ToSql, chrono_to_sql};
     use jiff::{Timestamp, Zoned, civil, tz::TimeZone};
     use mssql_tds::datatypes::column_values::{
         DEFAULT_VARTIME_SCALE, SqlDate, SqlDateTime2, SqlDateTimeOffset, SqlTime,
     };
 
-    fn date_to_sql(d: civil::Date) -> SqlDate {
+    fn date_to_sql(d: civil::Date) -> Result<SqlDate> {
         let chrono_date = chrono::NaiveDate::from_ymd_opt(
             i32::from(d.year()),
-            u32::try_from(d.month()).expect("jiff months are in 1..=12"),
-            u32::try_from(d.day()).expect("jiff days are in 1..=31"),
+            u32::try_from(d.month()).map_err(|_error| chrono_to_sql::date_range_error())?,
+            u32::try_from(d.day()).map_err(|_error| chrono_to_sql::date_range_error())?,
         )
-        .expect("date out of SQL Server DATE range (0001-01-01..=9999-12-31)");
-        let days = u32::try_from(chrono_date.num_days_from_ce() - 1)
-            .expect("date out of SQL Server DATE range (0001-01-01..=9999-12-31)");
-        SqlDate::create(days).expect("date out of SQL Server DATE range (0001-01-01..=9999-12-31)")
+        .ok_or_else(chrono_to_sql::date_range_error)?;
+        chrono_to_sql::naive_date_to_sql(&chrono_date)
     }
 
     fn time_to_sql(t: civil::Time) -> SqlTime {
@@ -657,51 +661,51 @@ mod jiff_to_sql {
         }
     }
 
-    fn datetime_to_sql(dt: civil::DateTime) -> SqlDateTime2 {
-        SqlDateTime2 {
-            days: date_to_sql(dt.date()).get_days(),
+    fn datetime_to_sql(dt: civil::DateTime) -> Result<SqlDateTime2> {
+        Ok(SqlDateTime2 {
+            days: date_to_sql(dt.date())?.get_days(),
             time: time_to_sql(dt.time()),
-        }
+        })
     }
 
-    fn timestamp_to_sql(timestamp: Timestamp, offset_minutes: i16) -> SqlDateTimeOffset {
+    fn timestamp_to_sql(timestamp: Timestamp, offset_minutes: i16) -> Result<SqlDateTimeOffset> {
         let utc = TimeZone::UTC.to_datetime(timestamp);
-        SqlDateTimeOffset {
-            datetime2: datetime_to_sql(utc),
+        Ok(SqlDateTimeOffset {
+            datetime2: datetime_to_sql(utc)?,
             offset: offset_minutes,
-        }
+        })
     }
 
     impl ToSql for civil::Date {
-        fn to_sql(&self) -> SqlType {
-            SqlType::Date(Some(date_to_sql(*self)))
+        fn to_sql(&self) -> Result<SqlType> {
+            Ok(SqlType::Date(Some(date_to_sql(*self)?)))
         }
     }
 
     impl ToSql for civil::Time {
-        fn to_sql(&self) -> SqlType {
-            SqlType::Time(Some(time_to_sql(*self)))
+        fn to_sql(&self) -> Result<SqlType> {
+            Ok(SqlType::Time(Some(time_to_sql(*self))))
         }
     }
 
     impl ToSql for civil::DateTime {
-        fn to_sql(&self) -> SqlType {
-            SqlType::DateTime2(Some(datetime_to_sql(*self)))
+        fn to_sql(&self) -> Result<SqlType> {
+            Ok(SqlType::DateTime2(Some(datetime_to_sql(*self)?)))
         }
     }
 
     impl ToSql for Timestamp {
-        fn to_sql(&self) -> SqlType {
-            SqlType::DateTimeOffset(Some(timestamp_to_sql(*self, 0)))
+        fn to_sql(&self) -> Result<SqlType> {
+            Ok(SqlType::DateTimeOffset(Some(timestamp_to_sql(*self, 0)?)))
         }
     }
 
     impl ToSql for Zoned {
-        fn to_sql(&self) -> SqlType {
-            SqlType::DateTimeOffset(Some(timestamp_to_sql(
+        fn to_sql(&self) -> Result<SqlType> {
+            Ok(SqlType::DateTimeOffset(Some(timestamp_to_sql(
                 self.timestamp(),
                 (self.offset().seconds() / 60) as i16,
-            )))
+            )?)))
         }
     }
 }
@@ -719,24 +723,24 @@ fn encode_string_parameters(sql_type: SqlType, unicode: bool) -> SqlType {
 }
 
 /// Build a `Vec<RpcParameter>` from a slice of ToSql values, using positional
-/// naming (@P1, @P2, ...) like tiberius.
-pub fn build_params(params: &[&dyn ToSql]) -> Vec<RpcParameter> {
+/// naming (@P1, @P2, ...) like tiberius. Returns an error if conversion fails.
+pub fn build_params(params: &[&dyn ToSql]) -> Result<Vec<RpcParameter>> {
     build_params_with_string_encoding(params, true)
 }
 
 pub(crate) fn build_params_with_string_encoding(
     params: &[&dyn ToSql],
     unicode: bool,
-) -> Vec<RpcParameter> {
+) -> Result<Vec<RpcParameter>> {
     params
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            RpcParameter::new(
+            Ok(RpcParameter::new(
                 Some(format!("@P{}", i + 1)),
                 StatusFlags::NONE,
-                encode_string_parameters(p.to_sql(), unicode),
-            )
+                encode_string_parameters(p.to_sql()?, unicode),
+            ))
         })
         .collect()
 }
@@ -746,7 +750,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
     fn ensure_equal<T: PartialEq + std::fmt::Debug>(actual: T, expected: T) -> TestResult {
         if actual != expected {
@@ -765,49 +769,49 @@ mod tests {
     #[test]
     fn to_sql_primitives() -> TestResult {
         ensure(
-            matches!(42i32.to_sql(), SqlType::Int(Some(42))),
+            matches!(42i32.to_sql()?, SqlType::Int(Some(42))),
             "expected int",
         )?;
         ensure(
-            matches!(255u8.to_sql(), SqlType::TinyInt(Some(255))),
+            matches!(255u8.to_sql()?, SqlType::TinyInt(Some(255))),
             "expected tinyint",
         )?;
         ensure(
-            matches!((-12i16).to_sql(), SqlType::SmallInt(Some(-12))),
+            matches!((-12i16).to_sql()?, SqlType::SmallInt(Some(-12))),
             "expected smallint",
         )?;
         ensure(
-            matches!(i64::MAX.to_sql(), SqlType::BigInt(Some(i64::MAX))),
+            matches!(i64::MAX.to_sql()?, SqlType::BigInt(Some(i64::MAX))),
             "expected bigint",
         )?;
         ensure(
-            matches!(true.to_sql(), SqlType::Bit(Some(true))),
+            matches!(true.to_sql()?, SqlType::Bit(Some(true))),
             "expected bit",
         )?;
         ensure(
-            matches!(1.5f32.to_sql(), SqlType::Real(Some(1.5))),
+            matches!(1.5f32.to_sql()?, SqlType::Real(Some(1.5))),
             "expected real",
         )?;
         ensure(
-            matches!(2.5f64.to_sql(), SqlType::Float(Some(2.5))),
+            matches!(2.5f64.to_sql()?, SqlType::Float(Some(2.5))),
             "expected float",
         )?;
         ensure(
-            matches!(Some(7i32).to_sql(), SqlType::Int(Some(7))),
+            matches!(Some(7i32).to_sql()?, SqlType::Int(Some(7))),
             "expected optional int",
         )?;
         ensure(
-            matches!(None::<i32>.to_sql(), SqlType::Int(None)),
+            matches!(None::<i32>.to_sql()?, SqlType::Int(None)),
             "expected typed SQL NULL",
         )?;
-        for value in ["hello".to_sql(), "hello".to_owned().to_sql()] {
+        for value in ["hello".to_sql()?, "hello".to_owned().to_sql()?] {
             let SqlType::NVarchar(Some(value), 4000) = value else {
                 return Err("expected nvarchar".into());
             };
             ensure_equal(value.to_utf8_string().as_str(), "hello")?;
         }
         let bytes = vec![0, 255, 42];
-        for value in [bytes.to_sql(), bytes.as_slice().to_sql()] {
+        for value in [bytes.to_sql()?, bytes.as_slice().to_sql()?] {
             ensure(
                 matches!(value, SqlType::VarBinaryMax(Some(v)) if v == bytes),
                 "expected binary bytes",
@@ -835,13 +839,15 @@ mod tests {
             format!("{:?}", DebugParams(params)),
             r#"[true, 255, -12, 42, 1.5, 2.5, "owned", Some(7), <sql param>]"#
         );
-        assert!(matches!(id.to_sql(), SqlType::Uuid(Some(value)) if value == id));
+        assert!(
+            matches!(id.to_sql().expect("valid parameter"), SqlType::Uuid(Some(value)) if value == id)
+        );
         assert!(matches!(
             encode_string_parameters(SqlType::NVarcharMax(None), false),
             SqlType::VarcharMax(None)
         ));
         assert!(matches!(
-            encode_string_parameters(42i32.to_sql(), false),
+            encode_string_parameters(42i32.to_sql().expect("valid parameter"), false),
             SqlType::Int(Some(42))
         ));
     }
@@ -913,11 +919,11 @@ mod tests {
         let time = time::Time::from_hms_nano(23, 45, 56, 123_456_700)?;
         let date = time::Date::from_calendar_date(2024, time::Month::February, 29)?;
         let dt = time::PrimitiveDateTime::new(date, time);
-        let SqlType::Time(Some(value)) = time.to_sql() else {
+        let SqlType::Time(Some(value)) = time.to_sql()? else {
             return Err("expected time".into());
         };
         ensure_equal(time::Time::from_sql(&ColumnValues::Time(value)), Some(time))?;
-        let SqlType::DateTime2(Some(value)) = dt.to_sql() else {
+        let SqlType::DateTime2(Some(value)) = dt.to_sql()? else {
             return Err("expected datetime2".into());
         };
         ensure_equal(
@@ -926,7 +932,7 @@ mod tests {
         )?;
         for offset in [-330, 0, 345] {
             let dt = dt.assume_offset(time::UtcOffset::from_whole_seconds(offset * 60)?);
-            let SqlType::DateTimeOffset(Some(value)) = dt.to_sql() else {
+            let SqlType::DateTimeOffset(Some(value)) = dt.to_sql()? else {
                 return Err("expected datetimeoffset".into());
             };
             ensure_equal(value.offset, offset as i16)?;
@@ -950,14 +956,14 @@ mod tests {
         use mssql_tds::datatypes::column_values::ColumnValues;
         let dt = jiff::civil::DateTime::new(2024, 2, 29, 23, 45, 56, 123_456_700)
             .map_err(|error| error.to_string())?;
-        let SqlType::Time(Some(value)) = dt.time().to_sql() else {
+        let SqlType::Time(Some(value)) = dt.time().to_sql()? else {
             return Err("expected time".into());
         };
         ensure_equal(
             jiff::civil::Time::from_sql(&ColumnValues::Time(value)),
             Some(dt.time()),
         )?;
-        let SqlType::DateTime2(Some(value)) = dt.to_sql() else {
+        let SqlType::DateTime2(Some(value)) = dt.to_sql()? else {
             return Err("expected datetime2".into());
         };
         ensure_equal(
@@ -969,7 +975,7 @@ mod tests {
                 .map_err(|error| error.to_string())?
                 .to_time_zone();
             let zoned = dt.to_zoned(zone).map_err(|error| error.to_string())?;
-            let SqlType::DateTimeOffset(Some(value)) = zoned.to_sql() else {
+            let SqlType::DateTimeOffset(Some(value)) = zoned.to_sql()? else {
                 return Err("expected datetimeoffset".into());
             };
             ensure_equal(value.offset, offset as i16)?;
@@ -978,7 +984,7 @@ mod tests {
             ensure_equal(actual.timestamp(), zoned.timestamp())?;
             ensure_equal(actual.offset(), zoned.offset())?;
             ensure_equal(actual.datetime(), dt)?;
-            let SqlType::DateTimeOffset(Some(value)) = zoned.timestamp().to_sql() else {
+            let SqlType::DateTimeOffset(Some(value)) = zoned.timestamp().to_sql()? else {
                 return Err("expected datetimeoffset".into());
             };
             ensure_equal(value.offset, 0)?;
@@ -999,7 +1005,7 @@ mod tests {
 
     #[test]
     fn build_params_positional_naming() {
-        let params = build_params(&[&1i32, &"test"]);
+        let params = build_params(&[&1i32, &"test"]).expect("valid parameters");
         assert_eq!(params.len(), 2);
         // name field is pub(crate) in mssql-tds, so we just verify count
     }
@@ -1017,36 +1023,64 @@ mod tests {
         use mssql_tds::datatypes::sql_udt::UdtTypeName;
         use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 
-        assert!(matches!(None::<bool>.to_sql(), SqlType::Bit(None)));
-        assert!(matches!(None::<u8>.to_sql(), SqlType::TinyInt(None)));
-        assert!(matches!(None::<i16>.to_sql(), SqlType::SmallInt(None)));
-        assert!(matches!(None::<i32>.to_sql(), SqlType::Int(None)));
-        assert!(matches!(None::<i64>.to_sql(), SqlType::BigInt(None)));
-        assert!(matches!(None::<f32>.to_sql(), SqlType::Real(None)));
-        assert!(matches!(None::<f64>.to_sql(), SqlType::Float(None)));
         assert!(matches!(
-            None::<String>.to_sql(),
+            None::<bool>.to_sql().expect("valid parameter"),
+            SqlType::Bit(None)
+        ));
+        assert!(matches!(
+            None::<u8>.to_sql().expect("valid parameter"),
+            SqlType::TinyInt(None)
+        ));
+        assert!(matches!(
+            None::<i16>.to_sql().expect("valid parameter"),
+            SqlType::SmallInt(None)
+        ));
+        assert!(matches!(
+            None::<i32>.to_sql().expect("valid parameter"),
+            SqlType::Int(None)
+        ));
+        assert!(matches!(
+            None::<i64>.to_sql().expect("valid parameter"),
+            SqlType::BigInt(None)
+        ));
+        assert!(matches!(
+            None::<f32>.to_sql().expect("valid parameter"),
+            SqlType::Real(None)
+        ));
+        assert!(matches!(
+            None::<f64>.to_sql().expect("valid parameter"),
+            SqlType::Float(None)
+        ));
+        assert!(matches!(
+            None::<String>.to_sql().expect("valid parameter"),
             SqlType::NVarchar(None, 4000)
         ));
         assert!(matches!(
-            None::<Vec<u8>>.to_sql(),
+            None::<Vec<u8>>.to_sql().expect("valid parameter"),
             SqlType::VarBinaryMax(None)
         ));
-        assert!(matches!(None::<uuid::Uuid>.to_sql(), SqlType::Uuid(None)));
         assert!(matches!(
-            None::<rust_decimal::Decimal>.to_sql(),
+            None::<uuid::Uuid>.to_sql().expect("valid parameter"),
+            SqlType::Uuid(None)
+        ));
+        assert!(matches!(
+            None::<rust_decimal::Decimal>
+                .to_sql()
+                .expect("valid parameter"),
             SqlType::Numeric(None)
         ));
         assert!(matches!(
-            None::<chrono::NaiveDate>.to_sql(),
+            None::<chrono::NaiveDate>.to_sql().expect("valid parameter"),
             SqlType::Date(None)
         ));
         assert!(matches!(
-            None::<chrono::NaiveTime>.to_sql(),
+            None::<chrono::NaiveTime>.to_sql().expect("valid parameter"),
             SqlType::Time(None)
         ));
         assert!(matches!(
-            None::<chrono::NaiveDateTime>.to_sql(),
+            None::<chrono::NaiveDateTime>
+                .to_sql()
+                .expect("valid parameter"),
             SqlType::DateTime2(None)
         ));
         assert!(matches!(
@@ -1101,7 +1135,7 @@ mod tests {
     fn decimal_to_sql_basic() {
         use rust_decimal::Decimal;
         let d = Decimal::new(12345, 2); // 123.45
-        let sql_type = d.to_sql();
+        let sql_type = d.to_sql().expect("valid parameter");
         // Should be Numeric type
         assert!(matches!(sql_type, SqlType::Numeric(Some(_))));
     }
@@ -1112,7 +1146,7 @@ mod tests {
         use rust_decimal::Decimal;
 
         let original = Decimal::new(12345, 2); // 123.45
-        let sql_type = original.to_sql();
+        let sql_type = original.to_sql()?;
 
         // Extract DecimalParts from SqlType
         let decimal_parts = match sql_type {
@@ -1135,7 +1169,7 @@ mod tests {
         use rust_decimal::Decimal;
 
         let original = Decimal::new(0, 0);
-        let sql_type = original.to_sql();
+        let sql_type = original.to_sql()?;
         let decimal_parts = match sql_type {
             SqlType::Numeric(Some(dp)) => dp,
             _ => return Err("expected SqlType::Numeric".into()),
@@ -1152,7 +1186,7 @@ mod tests {
         use rust_decimal::Decimal;
 
         let original = Decimal::new(-99999, 4); // -9.9999
-        let sql_type = original.to_sql();
+        let sql_type = original.to_sql()?;
         let decimal_parts = match sql_type {
             SqlType::Numeric(Some(dp)) => dp,
             _ => return Err("expected SqlType::Numeric".into()),
@@ -1170,7 +1204,7 @@ mod tests {
 
         // rust_decimal supports up to 28 digits of precision with i64 mantissa
         let original = Decimal::new(9223372036854775807i64, 10); // i64::MAX
-        let sql_type = original.to_sql();
+        let sql_type = original.to_sql()?;
         let decimal_parts = match sql_type {
             SqlType::Numeric(Some(dp)) => dp,
             _ => return Err("expected SqlType::Numeric".into()),
@@ -1199,7 +1233,7 @@ mod tests {
         // A value with 28 significant digits — the maximum for rust_decimal.
         let d = Decimal::from_str("9999999999999999999999999999")
             .expect("28 significant digits fit a decimal mantissa");
-        let sql_type = d.to_sql();
+        let sql_type = d.to_sql().expect("valid parameter");
         assert!(matches!(sql_type, SqlType::Numeric(Some(_))));
     }
 
@@ -1214,7 +1248,7 @@ mod tests {
             ("-9999999999999999999999999999", 28),
         ] {
             let decimal: rust_decimal::Decimal = text.parse()?;
-            let SqlType::Numeric(Some(parts)) = decimal.to_sql() else {
+            let SqlType::Numeric(Some(parts)) = decimal.to_sql()? else {
                 return Err("expected a non-null SQL numeric".into());
             };
             ensure_equal(parts.precision, precision)?;
@@ -1251,7 +1285,7 @@ mod tests {
         // Scale=28, mantissa=1 → "0.0000000000000000000000000001"
         // precision from ilog10(1)=0 → 1, but scale=28, so precision.max(28)=28
         let d = Decimal::new(1, 28);
-        let sql_type = d.to_sql();
+        let sql_type = d.to_sql().expect("valid parameter");
         assert!(matches!(sql_type, SqlType::Numeric(Some(_))));
     }
 
@@ -1263,7 +1297,7 @@ mod tests {
             let datetime = chrono::NaiveDate::from_ymd_opt(year, month, day)
                 .and_then(|date| date.and_hms_opt(0, 0, 0))
                 .ok_or("expected a valid SQL date boundary")?;
-            let SqlType::DateTime2(Some(value)) = datetime.to_sql() else {
+            let SqlType::DateTime2(Some(value)) = datetime.to_sql()? else {
                 return Err("expected SQL datetime2".into());
             };
             ensure_equal(
@@ -1275,21 +1309,100 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "date out of SQL Server DATE range")]
     fn chrono_datetime_rejects_dates_before_sql_epoch() {
         let datetime = chrono::NaiveDate::from_ymd_opt(0, 12, 31)
             .and_then(|date| date.and_hms_opt(0, 0, 0))
             .expect("chrono supports dates before the SQL epoch");
-        let _ = datetime.to_sql();
+        assert!(matches!(datetime.to_sql(), Err(Error::Conversion(_))));
     }
 
     #[test]
-    #[should_panic(expected = "date out of SQL Server DATE range")]
     fn chrono_datetime_rejects_dates_after_sql_range() {
         let datetime = chrono::NaiveDate::from_ymd_opt(10000, 1, 1)
             .and_then(|date| date.and_hms_opt(0, 0, 0))
             .expect("chrono supports years after 9999");
-        let _ = datetime.to_sql();
+        assert!(matches!(datetime.to_sql(), Err(Error::Conversion(_))));
+    }
+
+    #[test]
+    fn chrono_date_conversions_reject_out_of_range_values_and_preserve_nulls() {
+        use chrono::{FixedOffset, TimeZone, Utc};
+
+        for (year, month, day) in [(0, 12, 31), (10000, 1, 1)] {
+            let date = chrono::NaiveDate::from_ymd_opt(year, month, day).expect("chrono date");
+            let datetime = date.and_hms_opt(0, 0, 0).expect("chrono datetime");
+            assert!(matches!(date.to_sql(), Err(Error::Conversion(_))));
+            assert!(matches!(Some(date).to_sql(), Err(Error::Conversion(_))));
+            assert!(matches!(datetime.to_sql(), Err(Error::Conversion(_))));
+            assert!(matches!(
+                Utc.from_utc_datetime(&datetime).to_sql(),
+                Err(Error::Conversion(_))
+            ));
+        }
+        assert!(matches!(
+            None::<chrono::NaiveDate>.to_sql(),
+            Ok(SqlType::Date(None))
+        ));
+
+        for (utc, offset_hours) in [((0, 12, 31, 23), 1), ((10000, 1, 1, 0), -1)] {
+            let (year, month, day, hour) = utc;
+            let offset = FixedOffset::east_opt(offset_hours * 3600).expect("valid offset");
+            let value = Utc
+                .with_ymd_and_hms(year, month, day, hour, 0, 0)
+                .single()
+                .expect("valid UTC datetime")
+                .with_timezone(&offset);
+            assert!((1..=9999).contains(&chrono::Datelike::year(&value)));
+            assert!(matches!(value.to_sql(), Err(Error::Conversion(_))));
+        }
+    }
+
+    #[cfg(feature = "time")]
+    #[test]
+    fn time_date_conversions_check_range_and_offset_utc_date() {
+        use time::{Date, Month, UtcOffset};
+        for date in [
+            Date::from_calendar_date(1, Month::January, 1).expect("minimum SQL date"),
+            Date::from_calendar_date(9999, Month::December, 31).expect("maximum SQL date"),
+        ] {
+            assert!(matches!(date.to_sql(), Ok(SqlType::Date(Some(_)))));
+        }
+        let date = Date::from_calendar_date(0, Month::December, 31).expect("valid time date");
+        assert!(matches!(date.to_sql(), Err(Error::Conversion(_))));
+        assert!(matches!(
+            date.midnight().to_sql(),
+            Err(Error::Conversion(_))
+        ));
+        let offset_date = Date::from_calendar_date(1, Month::January, 1)
+            .expect("minimum SQL date")
+            .midnight()
+            .assume_offset(UtcOffset::from_hms(1, 0, 0).expect("valid offset"));
+        assert!(matches!(offset_date.to_sql(), Err(Error::Conversion(_))));
+        let offset_date = Date::from_calendar_date(9999, Month::December, 31)
+            .expect("maximum SQL date")
+            .with_hms(23, 0, 0)
+            .expect("valid time")
+            .assume_offset(UtcOffset::from_hms(-2, 0, 0).expect("valid offset"));
+        assert!(matches!(offset_date.to_sql(), Err(Error::Conversion(_))));
+    }
+
+    #[cfg(feature = "jiff")]
+    #[test]
+    fn jiff_date_conversions_check_range_and_timestamp_utc_date() {
+        for date in [jiff::civil::date(1, 1, 1), jiff::civil::date(9999, 12, 31)] {
+            assert!(matches!(date.to_sql(), Ok(SqlType::Date(Some(_)))));
+        }
+        let date = jiff::civil::date(0, 12, 31);
+        assert!(matches!(date.to_sql(), Err(Error::Conversion(_))));
+        assert!(matches!(
+            date.at(0, 0, 0, 0).to_sql(),
+            Err(Error::Conversion(_))
+        ));
+        let timestamp: jiff::Timestamp = "0000-12-31T23:00:00Z".parse().expect("valid timestamp");
+        assert!(matches!(timestamp.to_sql(), Err(Error::Conversion(_))));
+        let zoned = timestamp.to_zoned(jiff::tz::TimeZone::fixed(jiff::tz::offset(1)));
+        assert_eq!(zoned.year(), 1);
+        assert!(matches!(zoned.to_sql(), Err(Error::Conversion(_))));
     }
 
     #[cfg(feature = "time")]
@@ -1297,7 +1410,7 @@ mod tests {
     fn time_date_roundtrips_through_column_data() -> TestResult {
         use mssql_tds::datatypes::column_values::ColumnValues;
         let date = time::Date::from_calendar_date(2024, time::Month::February, 29)?;
-        let SqlType::Date(Some(sql_date)) = date.to_sql() else {
+        let SqlType::Date(Some(sql_date)) = date.to_sql()? else {
             return Err("expected SQL date".into());
         };
         let value = ColumnValues::Date(sql_date);
@@ -1310,7 +1423,7 @@ mod tests {
     fn jiff_date_roundtrips_through_column_data() -> TestResult {
         use mssql_tds::datatypes::column_values::ColumnValues;
         let date = jiff::civil::date(2024, 2, 29);
-        let SqlType::Date(Some(sql_date)) = date.to_sql() else {
+        let SqlType::Date(Some(sql_date)) = date.to_sql()? else {
             return Err("expected SQL date".into());
         };
         let value = ColumnValues::Date(sql_date);
@@ -1320,13 +1433,13 @@ mod tests {
 
     #[test]
     fn string_parameter_encoding_can_use_varchar() {
-        let ty = encode_string_parameters("hello".to_sql(), false);
+        let ty = encode_string_parameters("hello".to_sql().expect("valid parameter"), false);
         assert!(matches!(ty, SqlType::Varchar(_, 4000)));
     }
 
     #[test]
     fn string_parameter_encoding_defaults_to_nvarchar() {
-        let ty = encode_string_parameters("hello".to_sql(), true);
+        let ty = encode_string_parameters("hello".to_sql().expect("valid parameter"), true);
         assert!(matches!(ty, SqlType::NVarchar(_, 4000)));
     }
 
@@ -1338,7 +1451,11 @@ mod tests {
             ("😀".repeat(2000), false),
             ("😀".repeat(2001), true),
         ] {
-            for value in [text.as_str().to_sql(), text.to_sql(), json!(text).to_sql()] {
+            for value in [
+                text.as_str().to_sql()?,
+                text.to_sql()?,
+                json!(text).to_sql()?,
+            ] {
                 match value {
                     SqlType::NVarchar(Some(value), 4000) if !max => {
                         ensure_equal(value.to_utf8_string().as_str(), text.as_str())?;
@@ -1360,7 +1477,7 @@ mod tests {
             let value = json!(["a".repeat(count)]);
             let expected = value.to_string();
             ensure_equal(expected.encode_utf16().count(), count + 4)?;
-            match value.to_sql() {
+            match value.to_sql()? {
                 SqlType::NVarchar(Some(actual), 4000) if count == 3996 => {
                     ensure_equal(actual.to_utf8_string(), expected)?;
                 }
@@ -1384,25 +1501,25 @@ mod tests {
     fn json_value_to_sql_dispatches_by_variant() -> TestResult {
         ensure(
             matches!(
-                serde_json::Value::Null.to_sql(),
+                serde_json::Value::Null.to_sql()?,
                 SqlType::NVarchar(None, 4000)
             ),
             "expected SQL NULL",
         )?;
         ensure(
-            matches!(json!(true).to_sql(), SqlType::Bit(Some(true))),
+            matches!(json!(true).to_sql()?, SqlType::Bit(Some(true))),
             "expected JSON bit",
         )?;
         ensure(
-            matches!(json!(42).to_sql(), SqlType::BigInt(Some(42))),
+            matches!(json!(42).to_sql()?, SqlType::BigInt(Some(42))),
             "expected JSON bigint",
         )?;
         ensure(
-            matches!(json!(2.5).to_sql(), SqlType::Float(Some(v)) if (v - 2.5).abs() < f64::EPSILON),
+            matches!(json!(2.5).to_sql()?, SqlType::Float(Some(v)) if (v - 2.5).abs() < f64::EPSILON),
             "expected JSON float",
         )?;
 
-        let ty = json!("alice").to_sql();
+        let ty = json!("alice").to_sql()?;
         ensure(
             matches!(ty, SqlType::NVarchar(_, 4000)),
             "expected nvarchar string",
@@ -1414,14 +1531,14 @@ mod tests {
         }
 
         let array = json!([1, 2, 3]);
-        if let SqlType::NVarchar(Some(value), 4000) = array.to_sql() {
+        if let SqlType::NVarchar(Some(value), 4000) = array.to_sql()? {
             ensure_equal(value.to_utf8_string(), array.to_string())?;
         } else {
             return Err("expected NVarchar JSON text for array".into());
         }
 
         let object = json!({"name":"alice"});
-        if let SqlType::NVarchar(Some(value), 4000) = object.to_sql() {
+        if let SqlType::NVarchar(Some(value), 4000) = object.to_sql()? {
             ensure_equal(value.to_utf8_string(), object.to_string())?;
         } else {
             return Err("expected NVarchar JSON text for object".into());

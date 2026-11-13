@@ -195,18 +195,18 @@ impl BulkLoadRow for TokenRow<'_> {
 
 /// Convert a scalar or tuple into a compatibility bulk row.
 pub trait IntoRow<'a> {
-    /// Convert values to a row in tuple order.
-    fn into_row(self) -> TokenRow<'a>;
+    /// Convert values to a row in tuple order, or return a conversion error.
+    fn into_row(self) -> Result<TokenRow<'a>>;
 }
 
 impl<'a, A> IntoRow<'a> for A
 where
     A: IntoSql<'a>,
 {
-    fn into_row(self) -> TokenRow<'a> {
+    fn into_row(self) -> Result<TokenRow<'a>> {
         let mut row = TokenRow::with_capacity(1);
-        row.push(self.into_sql());
-        row
+        row.push(self.into_sql()?);
+        Ok(row)
     }
 }
 
@@ -216,10 +216,10 @@ macro_rules! impl_into_row {
         where
             $( $type: IntoSql<'a>, )+
         {
-            fn into_row(self) -> TokenRow<'a> {
+            fn into_row(self) -> Result<TokenRow<'a>> {
                 let mut row = TokenRow::with_capacity($len);
-                $( row.push(self.$field.into_sql()); )+
-                row
+                $( row.push(self.$field.into_sql()?); )+
+                Ok(row)
             }
         }
     };
@@ -534,8 +534,8 @@ mod tests {
         assert!(TokenRow::new().is_empty());
         let mut row = TokenRow::with_capacity(2);
         assert!(row.is_empty());
-        row.push(1i32.into_sql());
-        row.push(Option::<&str>::None.into_sql());
+        row.push(1i32.into_sql().expect("valid parameter"));
+        row.push(Option::<&str>::None.into_sql().expect("valid parameter"));
         assert_eq!(row.len(), 2);
         assert!(matches!(row.get(0), Some(ColumnData::I32(Some(1)))));
         assert_eq!(row.iter().count(), 2);
@@ -543,31 +543,55 @@ mod tests {
         row.clear();
         assert!(row.is_empty());
 
-        assert_eq!(1i32.into_row().len(), 1);
-        assert_eq!((1i32, 2i32).into_row().len(), 2);
-        assert_eq!((1i32, 2i32, 3i32).into_row().len(), 3);
-        assert_eq!((1i32, 2i32, 3i32, 4i32).into_row().len(), 4);
-        assert_eq!((1i32, 2i32, 3i32, 4i32, 5i32).into_row().len(), 5);
-        assert_eq!((1i32, 2i32, 3i32, 4i32, 5i32, 6i32).into_row().len(), 6);
+        assert_eq!(1i32.into_row().expect("valid row").len(), 1);
+        assert_eq!((1i32, 2i32).into_row().expect("valid row").len(), 2);
+        assert_eq!((1i32, 2i32, 3i32).into_row().expect("valid row").len(), 3);
         assert_eq!(
-            (1i32, 2i32, 3i32, 4i32, 5i32, 6i32, 7i32).into_row().len(),
+            (1i32, 2i32, 3i32, 4i32)
+                .into_row()
+                .expect("valid row")
+                .len(),
+            4
+        );
+        assert_eq!(
+            (1i32, 2i32, 3i32, 4i32, 5i32)
+                .into_row()
+                .expect("valid row")
+                .len(),
+            5
+        );
+        assert_eq!(
+            (1i32, 2i32, 3i32, 4i32, 5i32, 6i32)
+                .into_row()
+                .expect("valid row")
+                .len(),
+            6
+        );
+        assert_eq!(
+            (1i32, 2i32, 3i32, 4i32, 5i32, 6i32, 7i32)
+                .into_row()
+                .expect("valid row")
+                .len(),
             7
         );
         assert_eq!(
             (1i32, 2i32, 3i32, 4i32, 5i32, 6i32, 7i32, 8i32)
                 .into_row()
+                .expect("valid row")
                 .len(),
             8
         );
         assert_eq!(
             (1i32, 2i32, 3i32, 4i32, 5i32, 6i32, 7i32, 8i32, 9i32)
                 .into_row()
+                .expect("valid row")
                 .len(),
             9
         );
         assert_eq!(
             (1i32, 2i32, 3i32, 4i32, 5i32, 6i32, 7i32, 8i32, 9i32, 10i32)
                 .into_row()
+                .expect("valid row")
                 .len(),
             10
         );

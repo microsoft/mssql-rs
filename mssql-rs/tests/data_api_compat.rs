@@ -23,6 +23,35 @@ use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sql_string::SqlString;
 use mssql_tds::message::bulk_load::StreamingBulkLoadWriter;
 
+#[test]
+fn invalid_dates_fail_compatibility_binding_and_row_conversion() {
+    let invalid = chrono::NaiveDate::from_ymd_opt(0, 12, 31).expect("chrono date");
+    let valid = chrono::NaiveDate::from_ymd_opt(1, 1, 1).expect("chrono date");
+
+    assert!(matches!(
+        mssql_rs::compat::ToSql::to_sql(&invalid),
+        Err(Error::Conversion(_))
+    ));
+    assert!(matches!(invalid.into_sql(), Err(Error::Conversion(_))));
+    assert!(matches!(
+        Some(invalid).into_sql(),
+        Err(Error::Conversion(_))
+    ));
+    assert!(matches!(
+        Option::<chrono::NaiveDate>::None.into_sql(),
+        Ok(ColumnData::Date(None))
+    ));
+    assert!(matches!(valid.into_sql(), Ok(ColumnData::Date(Some(_)))));
+    assert!(matches!(invalid.into_row(), Err(Error::Conversion(_))));
+    assert!(matches!(
+        (42i32, invalid).into_row(),
+        Err(Error::Conversion(_))
+    ));
+    let mut query = Query::new("SELECT @P1");
+    assert!(matches!(query.bind(invalid), Err(Error::Conversion(_))));
+    query.bind(valid).expect("valid parameter");
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Status {
     UnchangedPass,
@@ -241,7 +270,7 @@ const TRACEABILITY: &[Trace] = &[
     Trace {
         behavior: "dynamic Query binding",
         source: "data_api.rs:execute_dynamic_query_and_bulk_behavior",
-        status: Status::UnchangedPass,
+        status: Status::AdaptedPass,
         evidence: "dynamic_query_builder_*; pass/data_api_query_builder.rs (#127)",
     },
     Trace {
@@ -259,19 +288,19 @@ const TRACEABILITY: &[Trace] = &[
     Trace {
         behavior: "TokenRow helpers",
         source: "data_api.rs:public_numeric_time_xml_and_token_row_helpers",
-        status: Status::UnchangedPass,
+        status: Status::AdaptedPass,
         evidence: "bulk::tests::token_row_helpers_and_tuple_arities_preserve_values; pass/data_api_bulk_row.rs (#129)",
     },
     Trace {
         behavior: "IntoRow tuple arities 1 through 10",
         source: "data_api.rs:public_numeric_time_xml_and_token_row_helpers",
-        status: Status::UnchangedPass,
+        status: Status::AdaptedPass,
         evidence: "compat_bulk_tuple_arities_finalize_and_reset; pass/data_api_bulk_row.rs (#129)",
     },
     Trace {
         behavior: "bulk send/finalize lifecycle",
         source: "data_api.rs:execute_dynamic_query_and_bulk_behavior",
-        status: Status::UnchangedPass,
+        status: Status::AdaptedPass,
         evidence: "compat_bulk_incremental_lifecycle_validates_and_runs_twice; pass/data_api_bulk_lifecycle.rs (#129)",
     },
     Trace {
@@ -299,14 +328,14 @@ fn phase_1_traceability_is_complete_and_stable() {
             .iter()
             .filter(|trace| trace.status == Status::UnchangedPass)
             .count(),
-        14
+        10
     );
     assert_eq!(
         TRACEABILITY
             .iter()
             .filter(|trace| trace.status == Status::AdaptedPass)
             .count(),
-        23
+        27
     );
     assert_eq!(
         TRACEABILITY
@@ -745,8 +774,8 @@ async fn dynamic_query_builder_queries_in_binding_order() {
     };
     let borrowed = String::from("borrowed");
     let mut query = Query::new("SELECT @P1 AS first_value, @P2 AS second_value");
-    query.bind(borrowed.as_str());
-    query.bind(String::from("owned"));
+    query.bind(borrowed.as_str()).expect("valid parameter");
+    query.bind(String::from("owned")).expect("valid parameter");
 
     let row = query
         .query(&mut client)
@@ -771,8 +800,8 @@ async fn dynamic_query_builder_executes_and_is_recreated_for_repeated_use() {
         .expect("create dynamic query table");
 
     let mut first = Query::new("INSERT INTO #compat_query_builder VALUES (@P1), (@P2)");
-    first.bind(1i32);
-    first.bind(2i32);
+    first.bind(1i32).expect("valid parameter");
+    first.bind(2i32).expect("valid parameter");
     assert_eq!(
         first
             .execute(&mut client)
@@ -785,7 +814,7 @@ async fn dynamic_query_builder_executes_and_is_recreated_for_repeated_use() {
     let mut second = Query::new(String::from(
         "UPDATE #compat_query_builder SET id = id + @P1",
     ));
-    second.bind(10i32);
+    second.bind(10i32).expect("valid parameter");
     assert_eq!(
         second
             .execute(&mut client)
@@ -844,7 +873,7 @@ async fn dynamic_query_builder_preserves_typed_null() {
         return;
     };
     let mut query = Query::new("SELECT @P1 AS nullable");
-    query.bind(Option::<i32>::None);
+    query.bind(Option::<i32>::None).expect("valid parameter");
 
     let row = query
         .query(&mut client)
@@ -873,7 +902,7 @@ async fn dynamic_query_builder_propagates_server_parameter_errors() {
     assert!(missing.query(&mut client).await.err().is_some());
 
     let mut wrong_type = Query::new("SELECT CAST(@P1 AS int)");
-    wrong_type.bind("not an integer");
+    wrong_type.bind("not an integer").expect("valid parameter");
     let stream = wrong_type
         .query(&mut client)
         .await
@@ -964,7 +993,7 @@ async fn compat_bulk_tuple_arities_finalize_and_reset() {
                 .bulk_insert($table)
                 .await
                 .expect("start compatibility bulk");
-            bulk.send($row.into_row())
+            bulk.send($row.into_row().expect("valid row"))
                 .await
                 .expect("send tuple-arity row");
             assert_eq!(
@@ -1038,16 +1067,16 @@ async fn compat_bulk_incremental_lifecycle_validates_and_runs_twice() {
         .await
         .expect("start first compatibility bulk");
     first
-        .send((1i32, Some("one")).into_row())
+        .send((1i32, Some("one")).into_row().expect("valid row"))
         .await
         .expect("send healthy row");
     let error = first
-        .send(2i32.into_row())
+        .send(2i32.into_row().expect("valid row"))
         .await
         .expect_err("wrong-width row must fail");
     assert!(matches!(error, Error::BulkInput(_)));
     first
-        .send((2i32, Option::<&str>::None).into_row())
+        .send((2i32, Option::<&str>::None).into_row().expect("valid row"))
         .await
         .expect("width failure must not poison request");
     assert_eq!(
@@ -1064,7 +1093,7 @@ async fn compat_bulk_incremental_lifecycle_validates_and_runs_twice() {
         .await
         .expect("start second compatibility bulk");
     second
-        .send((3i32, Some("three")).into_row())
+        .send((3i32, Some("three")).into_row().expect("valid row"))
         .await
         .expect("send second-operation row");
     assert_eq!(
@@ -1115,7 +1144,7 @@ async fn compat_bulk_oversized_value_is_explicit_input_error() {
         .bulk_insert("#compat_bulk_limit")
         .await
         .expect("start limited-width bulk");
-    bulk.send("too long for nvarchar(8)".into_row())
+    bulk.send("too long for nvarchar(8)".into_row().expect("valid row"))
         .await
         .expect("compatibility adapter retains rows until finalize");
     assert!(matches!(bulk.finalize().await, Err(Error::BulkInput(_))));
@@ -1125,7 +1154,7 @@ async fn compat_bulk_oversized_value_is_explicit_input_error() {
         .await
         .expect("start wrong-width bulk");
     too_wide
-        .send(("one", "two").into_row())
+        .send(("one", "two").into_row().expect("valid row"))
         .await
         .expect("row width is checked against metadata during finalize");
     assert!(matches!(
@@ -1157,7 +1186,7 @@ async fn compat_bulk_oversized_value_is_explicit_input_error() {
         .await
         .expect("start healthy bulk after completed input error");
     healthy
-        .send("fits".into_row())
+        .send("fits".into_row().expect("valid row"))
         .await
         .expect("healthy input stays quiet");
     assert_eq!(
@@ -1173,7 +1202,7 @@ async fn compat_bulk_oversized_value_is_explicit_input_error() {
 #[test]
 fn local_conversion_contract_uses_driver_value_types() {
     assert!(matches!(
-        None::<i32>.to_sql(),
+        None::<i32>.to_sql().expect("valid parameter"),
         mssql_tds::datatypes::sqltypes::SqlType::Int(None)
     ));
     assert_eq!(<i32 as FromSql>::from_sql(&ColumnValues::Int(7)), Some(7));
@@ -1188,7 +1217,7 @@ fn compat_conversion_traits_cover_values_nulls_and_errors() {
     macro_rules! check_value {
         ($value:expr, $variant:path, $ty:ty) => {{
             let value: $ty = $value;
-            let data = value.into_sql();
+            let data = value.into_sql().expect("valid parameter");
             assert!(matches!(data, $variant(Some(_))));
             assert_eq!(
                 <$ty>::from_sql_owned(data).expect("decode owned value"),
@@ -1207,22 +1236,26 @@ fn compat_conversion_traits_cover_values_nulls_and_errors() {
 
     let text = String::from("owned");
     assert_eq!(
-        String::from_sql_owned(text.clone().into_sql()).expect("decode owned string"),
+        String::from_sql_owned(text.clone().into_sql().expect("valid parameter"))
+            .expect("decode owned string"),
         Some(text)
     );
     let bytes = vec![1, 2, 3];
     assert_eq!(
-        Vec::<u8>::from_sql_owned(bytes.clone().into_sql()).expect("decode owned bytes"),
+        Vec::<u8>::from_sql_owned(bytes.clone().into_sql().expect("valid parameter"))
+            .expect("decode owned bytes"),
         Some(bytes)
     );
     let decimal = rust_decimal::Decimal::new(-12345, 2);
     assert_eq!(
-        rust_decimal::Decimal::from_sql_owned(decimal.into_sql()).expect("decode decimal"),
+        rust_decimal::Decimal::from_sql_owned(decimal.into_sql().expect("valid parameter"))
+            .expect("decode decimal"),
         Some(decimal)
     );
     let date = chrono::NaiveDate::from_ymd_opt(2024, 2, 29).expect("valid date");
     assert_eq!(
-        chrono::NaiveDate::from_sql_owned(date.into_sql()).expect("decode date"),
+        chrono::NaiveDate::from_sql_owned(date.into_sql().expect("valid parameter"))
+            .expect("decode date"),
         Some(date)
     );
 

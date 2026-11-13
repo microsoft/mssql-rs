@@ -12,8 +12,8 @@ The reference is [saurabh500/tiberius at commit `e01b6a4`](https://github.com/sa
 
 | Status | Scenarios |
 |---|---:|
-| Passes with the unchanged Tiberius-facing call | 14 |
-| Passes with an adapted driver call | 23 |
+| Passes with the unchanged Tiberius-facing call | 10 |
+| Passes with an adapted driver call | 27 |
 | Compile/API gap | 1 |
 | Behavioral gap | 0 |
 | Intentional improvement | 2 |
@@ -61,6 +61,14 @@ from `get`.
 in column order. The representation is created on first compatibility access,
 so native-only row access does not pay for it. Borrowed strings and byte slices
 remain borrowed through `IntoSql`.
+
+Unlike Tiberius's infallible parameter conversion, native `ToSql::to_sql`,
+`compat::ToSql::to_sql`, `IntoSql::into_sql`, `Query::bind`, and
+`IntoRow::into_row` return `Result`, as does native `query::build_params`.
+Propagate their errors with `?`.
+Dates outside 0001-01-01 through 9999-12-31 return `Error::Conversion`;
+offset datetime conversions check the UTC date. Failed parameter conversion
+does not start a query or invalidate the connection.
 
 Conversions cover primitives, strings and bytes, UUID, `rust_decimal`,
 `chrono`, and the `time` and `jiff` types when their features are enabled.

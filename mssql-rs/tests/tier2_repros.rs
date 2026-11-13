@@ -358,7 +358,7 @@ async fn test_333_special_character_password_login_succeeds() {
 
 #[test]
 fn test_221_nan_parameter_is_currently_encoded_as_float_nan() {
-    let sql_type = f64::NAN.to_sql();
+    let sql_type = f64::NAN.to_sql().expect("valid parameter");
     assert!(
         matches!(sql_type, mssql_tds::datatypes::sqltypes::SqlType::Float(Some(v)) if v.is_nan()),
         "driver currently passes NaN through to mssql-tds; live test verifies graceful recovery"

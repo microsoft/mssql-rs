@@ -42,8 +42,12 @@ impl<'a> Query<'a> {
     }
 
     /// Append a parameter in `@P1`, `@P2`, ... order.
-    pub fn bind(&mut self, param: impl IntoSql<'a> + 'a) {
-        self.params.push(param.into_sql());
+    ///
+    /// Returns a conversion error without appending the parameter if the value
+    /// cannot be represented.
+    pub fn bind(&mut self, param: impl IntoSql<'a> + 'a) -> Result<()> {
+        self.params.push(param.into_sql()?);
+        Ok(())
     }
 
     /// Execute the query and return its compatibility item stream.

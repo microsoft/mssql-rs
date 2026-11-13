@@ -129,11 +129,9 @@ impl PreparedStatement {
     pub(crate) async fn prepare(
         client: &mut TdsClient,
         sql: String,
-        param_types: &[&dyn ToSql],
-        unicode: bool,
+        declaration: String,
         session: Arc<()>,
     ) -> Result<Self> {
-        let declaration = Self::parameter_declaration(param_types, unicode)?;
         let parameters = vec![
             RpcParameter::new(None, StatusFlags::BY_REF_VALUE, SqlType::Int(None)),
             RpcParameter::new(
@@ -181,12 +179,12 @@ impl PreparedStatement {
         self.handle
     }
 
-    fn parameter_declaration(params: &[&dyn ToSql], unicode: bool) -> Result<String> {
+    pub(crate) fn parameter_declaration(params: &[&dyn ToSql], unicode: bool) -> Result<String> {
         params
             .iter()
             .enumerate()
             .map(|(index, param)| {
-                let value = match (param.to_sql(), unicode) {
+                let value = match (param.to_sql()?, unicode) {
                     (SqlType::NVarchar(value, len), false) => SqlType::Varchar(value, len),
                     (SqlType::NVarcharMax(value), false) => SqlType::VarcharMax(value),
                     (value, _) => value,

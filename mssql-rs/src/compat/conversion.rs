@@ -328,8 +328,8 @@ impl ColumnData<'_> {
 }
 
 impl NativeToSql for ColumnData<'_> {
-    fn to_sql(&self) -> SqlType {
-        match self.clone() {
+    fn to_sql(&self) -> Result<SqlType> {
+        Ok(match self.clone() {
             ColumnData::Bit(value) => SqlType::Bit(value),
             ColumnData::U8(value) => SqlType::TinyInt(value),
             ColumnData::I16(value) => SqlType::SmallInt(value),
@@ -360,65 +360,71 @@ impl NativeToSql for ColumnData<'_> {
                 SqlType::Json(value.map(|value| SqlJson::from(value.into_owned())))
             }
             ColumnData::Native(value) => value,
-        }
+        })
     }
 }
 
 /// Tiberius-shaped by-reference conversion to [`ColumnData`].
 pub trait ToSql: Send + Sync {
-    fn to_sql(&self) -> ColumnData<'_>;
+    /// Convert a parameter, returning an error if it cannot be represented.
+    fn to_sql(&self) -> Result<ColumnData<'_>>;
 }
 
 impl<T: NativeToSql + ?Sized> ToSql for T {
-    fn to_sql(&self) -> ColumnData<'_> {
-        ColumnData::from_native(NativeToSql::to_sql(self))
+    fn to_sql(&self) -> Result<ColumnData<'_>> {
+        NativeToSql::to_sql(self).map(ColumnData::from_native)
     }
 }
 
 impl ToSql for Cow<'_, str> {
-    fn to_sql(&self) -> ColumnData<'_> {
-        ColumnData::String(Some(Cow::Borrowed(self.as_ref())))
+    fn to_sql(&self) -> Result<ColumnData<'_>> {
+        Ok(ColumnData::String(Some(Cow::Borrowed(self.as_ref()))))
     }
 }
 
 impl ToSql for Option<Cow<'_, str>> {
-    fn to_sql(&self) -> ColumnData<'_> {
-        ColumnData::String(self.as_ref().map(|value| Cow::Borrowed(value.as_ref())))
+    fn to_sql(&self) -> Result<ColumnData<'_>> {
+        Ok(ColumnData::String(
+            self.as_ref().map(|value| Cow::Borrowed(value.as_ref())),
+        ))
     }
 }
 
 impl ToSql for Cow<'_, [u8]> {
-    fn to_sql(&self) -> ColumnData<'_> {
-        ColumnData::Binary(Some(Cow::Borrowed(self.as_ref())))
+    fn to_sql(&self) -> Result<ColumnData<'_>> {
+        Ok(ColumnData::Binary(Some(Cow::Borrowed(self.as_ref()))))
     }
 }
 
 impl ToSql for Option<Cow<'_, [u8]>> {
-    fn to_sql(&self) -> ColumnData<'_> {
-        ColumnData::Binary(self.as_ref().map(|value| Cow::Borrowed(value.as_ref())))
+    fn to_sql(&self) -> Result<ColumnData<'_>> {
+        Ok(ColumnData::Binary(
+            self.as_ref().map(|value| Cow::Borrowed(value.as_ref())),
+        ))
     }
 }
 
 impl ToSql for DecimalParts {
-    fn to_sql(&self) -> ColumnData<'_> {
-        ColumnData::Numeric(Some(*self))
+    fn to_sql(&self) -> Result<ColumnData<'_>> {
+        Ok(ColumnData::Numeric(Some(*self)))
     }
 }
 
 impl ToSql for Option<DecimalParts> {
-    fn to_sql(&self) -> ColumnData<'_> {
-        ColumnData::Numeric(*self)
+    fn to_sql(&self) -> Result<ColumnData<'_>> {
+        Ok(ColumnData::Numeric(*self))
     }
 }
 
 /// Tiberius-shaped by-value conversion to [`ColumnData`].
 pub trait IntoSql<'a>: Send + Sync {
-    fn into_sql(self) -> ColumnData<'a>;
+    /// Convert a parameter, returning an error if it cannot be represented.
+    fn into_sql(self) -> Result<ColumnData<'a>>;
 }
 
 impl<'a> IntoSql<'a> for ColumnData<'a> {
-    fn into_sql(self) -> ColumnData<'a> {
-        self
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(self)
     }
 }
 
@@ -426,16 +432,16 @@ macro_rules! impl_into_sql_native {
     ($($ty:ty => $null:expr),+ $(,)?) => {
         $(
             impl<'a> IntoSql<'a> for $ty {
-                fn into_sql(self) -> ColumnData<'a> {
-                    ColumnData::from_native(NativeToSql::to_sql(&self))
+                fn into_sql(self) -> Result<ColumnData<'a>> {
+                    NativeToSql::to_sql(&self).map(ColumnData::from_native)
                 }
             }
 
             impl<'a> IntoSql<'a> for Option<$ty> {
-                fn into_sql(self) -> ColumnData<'a> {
+                fn into_sql(self) -> Result<ColumnData<'a>> {
                     match self {
-                        Some(value) => ColumnData::from_native(NativeToSql::to_sql(&value)),
-                        None => $null,
+                        Some(value) => NativeToSql::to_sql(&value).map(ColumnData::from_native),
+                        None => Ok($null),
                     }
                 }
             }
@@ -479,122 +485,126 @@ impl_into_sql_native!(
 );
 
 impl<'a> IntoSql<'a> for String {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::String(Some(Cow::Owned(self)))
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::String(Some(Cow::Owned(self))))
     }
 }
 
 impl<'a> IntoSql<'a> for Option<String> {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::String(self.map(Cow::Owned))
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::String(self.map(Cow::Owned)))
     }
 }
 
 impl<'a> IntoSql<'a> for &'a str {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::String(Some(Cow::Borrowed(self)))
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::String(Some(Cow::Borrowed(self))))
     }
 }
 
 impl<'a> IntoSql<'a> for Option<&'a str> {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::String(self.map(Cow::Borrowed))
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::String(self.map(Cow::Borrowed)))
     }
 }
 
 impl<'a> IntoSql<'a> for &'a String {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::String(Some(Cow::Borrowed(self.as_str())))
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::String(Some(Cow::Borrowed(self.as_str()))))
     }
 }
 
 impl<'a> IntoSql<'a> for Option<&'a String> {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::String(self.map(|value| Cow::Borrowed(value.as_str())))
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::String(
+            self.map(|value| Cow::Borrowed(value.as_str())),
+        ))
     }
 }
 
 impl<'a> IntoSql<'a> for Cow<'a, str> {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::String(Some(self))
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::String(Some(self)))
     }
 }
 
 impl<'a> IntoSql<'a> for Option<Cow<'a, str>> {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::String(self)
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::String(self))
     }
 }
 
 impl<'a> IntoSql<'a> for Vec<u8> {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::Binary(Some(Cow::Owned(self)))
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::Binary(Some(Cow::Owned(self))))
     }
 }
 
 impl<'a> IntoSql<'a> for Option<Vec<u8>> {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::Binary(self.map(Cow::Owned))
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::Binary(self.map(Cow::Owned)))
     }
 }
 
 impl<'a> IntoSql<'a> for &'a [u8] {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::Binary(Some(Cow::Borrowed(self)))
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::Binary(Some(Cow::Borrowed(self))))
     }
 }
 
 impl<'a> IntoSql<'a> for Option<&'a [u8]> {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::Binary(self.map(Cow::Borrowed))
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::Binary(self.map(Cow::Borrowed)))
     }
 }
 
 impl<'a> IntoSql<'a> for &'a Vec<u8> {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::Binary(Some(Cow::Borrowed(self.as_slice())))
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::Binary(Some(Cow::Borrowed(self.as_slice()))))
     }
 }
 
 impl<'a> IntoSql<'a> for Option<&'a Vec<u8>> {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::Binary(self.map(|value| Cow::Borrowed(value.as_slice())))
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::Binary(
+            self.map(|value| Cow::Borrowed(value.as_slice())),
+        ))
     }
 }
 
 impl<'a> IntoSql<'a> for Cow<'a, [u8]> {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::Binary(Some(self))
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::Binary(Some(self)))
     }
 }
 
 impl<'a> IntoSql<'a> for Option<Cow<'a, [u8]>> {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::Binary(self)
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::Binary(self))
     }
 }
 
 impl<'a> IntoSql<'a> for &'a Uuid {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::Guid(Some(*self))
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::Guid(Some(*self)))
     }
 }
 
 impl<'a> IntoSql<'a> for Option<&'a Uuid> {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::Guid(self.copied())
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::Guid(self.copied()))
     }
 }
 
 impl<'a> IntoSql<'a> for DecimalParts {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::Numeric(Some(self))
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::Numeric(Some(self)))
     }
 }
 
 impl<'a> IntoSql<'a> for Option<DecimalParts> {
-    fn into_sql(self) -> ColumnData<'a> {
-        ColumnData::Numeric(self)
+    fn into_sql(self) -> Result<ColumnData<'a>> {
+        Ok(ColumnData::Numeric(self))
     }
 }
 
@@ -846,12 +856,14 @@ mod tests {
             + PartialEq
             + std::fmt::Debug,
     {
-        let by_ref = <T as ToSql>::to_sql(&value).into_owned();
+        let by_ref = <T as ToSql>::to_sql(&value)
+            .expect("valid parameter")
+            .into_owned();
         assert_eq!(
             <T as FromSql>::from_sql(&by_ref).expect("decode by-reference conversion"),
             Some(value.clone())
         );
-        let by_value = <T as IntoSql>::into_sql(value.clone());
+        let by_value = <T as IntoSql>::into_sql(value.clone()).expect("valid parameter");
         assert_eq!(
             T::from_sql_owned(by_value).expect("decode owned conversion"),
             Some(value)
@@ -860,7 +872,7 @@ mod tests {
 
     #[test]
     fn owned_and_borrowed_values_use_native_encoding() {
-        let owned = String::from("owned").into_sql();
+        let owned = String::from("owned").into_sql().expect("valid parameter");
         assert!(matches!(owned, ColumnData::String(Some(Cow::Owned(_)))));
         assert_eq!(
             String::from_sql_owned(owned.clone()).expect("decode owned string"),
@@ -872,41 +884,41 @@ mod tests {
         );
 
         assert!(matches!(
-            IntoSql::into_sql("borrowed"),
+            IntoSql::into_sql("borrowed").expect("valid parameter"),
             ColumnData::String(Some(Cow::Borrowed("borrowed")))
         ));
         let borrowed_string = "borrowed string".to_string();
         assert!(matches!(
-            IntoSql::into_sql(&borrowed_string),
+            IntoSql::into_sql(&borrowed_string).expect("valid parameter"),
             ColumnData::String(Some(Cow::Borrowed("borrowed string")))
         ));
 
         let bytes = [1, 2, 3];
         assert!(matches!(
-            bytes.as_slice().into_sql(),
+            bytes.as_slice().into_sql().expect("valid parameter"),
             ColumnData::Binary(Some(Cow::Borrowed(value))) if value == bytes
         ));
         let borrowed_bytes = bytes.to_vec();
         assert!(matches!(
-            IntoSql::into_sql(&borrowed_bytes),
+            IntoSql::into_sql(&borrowed_bytes).expect("valid parameter"),
             ColumnData::Binary(Some(Cow::Borrowed(value))) if value == bytes
         ));
         let cow_text = Cow::Borrowed("cow text");
         assert!(matches!(
-            ToSql::to_sql(&cow_text),
+            ToSql::to_sql(&cow_text).expect("valid parameter"),
             ColumnData::String(Some(Cow::Borrowed("cow text")))
         ));
         let cow_bytes = Cow::Borrowed(bytes.as_slice());
         assert!(matches!(
-            ToSql::to_sql(&cow_bytes),
+            ToSql::to_sql(&cow_bytes).expect("valid parameter"),
             ColumnData::Binary(Some(Cow::Borrowed(value))) if value == bytes
         ));
         assert_eq!(
-            ToSql::to_sql(&Option::<Cow<'_, str>>::None),
+            ToSql::to_sql(&Option::<Cow<'_, str>>::None).expect("valid parameter"),
             ColumnData::String(None)
         );
         assert_eq!(
-            ToSql::to_sql(&Option::<Cow<'_, [u8]>>::None),
+            ToSql::to_sql(&Option::<Cow<'_, [u8]>>::None).expect("valid parameter"),
             ColumnData::Binary(None)
         );
 
@@ -1542,7 +1554,10 @@ mod tests {
         ];
         for value in values {
             let owned = value.clone().into_owned();
-            assert_eq!(ColumnData::from_native(NativeToSql::to_sql(&value)), owned);
+            assert_eq!(
+                ColumnData::from_native(NativeToSql::to_sql(&value).expect("valid parameter")),
+                owned
+            );
         }
         assert!(matches!(
             ColumnData::String(Some(Cow::Borrowed("text"))).into_owned(),
@@ -1568,15 +1583,17 @@ mod tests {
         let oversized = "😀".repeat(2001);
 
         assert!(matches!(
-            NativeToSql::to_sql(&ColumnData::String(Some(Cow::Borrowed(&bounded)))),
+            NativeToSql::to_sql(&ColumnData::String(Some(Cow::Borrowed(&bounded))))
+                .expect("valid parameter"),
             SqlType::NVarchar(Some(_), 4000)
         ));
         assert!(matches!(
-            NativeToSql::to_sql(&ColumnData::String(Some(Cow::Borrowed(&oversized)))),
+            NativeToSql::to_sql(&ColumnData::String(Some(Cow::Borrowed(&oversized))))
+                .expect("valid parameter"),
             SqlType::NVarcharMax(Some(_))
         ));
         assert!(matches!(
-            NativeToSql::to_sql(&ColumnData::String(None)),
+            NativeToSql::to_sql(&ColumnData::String(None)).expect("valid parameter"),
             SqlType::NVarchar(None, 4000)
         ));
     }
@@ -1600,13 +1617,17 @@ mod tests {
                 .expect("valid decimal"),
         );
         let numeric = DecimalParts::new(true, 7, 2, 1_234_567);
-        assert_eq!(ToSql::to_sql(&numeric), ColumnData::Numeric(Some(numeric)));
         assert_eq!(
-            DecimalParts::from_sql_owned(numeric.into_sql()).expect("decode numeric parts"),
+            ToSql::to_sql(&numeric).expect("valid parameter"),
+            ColumnData::Numeric(Some(numeric))
+        );
+        assert_eq!(
+            DecimalParts::from_sql_owned(numeric.into_sql().expect("valid parameter"))
+                .expect("decode numeric parts"),
             Some(numeric)
         );
         assert_eq!(
-            ToSql::to_sql(&Option::<DecimalParts>::None),
+            ToSql::to_sql(&Option::<DecimalParts>::None).expect("valid parameter"),
             ColumnData::Numeric(None)
         );
         assert_eq!(
@@ -1631,7 +1652,9 @@ mod tests {
         let chrono_utc = chrono::Utc.from_utc_datetime(&chrono_datetime);
         assert_roundtrip(chrono_utc);
         assert_eq!(
-            Option::<chrono::DateTime<chrono::Utc>>::None.into_sql(),
+            Option::<chrono::DateTime<chrono::Utc>>::None
+                .into_sql()
+                .expect("valid parameter"),
             ColumnData::DateTimeOffset(None)
         );
         let (_, _, _, chrono_datetime2, _) = samples();

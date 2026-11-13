@@ -245,8 +245,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tds`] on SQL errors, parameter binding failures,
-    /// or connection issues.
+    /// Returns [`Error::Conversion`] for invalid parameters and [`Error::Tds`]
+    /// for SQL errors, parameter binding failures, or connection issues.
     pub async fn query(
         &mut self,
         sql: impl Into<String>,
@@ -259,7 +259,7 @@ impl Client {
         }
 
         let rpc_params =
-            build_params_with_string_encoding(params, self.send_string_parameters_as_unicode);
+            build_params_with_string_encoding(params, self.send_string_parameters_as_unicode)?;
         let mut operation = Operation::new(&mut self.inner)?;
         let result = async {
             operation.close_query().await.map_err(Error::Tds)?;
@@ -280,27 +280,31 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tds`] on SQL errors or connection issues.
+    /// Returns [`Error::Conversion`] for invalid parameters and [`Error::Tds`]
+    /// for SQL errors or connection issues.
     pub async fn execute(
         &mut self,
         sql: impl Into<String>,
         params: &[&dyn ToSql],
     ) -> Result<ExecuteResult> {
         let sql = sql.into();
+        let rpc_params = if params.is_empty() {
+            None
+        } else {
+            Some(build_params_with_string_encoding(
+                params,
+                self.send_string_parameters_as_unicode,
+            )?)
+        };
         let mut operation = Operation::new(&mut self.inner)?;
         let result = async {
             operation.close_query().await.map_err(Error::Tds)?;
-            let result = if params.is_empty() {
-                operation.execute(sql, ()).await.map_err(Error::Tds)?
-            } else {
-                let rpc_params = build_params_with_string_encoding(
-                    params,
-                    self.send_string_parameters_as_unicode,
-                );
-                operation
+            let result = match rpc_params {
+                None => operation.execute(sql, ()).await.map_err(Error::Tds)?,
+                Some(rpc_params) => operation
                     .execute_sp_executesql(sql, rpc_params, ())
                     .await
-                    .map_err(Error::Tds)?
+                    .map_err(Error::Tds)?,
             };
             Self::collect_execute_results(&mut operation, result).await
         }
@@ -370,14 +374,13 @@ impl Client {
     ) -> crate::compat::QueryStream<'a> {
         let sql = sql.into();
         let rpc_params = if params.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(build_params_with_string_encoding(
-                params,
-                self.send_string_parameters_as_unicode,
-            ))
+            build_params_with_string_encoding(params, self.send_string_parameters_as_unicode)
+                .map(Some)
         };
         let stream = Box::pin(async_stream::try_stream! {
+            let rpc_params = rpc_params?;
             let mut operation = Operation::new(&mut self.inner)?;
             let result: Result<()> = async {
                 operation.close_query().await.map_err(Error::Tds)?;
@@ -516,22 +519,26 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tds`] on SQL errors, connection issues, or if the
-    /// server returns an unexpected response from `sp_prepare`.
+    /// Returns [`Error::Conversion`] for invalid parameter samples and
+    /// [`Error::Tds`] on SQL errors, connection issues, or if the server
+    /// returns an unexpected response from `sp_prepare`.
     pub async fn prepare(
         &mut self,
         sql: impl Into<String>,
         param_types: &[&dyn ToSql],
     ) -> Result<crate::prepared::PreparedStatement> {
         let sql = sql.into();
+        let declaration = crate::prepared::PreparedStatement::parameter_declaration(
+            param_types,
+            self.send_string_parameters_as_unicode,
+        )?;
         let mut operation = Operation::new(&mut self.inner)?;
         let result = async {
             operation.close_query().await.map_err(Error::Tds)?;
             crate::prepared::PreparedStatement::prepare(
                 &mut operation,
                 sql,
-                param_types,
-                self.send_string_parameters_as_unicode,
+                declaration,
                 Arc::clone(&self.prepared_session),
             )
             .await
@@ -558,7 +565,7 @@ impl Client {
             Some(build_params_with_string_encoding(
                 params,
                 self.send_string_parameters_as_unicode,
-            ))
+            )?)
         };
         let mut operation = Operation::new(&mut self.inner)?;
         let result = async {
@@ -596,7 +603,7 @@ impl Client {
             Some(build_params_with_string_encoding(
                 params,
                 self.send_string_parameters_as_unicode,
-            ))
+            )?)
         };
         let mut operation = Operation::new(&mut self.inner)?;
         let result = async {

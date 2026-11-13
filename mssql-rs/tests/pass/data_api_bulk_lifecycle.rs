@@ -7,7 +7,7 @@ use mssql_rs::{Client, Error, ExecuteResult, IntoRow, Result};
 
 async fn send(client: &mut Client) -> Result<()> {
     let mut bulk = client.bulk_insert("#items").await?;
-    bulk.send((1i32, Option::<&str>::None).into_row()).await?;
+    bulk.send((1i32, Option::<&str>::None).into_row().expect("valid row")).await?;
     let result: ExecuteResult = bulk.finalize().await?;
     let _: &[u64] = result.rows_affected();
     Ok(())

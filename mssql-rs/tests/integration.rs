@@ -7,7 +7,73 @@
 
 pub mod common;
 
-use mssql_rs::{Client, TdsManager};
+use futures_util::StreamExt;
+use mssql_rs::{Client, Error, IntoRow, Query, TdsManager};
+
+#[tokio::test]
+async fn invalid_date_parameters_leave_connection_usable() {
+    let cfg = common::live_config_or_exit();
+    let mut client = Client::connect(&cfg).await.expect("connect failed");
+    let invalid = chrono::NaiveDate::from_ymd_opt(0, 12, 31).expect("chrono date");
+    let valid = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).expect("chrono date");
+
+    assert!(matches!(
+        client.query("SELECT @P1", &[&invalid]).await,
+        Err(Error::Conversion(_))
+    ));
+    assert!(matches!(
+        client.execute("SELECT @P1", &[&invalid]).await,
+        Err(Error::Conversion(_))
+    ));
+    assert!(matches!(
+        client.prepare("SELECT @P1", &[&invalid]).await,
+        Err(Error::Conversion(_))
+    ));
+    {
+        let mut stream = client.query_streamed("SELECT @P1", &[&invalid]);
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(Error::Conversion(_)))
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    let statement = client
+        .prepare("SELECT @P1", &[&valid])
+        .await
+        .expect("prepare");
+    assert!(matches!(
+        statement.query(&mut client, &[&invalid]).await,
+        Err(Error::Conversion(_))
+    ));
+    assert!(matches!(
+        statement.execute(&mut client, &[&invalid]).await,
+        Err(Error::Conversion(_))
+    ));
+    statement.close(&mut client).await.expect("close statement");
+
+    let mut query = Query::new("SELECT @P1 AS value");
+    query.bind(42i32).expect("valid parameter");
+    assert!(matches!(query.bind(invalid), Err(Error::Conversion(_))));
+    assert!(matches!(
+        (42i32, invalid).into_row(),
+        Err(Error::Conversion(_))
+    ));
+    let rows = query
+        .query(&mut client)
+        .await
+        .expect("query")
+        .into_first_result()
+        .await
+        .expect("results");
+    assert_eq!(
+        rows.first()
+            .expect("expected result row")
+            .get::<i32, _>("value"),
+        Some(42)
+    );
+    assert!(!client.is_connection_dead());
+}
 
 #[tokio::test]
 async fn long_native_string_and_json_parameters_roundtrip() {

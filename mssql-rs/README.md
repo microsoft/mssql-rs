@@ -79,6 +79,13 @@ The example trusts the server certificate for local development. Remove
 | `row.get::<&str, _>("col")` | `row.get::<&str, _>("col")` |
 | `tiberius::AuthMethod::sql_server` | `AuthMethod::sql_server` |
 
+Parameter conversion is fallible: `ToSql::to_sql`, `IntoSql::into_sql`,
+`Query::bind`, `IntoRow::into_row`, and `query::build_params` return `Result`. Dates outside SQL
+Server's supported range return `Error::Conversion` instead of panicking;
+offset datetimes are checked in UTC. See the
+[data API compatibility guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-rs/docs/data-api-compatibility.md)
+for details.
+
 ### Pooling behavior change
 
 `TdsManager::new` and `TdsManager::create_pool` now reset reused sessions using
