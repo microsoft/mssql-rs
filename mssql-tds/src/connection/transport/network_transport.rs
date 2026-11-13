@@ -1894,7 +1894,8 @@ impl NetworkTransport {
     }
 
     /// Appends the response's next packet to the unread bytes, if it arrives
-    /// by `deadline` and before any cancellation.
+    /// by `deadline` and before any cancellation. A cancellation wins over a
+    /// packet ready at the same time, as in `await_read_or_interrupt`.
     async fn next_packet_by(
         &mut self,
         deadline: Instant,
@@ -1920,8 +1921,9 @@ impl NetworkTransport {
             Err(error) => Poll::Ready(Err(error)),
         });
         tokio::select! {
-            arrived = timeout_at(deadline, arrival) => arrived.unwrap_or(Ok(false)),
+            biased;
             () = cancelled => Ok(false),
+            arrived = timeout_at(deadline, arrival) => arrived.unwrap_or(Ok(false)),
         }
     }
 
@@ -5362,6 +5364,37 @@ pub(crate) mod tests {
 
         assert!(!wanted.unwrap());
         assert!(!is_known_dead(&transport));
+    }
+
+    /// A cancellation wins over a packet that is ready at the same time, and
+    /// the packet stays unread for the next read. An unbiased choice would take
+    /// either one at random, so the race is run repeatedly.
+    #[tokio::test]
+    async fn waiting_for_a_wanted_token_prefers_a_cancellation_to_a_ready_packet() {
+        let done_proc = [vec![TokenType::DoneProc as u8], vec![0; 12]].concat();
+        let wanted = |kind: u8| kind == TokenType::DoneProc as u8;
+        for _ in 0..32 {
+            let (mut transport, mut server) =
+                create_readable_network_transport(&ClientContext::default());
+            server
+                .write_all(&tabular_packet(&done_proc, true))
+                .await
+                .unwrap();
+            let handle = cancelled_handle();
+
+            assert!(
+                !transport
+                    .wanted_token_within(Duration::from_secs(600), Some(&handle), wanted)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                transport
+                    .wanted_token_within(Duration::from_secs(5), None, wanted)
+                    .await
+                    .unwrap()
+            );
+        }
     }
 
     /// Test that demonstrates the multi-packet read bug WITHOUT checking internal fields.

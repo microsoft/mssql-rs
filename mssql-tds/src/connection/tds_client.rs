@@ -6607,18 +6607,15 @@ impl TdsClient {
     /// Whether the next token is a whole token of the failed statement's
     /// procedure tail, waiting for one until `deadline` at most. Nothing is
     /// read, and the time waited is not charged to the request's timeout. A
-    /// pending cancellation ends the look-ahead even over a buffered tail:
-    /// reading it would send ATTENTION and fail the completion, where the
-    /// caller settles the cancellation and keeps the statement's error alone.
+    /// cancellation before or during the wait ends the look-ahead even when the
+    /// tail has arrived: reading it would send ATTENTION and fail the
+    /// completion, where the caller settles the cancellation and keeps the
+    /// statement's error alone.
     async fn procedure_tail_token_by(&mut self, deadline: Instant) -> TdsResult<bool> {
         if self.parked_token.is_some() {
             return Ok(true);
         }
-        if self
-            .cancel_handle
-            .as_ref()
-            .is_some_and(|handle| handle.cancel_token.is_cancelled())
-        {
+        if self.request_cancelled() {
             return Ok(false);
         }
         let wait = deadline.saturating_duration_since(Instant::now());
@@ -6627,9 +6624,15 @@ impl TdsClient {
             .wanted_token_within(wait, self.cancel_handle.as_ref(), is_procedure_tail_token)
             .await
         {
-            Ok(ready) => Ok(ready),
+            Ok(arrived) => Ok(arrived && !self.request_cancelled()),
             Err(error) => Err(self.fail_read(error)),
         }
+    }
+
+    fn request_cancelled(&self) -> bool {
+        self.cancel_handle
+            .as_ref()
+            .is_some_and(|handle| handle.cancel_token.is_cancelled())
     }
 
     async fn complete_failed_statement_inner(
@@ -10542,6 +10545,9 @@ mod tests {
         response_pause_at: Option<usize>,
         /// Every wait `wanted_token_within` was given.
         response_waits: Arc<std::sync::Mutex<Vec<Duration>>>,
+        /// Cancelled by `wanted_token_within` before it reports the next token,
+        /// as when a cancellation lands while the procedure tail arrives.
+        cancel_during_wait: Option<tokio_util::sync::CancellationToken>,
     }
 
     impl TestTransport {
@@ -10585,6 +10591,7 @@ mod tests {
                 row_read_error: None,
                 response_pause_at: None,
                 response_waits: Arc::new(std::sync::Mutex::new(Vec::new())),
+                cancel_during_wait: None,
             }
         }
 
@@ -10946,6 +10953,9 @@ mod tests {
             wanted: fn(u8) -> bool,
         ) -> TdsResult<bool> {
             self.response_waits.lock().unwrap().push(wait);
+            if let Some(cancel) = self.cancel_during_wait.take() {
+                cancel.cancel();
+            }
             if self.response_pause_at != Some(self.pending_tokens.len()) {
                 return Ok(self.pending_tokens.front().is_none_or(|token| {
                     wanted(crate::test_client_support::scripted_token_type(token))
@@ -14060,6 +14070,41 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    /// A cancellation that lands during the wait, as the tail arrives, ends the
+    /// look-ahead too: the tail is left unread rather than read under the
+    /// cancelled handle, which would send ATTENTION and fail the completion.
+    #[tokio::test]
+    async fn a_cancellation_during_the_procedure_tail_wait_leaves_an_arrived_tail() {
+        let cancellation = CancelHandle::new();
+        let transport = TestTransport {
+            cancel_during_wait: Some(cancellation.cancel_token.clone()),
+            ..TestTransport::with_tokens(vec![
+                Tokens::Error(error_token_with_severity(16)),
+                done_in_proc_more(),
+                return_status(-6),
+                done_proc_no_more(),
+            ])
+        };
+        let attentions = Arc::clone(&transport.attentions);
+        let mut client = create_test_client_with_transport(transport);
+        client
+            .execute(
+                "q".to_string(),
+                ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+            )
+            .await
+            .unwrap_err();
+        client.cancel_handle = Some(cancellation.child_handle());
+
+        assert!(client.complete_failed_statement().await.unwrap());
+        assert!(client.has_open_batch());
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(matches!(
+            client.advance().await,
+            Err(crate::error::Error::OperationCancelledError(_))
+        ));
     }
 
     /// The same inside a row set: the errors collected there are dropped with
