@@ -318,6 +318,8 @@ stages:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
       ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
     steps:
+      - bash: bash .pipeline/scripts/probe-azure-vm.sh
+        displayName: 'Probe Azure public-cloud SMBIOS asset tag (throwaway experiment)'
       - template: cargo-authenticate-template.yml
         parameters:
           osType: Linux
@@ -459,6 +461,8 @@ stages:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
       ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
     steps:
+      - bash: bash .pipeline/scripts/probe-azure-vm.sh
+        displayName: 'Probe Azure public-cloud SMBIOS asset tag (throwaway experiment)'
       - script: |
           .pipeline/scripts/print-disk-info.sh
         displayName: 'Print debug information about agent'

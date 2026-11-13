@@ -33,6 +33,34 @@ def load_template(name):
     return yaml.safe_load((_TEMPLATES / name).read_text(encoding="utf-8"))
 
 
+@pytest.mark.skipif(not _BASH, reason="Bash is required")
+@pytest.mark.parametrize(
+    "read_result,success",
+    [
+        ("printf '%s\\n' '7783-7084-3265-9085-8269-3286-77'", True),
+        ("printf '%s\\n' 'not-azure'", False),
+        ("printf '%s\\n' ''", False),
+        ("echo 'Cannot read chassis asset tag' >&2; return 1", False),
+    ],
+)
+def test_linux_azure_vm_probe(read_result, success):
+    script = (_ROOT / ".pipeline" / "scripts" / "probe-azure-vm.sh").read_text(
+        encoding="utf-8"
+    )
+    mock = (
+        'cat() { [[ "$#" == 1 && "$1" == /sys/class/dmi/id/chassis_asset_tag ]]'
+        f" || return 99; {read_result}; }}\n"
+    )
+    result = subprocess.run(
+        [_BASH, "-c", mock + script], capture_output=True, text=True, timeout=10
+    )
+    assert (result.returncode == 0) == success, result.stdout + result.stderr
+    assert ("azurePublicCloudTagMatch=true" in result.stdout) == success
+    assert ("SMBIOSAssetTag=7783-7084-3265-9085-8269-3286-77" in result.stdout) == success
+    if "Cannot read" in read_result:
+        assert "Cannot read chassis asset tag" in result.stderr
+
+
 @pytest.fixture
 def stress_pipeline():
     return yaml.safe_load(
