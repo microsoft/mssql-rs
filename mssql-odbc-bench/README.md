@@ -225,9 +225,8 @@ outside the timed region.
 Preflight and every sample verify `SQLRowCount`, all parameter status entries,
 `SQL_ATTR_PARAMS_PROCESSED_PTR`, row count, numeric sums, and total text length.
 The dedicated perf runners use parameter arrays for the candidate and pinned
-msodbcsql legs. The checked-in Rust baseline predates parameter-array execution
-and rejects `SQL_ATTR_PARAMSET_SIZE > 1`, so it runs the explicitly reported
-sequential mode instead; the result is a sequential-baseline comparison, not a
+msodbcsql legs, and select the explicitly reported sequential mode for the
+pinned Rust baseline; the result is a sequential-baseline comparison, not a
 claim that the pinned baseline executed a parameter array.
 
 ### `pywrite` — `mssql-python` `executemany` shape
