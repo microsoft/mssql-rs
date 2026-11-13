@@ -147,9 +147,10 @@ jobs:
       - name: Download Cobertura coverage artifact
         env:
           BUILD_ID: ${{ steps.build.outputs.build_id }}
+          ARTIFACT_NAME: ${{ steps.build.outputs.artifact_name }}
         run: |
           curl --location --proto '=https' --proto-redir '=https' \
-            "https://dev.azure.com/sqlclientdrivers/public/_apis/build/builds/${BUILD_ID}/artifacts?api-version=7.1&artifactName=CoberturaCoverage&%24format=zip" \
+            "https://dev.azure.com/sqlclientdrivers/public/_apis/build/builds/${BUILD_ID}/artifacts?api-version=7.1&artifactName=${ARTIFACT_NAME}&%24format=zip" \
             --output "$RUNNER_TEMP/coverage-artifact.zip" --fail --silent --show-error
 
       - name: Checkout coverage source
@@ -169,10 +170,12 @@ jobs:
         id: report
         env:
           BUILD_ID: ${{ steps.build.outputs.build_id }}
+          ARTIFACT_NAME: ${{ steps.build.outputs.artifact_name }}
         run: |
           python -I tooling/.github/scripts/coverage-report.py \
             --archive "$RUNNER_TEMP/coverage-artifact.zip" \
             --source "$GITHUB_WORKSPACE/source" --build-id "$BUILD_ID" \
+            --artifact-name "$ARTIFACT_NAME" \
             --output "$GITHUB_OUTPUT" --temp-dir "$RUNNER_TEMP"
 
   post-comment:

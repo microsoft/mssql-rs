@@ -17,14 +17,18 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 
-def extract_coverage(archive_path: Path, destination: Path) -> None:
-    expected = "CoberturaCoverage/cobertura.xml"
+def extract_coverage(
+    archive_path: Path, destination: Path, artifact_name: str = "CoberturaCoverage"
+) -> None:
+    if not re.fullmatch(r"CoberturaCoverage(?:_[1-9][0-9]*_[1-9][0-9]*)?", artifact_name):
+        raise ValueError("Invalid coverage artifact name")
+    expected = f"{artifact_name}/cobertura.xml"
     with zipfile.ZipFile(archive_path) as archive:
         files = []
         for member in archive.infolist():
             name = member.orig_filename
             kind = stat.S_IFMT(member.external_attr >> 16)
-            if name == "CoberturaCoverage/" and member.is_dir():
+            if name == f"{artifact_name}/" and member.is_dir():
                 if kind not in (0, stat.S_IFDIR):
                     raise ValueError("Coverage archive directory is not a directory")
                 continue
@@ -44,13 +48,16 @@ def percentage(value: object, maximum: float = 100) -> float:
     return float(value)
 
 
-def generate_report(archive: Path, source: Path, build_id: str, temp_dir: Path) -> dict:
+def generate_report(
+    archive: Path, source: Path, build_id: str, temp_dir: Path,
+    artifact_name: str = "CoberturaCoverage",
+) -> dict:
     if not re.fullmatch(r"[1-9][0-9]*", build_id):
         raise ValueError("Invalid Azure DevOps build ID")
     with tempfile.TemporaryDirectory(prefix="coverage-report-", dir=temp_dir) as directory:
         work = Path(directory)
         xml = work / "coverage.xml"
-        extract_coverage(archive, xml)
+        extract_coverage(archive, xml, artifact_name)
         root = ET.parse(xml).getroot()
         if root.tag != "coverage":
             raise ValueError("Expected a Cobertura coverage root")
@@ -94,11 +101,13 @@ def main() -> None:
     parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--build-id", required=True)
+    parser.add_argument("--artifact-name", default="CoberturaCoverage")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--temp-dir", type=Path, required=True)
     args = parser.parse_args()
     report = generate_report(
-        args.archive.resolve(), args.source.resolve(), args.build_id, args.temp_dir.resolve()
+        args.archive.resolve(), args.source.resolve(), args.build_id, args.temp_dir.resolve(),
+        args.artifact_name,
     )
     write_output(args.output, report)
 
