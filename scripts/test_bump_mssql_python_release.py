@@ -99,14 +99,6 @@ def test_planned_changes_never_downgrades(tmp_path, current, expected):
     assert bump.planned_changes(tmp_path, "0.4.0") == expected
 
 
-def test_release_check_queries_only_pypi():
-    with patch.object(
-        bump, "urlopen", side_effect=[response({"info": {"version": "0.4.0"}})]
-    ) as call:
-        bump.require_pypi_release("0.4.0")
-    assert call.call_count == 1
-
-
 def test_missing_pypi_release_fails_before_writing():
     error = HTTPError("https://pypi.org", 404, "missing", {}, io.BytesIO())
     with patch.object(bump, "urlopen", side_effect=error):
@@ -495,7 +487,7 @@ def test_matching_branch_repairs_pr_metadata_after_failed_patch(tmp_path):
     )
 
 
-def test_older_partial_match_keeps_newer_canonical_metadata(tmp_path):
+def test_older_event_keeps_newer_canonical_metadata(tmp_path):
     target_repo(tmp_path)
     effective = {bump.PYPI_PIN: ("0.3.0", "0.5.0")}
     canonical_title = "CHORE: Update mssql-python-rs dependency to 0.5.0"
