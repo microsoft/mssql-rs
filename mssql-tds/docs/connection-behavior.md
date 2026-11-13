@@ -219,6 +219,20 @@ every non-Strict mode) stay on a socket with Secure Transport.
 dependency, which hands Objective-C blocks to Network.framework, so Strict
 connections use a socket and Secure Transport (TLS 1.2 maximum).
 
+## Abandoned connection teardown
+
+`ClientContext::abort_on_drop` defaults to `false`. Setting it to `true`
+disables deferred TLS drain on abandoned transports. On macOS Network.framework
+this force-cancels the connection synchronously instead of scheduling the
+graceful close barrier. The policy applies from connection-attempt creation,
+including interrupted handshakes and login, through client destruction.
+Other backends already release their local transports synchronously on Drop.
+Explicitly awaited `close_connection()` still uses graceful shutdown.
+
+The private native pool enables this policy in every `ConnectSpec`, so discard
+finishes before its capacity slot becomes available. Normal direct connections
+retain their existing graceful Drop behavior.
+
 ## Execution stack usage
 
 Command execution keeps session-recovery state in a separately boxed future,

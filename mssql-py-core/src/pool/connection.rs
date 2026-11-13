@@ -96,7 +96,8 @@ pub(crate) struct ConnectSpec {
 
 impl ConnectSpec {
     /// Takes ownership of effective options without repeating caller validation.
-    pub(crate) fn new(context: ClientContext, expected_auth: AuthBinding) -> Self {
+    pub(crate) fn new(mut context: ClientContext, expected_auth: AuthBinding) -> Self {
+        context.abort_on_drop = true;
         Self {
             context,
             expected_auth,
@@ -216,6 +217,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    #[test]
+    fn pooled_specs_require_synchronous_transport_discard() {
+        let context = ClientContext::with_data_source("tcp:localhost,1433");
+        assert!(!context.abort_on_drop);
+        let binding = AuthBinding::new(vec![1].into_boxed_slice()).unwrap();
+        let spec = ConnectSpec::new(context, binding);
+        assert!(spec.context().abort_on_drop);
+        assert!(spec.context().clone().abort_on_drop);
+    }
 
     #[test]
     fn keys_and_bindings_are_opaque_and_distinct() {

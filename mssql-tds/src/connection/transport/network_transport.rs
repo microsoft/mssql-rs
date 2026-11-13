@@ -935,6 +935,7 @@ pub(crate) async fn create_transport(
     keep_alive_interval_in_ms: u32,
     multi_subnet_failover: bool,
     connect_timeout_ms: u64,
+    _abort_on_drop: bool,
     diagnosis: Option<&Diagnosis>,
 ) -> TdsResult<(NetworkTransport, Option<Resolution>)> {
     let encryption_mode = encryption_options.mode;
@@ -954,6 +955,7 @@ pub(crate) async fn create_transport(
                 keep_alive_interval_in_ms,
                 multi_subnet_failover,
                 connect_timeout_ms,
+                _abort_on_drop,
                 diagnosis,
             )
             .await;
@@ -999,6 +1001,7 @@ async fn create_network_framework_transport(
     keep_alive_interval_in_ms: u32,
     multi_subnet_failover: bool,
     connect_timeout_ms: u64,
+    abort_on_drop: bool,
     diagnosis: Option<&Diagnosis>,
 ) -> TdsResult<(NetworkTransport, Option<Resolution>)> {
     use crate::connection::transport::tls::network_framework_engine::Connector;
@@ -1018,6 +1021,7 @@ async fn create_network_framework_transport(
                     &ssl_handler.connect_params(&validation, host_name),
                     keep_alive_in_ms,
                     keep_alive_interval_in_ms,
+                    abort_on_drop,
                 )
             })
             .inspect_err(|e| connect_stage::record_error(&tls_stage(), e))
@@ -8558,6 +8562,7 @@ mod network_framework_stage_tests {
             1_000,
             multi_subnet_failover,
             TIMEOUT.as_millis() as u64,
+            false,
             diagnosis,
         );
         let result = timeout(TIMEOUT, connecting)
@@ -8619,6 +8624,7 @@ mod network_framework_stage_tests {
                         1_000,
                         multi_subnet_failover,
                         250,
+                        false,
                         Some(&diagnosis),
                     ),
                 )

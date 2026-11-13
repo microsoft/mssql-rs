@@ -72,6 +72,9 @@ owns key construction, logical connection/cursor ownership and result delivery.
   still live. The slot adaptation requires local client destruction before
   returning an empty slot; bare Drop is not successful clean return.
 - `PoolLease` Drop destroys the client before releasing capacity.
+  `ConnectSpec` enables synchronous transport abort on Drop from the start of
+  physical opening, including macOS Network.framework TLS; discarded clients
+  cannot keep a deferred graceful drain alive after releasing their slot.
   `return_quiescent()` is test-only, not a production check-in API. Safe,
   awaited return belongs to AB#50052.
 - The caller constructs canonical keys and expected authentication bindings.

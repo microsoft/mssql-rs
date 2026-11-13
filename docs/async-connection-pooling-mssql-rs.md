@@ -1312,6 +1312,10 @@ Fresh login and initialization failures propagate without retry.
 All stages retain the original absolute acquisition deadline, cancellation
 signal and pool generation. Operation guards cancel TDS handles on interruption;
 caller-owned parallel TCP attempts drop synchronously before slot release.
+Pooled `ConnectSpec` enables `ClientContext::abort_on_drop` before physical
+opening. Network.framework connections then force-cancel on Drop, including
+interrupted opens and initialization, rather than draining TLS asynchronously
+after capacity has been released. Direct connections retain graceful teardown.
 No application SQL is replayed.
 
 This slice enables SQL-password login only, rejects nonzero session-recovery
