@@ -9,8 +9,7 @@ changes sqlcmd's output, exit code, or the connection's session settings, and it
 fails open: every error is ignored.
 
 The field list is the one proposed to the privacy review. Nothing is final until
-that review, notice and opt-out controls, retention, and the dependency approval
-below are done.
+that review, and notice and opt-out controls, and retention, are done.
 
 ## Notice
 
@@ -36,7 +35,7 @@ unchanged.
 | Setting | Effect |
 |---|---|
 | `SQLCMD_TELEMETRY_OPTOUT=1` (or `true`, `yes`) | No event, no server query, and the device ID is neither read nor created. |
-| `SQLCMD_TELEMETRY_CONNECTION_STRING` | An override for testing or another destination, not something users need. The built-in connection string (the SQLCMD resource, in `telemetry.rs`) is used only when the variable is absent. A variable that is set to an empty, invalid (including an instrumentation key that is not a GUID, or an ingestion endpoint that is not an HTTPS URL with a host once a lowercase `http://` is rewritten to `https://`, as the exporter does) or non-text value turns telemetry off; it does not fall back to the built-in one, and nothing else (the device ID, the server query) runs. |
+| `SQLCMD_TELEMETRY_CONNECTION_STRING` | An override for testing or another destination, not something users need. The built-in connection string (the SQLCMD resource, in `telemetry.rs`) is used only when the variable is absent. A variable that is set to an empty, invalid (including an instrumentation key that is not a GUID, or an ingestion endpoint that is not an `https://` URL with a host) or non-text value turns telemetry off; it does not fall back to the built-in one, and nothing else (the device ID, the server query) runs. |
 | `SQLCMD_CALLER_TYPE` | The caller declares itself: `human`, `agent`, `pipeline` or `other_automation`. Not a telemetry switch; it only sets the caller category. |
 
 `APPLICATIONINSIGHTS_CONNECTION_STRING` is deliberately not read: Azure App
@@ -54,10 +53,10 @@ flowchart LR
     ABI[mssql-sqlcmd C ABI]
     Session[One event under assembly]
     Worker[Export thread]
-    Filter[Event-only, allowlist HTTP filter]
+    Check[Allowlist check on the final property list]
     AI[Application Insights AppEvents]
 
-    Native -->|invocation, then server row| ABI --> Session --> Worker --> Filter --> AI
+    Native -->|invocation, then server row| ABI --> Session --> Worker --> Check --> AI
 ```
 
 1. After the command line is parsed, native sqlcmd records the invocation
@@ -75,12 +74,13 @@ flowchart LR
 The Rust `sqlcmd diagnose` path records its server row from its own session
 probe, with the same functions.
 
-The exporter maps an OpenTelemetry span event named `ai.custom` to an
-Application Insights custom event when it carries `ai.customEvent.name`. It also
-always creates a `RemoteDependency` envelope for the enclosing span; the HTTP
-client removes that envelope from the compressed payload, and every remaining
-event is checked against the allowlist below before it is sent. Tests inspect
-the final request body.
+The event is one `Microsoft.ApplicationInsights.Event` item (`name`, `time`,
+`iKey`, and `data` with `baseType: EventData` and `baseData` `{ver: 2, name,
+properties}`), POSTed as a one-element JSON array to
+`{IngestionEndpoint}/v2/track`, the public ingestion API. It carries no tags, so
+nothing but the properties below identifies the machine or the user. The
+property list is checked against the allowlist once more, as the last step before
+it is serialized. Tests inspect the final request body.
 
 ## Event schema
 
@@ -102,9 +102,9 @@ The event timestamp is the standard one.
 | `sqlcmdcli_server_platform` | `NT x64`, `NT INTEL X86`, `NT ARM64`, `Linux x64`, `Linux ARM64` (DacFx's labels) | `@@VERSION` |
 
 A property whose value is unavailable, or does not validate against its set or
-shape, is omitted; a server value is never forwarded verbatim. The HTTP filter
-rejects the whole event if it carries an unknown key, a value outside its set,
-or no `os` and `arch`, and removes the exporter's automatic tags.
+shape, is omitted; a server value is never forwarded verbatim. The event is not
+built at all if its final list carries an unknown key or a value outside its set,
+or lacks `os` and `arch`.
 
 There is no completion event, duration, or outcome, and nothing is sent about
 the connection's success. A run that never connects still reports the
@@ -115,11 +115,13 @@ if the half-second exit window is enough (see Failure behavior and latency).
 
 The four server properties (engine edition, SQL Server version, server OS and
 server platform) come from one `SELECT`, returned by
-`mssql_sqlcmd_telemetry_server_info_query`. Native sqlcmd appends it to the
-`SET TEXTSIZE` batch it already sends after login, only on the first connection
-and only when telemetry is enabled, so it adds no round trip (measured about
-2 ms against Azure SQL Database; a separate batch added about 196 ms). If the
-combined batch fails, the plain `SET TEXTSIZE` is sent, as it would have been.
+`mssql_sqlcmd_telemetry_server_info_query`. Native sqlcmd sends it in the same
+batch as the `SET TEXTSIZE` it already sends after login, ahead of it so that
+the session's `@@ROWCOUNT` stays 0 as it is without telemetry, only on the first
+connection and only when telemetry is enabled, so it adds no round trip
+(measured about 2 ms against Azure SQL Database; a separate batch added about
+196 ms). If the combined batch fails, the plain `SET TEXTSIZE` is sent, as it
+would have been.
 The Rust `diagnose` path adds the columns to its existing session probe, and
 records the row after that check's timing is taken, so telemetry cannot change
 the reported duration or clock offset. The query needs no permission beyond a
@@ -254,33 +256,15 @@ silently, after the destination, so without OpenSSL telemetry is off: no device
 ID, no server query, nothing sent or printed. Only a TLS connection the user
 asked for reports the missing library.
 
-The event is exported at once by its own thread, using a simple exporter: the
-event is sent on that thread, inside the call that ends the span, and the
-provider is then shut down, so nothing waits on a batch timer in a long
-interactive session. A transport failure, a failure in the filter, a response
-that does not match what was sent, and a rejection by the service (any status
-but a 200 or a fully accepted 206: a 204, a 4xx or 5xx, or a 206 that rejected
-the event) are all recorded as a failure, because the SDK's shutdown does not
-hand the export result back. The exporter retries throttling, server errors and
-every error the HTTP client returns: a transport failure and, because the filter
-reports through the same error, a filter failure or a malformed response (see
-below). It backs off for up to about 35 seconds, and the last attempt decides the
-outcome, so a retry that succeeds is not reported as a failure. Nothing bounds
-that thread but the exporter's own retries; the process waits for it only as
-long as the bound passed to shutdown. If shutdown arrives first, for example
-during the backoff, it reports a timeout, not success, and a failure that the
-exporter is still retrying is also reported as a timeout. An all-filtered or
-malformed request is an error, not a synthetic success. An ingestion response is
-checked against the request before a partial one's indices are translated back
-to the original batch. A 206 or 500 response is malformed when it is not a JSON
-object, has no integer `itemsReceived` or `itemsAccepted` or no `errors` array,
-its `itemsReceived` is not the number of items sent, its accepted items plus
-itemized errors exceed that number, or an error has no integer `index` or one
-that is repeated or outside the request. A malformed response is an error,
-retried like any other, and never taken as an acceptance. A 206 whose counts
-match the request but that accepted fewer items than it received without
-itemizing an error for them is a rejection that is not retried, because there is
-no item for the exporter to retry; it too is never an acceptance.
+The event is sent once, by its own thread, with one POST and no retry: the
+process waits for the answer for at most the bound passed to shutdown, so a
+retry could never complete in time. Only a 200, or a 206 that reports one item
+received and one accepted, is a delivery. Every other answer is a failure: a
+transport error, any other status (a 204, a throttle, a 4xx or 5xx), or a 206
+that did not accept the event or whose body cannot be read. Redirects are not
+followed, so the event goes only to the configured endpoint. If shutdown arrives
+before the answer, it reports a timeout, not success, and the send is abandoned
+with the process. Nothing is stored for a later run.
 
 Recording and shutdown are ordered by one lock: a call admitted before shutdown
 is sent by it, and a call after it is not recorded. Shutdown takes that lock
@@ -289,10 +273,9 @@ while another thread holds it. It is not async-signal-safe (it takes locks,
 allocates and spawns a thread), so it must never be called from a POSIX signal
 handler, which is why the Linux and macOS handlers do not flush.
 
-The SDK reads `OTEL_*` environment variables for its defaults. The provider sets
-an empty resource, an always-on sampler and an event limit itself, so ambient
-tracing configuration can neither add identifiers to the event nor switch it
-off.
+The event is built only from the typed property list, never from the
+environment, so ambient settings (such as `OTEL_*` variables) cannot add
+identifiers to it or switch it off.
 
 ## C ABI
 
@@ -313,13 +296,10 @@ bounded wait expires; and `3` on failure or a caught panic. All are fail-open.
 
 ## Dependency review
 
-The transport uses `opentelemetry`, `opentelemetry_sdk`,
-`opentelemetry-application-insights`, `opentelemetry-http`, reqwest with the
-repository's native-TLS convention, and `uuid` for the device ID. The Application
-Insights exporter is a community crate that states it is not an official
-Microsoft product, so shipping approval for it remains an owning-team decision.
-It is pinned to the exact version the request filter and response checks were
-written against (`=0.46.0`); a bump needs those re-checked, because they depend
-on the crate's internal request and response handling.
-The implementation is validated with in-memory HTTP clients, unit tests, and
-runs of the real native sqlcmd; it does not claim live DataX delivery.
+The transport is `reqwest` (blocking, with the repository's native-TLS
+convention) posting to the ingestion API directly, and `uuid` for the device ID.
+There is no telemetry SDK or exporter: the one event is a small fixed-schema
+JSON item, so the crate owns its serialization and the single success check
+instead of depending on a third-party exporter's internals. The implementation
+is validated with unit tests, a local HTTP round trip, and runs of the real
+native sqlcmd; it does not claim live delivery to the production resource.

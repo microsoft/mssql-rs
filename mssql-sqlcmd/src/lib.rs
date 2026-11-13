@@ -24,6 +24,7 @@ pub mod diagnostics;
 pub mod ffi;
 pub mod formatter;
 pub mod i18n;
+mod ingestion;
 #[cfg(all(target_pointer_width = "64", target_os = "linux"))]
 mod openssl_runtime;
 pub mod server_info;

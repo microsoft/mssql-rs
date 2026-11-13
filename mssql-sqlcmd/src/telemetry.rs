@@ -3,33 +3,17 @@
 
 //! Privacy-safe Application Insights usage telemetry for native sqlcmd.
 
-use std::collections::{BTreeSet, HashMap};
-use std::fmt;
-use std::io::{Read, Write};
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::TryLockError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
-use async_trait::async_trait;
-use bytes::Bytes;
-use flate2::Compression;
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use http::{Request, Response};
-use opentelemetry::trace::{Span, Tracer, TracerProvider as _};
-use opentelemetry::{KeyValue, Value};
-use opentelemetry_application_insights::{Exporter, HttpClient};
-use opentelemetry_http::HttpError;
-use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
-use serde_json::Value as JsonValue;
 use tracing::debug;
 
 use crate::caller;
 use crate::device_id;
+use crate::ingestion::{self, Destination, HttpPost, Post};
 use crate::server_info::{self, RawServerInfo, ServerInfo};
 
 pub const USAGE_EVENT_NAME: &str = "sqlcmdcli_usage";
@@ -45,7 +29,7 @@ pub const OPTOUT_ENV: &str = "SQLCMD_TELEMETRY_OPTOUT";
 /// otherwise: the SQLCMD resource DataX created for this product. An
 /// instrumentation key can only send events, never read them, and client tools
 /// ship it for that reason; it is not a secret. Only the key and the ingestion
-/// endpoint are kept, since the exporter needs nothing else.
+/// endpoint are kept, since sending needs nothing else.
 const DEFAULT_CONNECTION_STRING: &str = "InstrumentationKey=0e88a50a-3564-4c2b-9b20-9e9b0e8af3d4;\
      IngestionEndpoint=https://centralus-2.in.applicationinsights.azure.com/";
 
@@ -57,15 +41,10 @@ const BUILT_IN_CONNECTION_STRING: Option<&str> = Some(DEFAULT_CONNECTION_STRING)
 #[cfg(test)]
 const BUILT_IN_CONNECTION_STRING: Option<&str> = None;
 
-const CUSTOM_EVENT_OTEL_NAME: &str = "ai.custom";
-const CUSTOM_EVENT_NAME_ATTRIBUTE: &str = "ai.customEvent.name";
-const APPLICATION_INSIGHTS_EVENT_ENVELOPE: &str = "Microsoft.ApplicationInsights.Event";
 /// The longest sqlcmd version accepted. A valid version is ASCII, so this is its
 /// length both in UTF-8 bytes (`version_is_safe`) and in UTF-16 code units (the
 /// C ABI's check before it reads the text).
 pub(crate) const MAX_VERSION_LEN: usize = 64;
-/// The event is one span with one span event; a little room beyond that.
-const MAX_EVENTS_PER_SPAN: u32 = 8;
 /// The longest the process waits for the event at exit, whatever the caller
 /// asks for. Half a second keeps a short run (`sqlcmd -Q "SELECT 1"`) from being
 /// held up by a cold send; an event that is not delivered by then is dropped.
@@ -141,281 +120,55 @@ struct Session {
 
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// What a test transport was asked to send.
 #[cfg(test)]
-static ABI_TEST_CLIENT: Mutex<Option<mpsc::Sender<Request<Bytes>>>> = Mutex::new(None);
+struct Captured {
+    url: String,
+    body: Vec<u8>,
+}
+
+#[cfg(test)]
+static ABI_TEST_CLIENT: Mutex<Option<mpsc::Sender<Captured>>> = Mutex::new(None);
+
+#[cfg(test)]
+static ABI_TEST_DELAY: Mutex<Duration> = Mutex::new(Duration::ZERO);
+
+/// The status and body the test transport answers with; status 0 is a transport
+/// error.
+#[cfg(test)]
+static ABI_TEST_RESPONSE: Mutex<(u16, &'static str)> = Mutex::new((200, ""));
+
+#[cfg(test)]
+struct TestPost(mpsc::Sender<Captured>);
+
+#[cfg(test)]
+impl Post for TestPost {
+    fn post(&self, url: &reqwest::Url, body: Vec<u8>) -> Result<ingestion::Reply, String> {
+        let delay = *ABI_TEST_DELAY.lock().expect("delay lock");
+        std::thread::sleep(delay);
+        self.0
+            .send(Captured {
+                url: url.to_string(),
+                body,
+            })
+            .map_err(|error| error.to_string())?;
+        let (status, body) = *ABI_TEST_RESPONSE.lock().expect("response lock");
+        if status == 0 {
+            return Err("test transport error".to_owned());
+        }
+        Ok(ingestion::Reply {
+            status,
+            body: body.as_bytes().to_vec(),
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FlushOutcome {
     Completed,
     Failed,
     TimedOut,
-}
-
-#[derive(Debug)]
-struct EventOnlyClient<C> {
-    inner: C,
-    delivered: Arc<AtomicBool>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug)]
-struct AbiTestClient(mpsc::Sender<Request<Bytes>>);
-
-#[cfg(test)]
-static ABI_TEST_DELAY: Mutex<Duration> = Mutex::new(Duration::ZERO);
-
-/// The status and body the test client answers with.
-#[cfg(test)]
-static ABI_TEST_RESPONSE: Mutex<(u16, &'static str)> = Mutex::new((200, ""));
-
-#[cfg(test)]
-#[async_trait]
-impl HttpClient for AbiTestClient {
-    async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
-        let delay = *ABI_TEST_DELAY.lock().expect("delay lock");
-        std::thread::sleep(delay);
-        self.0
-            .send(request)
-            .map_err(|error| filter_error(error.to_string()))?;
-        let (status, body) = *ABI_TEST_RESPONSE.lock().expect("response lock");
-        Ok(Response::builder()
-            .status(status)
-            .body(Bytes::from_static(body.as_bytes()))
-            .expect("valid test response"))
-    }
-}
-
-impl<C> EventOnlyClient<C> {
-    fn new(inner: C, delivered: Arc<AtomicBool>) -> Self {
-        Self { inner, delivered }
-    }
-}
-
-#[async_trait]
-impl<C> HttpClient for EventOnlyClient<C>
-where
-    C: HttpClient,
-{
-    async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
-        let filtered = match filter_event_request(request) {
-            Ok(filtered) => filtered,
-            Err(error) => {
-                self.delivered.store(false, Ordering::Release);
-                return Err(error);
-            }
-        };
-        let FilteredRequest {
-            request,
-            original_indices,
-            original_count,
-        } = filtered;
-        let response = match self.inner.send_bytes(request).await {
-            Ok(response) => response,
-            Err(error) => {
-                self.delivered.store(false, Ordering::Release);
-                return Err(error);
-            }
-        };
-        // The exporter retries throttling and server errors itself, and its
-        // shutdown does not hand the result back, so the outcome is kept here.
-        // Each attempt overwrites the last, so the attempt the exporter stops on
-        // decides: a 503 that a retry answers with 200 is a delivery. It starts
-        // false, so an export that never reaches this client is not a delivery.
-        match check_ingestion_response(response, &original_indices, original_count) {
-            Ok((response, accepted)) => {
-                self.delivered.store(accepted, Ordering::Release);
-                Ok(response)
-            }
-            Err(error) => {
-                self.delivered.store(false, Ordering::Release);
-                Err(error)
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct TelemetryProvider {
-    provider: SdkTracerProvider,
-    delivered: Arc<AtomicBool>,
-}
-
-#[derive(Debug)]
-struct FilteredRequest {
-    request: Request<Bytes>,
-    original_indices: Vec<usize>,
-    original_count: usize,
-}
-
-#[derive(Debug)]
-struct FilterError(String);
-
-impl fmt::Display for FilterError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for FilterError {}
-
-fn filter_event_request(request: Request<Bytes>) -> Result<FilteredRequest, HttpError> {
-    let (parts, body) = request.into_parts();
-    let mut decompressed = Vec::new();
-    GzDecoder::new(body.as_ref())
-        .read_to_end(&mut decompressed)
-        .map_err(filter_error)?;
-
-    let envelopes: Vec<JsonValue> = serde_json::from_slice(&decompressed).map_err(filter_error)?;
-    let original_count = envelopes.len();
-    let (original_indices, mut envelopes): (Vec<_>, Vec<_>) = envelopes
-        .into_iter()
-        .enumerate()
-        .filter(|(_, envelope)| {
-            envelope.get("name").and_then(JsonValue::as_str)
-                == Some(APPLICATION_INSIGHTS_EVENT_ENVELOPE)
-        })
-        .unzip();
-    if original_indices.is_empty() {
-        return Err(filter_error(
-            "Application Insights exporter payload contained no custom event",
-        ));
-    }
-    for envelope in &mut envelopes {
-        validate_and_sanitize_event(envelope)?;
-    }
-
-    let serialized = serde_json::to_vec(&envelopes).map_err(filter_error)?;
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&serialized).map_err(filter_error)?;
-    let compressed = encoder.finish().map_err(filter_error)?;
-    Ok(FilteredRequest {
-        request: Request::from_parts(parts, Bytes::from(compressed)),
-        original_indices,
-        original_count,
-    })
-}
-
-fn validate_and_sanitize_event(envelope: &mut JsonValue) -> Result<(), HttpError> {
-    if envelope
-        .pointer("/data/baseData/name")
-        .and_then(JsonValue::as_str)
-        != Some(USAGE_EVENT_NAME)
-    {
-        return Err(filter_error(
-            "Application Insights exporter payload contained an unexpected event",
-        ));
-    }
-
-    let Some(properties) = envelope
-        .pointer("/data/baseData/properties")
-        .and_then(JsonValue::as_object)
-    else {
-        return Err(filter_error(
-            "Application Insights usage event had no properties",
-        ));
-    };
-    if properties.iter().any(|(key, value)| {
-        !value
-            .as_str()
-            .is_some_and(|value| property_is_valid(key, value))
-    }) || REQUIRED_KEYS
-        .iter()
-        .any(|key| !properties.contains_key(*key))
-    {
-        return Err(filter_error(
-            "Application Insights usage event had unexpected properties",
-        ));
-    }
-
-    envelope
-        .as_object_mut()
-        .ok_or_else(|| filter_error("Application Insights event envelope was not an object"))?
-        .remove("tags");
-    Ok(())
-}
-
-/// Checks an ingestion response against what was sent, translates a partial
-/// one back to the exporter's original batch, and says whether the service
-/// accepted the event, as the exporter judges it: only a 200, or a 206 in which
-/// every item was accepted. Any other status (a 201 or 204 as well as a 4xx or
-/// 5xx) is a failure to the exporter, so it is not accepted here. A malformed
-/// response is an error and never an apparent success.
-fn check_ingestion_response(
-    response: Response<Bytes>,
-    original_indices: &[usize],
-    original_count: usize,
-) -> Result<(Response<Bytes>, bool), HttpError> {
-    let status = response.status();
-    if !matches!(status.as_u16(), 206 | 500) {
-        let accepted = status.as_u16() == 200;
-        return Ok((response, accepted));
-    }
-    let (parts, body) = response.into_parts();
-    let mut payload: JsonValue = serde_json::from_slice(&body).map_err(filter_error)?;
-    let object = payload
-        .as_object_mut()
-        .ok_or_else(|| filter_error("Application Insights response was not an object"))?;
-    let sent = original_indices.len() as u64;
-    let items_received = object.get("itemsReceived").and_then(JsonValue::as_u64);
-    let items_accepted = object.get("itemsAccepted").and_then(JsonValue::as_u64);
-    let (Some(items_received), Some(items_accepted)) = (items_received, items_accepted) else {
-        return Err(filter_error(
-            "Application Insights response had no item counts",
-        ));
-    };
-    if items_received != sent || items_accepted > items_received {
-        return Err(filter_error(
-            "Application Insights response counts do not match the request",
-        ));
-    }
-
-    let mut seen = BTreeSet::new();
-    let mut error_count = 0u64;
-    // The exporter requires the array, even an empty one.
-    {
-        let errors = object
-            .get_mut("errors")
-            .and_then(JsonValue::as_array_mut)
-            .ok_or_else(|| filter_error("Application Insights response had no errors list"))?;
-        for error in errors {
-            let filtered_index = error
-                .get("index")
-                .and_then(JsonValue::as_u64)
-                .ok_or_else(|| filter_error("Application Insights response error had no index"))?;
-            let original_index = usize::try_from(filtered_index)
-                .ok()
-                .and_then(|index| original_indices.get(index))
-                .ok_or_else(|| filter_error("invalid Application Insights response index"))?;
-            if !seen.insert(filtered_index) {
-                return Err(filter_error(
-                    "duplicate Application Insights response index",
-                ));
-            }
-            error_count += 1;
-            error["index"] = JsonValue::from(*original_index);
-        }
-    }
-    if items_accepted + error_count > items_received {
-        return Err(filter_error(
-            "Application Insights response counts are inconsistent",
-        ));
-    }
-    // A 500 is a rejection even when its body parses; a 206 is one if any item
-    // was rejected.
-    let accepted = status.as_u16() == 206 && error_count == 0 && items_accepted == items_received;
-
-    let dropped_count = original_count.saturating_sub(original_indices.len()) as u64;
-    object.insert("itemsReceived".to_owned(), JsonValue::from(original_count));
-    object.insert(
-        "itemsAccepted".to_owned(),
-        JsonValue::from(items_accepted + dropped_count),
-    );
-    let body = serde_json::to_vec(&payload).map_err(filter_error)?;
-    Ok((Response::from_parts(parts, Bytes::from(body)), accepted))
-}
-
-fn filter_error(error: impl fmt::Display) -> HttpError {
-    Box::new(FilterError(error.to_string()))
 }
 
 /// Whether the user turned telemetry off.
@@ -430,94 +183,15 @@ fn opted_out() -> bool {
         .unwrap_or(false)
 }
 
-/// A client that only lets the exporter parse a connection string.
-#[derive(Debug)]
-struct ValidationClient;
-
-#[async_trait]
-impl HttpClient for ValidationClient {
-    async fn send_bytes(&self, _request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
-        Err(filter_error("the validation client sends nothing"))
-    }
-}
-
-/// Whether the exporter accepts `connection_string`, its instrumentation key is
-/// a GUID and its ingestion endpoint is an HTTPS URL with a host. The exporter
-/// checks neither, so a mistyped key or endpoint would otherwise enable
-/// collection (the device ID, the server query) that can never be delivered.
+/// Whether `connection_string` names a destination that can deliver: its
+/// instrumentation key is a GUID and its ingestion endpoint is an HTTPS URL with
+/// a host. A mistyped key or endpoint would otherwise enable collection (the
+/// device ID, the server query) that can never be delivered.
 fn connection_string_is_valid(connection_string: &str) -> bool {
-    // Before the exporter parses it: a bare authority (`localhost`, or
-    // `https://`, which loses its trailing `/` and becomes `https:`) parses as a
-    // URI with no scheme, and the exporter then panics appending `/v2/track`;
-    // the panic message would reach stderr. The `localhost` and `https://` rows
-    // of the invalid-configuration test pin this order.
-    let fields = connection_string_fields(connection_string);
-    fields
-        .get("instrumentationkey")
-        .is_some_and(|key| device_id::is_hyphenated_guid(key))
-        && ingestion_endpoint_is_usable(&fields)
-        && Exporter::new_from_connection_string(connection_string, ValidationClient).is_ok()
+    Destination::parse(connection_string).is_some()
 }
 
-/// The fields the way the exporter reads them, so what is checked is what is
-/// used: names are folded with `str::to_lowercase` as the exporter does, nothing
-/// is trimmed, and when a name repeats the last one wins. A part that is not a
-/// `name=value` is skipped here; the exporter rejects the whole string for it
-/// afterwards.
-fn connection_string_fields(connection_string: &str) -> HashMap<String, &str> {
-    connection_string
-        .split(';')
-        .filter_map(|part| part.split_once('='))
-        .map(|(name, value)| (name.to_lowercase(), value))
-        .collect()
-}
-
-/// The endpoint the exporter would send to (as it builds it: a lowercase
-/// `http://` becomes `https://`, a trailing `/` goes, and `EndpointSuffix` with
-/// an optional `Location` stands in for a missing `IngestionEndpoint`) must be
-/// an HTTPS URL with a host, and the exporter's request URL (`v2/track`
-/// appended, which it `expect`s to parse) must parse. The exporter accepts
-/// another scheme, which only fails when the event is sent, and panics on a
-/// bare host.
-fn ingestion_endpoint_is_usable(fields: &HashMap<String, &str>) -> bool {
-    let endpoint = if let Some(endpoint) = fields.get("ingestionendpoint") {
-        (*endpoint).to_owned()
-    } else if let Some(suffix) = fields.get("endpointsuffix") {
-        let location = fields
-            .get("location")
-            .map(|location| format!("{location}."))
-            .unwrap_or_default();
-        format!("https://{location}dc.{suffix}")
-    } else {
-        // The exporter's own default.
-        return true;
-    };
-    let mut endpoint = endpoint.trim().to_owned();
-    if !endpoint.starts_with("https://") {
-        endpoint = endpoint.replace("http://", "https://");
-    }
-    let Ok(uri) = endpoint.trim_end_matches('/').parse::<http::Uri>() else {
-        return false;
-    };
-    uri.scheme_str() == Some("https")
-        && uri.host().is_some_and(|host| !host.is_empty())
-        && v2_track_parses(&uri)
-}
-
-/// Whether the exporter can build its request URL from `uri`: its
-/// `append_v2_track` (0.46.0 `src/lib.rs`) appends `v2/track` this way and
-/// `expect`s the result to parse. A URI near `http`'s length limit parses
-/// alone but not then.
-fn v2_track_parses(uri: &http::Uri) -> bool {
-    let mut track = uri.to_string();
-    if !track.ends_with('/') {
-        track.push('/');
-    }
-    track.push_str("v2/track");
-    track.parse::<http::Uri>().is_ok()
-}
-
-/// The destination this run would send to, and only if the exporter accepts it.
+/// The destination this run would send to, and only if it can deliver.
 fn destination() -> Option<String> {
     destination_from(
         std::env::var(CONNECTION_STRING_ENV),
@@ -560,7 +234,7 @@ fn enabled_with(built_in: Option<&str>) -> bool {
 /// The HTTP client needs OpenSSL on 64-bit Linux. Checked without the report
 /// `openssl_runtime` writes, so telemetry adds no output of its own, and after
 /// the destination, so that a run with telemetry off never loads it. Tests send
-/// through their own client; `TRANSPORT_MISSING` stands in for a host without
+/// through their own transport; `TRANSPORT_MISSING` stands in for a host without
 /// OpenSSL and `TRANSPORT_CHECKS` counts the calls, so a test can see that a run
 /// with telemetry off never gets here.
 fn transport_available() -> bool {
@@ -603,7 +277,7 @@ fn arch_value() -> &'static str {
 }
 
 /// Whether `value` is one `key` may carry. Applied to every property before an
-/// event is built and again when the request is filtered.
+/// event is built and again on the final list before it is serialized.
 ///
 /// This is also the allowlist of keys: a key that is not matched here falls to
 /// `server_info::value_is_valid`, whose default is `false`, so an unlisted key
@@ -724,9 +398,6 @@ pub fn record_server_info(raw: &RawServerInfo) {
 }
 
 /// Starts sending the event on its own thread, once.
-///
-/// The thread exports the one event when its span ends, then shuts its provider
-/// down, so nothing waits on a timer.
 fn start_export(session: &mut Session) {
     if session.export.is_some() {
         return;
@@ -746,22 +417,60 @@ fn start_export(session: &mut Session) {
     }
 }
 
+/// Sends the one event, once, and reports whether the service took it. There is
+/// no retry: the process waits for this at most [`MAX_FLUSH_TIMEOUT`].
 fn export_once(properties: &[(&'static str, String)]) -> FlushOutcome {
-    let Some(connection_string) = destination() else {
+    let Some(destination) = destination().as_deref().and_then(Destination::parse) else {
         return FlushOutcome::Failed;
     };
-    let Ok(provider) = production_provider(&connection_string) else {
-        debug!("sqlcmd telemetry configuration is invalid");
+    let Some(body) = usage_body(&destination, properties, SystemTime::now()) else {
         return FlushOutcome::Failed;
     };
-    // The simple exporter has already sent the event, retries included, when the
-    // span ended; shutting down only releases the provider.
-    emit_usage(&provider.provider, properties, SystemTime::now());
-    if provider.provider.shutdown().is_ok() && provider.delivered.load(Ordering::Acquire) {
+    let Some(post) = production_post() else {
+        debug!("sqlcmd telemetry transport could not be created");
+        return FlushOutcome::Failed;
+    };
+    if ingestion::deliver(&*post, &destination, body) {
         FlushOutcome::Completed
     } else {
         FlushOutcome::Failed
     }
+}
+
+/// The request body for the usage event, only if every property is one that may
+/// be sent and the ones every event has are present. This is the last check
+/// before anything leaves the process, on the list that will be serialized.
+fn usage_body(
+    destination: &Destination,
+    properties: &[(&'static str, String)],
+    time: SystemTime,
+) -> Option<Vec<u8>> {
+    let allowed = properties
+        .iter()
+        .all(|(key, value)| property_is_valid(key, value))
+        && REQUIRED_KEYS
+            .iter()
+            .all(|required| properties.iter().any(|(key, _)| key == required));
+    if !allowed {
+        debug!("sqlcmd telemetry event had unexpected properties");
+        return None;
+    }
+    destination.event_body(USAGE_EVENT_NAME, properties, time)
+}
+
+fn production_post() -> Option<Box<dyn Post>> {
+    #[cfg(test)]
+    if let Some(sender) = ABI_TEST_CLIENT
+        .lock()
+        .expect("ABI test client lock")
+        .clone()
+    {
+        return Some(Box::new(TestPost(sender)));
+    }
+
+    HttpPost::new(HTTP_TIMEOUT)
+        .ok()
+        .map(|post| Box::new(post) as Box<dyn Post>)
 }
 
 /// Sends the event if it has not been sent, and waits for it within `timeout`
@@ -804,70 +513,6 @@ pub fn shutdown(timeout: Duration) -> FlushOutcome {
     }
 }
 
-fn production_provider(
-    connection_string: &str,
-) -> Result<TelemetryProvider, Box<dyn std::error::Error + Send + Sync>> {
-    #[cfg(test)]
-    if let Some(client) = ABI_TEST_CLIENT
-        .lock()
-        .expect("ABI test client lock")
-        .clone()
-    {
-        return provider_with_client(connection_string, AbiTestClient(client));
-    }
-
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(HTTP_TIMEOUT)
-        .timeout(HTTP_TIMEOUT)
-        .build()?;
-    provider_with_client(connection_string, client)
-}
-
-fn provider_with_client<C>(
-    connection_string: &str,
-    client: C,
-) -> Result<TelemetryProvider, Box<dyn std::error::Error + Send + Sync>>
-where
-    C: HttpClient + 'static,
-{
-    let delivered = Arc::new(AtomicBool::new(false));
-    let exporter = Exporter::new_from_connection_string(
-        connection_string,
-        EventOnlyClient::new(client, Arc::clone(&delivered)),
-    )?;
-    // One event, exported when its span ends, on this thread: nothing is queued
-    // behind a timer. The SDK reads OTEL_* variables for its defaults, so the
-    // resource, the sampler and the event limit are set here so that ambient
-    // tracing configuration can neither add identifiers to the event nor switch
-    // it off.
-    Ok(TelemetryProvider {
-        provider: SdkTracerProvider::builder()
-            .with_simple_exporter(exporter)
-            .with_resource(Resource::builder_empty().build())
-            .with_sampler(Sampler::AlwaysOn)
-            .with_max_events_per_span(MAX_EVENTS_PER_SPAN)
-            .build(),
-        delivered,
-    })
-}
-
-fn emit_usage(
-    provider: &SdkTracerProvider,
-    properties: &[(&'static str, String)],
-    timestamp: SystemTime,
-) {
-    let tracer = provider.tracer("mssql-sqlcmd");
-    let mut span = tracer.start("sqlcmd.telemetry");
-    let mut attributes = vec![KeyValue::new(CUSTOM_EVENT_NAME_ATTRIBUTE, USAGE_EVENT_NAME)];
-    attributes.extend(
-        properties
-            .iter()
-            .map(|(key, value)| KeyValue::new(*key, Value::String(value.clone().into()))),
-    );
-    span.add_event_with_timestamp(CUSTOM_EVENT_OTEL_NAME, timestamp, attributes);
-    span.end_with_timestamp(timestamp);
-}
-
 /// A native sqlcmd version: two to four numeric parts, then optionally a `-` or
 /// `+` suffix of letters, digits, `.`, `-` and `+` (`18.7.0001.1`,
 /// `18.5.1-preview.2`). Anything else, such as a free-form label, is not sent.
@@ -896,159 +541,10 @@ fn version_is_safe(version: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
-    use std::future::Future;
-    use std::task::{Context, Poll, Wake, Waker};
-    use std::time::UNIX_EPOCH;
-
-    #[derive(Debug, Default)]
-    struct InMemoryClient {
-        requests: Mutex<Vec<Request<Bytes>>>,
-        responses: Mutex<VecDeque<Result<Response<Bytes>, HttpError>>>,
-    }
-
-    #[derive(Clone, Debug)]
-    struct SharedClient(Arc<InMemoryClient>);
-
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
-    impl InMemoryClient {
-        fn succeeding() -> SharedClient {
-            let client = SharedClient(Arc::new(Self::default()));
-            client
-                .0
-                .responses
-                .lock()
-                .expect("response lock")
-                .push_back(Ok(Response::builder()
-                    .status(200)
-                    .body(Bytes::new())
-                    .expect("valid response")));
-            client
-        }
-
-        fn envelopes(&self) -> Vec<JsonValue> {
-            let requests = self.requests.lock().expect("request lock");
-            let request = requests.first().expect("one telemetry request");
-            let mut decompressed = Vec::new();
-            GzDecoder::new(request.body().as_ref())
-                .read_to_end(&mut decompressed)
-                .expect("gzip body");
-            serde_json::from_slice(&decompressed).expect("JSON envelopes")
-        }
-    }
-
-    #[async_trait]
-    impl HttpClient for SharedClient {
-        async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
-            self.0.requests.lock().expect("request lock").push(request);
-            self.0
-                .responses
-                .lock()
-                .expect("response lock")
-                .pop_front()
-                .expect("configured response")
-        }
-    }
+    use serde_json::Value as JsonValue;
 
     const TEST_CONNECTION_STRING: &str = "InstrumentationKey=00000000-0000-0000-0000-000000000000;\
          IngestionEndpoint=https://example.test";
-
-    fn poll_ready<F: Future>(future: F) -> F::Output {
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut context = Context::from_waker(&waker);
-        let mut future = std::pin::pin!(future);
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => output,
-            Poll::Pending => panic!("test future unexpectedly remained pending"),
-        }
-    }
-
-    fn event_envelope() -> JsonValue {
-        serde_json::json!({
-            "name": APPLICATION_INSIGHTS_EVENT_ENVELOPE,
-            "tags": {
-                "ai.internal.sdkVersion": "opentelemetry0.33.1",
-                "ai.operation.id": "0123456789abcdef0123456789abcdef"
-            },
-            "data": {
-                "baseData": {
-                    "name": USAGE_EVENT_NAME,
-                    "properties": {
-                        "sqlcmdcli_version": "18.5",
-                        "sqlcmdcli_os": "windows",
-                        "sqlcmdcli_arch": "x86_64",
-                        "sqlcmdcli_command": "diagnose",
-                        "sqlcmdcli_caller_type": "unknown"
-                    }
-                }
-            }
-        })
-    }
-
-    #[test]
-    fn exporter_sends_only_one_application_insights_event() {
-        let client = InMemoryClient::succeeding();
-        let provider = provider_with_client(TEST_CONNECTION_STRING, client.clone())
-            .expect("valid test configuration");
-
-        emit_usage(
-            &provider.provider,
-            &[
-                (KEY_VERSION, "18.5.1-preview.2".to_owned()),
-                (KEY_OS, "windows".to_owned()),
-                (KEY_ARCH, "x86_64".to_owned()),
-            ],
-            UNIX_EPOCH + Duration::from_secs(1_730_736_000),
-        );
-        provider
-            .provider
-            .shutdown_with_timeout(Duration::from_secs(1))
-            .expect("bounded shutdown");
-
-        let envelopes = client.0.envelopes();
-        assert_eq!(envelopes.len(), 1);
-        assert_eq!(
-            envelopes[0].get("name").and_then(JsonValue::as_str),
-            Some(APPLICATION_INSIGHTS_EVENT_ENVELOPE)
-        );
-        assert_eq!(
-            envelopes[0]
-                .pointer("/data/baseData/name")
-                .and_then(JsonValue::as_str),
-            Some(USAGE_EVENT_NAME)
-        );
-        assert_eq!(
-            envelopes[0]
-                .pointer("/data/baseData/properties/sqlcmdcli_version")
-                .and_then(JsonValue::as_str),
-            Some("18.5.1-preview.2")
-        );
-        assert!(envelopes[0].get("tags").is_none());
-        let property_keys: BTreeSet<_> = envelopes[0]
-            .pointer("/data/baseData/properties")
-            .and_then(JsonValue::as_object)
-            .expect("event properties")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(
-            property_keys,
-            ["sqlcmdcli_arch", "sqlcmdcli_os", "sqlcmdcli_version",]
-                .into_iter()
-                .collect()
-        );
-        assert!(
-            envelopes
-                .iter()
-                .all(|envelope| envelope.get("name").and_then(JsonValue::as_str)
-                    != Some("Microsoft.ApplicationInsights.RemoteDependency"))
-        );
-    }
 
     #[test]
     fn native_abi_flow_sends_one_event_with_the_server_properties_early() {
@@ -1077,6 +573,7 @@ mod tests {
             .expect("event sent after the connection was recorded");
         assert_eq!(crate::ffi::mssql_sqlcmd_telemetry_shutdown(1_000), 0);
 
+        assert_eq!(request.url, "https://example.test/v2/track");
         let properties = event_properties(&request);
         assert_eq!(properties["sqlcmdcli_version"], "18.5");
         assert_eq!(properties[KEY_COMMAND], "diagnose");
@@ -1213,7 +710,7 @@ mod tests {
     #[test]
     fn the_shipped_default_destination_is_valid() {
         assert!(connection_string_is_valid(DEFAULT_CONNECTION_STRING));
-        // The shipped string is only what the exporter needs, and is not one of
+        // The shipped string is only the key and the endpoint, and is not one of
         // the test fixtures.
         assert_ne!(DEFAULT_CONNECTION_STRING, TEST_CONNECTION_STRING);
         assert!(!DEFAULT_CONNECTION_STRING.contains("LiveEndpoint"));
@@ -1262,19 +759,15 @@ mod tests {
             "InstrumentationKey=broken",
             "InstrumentationKey=00000000-0000-0000-0000-00000000000",
             "InstrumentationKey=00000000-0000-0000-0000-00000000000g",
-            // The exporter uses the last key and does not trim it.
+            // The last key is the one used, and nothing is trimmed.
             "InstrumentationKey=00000000-0000-0000-0000-000000000000;InstrumentationKey=broken",
-            // `str::to_lowercase` folds U+212A (Kelvin sign) to `k`, so the
-            // exporter reads this as a second InstrumentationKey, the last.
-            "InstrumentationKey=00000000-0000-0000-0000-000000000000;Instrumentation\u{212A}ey=broken",
             "InstrumentationKey= 00000000-0000-0000-0000-000000000000",
             "InstrumentationKey=00000000-0000-0000-0000-000000000000 ",
             "IngestionEndpoint=https://example.invalid/",
-            // A valid key with an endpoint that can never be reached. The
-            // `localhost` and `https://` rows panic in the exporter if it parses
-            // them first, so they pin the order of the checks.
+            // A valid key with an endpoint that can never be reached.
             "InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=localhost",
             "InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=ftp://example.test",
+            "InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=http://example.test",
             "InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=https://",
             "InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=https:///path",
             "InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=https://example.test;IngestionEndpoint=localhost",
@@ -1289,19 +782,6 @@ mod tests {
             // OpenSSL, so moving the check ahead of the destination fails this.
             assert_eq!(TRANSPORT_CHECKS.load(Ordering::Acquire), 0, "{invalid:?}");
         }
-    }
-
-    /// The endpoint is checked as the exporter will use it, with `v2/track`
-    /// appended: one near the length limit of a URI parses alone and not then,
-    /// and the exporter panics on it. Called directly: an environment value this
-    /// long does not fit on Windows.
-    #[test]
-    fn an_endpoint_too_long_for_the_request_url_is_invalid() {
-        const KEY: &str = "InstrumentationKey=00000000-0000-0000-0000-000000000000";
-        let too_long = format!("{KEY};IngestionEndpoint=https://{}", "a".repeat(65_520));
-        assert!(!connection_string_is_valid(&too_long));
-        let fits = format!("{KEY};IngestionEndpoint=https://{}", "a".repeat(1_000));
-        assert!(connection_string_is_valid(&fits));
     }
 
     /// A host that cannot send (no OpenSSL) does nothing: no device ID, no server
@@ -1322,70 +802,37 @@ mod tests {
         assert!(enabled());
     }
 
-    /// The forms the exporter itself accepts and builds an HTTPS endpoint from.
+    /// The service's answer decides the outcome the C ABI reports, and the event
+    /// is sent once whatever the answer: there is no retry.
     #[test]
-    fn the_endpoint_forms_the_exporter_builds_are_valid() {
-        const KEY: &str = "InstrumentationKey=00000000-0000-0000-0000-000000000000";
-        for valid in [
-            KEY.to_owned(),
-            format!("{KEY};IngestionEndpoint=https://example.test/"),
-            format!("{KEY};IngestionEndpoint=http://example.test"),
-            format!("{KEY};EndpointSuffix=applicationinsights.azure.cn"),
-            format!("{KEY};EndpointSuffix=applicationinsights.azure.cn;Location=chinaeast"),
-            format!(
-                "{KEY};ingestionendpoint=https://example.test;IngestionEndpoint=https://other.test"
-            ),
-        ] {
-            assert!(connection_string_is_valid(&valid), "{valid}");
-        }
-    }
-
-    /// What a row of the table below expects from `shutdown`.
-    #[derive(Clone, Copy, Debug)]
-    enum Expect {
-        /// The service accepted the event.
-        Completed,
-        /// Rejected outright, with no retry: a status the exporter does not retry
-        /// (204, 400 and 403 here; throttling, 429, is retried), or a 206 that
-        /// took fewer items than it received without itemizing an error for them.
-        Failed,
-        /// Throttled, a server error, or any error the exporter retries: a
-        /// transport failure, a filter failure or a malformed response (see
-        /// `check_ingestion_response`). It retries with a backoff, so a short
-        /// wait ends first. Never a success.
-        NotCompleted,
-    }
-
-    /// The service's answer decides the outcome the C ABI reports: a rejection is
-    /// a failure even though the SDK's shutdown does not hand the result back.
-    #[test]
-    fn a_rejected_event_is_reported_as_a_failure() {
-        use Expect::{Completed, Failed, NotCompleted};
-        for (status, body, expect) in [
+    fn the_answer_decides_the_outcome_and_nothing_is_retried() {
+        use FlushOutcome::{Completed, Failed};
+        for (status, body, expected) in [
             (200, "", Completed),
             (
                 206,
                 r#"{"itemsReceived":1,"itemsAccepted":1,"errors":[]}"#,
                 Completed,
             ),
-            (403, "", Failed),
-            (204, "", Failed),
-            (400, r#"{"errors":[]}"#, Failed),
-            (429, "", NotCompleted),
-            (500, "", NotCompleted),
-            (503, "", NotCompleted),
             (
                 206,
                 r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[{"index":0,"statusCode":429}]}"#,
-                NotCompleted,
+                Failed,
             ),
-            (206, "not json", NotCompleted),
-            // Nothing itemized to retry, so the exporter gives up: a failure.
             (
                 206,
                 r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[]}"#,
                 Failed,
             ),
+            (206, "not json", Failed),
+            (204, "", Failed),
+            (400, "", Failed),
+            (403, "", Failed),
+            (429, "", Failed),
+            (500, "", Failed),
+            (503, "", Failed),
+            // A transport error.
+            (0, "", Failed),
         ] {
             let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
             let requests = guard.capture_requests();
@@ -1396,119 +843,16 @@ mod tests {
                 format: FormatUse::Absent,
             });
 
-            let wait = match expect {
-                NotCompleted => Duration::from_millis(300),
-                Completed | Failed => Duration::from_secs(1),
-            };
-            let outcome = shutdown(wait);
+            let outcome = shutdown(Duration::from_secs(1));
 
+            assert_eq!(outcome, expected, "{status} {body}");
             assert!(requests.try_recv().is_ok(), "the event was sent: {status}");
-            match expect {
-                Completed => assert_eq!(outcome, FlushOutcome::Completed, "{status} {body}"),
-                Failed => assert_eq!(outcome, FlushOutcome::Failed, "{status} {body}"),
-                NotCompleted => assert_eq!(outcome, FlushOutcome::TimedOut, "{status} {body}"),
-            }
-        }
-    }
-
-    /// The same decision at the level of one response: which are accepted.
-    #[test]
-    fn a_response_is_accepted_only_if_the_service_took_the_event() {
-        let response = |status: u16, body: &'static str| {
-            Response::builder()
-                .status(status)
-                .body(Bytes::from_static(body.as_bytes()))
-                .expect("valid response")
-        };
-        let accepted = |status: u16, body: &'static str| {
-            check_ingestion_response(response(status, body), &[0], 1).map(|(_, accepted)| accepted)
-        };
-        assert!(accepted(200, "").expect("ok"));
-        assert!(accepted(206, r#"{"itemsReceived":1,"itemsAccepted":1,"errors":[]}"#).expect("ok"));
-        // The exporter treats every status but 200 and 206 as a failure, so a
-        // 2xx other than those is not an acceptance either.
-        for rejected in [201, 202, 204, 301, 400, 401, 403, 408, 429, 503] {
+            // Give a retry, if there were one, time to arrive.
             assert!(
-                !accepted(rejected, "").expect("passed through"),
-                "{rejected}"
+                requests.recv_timeout(Duration::from_millis(100)).is_err(),
+                "no retry: {status}"
             );
         }
-        assert!(
-            !accepted(
-                206,
-                r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[{"index":0}]}"#
-            )
-            .expect("ok")
-        );
-        // An undercount with no itemized errors is not an acceptance either.
-        assert!(
-            !accepted(206, r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[]}"#).expect("ok")
-        );
-        // A 500 is a rejection even with a well-formed body.
-        assert!(
-            !accepted(
-                500,
-                r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[{"index":0}]}"#
-            )
-            .expect("ok")
-        );
-        // ...and even when the body reports every item accepted.
-        assert!(
-            !accepted(500, r#"{"itemsReceived":1,"itemsAccepted":1,"errors":[]}"#).expect("ok")
-        );
-        // A malformed one is an error, not an acceptance.
-        assert!(accepted(206, "[]").is_err());
-    }
-
-    /// The exporter retries, so the attempt it stops on decides: a rejection that
-    /// a retry turns into a delivery is not a failure, and the reverse is.
-    #[test]
-    fn the_last_attempt_decides_the_outcome() {
-        let reply = |status: u16| {
-            Ok(Response::builder()
-                .status(status)
-                .body(Bytes::new())
-                .expect("valid response"))
-        };
-        for (attempts, failed) in [
-            (vec![503, 200], false),
-            (vec![429, 429, 200], false),
-            (vec![200, 503], true),
-            (vec![503, 503], true),
-            (vec![403], true),
-            (vec![200], false),
-        ] {
-            let inner = InMemoryClient::succeeding();
-            *inner.0.responses.lock().expect("response lock") =
-                attempts.iter().map(|status| reply(*status)).collect();
-            let delivered = Arc::new(AtomicBool::new(false));
-            let client = EventOnlyClient::new(inner, Arc::clone(&delivered));
-            for _ in &attempts {
-                let request = track_request(&[event_envelope()]);
-                poll_ready(client.send_bytes(request)).expect("the response is passed on");
-            }
-            assert_eq!(delivered.load(Ordering::Acquire), !failed, "{attempts:?}");
-        }
-    }
-
-    #[test]
-    fn a_transport_error_that_a_retry_recovers_from_is_a_delivery() {
-        let ok = || {
-            Ok(Response::builder()
-                .status(200)
-                .body(Bytes::new())
-                .expect("valid response"))
-        };
-        // An error that a retry recovers from is a delivery.
-        let inner = InMemoryClient::succeeding();
-        *inner.0.responses.lock().expect("response lock") =
-            VecDeque::from([Err(filter_error("connection reset")), ok()]);
-        let delivered = Arc::new(AtomicBool::new(false));
-        let client = EventOnlyClient::new(inner, Arc::clone(&delivered));
-        assert!(poll_ready(client.send_bytes(track_request(&[event_envelope()]))).is_err());
-        assert!(!delivered.load(Ordering::Acquire));
-        assert!(poll_ready(client.send_bytes(track_request(&[event_envelope()]))).is_ok());
-        assert!(delivered.load(Ordering::Acquire));
     }
 
     /// A call that is admitted before shutdown is sent by it, and one that comes
@@ -1578,59 +922,6 @@ mod tests {
         drop(held);
     }
 
-    /// Ambient tracing configuration must neither switch the event off nor add
-    /// identifiers to it.
-    #[test]
-    fn ambient_opentelemetry_settings_do_not_change_the_event() {
-        let _guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
-        let vars = [
-            ("OTEL_TRACES_SAMPLER", "always_off"),
-            ("OTEL_SPAN_EVENT_COUNT_LIMIT", "0"),
-            ("OTEL_SERVICE_NAME", "someone-elses-service"),
-            (
-                "OTEL_RESOURCE_ATTRIBUTES",
-                "device.id=abc,ai.user.id=someone",
-            ),
-        ];
-        for (name, value) in vars {
-            // SAFETY: serialized by the test environment lock.
-            unsafe { std::env::set_var(name, value) };
-        }
-        let client = InMemoryClient::succeeding();
-        let provider = provider_with_client(TEST_CONNECTION_STRING, client.clone())
-            .expect("valid test configuration");
-        emit_usage(
-            &provider.provider,
-            &[
-                (KEY_OS, "windows".to_owned()),
-                (KEY_ARCH, "x86_64".to_owned()),
-            ],
-            UNIX_EPOCH + Duration::from_secs(1_730_736_000),
-        );
-        provider
-            .provider
-            .shutdown_with_timeout(Duration::from_secs(1))
-            .expect("bounded shutdown");
-        for (name, _) in vars {
-            // SAFETY: as above.
-            unsafe { std::env::remove_var(name) };
-        }
-
-        let envelopes = client.0.envelopes();
-        assert_eq!(envelopes.len(), 1, "the event was not switched off");
-        assert!(envelopes[0].get("tags").is_none());
-        let text = serde_json::to_string(&envelopes[0]).expect("envelope text");
-        for leaked in [
-            "someone-elses-service",
-            "device.id",
-            "ai.user.id",
-            "someone",
-        ] {
-            assert!(!text.contains(leaked), "{leaked}");
-        }
-        assert!(provider.delivered.load(Ordering::Acquire));
-    }
-
     /// A send slower than the cap is cut off at the cap, whatever the caller
     /// asks for: the library's cap, not the request, bounds the delay at exit.
     /// Both the cap itself and a much longer request give `TimedOut` in about
@@ -1694,6 +985,77 @@ mod tests {
         }
     }
 
+    /// The last check before anything leaves the process: a list with a value or
+    /// a key outside the allowlist, or without the properties every event has, is
+    /// not serialized at all.
+    #[test]
+    fn an_event_with_unexpected_properties_is_not_built() {
+        let destination = Destination::parse(TEST_CONNECTION_STRING).expect("destination");
+        let time = SystemTime::UNIX_EPOCH;
+        let valid = || {
+            vec![
+                (KEY_OS, "windows".to_owned()),
+                (KEY_ARCH, "x86_64".to_owned()),
+                (KEY_VERSION, "18.5".to_owned()),
+            ]
+        };
+        assert!(usage_body(&destination, &valid(), time).is_some());
+
+        let mut bad_value = valid();
+        bad_value.push((KEY_COMMAND, "SELECT secret FROM users".to_owned()));
+        assert!(usage_body(&destination, &bad_value, time).is_none());
+
+        let mut unknown_key = valid();
+        unknown_key.push(("sqlcmdcli_server_name", "prod-db-01".to_owned()));
+        assert!(usage_body(&destination, &unknown_key, time).is_none());
+
+        for missing in [KEY_OS, KEY_ARCH] {
+            let without: Vec<_> = valid()
+                .into_iter()
+                .filter(|(key, _)| *key != missing)
+                .collect();
+            assert!(
+                usage_body(&destination, &without, time).is_none(),
+                "{missing}"
+            );
+        }
+    }
+
+    /// What goes on the wire is the typed list and nothing the environment can
+    /// add: no tags, one item, the configured instrumentation key.
+    #[test]
+    fn the_wire_event_carries_only_the_properties() {
+        let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
+        let requests = guard.capture_requests();
+        record_usage(Invocation {
+            version: Some("18.5"),
+            command: Command::Diagnose,
+            format: FormatUse::Json,
+        });
+        assert_eq!(shutdown(Duration::from_secs(1)), FlushOutcome::Completed);
+
+        let request = requests.try_recv().expect("one request");
+        let items: Vec<JsonValue> = serde_json::from_slice(&request.body).expect("JSON array");
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        let keys: std::collections::BTreeSet<_> = item
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["data", "iKey", "name", "time"].into_iter().collect(),
+            "no tags, no sample rate"
+        );
+        assert_eq!(item["name"], "Microsoft.ApplicationInsights.Event");
+        assert_eq!(item["iKey"], "00000000-0000-0000-0000-000000000000");
+        assert_eq!(item["data"]["baseType"], "EventData");
+        assert_eq!(item["data"]["baseData"]["ver"], 2);
+        assert_eq!(item["data"]["baseData"]["name"], USAGE_EVENT_NAME);
+    }
+
     /// Serializes the tests that use the process-wide session and environment,
     /// and clears them afterwards.
     struct TestEnv {
@@ -1711,7 +1073,7 @@ mod tests {
             // the telemetry module.
             unsafe {
                 std::env::remove_var(OPTOUT_ENV);
-                // A declaration wins over every environment marker, so the
+                // A declared caller type, so that what the tests assert about the
                 // caller type does not depend on where the tests run.
                 std::env::set_var(caller::DECLARED_CALLER_ENV, "pipeline");
                 match connection_string {
@@ -1729,8 +1091,8 @@ mod tests {
             Self { _lock: lock }
         }
 
-        /// Sends what the exporter would post to the returned channel instead.
-        fn capture_requests(&self) -> mpsc::Receiver<Request<Bytes>> {
+        /// Sends what would be posted to the returned channel instead.
+        fn capture_requests(&self) -> mpsc::Receiver<Captured> {
             let (sender, receiver) = mpsc::channel();
             *ABI_TEST_CLIENT.lock().expect("ABI test client lock") = Some(sender);
             receiver
@@ -1819,33 +1181,22 @@ mod tests {
         }
     }
 
-    fn event_properties(request: &Request<Bytes>) -> std::collections::BTreeMap<String, String> {
-        let mut decompressed = Vec::new();
-        GzDecoder::new(request.body().as_ref())
-            .read_to_end(&mut decompressed)
-            .expect("gzip exporter request");
-        let envelopes: Vec<JsonValue> =
-            serde_json::from_slice(&decompressed).expect("exporter JSON");
-        assert_eq!(envelopes.len(), 1);
+    fn event_properties(request: &Captured) -> std::collections::BTreeMap<String, String> {
+        let items: Vec<JsonValue> = serde_json::from_slice(&request.body).expect("request JSON");
+        assert_eq!(items.len(), 1);
         assert_eq!(
-            envelopes[0]
+            items[0]
                 .pointer("/data/baseData/name")
                 .and_then(JsonValue::as_str),
             Some(USAGE_EVENT_NAME)
         );
-        envelopes[0]
+        items[0]
             .pointer("/data/baseData/properties")
             .and_then(JsonValue::as_object)
             .expect("event properties")
             .iter()
             .map(|(key, value)| (key.clone(), value.as_str().expect("string").to_owned()))
             .collect()
-    }
-
-    #[test]
-    fn invalid_connection_string_is_rejected_without_http() {
-        let client = InMemoryClient::succeeding();
-        assert!(provider_with_client("not a connection string", client).is_err());
     }
 
     #[test]
@@ -1880,240 +1231,5 @@ mod tests {
         ] {
             assert!(version_is_safe(version), "{version:?}");
         }
-    }
-
-    fn gzip_json(envelopes: &[JsonValue]) -> Vec<u8> {
-        let body = serde_json::to_vec(envelopes).expect("serialize envelopes");
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&body).expect("compress envelopes");
-        encoder.finish().expect("finish gzip")
-    }
-
-    /// A request to the track endpoint with the given body.
-    fn track_request_with(body: Bytes) -> Request<Bytes> {
-        Request::post("https://example.test/v2/track")
-            .body(body)
-            .expect("valid request")
-    }
-
-    /// A request to the track endpoint carrying `envelopes`, compressed as the
-    /// exporter sends them.
-    fn track_request(envelopes: &[JsonValue]) -> Request<Bytes> {
-        track_request_with(Bytes::from(gzip_json(envelopes)))
-    }
-
-    /// The envelope of the span the exporter always adds around the event.
-    fn dependency_envelope() -> JsonValue {
-        serde_json::json!({"name": "Microsoft.ApplicationInsights.RemoteDependency"})
-    }
-
-    #[test]
-    fn event_filter_drops_the_enclosing_dependency() {
-        let request = track_request(&[dependency_envelope(), event_envelope()]);
-
-        let filtered = filter_event_request(request).expect("filter succeeds");
-        let mut decompressed = Vec::new();
-        GzDecoder::new(filtered.request.body().as_ref())
-            .read_to_end(&mut decompressed)
-            .expect("decompress filtered body");
-        let envelopes: Vec<JsonValue> =
-            serde_json::from_slice(&decompressed).expect("filtered JSON");
-        assert_eq!(envelopes.len(), 1);
-        assert_eq!(
-            envelopes[0].get("name").and_then(JsonValue::as_str),
-            Some(APPLICATION_INSIGHTS_EVENT_ENVELOPE)
-        );
-        assert!(envelopes[0].get("tags").is_none());
-    }
-
-    #[test]
-    fn event_filter_rejects_an_all_filtered_payload() {
-        assert!(filter_event_request(track_request(&[dependency_envelope()])).is_err());
-    }
-
-    #[test]
-    fn client_does_not_record_an_all_filtered_payload_as_delivered() {
-        let request = track_request(&[dependency_envelope()]);
-        let delivered = Arc::new(AtomicBool::new(false));
-        let client = EventOnlyClient::new(InMemoryClient::succeeding(), Arc::clone(&delivered));
-
-        assert!(poll_ready(client.send_bytes(request)).is_err());
-        assert!(!delivered.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn client_does_not_record_a_transport_failure_as_delivered() {
-        let inner = InMemoryClient::succeeding();
-        *inner.0.responses.lock().expect("response lock") =
-            VecDeque::from([Err(filter_error("connection refused"))]);
-        let delivered = Arc::new(AtomicBool::new(false));
-        let client = EventOnlyClient::new(inner, Arc::clone(&delivered));
-
-        assert!(poll_ready(client.send_bytes(track_request(&[event_envelope()]))).is_err());
-        assert!(!delivered.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn client_does_not_record_a_rejection_as_delivered_but_passes_the_response_on() {
-        let inner = InMemoryClient::succeeding();
-        *inner.0.responses.lock().expect("response lock") =
-            VecDeque::from([Ok(Response::builder()
-                .status(403)
-                .body(Bytes::new())
-                .expect("valid response"))]);
-        let delivered = Arc::new(AtomicBool::new(false));
-        let client = EventOnlyClient::new(inner, Arc::clone(&delivered));
-
-        let response = poll_ready(client.send_bytes(track_request(&[event_envelope()])))
-            .expect("the exporter still sees the response");
-        assert_eq!(response.status().as_u16(), 403);
-        assert!(!delivered.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn event_filter_rejects_malformed_compressed_payload() {
-        assert!(filter_event_request(track_request_with(Bytes::from_static(b"not gzip"))).is_err());
-    }
-
-    #[test]
-    fn client_does_not_record_malformed_compression_as_delivered() {
-        let delivered = Arc::new(AtomicBool::new(false));
-        let client = EventOnlyClient::new(InMemoryClient::succeeding(), Arc::clone(&delivered));
-        let request = track_request_with(Bytes::from_static(b"not gzip"));
-        assert!(poll_ready(client.send_bytes(request)).is_err());
-        assert!(!delivered.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn event_filter_rejects_wrong_name_and_properties() {
-        for envelope in [
-            {
-                let mut envelope = event_envelope();
-                envelope["data"]["baseData"]["name"] = JsonValue::from("unexpected");
-                envelope
-            },
-            {
-                let mut envelope = event_envelope();
-                envelope["data"]["baseData"]["properties"]["unapproved"] = JsonValue::from("value");
-                envelope
-            },
-            {
-                let mut envelope = event_envelope();
-                envelope["data"]["baseData"]["properties"]
-                    .as_object_mut()
-                    .expect("properties")
-                    .remove("sqlcmdcli_os");
-                envelope
-            },
-            {
-                let mut envelope = event_envelope();
-                envelope["data"]["baseData"]["properties"]["sqlcmdcli_format"] =
-                    JsonValue::from("xml");
-                envelope
-            },
-        ] {
-            assert!(filter_event_request(track_request(&[envelope])).is_err());
-        }
-    }
-
-    #[test]
-    fn partial_response_indices_are_mapped_to_the_original_exporter_batch() {
-        let request = track_request(&[dependency_envelope(), event_envelope()]);
-        let filtered = filter_event_request(request).expect("filter succeeds");
-        let response = Response::builder()
-            .status(206)
-            .body(Bytes::from_static(
-                br#"{"itemsReceived":1,"itemsAccepted":0,"errors":[{"index":0,"statusCode":429}]}"#,
-            ))
-            .expect("valid response");
-
-        let (translated, accepted) = check_ingestion_response(
-            response,
-            &filtered.original_indices,
-            filtered.original_count,
-        )
-        .expect("translation succeeds");
-        assert!(!accepted, "the one retained event was rejected");
-        let payload: JsonValue =
-            serde_json::from_slice(translated.body()).expect("translated JSON");
-        assert_eq!(payload["itemsReceived"], 2);
-        assert_eq!(payload["itemsAccepted"], 1);
-        assert_eq!(payload["errors"][0]["index"], 1);
-    }
-
-    #[test]
-    fn malformed_partial_response_is_an_error() {
-        let response = Response::builder()
-            .status(206)
-            .body(Bytes::from_static(b"not json"))
-            .expect("valid response");
-
-        assert!(check_ingestion_response(response, &[1], 2).is_err());
-    }
-
-    #[test]
-    fn a_partial_response_that_does_not_match_the_request_is_an_error_not_a_success() {
-        // One event was retained out of two envelopes (index 1 of the original).
-        for body in [
-            r#"{"itemsReceived":0,"itemsAccepted":1,"errors":[]}"#,
-            r#"{"itemsReceived":2,"itemsAccepted":2,"errors":[]}"#,
-            r#"{"itemsReceived":1,"itemsAccepted":2,"errors":[]}"#,
-            r#"{"itemsReceived":1,"itemsAccepted":1,"errors":[{"index":0}]}"#,
-            r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[{"index":5}]}"#,
-            r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[{"index":0},{"index":0}]}"#,
-            r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[{"statusCode":429}]}"#,
-            r#"{"itemsReceived":1,"itemsAccepted":0,"errors":"none"}"#,
-            r#"{"itemsReceived":1,"itemsAccepted":1}"#,
-            r#"{"itemsReceived":1,"itemsAccepted":0,"errors":null}"#,
-            r#"{"itemsAccepted":0,"errors":[]}"#,
-            r#"{"itemsReceived":"1","itemsAccepted":0}"#,
-            r#"[]"#,
-            r#""text""#,
-            r#"7"#,
-            r#"null"#,
-        ] {
-            let response = Response::builder()
-                .status(206)
-                .body(Bytes::from(body))
-                .expect("valid response");
-            assert!(
-                check_ingestion_response(response, &[1], 2).is_err(),
-                "{body}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_consistent_partial_response_without_errors_is_translated() {
-        let response = Response::builder()
-            .status(206)
-            .body(Bytes::from_static(
-                br#"{"itemsReceived":1,"itemsAccepted":1,"errors":[]}"#,
-            ))
-            .expect("valid response");
-
-        let (translated, accepted) =
-            check_ingestion_response(response, &[1], 2).expect("consistent");
-        assert!(accepted);
-        let payload: JsonValue = serde_json::from_slice(translated.body()).expect("JSON");
-        assert_eq!(payload["itemsReceived"], 2);
-        assert_eq!(payload["itemsAccepted"], 2);
-    }
-
-    #[test]
-    fn client_does_not_record_malformed_partial_response_as_delivered() {
-        let inner = InMemoryClient::succeeding();
-        *inner.0.responses.lock().expect("response lock") =
-            VecDeque::from([Ok(Response::builder()
-                .status(206)
-                .body(Bytes::from_static(b"not JSON"))
-                .expect("valid response"))]);
-        let delivered = Arc::new(AtomicBool::new(false));
-        let client = EventOnlyClient::new(inner, Arc::clone(&delivered));
-
-        let request = track_request(&[dependency_envelope(), event_envelope()]);
-
-        assert!(poll_ready(client.send_bytes(request)).is_err());
-        assert!(!delivered.load(Ordering::Acquire));
     }
 }
