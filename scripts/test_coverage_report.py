@@ -314,80 +314,289 @@ def test_security_regressions_run_in_validation():
     assert "scripts/test_coverage_report.py" in command.split()
 
 
-@pytest.mark.parametrize("macos_attempt", ["1_2", "2_2"])
-def test_coverage_downloads_follow_each_producers_recorded_attempt(macos_attempt):
-    templates = ROOT / ".pipeline" / "templates"
-    def load(name):
-        return yaml.safe_load((templates / name).read_text(encoding="utf-8"))
+TEMPLATES = ROOT / ".pipeline" / "templates"
+MERGE_SPEC = importlib.util.spec_from_file_location(
+    "merge_cobertura", ROOT / ".pipeline" / "scripts" / "merge-cobertura.py"
+)
+assert MERGE_SPEC and MERGE_SPEC.loader
+merging = importlib.util.module_from_spec(MERGE_SPEC)
+MERGE_SPEC.loader.exec_module(merging)
+# Each coverage artifact prefix and the Build job that publishes it.
+COVERAGE_OWNERS = {
+    "CoberturaCoverageRust_Windows": "Build_Windows",
+    "CoberturaCoverageOdbcE2E_Windows": "Build_Windows",
+    "CoberturaCoverageRust_Linux": "Build_Linux",
+    "CoberturaCoverageOdbcE2E_Linux": "Build_Linux",
+    "CoberturaCoveragePython": "Build_Linux",
+    "CoberturaCoveragePyCoreRust": "Build_Linux",
+    "CoberturaCoverageRust_MacOS": "Test_MacOS",
+}
+ATTEMPT = "$(coverageAttempt.value)"
 
-    stages = load("validation-stages.yml")["stages"]
+
+def load_template(name):
+    return yaml.safe_load((TEMPLATES / name).read_text(encoding="utf-8"))
+
+
+def template_steps(value):
+    for step in value:
+        if not isinstance(step, dict):
+            continue
+        yield step
+        for key, nested in step.items():
+            if key.startswith("${{") and isinstance(nested, list):
+                yield from template_steps(nested)
+
+
+def attempt_branch(os_type):
+    steps = load_template("coverage-attempt-template.yml")["steps"]
+    return next(iter(steps[0 if os_type == "Windows" else 1].values()))[0]
+
+
+def recorded_attempt(os_type, stage_attempt, job_attempt):
+    """The `coverageAttempt.value` output the attempt template's command sets."""
+    branch = attempt_branch(os_type)
+    command = branch.get("pwsh", branch.get("bash"))
+    command = command.replace("$(System.StageAttempt)", str(stage_attempt))
+    command = command.replace("$(System.JobAttempt)", str(job_attempt))
+    return re.search(r"##vso\[task\.setvariable variable=value;isOutput=true\]([^\s\"']+)", command)[1]
+
+
+def coverage_wiring():
+    """Coverage producers, merge downloads and the merged artifact, read from the templates."""
+    stages = load_template("validation-stages.yml")["stages"]
     build = next(stage for stage in stages if stage.get("stage") == "Build")
     merge = next(stage for stage in stages if stage.get("stage") == "Coverage")["jobs"][0]
-    assert merge["workspace"]["clean"] == "all"
-    outputs = {"Build_Windows": "1_1", "Build_Linux": "1_1", "Test_MacOS": macos_attempt}
-    expected_owners = {
-        "CoberturaCoverageRust_Windows": "Build_Windows",
-        "CoberturaCoverageOdbcE2E_Windows": "Build_Windows",
-        "CoberturaCoverageRust_Linux": "Build_Linux",
-        "CoberturaCoverageOdbcE2E_Linux": "Build_Linux",
-        "CoberturaCoveragePython": "Build_Linux",
-        "CoberturaCoveragePyCoreRust": "Build_Linux",
-        "CoberturaCoverageRust_MacOS": "Test_MacOS",
-    }
-
-    def steps(value):
-        for step in value:
-            if not isinstance(step, dict):
-                continue
-            yield step
-            for key, nested in step.items():
-                if key.startswith("${{") and isinstance(nested, list):
-                    yield from steps(nested)
-
-    published = set()
-    for owner, suffix in outputs.items():
+    producers = {}
+    for owner in dict.fromkeys(COVERAGE_OWNERS.values()):
         job = next(job for job in build["jobs"] if job.get("job") == owner)
         invocation = next(
             step for step in job["steps"]
             if step.get("template") in ("build-template.yml", "build-template-container.yml")
         )
-        producer = load(invocation["template"])
-        setup = next(step for step in producer["steps"] if step.get("template") == "coverage-attempt-template.yml")
+        producer = load_template(invocation["template"])
         os_type = invocation["parameters"].get("osType", "Linux")
-        setup_os = setup["parameters"]["osType"].replace("${{ parameters.osType }}", os_type)
-        attempt_steps = load("coverage-attempt-template.yml")["steps"]
-        branch = next(iter(attempt_steps[0 if setup_os == "Windows" else 1].values()))[0]
-        assert branch["name"] == "coverageAttempt"
-        command = branch.get("pwsh", branch.get("bash"))
-        assert "variable=value;isOutput=true]$(System.StageAttempt)_$(System.JobAttempt)" in command
-        for step in (*steps(producer["steps"]), *steps(job["steps"])):
+        setup = next(
+            (step for step in producer["steps"] if step.get("template") == "coverage-attempt-template.yml"),
+            None,
+        )
+        published = {}
+        for step in (*template_steps(producer["steps"]), *template_steps(job["steps"])):
             name = step.get("inputs", {}).get("artifactName", "")
             name = name.replace("${{ parameters.osType }}", os_type)
-            prefix = name.removesuffix("_$(coverageAttempt.value)")
-            if expected_owners.get(prefix) == owner:
-                assert name.endswith("_$(coverageAttempt.value)")
-                published.add(name.replace("$(coverageAttempt.value)", suffix))
-
-    downloaded = set()
+            if COVERAGE_OWNERS.get(name.removesuffix(f"_{ATTEMPT}")) == owner:
+                published[name] = Path(step["inputs"]["targetPath"]).name
+        producers[owner] = SimpleNamespace(os_type=os_type, setup=setup, published=published)
+    downloads = []
     for step in merge["steps"]:
         if step.get("task") != "DownloadPipelineArtifact@2":
             continue
         name = step["inputs"]["artifactName"]
-        variable = re.search(r"\$\((\w+)\)", name)[1]
-        expression = merge["variables"][variable]
-        owner = re.fullmatch(
-            r"\$\[ stageDependencies\.Build\.(\w+)\.outputs\['coverageAttempt.value'\] \]",
-            expression,
-        )[1]
-        prefix = name.split("$(")[0].removesuffix("_")
-        assert owner == expected_owners[prefix]
-        downloaded.add(name.replace(f"$({variable})", outputs[owner]))
-    assert published == downloaded == {
-        f"{prefix}_{outputs[owner]}" for prefix, owner in expected_owners.items()
-    }
-    assert any(step.get("template") == "coverage-attempt-template.yml" for step in merge["steps"])
+        reference = re.search(r"\$\((\w+)\)", name)
+        variable = owner = None
+        if reference:
+            variable = reference[1]
+            owner = re.fullmatch(
+                r"\$\[ stageDependencies\.Build\.(\w+)\.outputs\['coverageAttempt.value'\] \]",
+                merge["variables"][variable],
+            )[1]
+        directory = step["inputs"]["targetPath"].removeprefix("$(Pipeline.Workspace)/")
+        downloads.append(SimpleNamespace(name=name, variable=variable, owner=owner, directory=directory))
     merged = next(step for step in merge["steps"] if step.get("task") == "PublishPipelineArtifact@1")
-    assert merged["inputs"]["artifactName"] == "CoberturaCoverage_$(coverageAttempt.value)"
+    script = next(step["bash"] for step in merge["steps"] if step.get("displayName") == "Merge Cobertura reports")
+    attempt = next(
+        (step for step in merge["steps"] if step.get("template") == "coverage-attempt-template.yml"), {}
+    )
+    default_os = load_template("coverage-attempt-template.yml")["parameters"][0]["default"]
+    return SimpleNamespace(
+        producers=producers, merge=merge, downloads=downloads,
+        merged=merged["inputs"]["artifactName"], merge_script=script,
+        merge_os=attempt.get("parameters", {}).get("osType", default_os),
+    )
+
+
+@pytest.mark.parametrize("macos_attempt", ["1_2", "2_2"])
+def test_coverage_downloads_follow_each_producers_recorded_attempt(macos_attempt):
+    wiring = coverage_wiring()
+    assert wiring.merge["workspace"]["clean"] == "all"
+    outputs = {"Build_Windows": "1_1", "Build_Linux": "1_1", "Test_MacOS": macos_attempt}
+
+    published = set()
+    for owner, suffix in outputs.items():
+        producer = wiring.producers[owner]
+        assert producer.setup is not None
+        setup_os = producer.setup["parameters"]["osType"].replace("${{ parameters.osType }}", producer.os_type)
+        branch = attempt_branch(setup_os)
+        assert branch["name"] == "coverageAttempt"
+        command = branch.get("pwsh", branch.get("bash"))
+        assert "variable=value;isOutput=true]$(System.StageAttempt)_$(System.JobAttempt)" in command
+        for name in producer.published:
+            assert name.endswith(f"_{ATTEMPT}")
+            published.add(name.replace(ATTEMPT, suffix))
+
+    downloaded = set()
+    for download in wiring.downloads:
+        prefix = download.name.split("$(")[0].removesuffix("_")
+        assert download.owner == COVERAGE_OWNERS[prefix]
+        downloaded.add(download.name.replace(f"$({download.variable})", outputs[download.owner]))
+    assert published == downloaded == {
+        f"{prefix}_{outputs[owner]}" for prefix, owner in COVERAGE_OWNERS.items()
+    }
+    assert any(step.get("template") == "coverage-attempt-template.yml" for step in wiring.merge["steps"])
+    assert wiring.merged == f"CoberturaCoverage_{ATTEMPT}"
+
+
+class ArtifactExists(Exception):
+    pass
+
+
+class FakeArtifactStore:
+    """One Azure build's pipeline artifacts: kept across retries and never overwritten."""
+
+    def __init__(self, build_id):
+        self.build_id = build_id
+        self.artifacts = {}
+
+    def publish(self, name, files):
+        if name in self.artifacts:
+            raise ArtifactExists(f"Artifact {name} already exists for build {self.build_id}.")
+        self.artifacts[name] = dict(files)
+
+    def download(self, name, target):
+        if name not in self.artifacts:
+            return False
+        target.mkdir(parents=True, exist_ok=True)
+        for filename, content in self.artifacts[name].items():
+            (target / filename).write_text(content, encoding="utf-8")
+        return True
+
+    def archive(self, name, path):
+        with zipfile.ZipFile(path, "w") as output:
+            for filename, content in self.artifacts[name].items():
+                output.writestr(f"{name}/{filename}", content)
+        return path
+
+
+def attempt_report(prefix, attempt):
+    """A Cobertura report whose only source file names its producer and attempt."""
+    return (
+        f'<coverage line-rate="1"><packages><package name="src"><classes>'
+        f'<class name="{prefix}" filename="src/{prefix}_{attempt}.rs">'
+        f'<lines><line number="1" hits="1"/></lines></class>'
+        f"</classes></package></packages></coverage>"
+    )
+
+
+def report_sources(xml):
+    return {Path(item.get("filename")).name for item in ET.fromstring(xml).iter("class")}
+
+
+class SimulatedRetryBuild:
+    """Replays producer, merge and reporting steps of one Azure build across retries.
+
+    Artifact names and attempt outputs come from the real templates, and the merge
+    and reporting run the production scripts. Azure itself is simulated: the store
+    rejects reused names, and `stageDependencies` resolves to each producer's latest
+    attempt.
+    """
+
+    BUILD_ID = 191709
+
+    def __init__(self, tmp_path, monkeypatch):
+        self.tmp_path = tmp_path
+        self.monkeypatch = monkeypatch
+        self.wiring = coverage_wiring()
+        self.store = FakeArtifactStore(self.BUILD_ID)
+        self.outputs = {}
+        self.merges = 0
+
+    def produce(self, owner, stage_attempt, job_attempt):
+        producer = self.wiring.producers[owner]
+        attempt = recorded_attempt(producer.os_type, stage_attempt, job_attempt)
+        for name, filename in producer.published.items():
+            prefix = name.removesuffix(f"_{ATTEMPT}")
+            self.store.publish(name.replace(ATTEMPT, attempt), {filename: attempt_report(prefix, attempt)})
+        self.outputs[owner] = attempt
+
+    def merge(self, stage_attempt, job_attempt):
+        self.merges += 1
+        workspace = self.tmp_path / f"merge-{self.merges}"
+        for download in self.wiring.downloads:
+            name = download.name
+            if download.variable:
+                name = name.replace(f"$({download.variable})", self.outputs[download.owner])
+            self.store.download(name, workspace / download.directory)
+        script = self.wiring.merge_script
+        inputs = []
+        for variable, path in re.findall(r'(?:(\w+)=)?"\$\(Pipeline\.Workspace\)/([^"]+)"', script):
+            prefix = re.search(rf'"\${variable}::([^"]+)"', script) if variable else None
+            if (workspace / path).is_file():
+                inputs.append(str(workspace / path) + (f"::{prefix[1]}" if prefix else ""))
+        merged = workspace / "cobertura.xml"
+        assert merging.main(["--output", str(merged), *inputs]) == 0
+        attempt = recorded_attempt(self.wiring.merge_os, stage_attempt, job_attempt)
+        name = self.wiring.merged.replace(ATTEMPT, attempt)
+        self.store.publish(name, {"cobertura.xml": merged.read_text(encoding="utf-8")})
+        return name
+
+    def report(self, stage_attempt, job_attempt):
+        """Select and extract the coverage the PR comment would report."""
+        def get_json(url, *, deadline):
+            path = urlparse(url).path
+            if path.endswith(f"/builds/{self.BUILD_ID}/artifacts"):
+                return {"value": [{"name": name} for name in self.store.artifacts]}
+            assert path.endswith(f"/builds/{self.BUILD_ID}/timeline"), url
+            return {"records": coverage_timeline(stage_attempt, job_attempt)}
+        self.monkeypatch.setattr(polling, "get_json", get_json)
+        name = polling.coverage_artifact(self.BUILD_ID, deadline=60)
+        assert name is not None
+        archive = self.store.archive(name, self.tmp_path / f"{name}.zip")
+        destination = self.tmp_path / f"{name}.xml"
+        coverage_report.extract_coverage(archive, destination, name)
+        return name, report_sources(destination.read_text(encoding="utf-8"))
+
+
+def expected_sources(attempts):
+    return {
+        f"{prefix}_{attempts[owner]}.rs" for prefix, owner in COVERAGE_OWNERS.items()
+    }
+
+
+@pytest.mark.parametrize("retried", [
+    "Build_Windows", "Build_Linux", pytest.param("Test_MacOS", id="partial_macos_retry"),
+])
+def test_job_retry_in_the_same_build_publishes_and_reports_its_coverage(tmp_path, monkeypatch, retried):
+    build = SimulatedRetryBuild(tmp_path, monkeypatch)
+    for owner in build.wiring.producers:
+        build.produce(owner, 1, 1)
+    # The retried job published its coverage and then failed; the retry keeps
+    # those artifacts in the build and every other job's successful coverage.
+    build.produce(retried, 1, 2)
+    attempts = {owner: "1_2" if owner == retried else "1_1" for owner in build.wiring.producers}
+    stale = expected_sources({owner: "1_1" for owner in build.wiring.producers})
+
+    assert build.merge(1, 1) == "CoberturaCoverage_1_1"
+    name, sources = build.report(1, 1)
+    assert sources == expected_sources(attempts)
+    assert not sources & (stale - expected_sources(attempts))
+    assert name == "CoberturaCoverage_1_1"
+
+
+def test_stage_retry_in_the_same_build_reports_the_current_merged_coverage(tmp_path, monkeypatch):
+    build = SimulatedRetryBuild(tmp_path, monkeypatch)
+    for owner in build.wiring.producers:
+        build.produce(owner, 1, 1)
+    # The first Coverage run published its merged report before the stage failed.
+    stale = build.merge(1, 1)
+    # Rerunning the Build stage reruns its jobs as stage attempt 2, then Coverage.
+    for owner in build.wiring.producers:
+        build.produce(owner, 2, 1)
+    current = build.merge(2, 1)
+
+    name, sources = build.report(2, 1)
+    assert sources == expected_sources({owner: "2_1" for owner in build.wiring.producers})
+    assert not sources & expected_sources({owner: "1_1" for owner in build.wiring.producers})
+    assert (stale, current, name) == ("CoberturaCoverage_1_1",) + ("CoberturaCoverage_2_1",) * 2
 
 
 def run_workflow_script(script, **values):
