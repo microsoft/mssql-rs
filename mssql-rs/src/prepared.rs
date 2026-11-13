@@ -10,16 +10,13 @@
 //!
 //! # Why
 //!
-//! Sending a parameterized query through [`Client::query`](crate::Client::query)
-//! uses `sp_executesql`: SQL Server parses + plan-compiles the statement on
-//! every call. For a hot loop that executes the same statement with different
-//! values, paying that cost N times is wasteful.
-//!
-//! [`Client::prepare`](crate::Client::prepare) compiles the statement *once*
-//! server-side via `sp_prepare`, returning a [`PreparedStatement`] handle.
-//! Subsequent invocations through [`PreparedStatement::query`] /
-//! [`PreparedStatement::execute`] use `sp_execute` with that handle and skip
-//! parse + plan-compile.
+//! [`Client::query`](crate::Client::query) uses `sp_executesql`, which can
+//! reuse cached execution plans for repeated parameterized queries.
+//! [`Client::prepare`](crate::Client::prepare) instead creates a server-side
+//! prepared handle via `sp_prepare`. Subsequent invocations through
+//! [`PreparedStatement::query`] / [`PreparedStatement::execute`] use
+//! `sp_execute` with that handle. SQL Server manages the underlying plan and
+//! may recompile it when needed.
 //!
 //! # Example
 //!

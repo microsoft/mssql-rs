@@ -489,8 +489,8 @@ impl Client {
     /// Returns a [`PreparedStatement`](crate::prepared::PreparedStatement)
     /// handle that can be executed many times via
     /// [`PreparedStatement::query`](crate::prepared::PreparedStatement::query)
-    /// or [`PreparedStatement::execute`](crate::prepared::PreparedStatement::execute)
-    /// without re-parsing or re-compiling the plan on the server.
+    /// or [`PreparedStatement::execute`](crate::prepared::PreparedStatement::execute).
+    /// SQL Server manages the underlying plan and may recompile it when needed.
     ///
     /// The `param_types` slice supplies **sample values** whose
     /// [`ToSql`] mapping is used to derive the parameter declaration string
