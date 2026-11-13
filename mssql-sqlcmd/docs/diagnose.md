@@ -1,13 +1,13 @@
 # sqlcmd diagnose
 
-`sqlcmd diagnose [-S <server> | -D -S <dsn>] [-U <login> -P <password> | -E] [-d <database>] [-N[s|m|o]] [-C] [-F <certificate-name>] [-l <seconds>] [--depth <depth>] [--local-detail] [--format json]`
+`sqlcmd diagnose [-S <server> | -D -S <dsn>] [-U <login> -P <password> | -E | -G {-U <login> -P <password> | -P <token-file>}] [-d <database>] [-N[s|m|o]] [-C] [-F <certificate-name>] [-l <seconds>] [--depth <depth>] [--local-detail] [--format json]`
 checks, from the bottom up, that a connection can be made, and when it cannot,
 where and why. It follows the diagnostic depths of the sqlcmd specification;
 each includes the ones before it, and the deepest is the default:
 
 | Depth (`--depth`) | Checks |
 |---|---|
-| `connectionInput` | the settings sqlcmd resolved and where each came from (a command-line option, an environment variable, an ODBC data source (DSN) given with `-D`, or the default); the server given to `-S`, or the one the DSN names, checked with the client's rules; local findings for an instance name with a port, for `-F` with `-C`, for a DSN that names no server, and for a login that a DSN's `Trusted_Connection=yes` leaves unused; no external call |
+| `connectionInput` | the settings sqlcmd resolved and where each came from (a command-line option, an environment variable, an ODBC data source (DSN) given with `-D`, or the default); the server given to `-S`, or the one the DSN names, checked with the client's rules; with `-G -P <token-file>`, the access token file, read as sqlcmd reads it; local findings for an instance name with a port, for `-F` with `-C`, for a DSN that names no server, and for a login that a DSN's `Trusted_Connection=yes` leaves unused; no name resolution, SQL Server Browser query or connection, though the access token file is read from the path given, which can be on a network share |
 | `endpointResolution` | the client resolves the host name and asks SQL Server Browser for a named instance's port (never guessing 1433), then stops |
 | `networkReachability` | the client also opens its transport: a TCP connection to the first resolved address that accepts, and to every address after it, or a pipe; then it stops |
 | `connectionAttempt` | the client also logs in, with its pre-login, TLS and login phases |
@@ -16,8 +16,42 @@ each includes the ones before it, and the deepest is the default:
 Checks run best effort: a failed check skips only what needs its result, and
 each skipped check names what blocked it. In the JSON report a skipped check
 gives its `reason` (`blockedByPrerequisite`, `explicitPortRequired`,
-`notApplicable`, `canceled`), the check that blocked it as `blockedBy`, and a
-`detail` in words (none for `blockedByPrerequisite`).
+`notApplicable`, `canceled`, `notSupported`), the check that blocked it as
+`blockedBy`, and a `detail` in words (none for `blockedByPrerequisite`). A
+check that is `notSupported` could not be completed because diagnose lacks
+what it needs; it keeps the phases it went through, and the run is
+`partial`.
+
+With `-G` (Microsoft Entra authentication), diagnose takes the method sqlcmd
+selects, and names it as sqlcmd's `--format json` does: `-G` with `-U` is
+`ActiveDirectoryPassword`, and `-G -P <file>` without `-U`
+`ActiveDirectoryAccessToken`, with the authentication's source `-G`. `-G`
+without `-U` or `-P` (`ActiveDirectoryIntegrated`) is not supported yet: the
+driver sqlcmd uses then logs in with Microsoft Entra, or with Windows
+authentication (Kerberos elsewhere) when the server's pre-login answer does
+not require Microsoft Entra or only the login is encrypted, and diagnose does
+not model that choice. Connection input reads the access token file as sqlcmd
+does, its bytes as they are (up to sqlcmd's 1 MiB), and the client sends them
+as the token: a file that is missing (`accessTokenFileNotFound`), cannot be
+read (`accessTokenFileUnreadable`), is too large (`accessTokenFileTooLarge`)
+or is not UTF-16LE text (`accessTokenFileNotUtf16`), the form in which sqlcmd
+passes the token to the driver, is `diagnosed` with
+`client.inputConfiguration`, and the file is not named. The path is opened as
+given, so a file on a network share (a UNC path on Windows, or a network file
+system) is read over the network. The file is read on a thread of its own
+within the time limit (`-l`), which connection input then reports as its
+`deadlineMs`, its `durationMs` counting the read: a file not read in time,
+such as a pipe no one writes to or a share that does not answer, is
+`inconclusive` (`accessTokenFileTimedOut`), and a cancel is seen during the
+read. The
+server's rejection of an Entra login is `diagnosed` with
+`security.authentication.entra` and `"entraStage": "serverRejection"`.
+diagnose does not acquire Entra tokens yet: with `ActiveDirectoryPassword` the
+client goes as far as the server's request for a token, after pre-login and
+TLS; the connection attempt is then `skipped` (`notSupported`), with an
+informational finding that the server asked for a token, the authentication
+outcome is `notEvaluated`, and the run is `partial`. No token, password or
+authority the server names is reported.
 
 With `-D` (Linux and macOS; sqlcmd on Windows treats `-D` as obsolete), `-S`
 names an ODBC data source (DSN). Native sqlcmd reads the DSN from the user and
@@ -46,7 +80,7 @@ with `-U` or `SQLCMDUSER`; connection input reports that as an informational
 finding. Native sqlcmd refuses, as an invalid invocation, a DSN with settings
 diagnose does not model yet (`Authentication`, `ServerCertificate`, a
 read-only `ApplicationIntent`, `MultiSubnetFailover=Yes`, or `RegPrecedence`),
-as it refuses `-G`, `-J`, `-K` and `-M`.
+as it refuses `-J`, `-K`, `-M`, and `-G` without `-U` or `-P`.
 
 A named instance whose port SQL Server Browser does not give (no usable port
 in its answer, for `tcp:host\instance` an answer that lists only a pipe
@@ -90,7 +124,9 @@ addresses, and `tcpConnect` is still checked with those addresses. The report ad
   `inconclusive`, `notEvaluated`), and an exit code per category: 0 passed,
   1 issue detected, 2 inconclusive, 3 partial, 4 canceled, 5 internal failure,
   6 invalid invocation. A run is `partial` when this computer would not let a
-  check run (for example, the operating system refused to open the socket), and
+  check run (for example, the operating system refused to open the socket), or
+  when diagnose could not complete a check (`notSupported`, such as a Microsoft
+  Entra login whose token diagnose does not acquire), and
   `canceled` when the host cancels it (`mssql_sqlcmd_diagnostics_cancel`; sqlcmd
   does so on Ctrl+C): the checks that finished are kept and the others are
   skipped as `canceled`;
@@ -158,7 +194,8 @@ check reports certificate subject or SAN names or file paths; they would be
 labelled the same way. The password is never part of the report.
 
 The checks observe the client's real connection: sqlcmd makes no network call
-of its own. `mssql-tds` makes one connection attempt, as a normal run does,
+of its own, other than reading an access token file that is on a network
+share. `mssql-tds` makes one connection attempt, as a normal run does,
 through its diagnostic entry point (`TdsConnectionProvider::diagnose_client`):
 it resolves the name, asks SQL Server Browser (past its instance cache)
 whenever the attempt reaches it, follows its protocol order, connects, and

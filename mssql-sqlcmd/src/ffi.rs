@@ -641,6 +641,69 @@ pub const MSSQL_SQLCMD_AUTH_SQL_PASSWORD: i32 = 0;
 /// Windows authentication (Kerberos off Windows); `user` and `password` are
 /// ignored.
 pub const MSSQL_SQLCMD_AUTH_INTEGRATED: i32 = 1;
+/// Microsoft Entra password authentication (`-G` with `-U`), with `user` and
+/// `password`. diagnose does not acquire the token, so the login is not
+/// evaluated.
+pub const MSSQL_SQLCMD_AUTH_ENTRA_PASSWORD: i32 = 2;
+/// A Microsoft Entra access token (`-G -P` without `-U`): `password` is the
+/// `-P` value, the file sqlcmd reads the token from; `user` is ignored.
+pub const MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN: i32 = 3;
+// Microsoft Entra integrated authentication (`-G` without `-U` or `-P`) has no
+// value yet: sqlcmd's driver logs in with it, or with Windows authentication
+// when the server's pre-login answer does not require Microsoft Entra, which
+// diagnose does not model.
+
+/// The `authentication` of a [`MssqlSqlcmdDiagnosticsRequest`], read once from
+/// its `MSSQL_SQLCMD_AUTH_*` value. Each use matches every kind, so a kind added
+/// later does not compile until every use handles it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthKind {
+    SqlPassword,
+    Integrated,
+    EntraPassword,
+    EntraAccessToken,
+}
+
+impl AuthKind {
+    /// The kind an `MSSQL_SQLCMD_AUTH_*` value names, or `None` for any other
+    /// value.
+    fn from_c(value: i32) -> Option<Self> {
+        Some(match value {
+            MSSQL_SQLCMD_AUTH_SQL_PASSWORD => Self::SqlPassword,
+            MSSQL_SQLCMD_AUTH_INTEGRATED => Self::Integrated,
+            MSSQL_SQLCMD_AUTH_ENTRA_PASSWORD => Self::EntraPassword,
+            MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN => Self::EntraAccessToken,
+            _ => return None,
+        })
+    }
+
+    /// Whether a login of this kind needs `user`.
+    fn needs_user(self) -> bool {
+        match self {
+            Self::SqlPassword | Self::EntraPassword => true,
+            Self::Integrated | Self::EntraAccessToken => false,
+        }
+    }
+
+    /// Whether a login of this kind needs `password`: an empty password is a
+    /// value, and an access token's is the file `-P` names.
+    fn needs_password(self) -> bool {
+        match self {
+            Self::SqlPassword | Self::EntraPassword | Self::EntraAccessToken => true,
+            Self::Integrated => false,
+        }
+    }
+
+    /// The option that selects this kind on sqlcmd's command line.
+    #[cfg(target_pointer_width = "64")]
+    fn command_name(self) -> &'static str {
+        match self {
+            Self::SqlPassword => "-U",
+            Self::Integrated => "-E",
+            Self::EntraPassword | Self::EntraAccessToken => "-G",
+        }
+    }
+}
 
 /// `encrypt` of [`MssqlSqlcmdDiagnosticsRequest`], as sqlcmd's `-N` sets it.
 pub const MSSQL_SQLCMD_ENCRYPT_OPTIONAL: i32 = 0;
@@ -694,9 +757,11 @@ pub struct MssqlSqlcmdDiagnosticsRequest {
     /// An `MSSQL_SQLCMD_AUTH_*` value.
     pub authentication: i32,
     /// `-U`. Required (not null) for a valid [`MSSQL_SQLCMD_AUTH_SQL_PASSWORD`]
-    /// request; ignored otherwise.
+    /// or [`MSSQL_SQLCMD_AUTH_ENTRA_PASSWORD`] request; ignored otherwise.
     pub user: MssqlSqlcmdText,
-    /// `-P`. Required (not null, but may be empty) where `user` is.
+    /// `-P`. Required (not null, but may be empty) where `user` is. With
+    /// [`MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN`], the access token file, and
+    /// required.
     pub password: MssqlSqlcmdText,
     /// An `MSSQL_SQLCMD_ENCRYPT_*` value.
     pub encrypt: i32,
@@ -793,10 +858,10 @@ pub unsafe extern "C" fn mssql_sqlcmd_diagnostics_run(
         request.host_name_in_certificate_source,
         request.login_timeout_source,
     ];
+    let Some(authentication) = AuthKind::from_c(request.authentication) else {
+        return MSSQL_SQLCMD_INVALID_ARGUMENT;
+    };
     let valid = matches!(
-        request.authentication,
-        MSSQL_SQLCMD_AUTH_SQL_PASSWORD | MSSQL_SQLCMD_AUTH_INTEGRATED
-    ) && matches!(
         request.encrypt,
         MSSQL_SQLCMD_ENCRYPT_OPTIONAL
             | MSSQL_SQLCMD_ENCRYPT_MANDATORY
@@ -835,21 +900,16 @@ pub unsafe extern "C" fn mssql_sqlcmd_diagnostics_run(
         };
         let user = read_text(request.user);
         let password = read_text(request.password);
-        // A SQL login that will run needs both; an empty password is a value.
-        if request.authentication == MSSQL_SQLCMD_AUTH_SQL_PASSWORD
-            && invalid_reason.is_none()
+        // A login that will run has what its kind needs.
+        if invalid_reason.is_none()
             && !dsn_unusable
-            && (user.is_none() || password.is_none())
+            && ((authentication.needs_user() && user.is_none())
+                || (authentication.needs_password() && password.is_none()))
         {
             return MSSQL_SQLCMD_NULL_ARGUMENT;
         }
         #[cfg(target_pointer_width = "64")]
-        let authentication_command_name = if request.authentication == MSSQL_SQLCMD_AUTH_INTEGRATED
-        {
-            "-E"
-        } else {
-            "-U"
-        };
+        let authentication_command_name = authentication.command_name();
         #[cfg(target_pointer_width = "64")]
         let dsn_name = dsn.as_deref();
         #[cfg(target_pointer_width = "64")]
@@ -914,7 +974,7 @@ pub unsafe extern "C" fn mssql_sqlcmd_diagnostics_run(
         DiagnosticsInput {
             server,
             database: read_optional_text(request.database),
-            integrated: request.authentication == MSSQL_SQLCMD_AUTH_INTEGRATED,
+            authentication,
             user: user.unwrap_or_default(),
             password: password.unwrap_or_default(),
             encrypt: request.encrypt,
@@ -955,7 +1015,7 @@ pub unsafe extern "C" fn mssql_sqlcmd_diagnostics_run(
 struct DiagnosticsInput {
     server: String,
     database: Option<String>,
-    integrated: bool,
+    authentication: AuthKind,
     user: String,
     password: String,
     encrypt: i32,
@@ -981,13 +1041,19 @@ fn diagnose(input: DiagnosticsInput) -> Option<(String, i32)> {
     let request = Request {
         server: input.server,
         database: input.database,
-        authentication: if input.integrated {
-            Authentication::Integrated
-        } else {
-            Authentication::SqlPassword {
+        authentication: match input.authentication {
+            AuthKind::SqlPassword => Authentication::SqlPassword {
                 user: input.user,
                 password: input.password,
-            }
+            },
+            AuthKind::Integrated => Authentication::Integrated,
+            AuthKind::EntraPassword => Authentication::EntraPassword {
+                user: input.user,
+                password: input.password,
+            },
+            AuthKind::EntraAccessToken => Authentication::EntraAccessToken {
+                file: input.password,
+            },
         },
         encrypt: match input.encrypt {
             MSSQL_SQLCMD_ENCRYPT_OPTIONAL => Encrypt::Optional,
@@ -1916,6 +1982,48 @@ mod tests {
 
     #[cfg(target_pointer_width = "64")]
     #[test]
+    fn diagnose_reports_entra_methods_from_the_g_switch() {
+        use crate::diagnostics::entra::testing::{file_with, utf16le};
+        let token = file_with(&utf16le("token"));
+        let token_file = utf16(&token.0.to_string_lossy());
+        let (server, user, password) = (
+            utf16("tcp:db01.database.windows.net,1433"),
+            utf16("alice@contoso.com"),
+            utf16("Sentinel-Pa55word"),
+        );
+        for (authentication, name) in [
+            (MSSQL_SQLCMD_AUTH_ENTRA_PASSWORD, "ActiveDirectoryPassword"),
+            (
+                MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN,
+                "ActiveDirectoryAccessToken",
+            ),
+        ] {
+            let mut request = diagnostics_request(&server, &user, &password);
+            request.depth = MSSQL_SQLCMD_DEPTH_CONNECTION_INPUT;
+            request.authentication = authentication;
+            request.authentication_source = MSSQL_SQLCMD_SOURCE_COMMAND_LINE;
+            if authentication == MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN {
+                request.user = NULL_TEXT;
+                request.password = text(&token_file);
+            }
+            let (status, rendered, exit_code) = run_diagnostics(&request, MSSQL_SQLCMD_REPORT_JSON);
+            assert_eq!((status, exit_code), (MSSQL_SQLCMD_OK, 0), "{rendered}");
+            assert!(
+                rendered.contains(&format!("\"authentication\": \"{name}\"")),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains(
+                    "\"authentication\": { \"source\": \"commandLine\", \"name\": \"-G\" }"
+                ),
+                "{rendered}"
+            );
+            assert!(!rendered.contains("Sentinel"), "{rendered}");
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
     fn diagnose_invalid_target_renders_in_the_selected_locale() {
         let pseudo = utf16("qps-ploc");
         // SAFETY: test text points to readable UTF-16 data.
@@ -2045,6 +2153,19 @@ mod tests {
         let mut bad = diagnostics_request(&server, &user, &password);
         bad.authentication = 7;
         cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_INVALID_ARGUMENT));
+        let mut bad = diagnostics_request(&server, &user, &password);
+        bad.authentication = MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN + 1;
+        cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_INVALID_ARGUMENT));
+        // An Entra password login needs its user, as a SQL login does; an
+        // access token needs its file.
+        let mut bad = diagnostics_request(&server, &user, &password);
+        bad.authentication = MSSQL_SQLCMD_AUTH_ENTRA_PASSWORD;
+        bad.user = NULL_TEXT;
+        cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_NULL_ARGUMENT));
+        let mut bad = diagnostics_request(&server, &user, &password);
+        bad.authentication = MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN;
+        bad.password = NULL_TEXT;
+        cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_NULL_ARGUMENT));
         let mut bad = diagnostics_request(&server, &user, &password);
         bad.encrypt = -1;
         cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_INVALID_ARGUMENT));
@@ -2252,6 +2373,14 @@ mod tests {
                 MSSQL_SQLCMD_AUTH_SQL_PASSWORD,
             ),
             ("MSSQL_SQLCMD_AUTH_INTEGRATED", MSSQL_SQLCMD_AUTH_INTEGRATED),
+            (
+                "MSSQL_SQLCMD_AUTH_ENTRA_PASSWORD",
+                MSSQL_SQLCMD_AUTH_ENTRA_PASSWORD,
+            ),
+            (
+                "MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN",
+                MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN,
+            ),
             (
                 "MSSQL_SQLCMD_ENCRYPT_OPTIONAL",
                 MSSQL_SQLCMD_ENCRYPT_OPTIONAL,

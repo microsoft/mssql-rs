@@ -177,6 +177,14 @@ void MSSQL_SQLCMD_CALL mssql_sqlcmd_free_text(const uint16_t* text, size_t len);
 
 #define MSSQL_SQLCMD_AUTH_SQL_PASSWORD 0 /* user and password */
 #define MSSQL_SQLCMD_AUTH_INTEGRATED 1   /* Windows; Kerberos elsewhere */
+/* Microsoft Entra (-G). diagnose does not acquire tokens: with a method that
+   needs one it goes as far as the server's request for a token, and the
+   login is not evaluated. -G without -U or -P (integrated) has no value yet:
+   the driver uses it or Windows authentication, depending on the server. */
+#define MSSQL_SQLCMD_AUTH_ENTRA_PASSWORD 2     /* -G -U: user and password */
+#define MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN 3 /* -G -P without -U: password is
+                                                  the -P value, the file sqlcmd
+                                                  reads the access token from */
 
 #define MSSQL_SQLCMD_ENCRYPT_OPTIONAL 0  /* -No */
 #define MSSQL_SQLCMD_ENCRYPT_MANDATORY 1 /* -N, -Nm (sqlcmd's default) */
@@ -185,9 +193,12 @@ void MSSQL_SQLCMD_CALL mssql_sqlcmd_free_text(const uint16_t* text, size_t len);
 #define MSSQL_SQLCMD_REPORT_TEXT 0
 #define MSSQL_SQLCMD_REPORT_JSON 1
 
-/* How far the diagnosis goes; each depth includes the ones before it. */
+/* How far the diagnosis goes; each depth includes the ones before it.
+   Connection input makes no DNS lookup, SQL Server Browser query or
+   connection; it reads a -G -P access token file from the path given, which
+   can be on a network share. */
 #define MSSQL_SQLCMD_DEPTH_DEFAULT -1             /* session validation */
-#define MSSQL_SQLCMD_DEPTH_CONNECTION_INPUT 0     /* parse -S; no external call */
+#define MSSQL_SQLCMD_DEPTH_CONNECTION_INPUT 0     /* parse -S; a -G -P token file */
 #define MSSQL_SQLCMD_DEPTH_ENDPOINT_RESOLUTION 1  /* + DNS, SQL Server Browser */
 #define MSSQL_SQLCMD_DEPTH_NETWORK_REACHABILITY 2 /* + TCP connect */
 #define MSSQL_SQLCMD_DEPTH_CONNECTION_ATTEMPT 3   /* + one connection attempt */
@@ -220,8 +231,11 @@ typedef struct MssqlSqlcmdDiagnosticsRequest {
     MssqlSqlcmdText server;   /* -S; required unless invalid_reason is given */
     MssqlSqlcmdText database; /* -d; NULL or empty for the login's default */
     int32_t authentication;   /* MSSQL_SQLCMD_AUTH_* */
-    MssqlSqlcmdText user;     /* -U; required (not NULL) for a valid SqlPassword request */
-    MssqlSqlcmdText password; /* -P; required (not NULL, may be empty) likewise */
+    MssqlSqlcmdText user;     /* -U; required (not NULL) for a valid SqlPassword
+                                 or Entra password request */
+    MssqlSqlcmdText password; /* -P; required (not NULL, may be empty) likewise;
+                                 for an Entra access token, the token file,
+                                 required */
     int32_t encrypt;          /* MSSQL_SQLCMD_ENCRYPT_* */
     int32_t trust_server_certificate; /* -C: non-zero to trust */
     MssqlSqlcmdText host_name_in_certificate; /* -F; NULL or empty if not given */
