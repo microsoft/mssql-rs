@@ -638,6 +638,47 @@ mod tests {
         }
     }
 
+    /// A failed statement whose completion cannot be read, here because the
+    /// connection closes inside its procedure's tail, ends the batch: the
+    /// statement's error and the read failure are both posted, and the
+    /// connection is released.
+    #[test]
+    fn more_results_posts_a_failed_statement_completion_failure() {
+        use mssql_tds::test_client_support::{
+            col_metadata, done_in_proc_more, int_columns, sql_error,
+        };
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        let first = position_first_and_inject_with_continue(
+            &handles,
+            vec![
+                col_metadata(int_columns(1)),
+                done_more(),
+                sql_error(50000, 16, "failed inside the procedure"),
+                done_in_proc_more(),
+            ],
+            true,
+        );
+        assert_eq!(first, StatementResult::Rows);
+
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        {
+            let state = stmt.inner.lock().unwrap();
+            assert!(!state.has_state(STMT_STATE_CURSOR_OPEN));
+            assert_eq!(state.diag_records.len(), 2);
+            assert!(state.diag_records.iter().any(|d| d.native_error == 50000));
+            assert!(
+                state
+                    .diag_records
+                    .iter()
+                    .any(|d| d.sql_state == SQLSTATE_HY000 && d.native_error == 0)
+            );
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        assert_eq!(dbc.inner.lock().unwrap().wire.statement_owner(), None);
+    }
+
     /// A failed statement's result reports no affected-row count rather than
     /// the previous statement's, whether later statements follow or it ends the
     /// batch (msodbcsql 18.07.0001 reports -1 for both).
