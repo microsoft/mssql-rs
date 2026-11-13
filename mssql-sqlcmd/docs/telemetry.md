@@ -271,17 +271,16 @@ long as the bound passed to shutdown. If shutdown arrives first, for example
 during the backoff, it reports a timeout, not success, and a failure that the
 exporter is still retrying is also reported as a timeout. An all-filtered or
 malformed request is an error, not a synthetic success. An ingestion response is
-checked against the request first (item counts, and that every error index is
-present, unique and in range) before a partial one's indices are translated
-back to the original batch. A 206 or 500 response is malformed when it is not
-a JSON object, lacks `itemsReceived`, `itemsAccepted` or `errors`, its
-`itemsReceived` is not the number of items sent, its accepted items plus
-itemized errors exceed that number, or an error lacks an index or has one that
-is repeated or outside the request. A malformed response is an error, retried
-like any other, and never taken as an acceptance. A 206 whose counts match the
-request but that accepted fewer items than it received without itemizing an
-error for them is a rejection that is not retried, because there is no item for
-the exporter to retry; it too is never an acceptance.
+checked against the request before a partial one's indices are translated back
+to the original batch. A 206 or 500 response is malformed when it is not a JSON
+object, has no integer `itemsReceived` or `itemsAccepted` or no `errors` array,
+its `itemsReceived` is not the number of items sent, its accepted items plus
+itemized errors exceed that number, or an error has no integer `index` or one
+that is repeated or outside the request. A malformed response is an error,
+retried like any other, and never taken as an acceptance. A 206 whose counts
+match the request but that accepted fewer items than it received without
+itemizing an error for them is a rejection that is not retried, because there is
+no item for the exporter to retry; it too is never an acceptance.
 
 Recording and shutdown are ordered by one lock: a call admitted before shutdown
 is sent by it, and a call after it is not recorded. Shutdown takes that lock
