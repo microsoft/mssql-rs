@@ -30,7 +30,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use crate::diagnostics::SettingOrigin;
 #[cfg(target_pointer_width = "64")]
 use crate::diagnostics::{
-    self, Authentication, Depth, Dsn, DsnStatus, Encrypt, Request, SettingSources,
+    self, ApplicationIntent, Authentication, Depth, Dsn, DsnStatus, Encrypt, Request,
+    SettingSources,
 };
 use crate::formatter::json::{Column, Connection, JsonDocument, Message, RunEnd};
 use crate::i18n;
@@ -407,6 +408,36 @@ pub unsafe extern "C" fn mssql_sqlcmd_json_end_batch(
     }
 }
 
+/// Attaches sqlcmd's `-p` values to the most recently started batch.
+/// A zero packet size means the driver did not expose it.
+///
+/// # Safety
+/// `document` as for [`mssql_sqlcmd_json_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mssql_sqlcmd_json_set_batch_statistics(
+    document: *mut MssqlSqlcmdJsonDocument,
+    packet_size: u32,
+    transactions: u32,
+    total_ms: u64,
+    average_ms: f64,
+    per_second: f64,
+) -> i32 {
+    // SAFETY: forwarded from the caller's guarantees.
+    unsafe {
+        with_document(document, |document| {
+            document
+                .set_batch_statistics(crate::formatter::json::BatchStatistics {
+                    packet_size: (packet_size != 0).then_some(packet_size),
+                    transactions,
+                    total_ms,
+                    average_ms,
+                    per_second,
+                })
+                .map_err(|_| MSSQL_SQLCMD_INVALID_STATE)
+        })
+    }
+}
+
 /// Starts a result set with `column_count` columns. The previous result set must
 /// have been ended: starting one while another is open is
 /// [`MSSQL_SQLCMD_INVALID_STATE`], and closes the open one without a count, so
@@ -534,7 +565,6 @@ pub unsafe extern "C" fn mssql_sqlcmd_json_add_message(
                 procedure: read_optional_text(message.procedure),
                 line: (message.line > 0).then_some(message.line),
                 source: read_optional_text(message.source),
-                sql_state: read_optional_text(message.sql_state),
                 text: read_text(message.text).ok_or(MSSQL_SQLCMD_NULL_ARGUMENT)?,
             });
             Ok(())
@@ -683,6 +713,72 @@ pub const MSSQL_SQLCMD_DSN_NOT_FOUND: i32 = 2;
 /// it supplied carry [`MSSQL_SQLCMD_SOURCE_DSN`].
 pub const MSSQL_SQLCMD_DSN_NO_SERVER: i32 = 3;
 
+/// `application_intent` of [`MssqlSqlcmdDiagnosticsRequest`], as sqlcmd's `-K`
+/// sets it.
+pub const MSSQL_SQLCMD_INTENT_DEFAULT: i32 = 0;
+pub const MSSQL_SQLCMD_INTENT_READ_WRITE: i32 = 1;
+pub const MSSQL_SQLCMD_INTENT_READ_ONLY: i32 = 2;
+
+/// The packet sizes sqlcmd's `-a` takes, in bytes.
+const PACKET_SIZES: std::ops::RangeInclusive<i32> = 512..=32767;
+/// One diagnostic record of sqlcmd's own driver connection, as sqlcmd reads it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MssqlSqlcmdDriverRecord {
+    /// The ODBC SQLSTATE.
+    pub sql_state: MssqlSqlcmdText,
+    /// SQL Server's error number, or the driver's native error (0 for none).
+    pub native_error: i32,
+    /// SQL Server's severity, or -1 for a record the driver raised itself.
+    pub severity: i32,
+    /// SQL Server's state, or -1.
+    pub state: i32,
+    /// The message without the driver's `[vendor][component]` prefix.
+    pub message: MssqlSqlcmdText,
+    /// The line sqlcmd prints for the record; null or empty when it prints none.
+    pub line: MssqlSqlcmdText,
+}
+
+/// What sqlcmd's own driver connection did; filled by the callback.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MssqlSqlcmdDriverResult {
+    /// Non-zero when the connection succeeded.
+    pub connected: i32,
+    /// Connection/setup duration from callback entry, excluding query/disconnect.
+    pub connect_ms: i64,
+    /// Non-zero when the query was given, the connection succeeded and the
+    /// query failed.
+    pub query_failed: i32,
+    /// Minimal-query duration, excluding disconnect and result cleanup.
+    pub query_ms: i64,
+    /// The query's first row, one text per column; a null `data` is SQL NULL.
+    pub values: *const MssqlSqlcmdText,
+    pub value_count: usize,
+    /// The connection's records, then the query's, in order.
+    pub records: *const MssqlSqlcmdDriverRecord,
+    pub record_count: usize,
+    /// e.g. `Microsoft ODBC Driver 18 for SQL Server`; null or empty if unknown.
+    pub driver_name: MssqlSqlcmdText,
+    /// Prefix of records produced by connecting; at most `record_count`.
+    pub connect_record_count: usize,
+}
+
+/// sqlcmd's own driver connection: connects with sqlcmd's driver and settings
+/// within `timeout_seconds`, runs `query` when it is not null or empty,
+/// disconnects, and fills `*result`. Returns [`MSSQL_SQLCMD_OK`] (a failed
+/// connection is a result, not an error). Called at most once per diagnosis,
+/// on the thread that called [`mssql_sqlcmd_diagnostics_run`]; what
+/// `*result` points to must stay valid until that call returns.
+pub type MssqlSqlcmdDriverConnect = Option<MssqlSqlcmdDriverConnectFn>;
+
+pub type MssqlSqlcmdDriverConnectFn = unsafe extern "C" fn(
+    context: *mut std::ffi::c_void,
+    query: MssqlSqlcmdText,
+    timeout_seconds: i32,
+    result: *mut MssqlSqlcmdDriverResult,
+) -> i32;
+
 /// What `sqlcmd diagnose` checks.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -735,6 +831,34 @@ pub struct MssqlSqlcmdDiagnosticsRequest {
     pub dsn: MssqlSqlcmdText,
     /// An `MSSQL_SQLCMD_DSN_*` value: what sqlcmd found for `dsn`.
     pub dsn_status: i32,
+    /// sqlcmd's own driver connection, or null. When given, the connection
+    /// attempt and session validation are made through it and decide the
+    /// result; `mssql-tds` then only adds evidence where the driver's errors
+    /// leave the cause open.
+    pub driver_connect: MssqlSqlcmdDriverConnect,
+    /// Passed to `driver_connect` as it is.
+    pub driver_context: *mut std::ffi::c_void,
+    /// `-K`: an `MSSQL_SQLCMD_INTENT_*` value; [`MSSQL_SQLCMD_INTENT_DEFAULT`]
+    /// (0) when not given, which is read-write.
+    pub application_intent: i32,
+    /// Non-zero for `-M` (MultiSubnetFailover).
+    pub multi_subnet_failover: i32,
+    /// `-a`, in bytes, 512 to 32767; 0 for the default.
+    pub packet_size: i32,
+    /// Non-zero for `-A` (a dedicated administrator connection).
+    pub dedicated_admin: i32,
+    /// `-H`; its source distinguishes omitted from explicitly empty.
+    pub workstation_name: MssqlSqlcmdText,
+    pub application_intent_source: i32,
+    pub multi_subnet_failover_source: i32,
+    pub packet_size_source: i32,
+    pub dedicated_admin_source: i32,
+    pub workstation_name_source: i32,
+    pub application_intent_source_name: MssqlSqlcmdText,
+    pub multi_subnet_failover_source_name: MssqlSqlcmdText,
+    pub packet_size_source_name: MssqlSqlcmdText,
+    pub dedicated_admin_source_name: MssqlSqlcmdText,
+    pub workstation_name_source_name: MssqlSqlcmdText,
 }
 
 /// Diagnoses the connection `request` describes, up to its depth, and renders
@@ -792,6 +916,11 @@ pub unsafe extern "C" fn mssql_sqlcmd_diagnostics_run(
         request.trust_server_certificate_source,
         request.host_name_in_certificate_source,
         request.login_timeout_source,
+        request.application_intent_source,
+        request.multi_subnet_failover_source,
+        request.packet_size_source,
+        request.dedicated_admin_source,
+        request.workstation_name_source,
     ];
     let valid = matches!(
         request.authentication,
@@ -804,6 +933,10 @@ pub unsafe extern "C" fn mssql_sqlcmd_diagnostics_run(
     ) && matches!(format, MSSQL_SQLCMD_REPORT_TEXT | MSSQL_SQLCMD_REPORT_JSON)
         && (MSSQL_SQLCMD_DEPTH_DEFAULT..=MSSQL_SQLCMD_DEPTH_SESSION_VALIDATION)
             .contains(&request.depth)
+        && (MSSQL_SQLCMD_INTENT_DEFAULT..=MSSQL_SQLCMD_INTENT_READ_ONLY)
+            .contains(&request.application_intent)
+        // As sqlcmd's -a takes it.
+        && (request.packet_size == 0 || PACKET_SIZES.contains(&request.packet_size))
         && sources.into_iter().all(source_value_valid)
         && (MSSQL_SQLCMD_DSN_NONE..=MSSQL_SQLCMD_DSN_NO_SERVER).contains(&request.dsn_status)
         // Only a data source that was found supplies settings.
@@ -910,6 +1043,41 @@ pub unsafe extern "C" fn mssql_sqlcmd_diagnostics_run(
                 Some("SQLCMDLOGINTIMEOUT"),
                 dsn_name,
             ),
+            application_intent: setting_origin(
+                request.application_intent_source,
+                "-K",
+                request.application_intent_source_name,
+                None,
+                dsn_name,
+            ),
+            multi_subnet_failover: setting_origin(
+                request.multi_subnet_failover_source,
+                "-M",
+                request.multi_subnet_failover_source_name,
+                None,
+                dsn_name,
+            ),
+            packet_size: setting_origin(
+                request.packet_size_source,
+                "-a",
+                request.packet_size_source_name,
+                Some("SQLCMDPACKETSIZE"),
+                dsn_name,
+            ),
+            dedicated_admin: setting_origin(
+                request.dedicated_admin_source,
+                "-A",
+                request.dedicated_admin_source_name,
+                None,
+                dsn_name,
+            ),
+            workstation_name: setting_origin(
+                request.workstation_name_source,
+                "-H",
+                request.workstation_name_source_name,
+                Some("SQLCMDWORKSTATION"),
+                dsn_name,
+            ),
         };
         DiagnosticsInput {
             server,
@@ -930,6 +1098,26 @@ pub unsafe extern "C" fn mssql_sqlcmd_diagnostics_run(
             sources,
             dsn: dsn.filter(|_| request.dsn_status != MSSQL_SQLCMD_DSN_NONE),
             dsn_status: request.dsn_status,
+            #[cfg(target_pointer_width = "64")]
+            driver: request
+                .driver_connect
+                .map(|connect| driver_hook(connect, request.driver_context)),
+            read_only_intent: request.application_intent == MSSQL_SQLCMD_INTENT_READ_ONLY,
+            multi_subnet_failover: request.multi_subnet_failover != 0,
+            packet_size: u16::try_from(request.packet_size)
+                .ok()
+                .filter(|size| *size != 0),
+            dedicated_admin: request.dedicated_admin != 0,
+            workstation_name: if matches!(
+                request.workstation_name_source,
+                MSSQL_SQLCMD_SOURCE_COMMAND_LINE
+                    | MSSQL_SQLCMD_SOURCE_ENVIRONMENT
+                    | MSSQL_SQLCMD_SOURCE_DSN
+            ) {
+                Some(read_text(request.workstation_name).unwrap_or_default())
+            } else {
+                read_optional_text(request.workstation_name)
+            },
         }
     };
 
@@ -973,6 +1161,133 @@ struct DiagnosticsInput {
     dsn: Option<String>,
     /// An `MSSQL_SQLCMD_DSN_*` value.
     dsn_status: i32,
+    #[cfg(target_pointer_width = "64")]
+    driver: Option<diagnostics::driver::DriverHook>,
+    /// `-K ReadOnly`.
+    read_only_intent: bool,
+    multi_subnet_failover: bool,
+    /// `-a`; `None` for the default.
+    packet_size: Option<u16>,
+    dedicated_admin: bool,
+    workstation_name: Option<String>,
+}
+
+/// The caller's context pointer, passed back to its callback as it is.
+#[cfg(target_pointer_width = "64")]
+struct DriverContext(*mut std::ffi::c_void);
+
+// SAFETY: the pointer is only handed back to the caller's callback, which the
+// library calls on the thread that called mssql_sqlcmd_diagnostics_run.
+#[cfg(target_pointer_width = "64")]
+unsafe impl Send for DriverContext {}
+// SAFETY: as for Send; the library never dereferences it.
+#[cfg(target_pointer_width = "64")]
+unsafe impl Sync for DriverContext {}
+
+#[cfg(target_pointer_width = "64")]
+impl DriverContext {
+    fn get(&self) -> *mut std::ffi::c_void {
+        self.0
+    }
+}
+
+/// sqlcmd's driver connection callback as a [`DriverHook`].
+#[cfg(target_pointer_width = "64")]
+fn driver_hook(
+    connect: MssqlSqlcmdDriverConnectFn,
+    context: *mut std::ffi::c_void,
+) -> diagnostics::driver::DriverHook {
+    let context = DriverContext(context);
+    diagnostics::driver::DriverHook::new(move |query, seconds| {
+        call_driver(connect, context.get(), query, seconds)
+    })
+}
+
+/// Calls the driver connection and reads what it returned.
+#[cfg(target_pointer_width = "64")]
+fn call_driver(
+    connect: MssqlSqlcmdDriverConnectFn,
+    context: *mut std::ffi::c_void,
+    query: Option<&str>,
+    seconds: u32,
+) -> diagnostics::driver::DriverOutcome {
+    use diagnostics::driver::{DriverOutcome, DriverRecord};
+    let query: Vec<u16> = query.unwrap_or_default().encode_utf16().collect();
+    let query = MssqlSqlcmdText {
+        data: if query.is_empty() {
+            std::ptr::null()
+        } else {
+            query.as_ptr()
+        },
+        len: query.len(),
+    };
+    let none = MssqlSqlcmdText {
+        data: std::ptr::null(),
+        len: 0,
+    };
+    let mut result = MssqlSqlcmdDriverResult {
+        connected: 0,
+        connect_ms: 0,
+        query_failed: 0,
+        query_ms: 0,
+        values: std::ptr::null(),
+        value_count: 0,
+        records: std::ptr::null(),
+        record_count: 0,
+        driver_name: none,
+        connect_record_count: 0,
+    };
+    // SAFETY: the caller of mssql_sqlcmd_diagnostics_run supplied the callback
+    // and its context; the query and result outlive the call.
+    let status = unsafe {
+        connect(
+            context,
+            query,
+            i32::try_from(seconds).unwrap_or(i32::MAX),
+            &mut result,
+        )
+    };
+    if status != MSSQL_SQLCMD_OK {
+        return DriverOutcome {
+            failed_status: Some(status),
+            ..DriverOutcome::default()
+        };
+    }
+    if result.connect_record_count > result.record_count
+        || (result.value_count != 0 && result.values.is_null())
+        || (result.record_count != 0 && result.records.is_null())
+    {
+        return DriverOutcome {
+            failed_status: Some(MSSQL_SQLCMD_INVALID_ARGUMENT),
+            ..DriverOutcome::default()
+        };
+    }
+    // SAFETY: the callback filled *result with arrays and texts valid until
+    // mssql_sqlcmd_diagnostics_run returns.
+    unsafe {
+        let row = read_array(result.values, result.value_count, |value| read_text(value))
+            .unwrap_or_default();
+        let records = read_array(result.records, result.record_count, |r| DriverRecord {
+            sql_state: read_text(r.sql_state).unwrap_or_default(),
+            native_error: r.native_error,
+            severity: (r.severity >= 0).then_some(r.severity),
+            state: (r.state >= 0).then_some(r.state),
+            message: read_text(r.message).unwrap_or_default(),
+            line: read_text(r.line).unwrap_or_default(),
+        })
+        .unwrap_or_default();
+        DriverOutcome {
+            connected: result.connected != 0,
+            connect_ms: u64::try_from(result.connect_ms).unwrap_or(0),
+            query_failed: result.query_failed != 0,
+            query_ms: u64::try_from(result.query_ms).unwrap_or(0),
+            row,
+            records,
+            connect_record_count: result.connect_record_count,
+            driver_name: read_optional_text(result.driver_name),
+            failed_status: None,
+        }
+    }
 }
 
 /// Runs the diagnosis and renders the report, with sqlcmd's exit code.
@@ -1016,6 +1331,16 @@ fn diagnose(input: DiagnosticsInput) -> Option<(String, i32)> {
                 _ => DsnStatus::NoServer,
             },
         }),
+        driver: input.driver,
+        application_intent: if input.read_only_intent {
+            ApplicationIntent::ReadOnly
+        } else {
+            ApplicationIntent::ReadWrite
+        },
+        multi_subnet_failover: input.multi_subnet_failover,
+        packet_size: input.packet_size,
+        dedicated_admin: input.dedicated_admin,
+        workstation_name: input.workstation_name,
     };
     let report = diagnostics::run(request);
     let text = if input.json {
@@ -1146,6 +1471,52 @@ mod tests {
         render_with(document, connection, 0, MSSQL_SQLCMD_RUN_FINISHED)
     }
 
+    #[test]
+    fn native_batch_statistics_validate_state_and_render_after_end_batch() {
+        let document = mssql_sqlcmd_json_new();
+        // SAFETY: the live document is freed once after these calls.
+        unsafe {
+            assert_eq!(
+                mssql_sqlcmd_json_set_batch_statistics(std::ptr::null_mut(), 0, 1, 1, 1.0, 1000.0),
+                MSSQL_SQLCMD_NULL_ARGUMENT
+            );
+            assert_eq!(
+                mssql_sqlcmd_json_set_batch_statistics(document, 0, 1, 1, 1.0, 1000.0),
+                MSSQL_SQLCMD_INVALID_STATE
+            );
+            assert_eq!(
+                mssql_sqlcmd_json_begin_batch(document, NULL_TEXT),
+                MSSQL_SQLCMD_OK
+            );
+            assert_eq!(mssql_sqlcmd_json_end_batch(document), MSSQL_SQLCMD_OK);
+            assert_eq!(
+                mssql_sqlcmd_json_set_batch_statistics(document, 0, 0, 1, 1.0, 1000.0),
+                MSSQL_SQLCMD_INVALID_STATE
+            );
+            assert_eq!(
+                mssql_sqlcmd_json_set_batch_statistics(document, 0, 1, 1, f64::NAN, 1000.0),
+                MSSQL_SQLCMD_INVALID_STATE
+            );
+            assert_eq!(
+                mssql_sqlcmd_json_set_batch_statistics(document, 0, 1, 1, 1.0, 1000.0),
+                MSSQL_SQLCMD_OK
+            );
+        }
+        let rendered = render(
+            document,
+            MssqlSqlcmdConnection {
+                server: NULL_TEXT,
+                database: NULL_TEXT,
+                authentication: NULL_TEXT,
+                encrypt: -1,
+            },
+        );
+        assert!(rendered.contains("\"statistics\":"));
+        assert!(rendered.contains("\"packetSize\": null"));
+        // SAFETY: this is the live allocation above, freed once.
+        unsafe { mssql_sqlcmd_json_free(document) };
+    }
+
     /// The full sequence a native caller makes: values in as UTF-16, the
     /// document out as UTF-16, NULL kept apart from text.
     #[test]
@@ -1256,7 +1627,7 @@ mod tests {
             "\"text\": \"SELECT 1\"",
             "\"rowsAffected\": 2",
             "\"count\": 3",
-            "\"number\": 50000,\n      \"severity\": 16,\n      \"state\": 1,\n      \"server\": \"db01\",\n      \"procedure\": \"p\",\n      \"line\": 2,\n      \"sqlState\": \"42000\",\n      \"text\": \"boom\"",
+            "\"number\": 50000,\n      \"severity\": 16,\n      \"state\": 1,\n      \"server\": \"db01\",\n      \"procedure\": \"p\",\n      \"line\": 2,\n      \"text\": \"boom\"",
         ] {
             assert!(
                 rendered.contains(expected),
@@ -1772,6 +2143,23 @@ mod tests {
             login_timeout_source_name: NULL_TEXT,
             dsn: NULL_TEXT,
             dsn_status: MSSQL_SQLCMD_DSN_NONE,
+            driver_connect: None,
+            driver_context: std::ptr::null_mut(),
+            application_intent: MSSQL_SQLCMD_INTENT_DEFAULT,
+            multi_subnet_failover: 0,
+            packet_size: 0,
+            dedicated_admin: 0,
+            workstation_name: NULL_TEXT,
+            application_intent_source: MSSQL_SQLCMD_SOURCE_UNKNOWN,
+            multi_subnet_failover_source: MSSQL_SQLCMD_SOURCE_UNKNOWN,
+            packet_size_source: MSSQL_SQLCMD_SOURCE_UNKNOWN,
+            dedicated_admin_source: MSSQL_SQLCMD_SOURCE_UNKNOWN,
+            workstation_name_source: MSSQL_SQLCMD_SOURCE_UNKNOWN,
+            application_intent_source_name: NULL_TEXT,
+            multi_subnet_failover_source_name: NULL_TEXT,
+            packet_size_source_name: NULL_TEXT,
+            dedicated_admin_source_name: NULL_TEXT,
+            workstation_name_source_name: NULL_TEXT,
         }
     }
 
@@ -1802,6 +2190,103 @@ mod tests {
             }
         };
         (status, rendered, exit_code)
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn the_native_callback_boundary_copies_values_records_and_status() {
+        struct Fixture {
+            values: Vec<MssqlSqlcmdText>,
+            records: Vec<MssqlSqlcmdDriverRecord>,
+            calls: usize,
+            status: i32,
+        }
+        /// # Safety
+        /// `context` and `result` must point to the test's live allocations.
+        unsafe extern "C" fn connect(
+            context: *mut std::ffi::c_void,
+            _query: MssqlSqlcmdText,
+            seconds: i32,
+            result: *mut MssqlSqlcmdDriverResult,
+        ) -> i32 {
+            // SAFETY: this test supplies live Fixture/result allocations.
+            unsafe {
+                let fixture = &mut *context.cast::<Fixture>();
+                fixture.calls += 1;
+                if seconds <= 0 {
+                    return MSSQL_SQLCMD_INVALID_ARGUMENT;
+                }
+                (*result).connected = 1;
+                (*result).query_failed = 1;
+                (*result).values = fixture.values.as_ptr();
+                (*result).value_count = fixture.values.len();
+                (*result).records = fixture.records.as_ptr();
+                (*result).record_count = fixture.records.len();
+                (*result).connect_record_count = 1;
+                fixture.status
+            }
+        }
+        let (info, error, state) = (
+            utf16("Changed database context"),
+            utf16("actual query error"),
+            utf16("42000"),
+        );
+        let mut fixture = Fixture {
+            values: vec![NULL_TEXT],
+            records: vec![
+                MssqlSqlcmdDriverRecord {
+                    sql_state: NULL_TEXT,
+                    native_error: 5701,
+                    severity: -1,
+                    state: -1,
+                    message: text(&info),
+                    line: NULL_TEXT,
+                },
+                MssqlSqlcmdDriverRecord {
+                    sql_state: text(&state),
+                    native_error: 50000,
+                    severity: 16,
+                    state: 1,
+                    message: text(&error),
+                    line: NULL_TEXT,
+                },
+            ],
+            calls: 0,
+            status: MSSQL_SQLCMD_OK,
+        };
+        let context = std::ptr::from_mut(&mut fixture).cast();
+        let outcome = call_driver(connect, context, Some("SELECT 1"), 1);
+        assert_eq!(outcome.row, [None]);
+        assert_eq!(outcome.records[0].severity, None);
+        assert_eq!(outcome.records[0].state, None);
+        assert_eq!(outcome.records[1].severity, Some(16));
+        assert_eq!(outcome.connect_record_count, 1);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = utf16(&format!(
+            "tcp:127.0.0.1,{}",
+            listener.local_addr().unwrap().port()
+        ));
+        let (user, password) = (utf16("sa"), utf16("not-shown"));
+        let mut request = diagnostics_request(&server, &user, &password);
+        request.driver_connect = Some(connect);
+        request.driver_context = context;
+        let (status, rendered, _) = run_diagnostics(&request, MSSQL_SQLCMD_REPORT_JSON);
+        assert_eq!(status, MSSQL_SQLCMD_OK);
+        assert!(rendered.contains("actual query error"), "{rendered}");
+        assert_eq!(fixture.calls, 2);
+        fixture.status = MSSQL_SQLCMD_INTERNAL_ERROR;
+        let context = std::ptr::from_mut(&mut fixture).cast();
+        assert_eq!(
+            call_driver(connect, context, None, 1).failed_status,
+            Some(MSSQL_SQLCMD_INTERNAL_ERROR)
+        );
+        fixture.status = MSSQL_SQLCMD_OK;
+        fixture.records.clear();
+        let context = std::ptr::from_mut(&mut fixture).cast();
+        assert_eq!(
+            call_driver(connect, context, None, 1).failed_status,
+            Some(MSSQL_SQLCMD_INVALID_ARGUMENT)
+        );
     }
 
     #[cfg(target_pointer_width = "64")]
@@ -1973,6 +2458,117 @@ mod tests {
 
     #[cfg(target_pointer_width = "64")]
     #[test]
+    fn explicitly_empty_workstation_is_not_the_omitted_default() {
+        let (server, user, password) = (utf16("127.0.0.1"), utf16("sa"), utf16("x"));
+        let empty = utf16("");
+        let mut request = diagnostics_request(&server, &user, &password);
+        request.depth = MSSQL_SQLCMD_DEPTH_CONNECTION_INPUT;
+        request.local_detail = 1;
+        for source in [
+            MSSQL_SQLCMD_SOURCE_UNKNOWN,
+            MSSQL_SQLCMD_SOURCE_COMMAND_LINE,
+            MSSQL_SQLCMD_SOURCE_ENVIRONMENT,
+        ] {
+            request.workstation_name_source = source;
+            for value in [NULL_TEXT, text(&empty)] {
+                request.workstation_name = value;
+                let (status, rendered, _) = run_diagnostics(&request, MSSQL_SQLCMD_REPORT_JSON);
+                assert_eq!(status, MSSQL_SQLCMD_OK);
+                let json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+                if source == MSSQL_SQLCMD_SOURCE_UNKNOWN {
+                    assert!(json["target"].get("workstationName").is_none());
+                } else {
+                    assert_eq!(json["target"]["workstationName"], "");
+                }
+            }
+        }
+    }
+
+    /// -K, -M, -a, -A and -H, with where each came from, reach the report;
+    /// left zeroed, the request reports as it did before them.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn diagnose_reports_the_connection_options_it_was_given() {
+        let (server, user, password) = (utf16("127.0.0.1"), utf16("sa"), utf16("x"));
+        let workstation = utf16("WS01");
+        let mut request = diagnostics_request(&server, &user, &password);
+        request.depth = MSSQL_SQLCMD_DEPTH_CONNECTION_INPUT;
+        let (status, plain, _) = run_diagnostics(&request, MSSQL_SQLCMD_REPORT_JSON);
+        assert_eq!(status, MSSQL_SQLCMD_OK);
+        let plain: serde_json::Value = serde_json::from_str(&plain).unwrap();
+        for key in [
+            "applicationIntent",
+            "multiSubnetFailover",
+            "packetSize",
+            "dedicatedAdminConnection",
+            "workstationName",
+        ] {
+            assert!(plain["target"].get(key).is_none(), "{key}: {plain}");
+        }
+        let expected = if cfg!(windows) { "auto" } else { "tcp" };
+        assert_eq!(plain["checks"][0]["protocol"], expected);
+
+        request.application_intent = MSSQL_SQLCMD_INTENT_READ_ONLY;
+        request.multi_subnet_failover = 1;
+        request.packet_size = 8192;
+        request.workstation_name = text(&workstation);
+        request.application_intent_source = MSSQL_SQLCMD_SOURCE_COMMAND_LINE;
+        request.multi_subnet_failover_source = MSSQL_SQLCMD_SOURCE_COMMAND_LINE;
+        request.packet_size_source = MSSQL_SQLCMD_SOURCE_ENVIRONMENT;
+        request.workstation_name_source = MSSQL_SQLCMD_SOURCE_ENVIRONMENT;
+        let (status, rendered, _) = run_diagnostics(&request, MSSQL_SQLCMD_REPORT_JSON);
+        assert_eq!(status, MSSQL_SQLCMD_OK);
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let target = &value["target"];
+        assert_eq!(target["server"], "127.0.0.1");
+        assert_eq!(target["applicationIntent"], "readOnly");
+        assert_eq!(target["multiSubnetFailover"], true);
+        assert_eq!(target["packetSize"], 8192);
+        assert_eq!(target["workstationName"], "WS01");
+        assert!(
+            target.get("dedicatedAdminConnection").is_none(),
+            "{rendered}"
+        );
+        // -M connects over TCP only.
+        assert_eq!(value["checks"][0]["protocol"], "tcp", "{rendered}");
+        let sources = &value["checks"][0]["sources"];
+        assert_eq!(
+            sources["applicationIntent"],
+            serde_json::json!({ "source": "commandLine", "name": "-K" })
+        );
+        assert_eq!(
+            sources["multiSubnetFailover"],
+            serde_json::json!({ "source": "commandLine", "name": "-M" })
+        );
+        // Without a source name, the environment variable is sqlcmd's own.
+        assert_eq!(
+            sources["packetSize"],
+            serde_json::json!({ "source": "environment", "name": "SQLCMDPACKETSIZE" })
+        );
+        assert_eq!(
+            sources["workstationName"],
+            serde_json::json!({ "source": "environment", "name": "SQLCMDWORKSTATION" })
+        );
+
+        let mut dac = diagnostics_request(&server, &user, &password);
+        dac.depth = MSSQL_SQLCMD_DEPTH_CONNECTION_INPUT;
+        dac.dedicated_admin = 1;
+        dac.dedicated_admin_source = MSSQL_SQLCMD_SOURCE_COMMAND_LINE;
+        let (status, rendered, _) = run_diagnostics(&dac, MSSQL_SQLCMD_REPORT_JSON);
+        assert_eq!(status, MSSQL_SQLCMD_OK);
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["target"]["server"], "127.0.0.1");
+        assert_eq!(value["target"]["dedicatedAdminConnection"], true);
+        // -A connects as admin:, the dedicated administrator connection.
+        assert_eq!(value["checks"][0]["protocol"], "admin", "{rendered}");
+        assert_eq!(
+            value["checks"][0]["sources"]["dedicatedAdminConnection"],
+            serde_json::json!({ "source": "commandLine", "name": "-A" })
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
     fn diagnose_reports_a_dsn_and_the_settings_it_supplied() {
         let (server, user, password) = (utf16("tcp:127.0.0.1,1"), utf16("sa"), utf16("x"));
         let dsn = utf16("SalesDsn");
@@ -2055,6 +2651,23 @@ mod tests {
         cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_INVALID_ARGUMENT));
         let mut bad = diagnostics_request(&server, &user, &password);
         bad.server_source = 99;
+        cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_INVALID_ARGUMENT));
+        for intent in [-1, MSSQL_SQLCMD_INTENT_READ_ONLY + 1] {
+            let mut bad = diagnostics_request(&server, &user, &password);
+            bad.application_intent = intent;
+            cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_INVALID_ARGUMENT));
+        }
+        // sqlcmd's -a takes 512 to 32767 bytes; 0 is the default.
+        for size in [-1, 1, 511, 32768] {
+            let mut bad = diagnostics_request(&server, &user, &password);
+            bad.packet_size = size;
+            cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_INVALID_ARGUMENT));
+        }
+        let mut bad = diagnostics_request(&server, &user, &password);
+        bad.packet_size_source = 99;
+        cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_INVALID_ARGUMENT));
+        let mut bad = diagnostics_request(&server, &user, &password);
+        bad.workstation_name_source = MSSQL_SQLCMD_SOURCE_DSN;
         cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_INVALID_ARGUMENT));
         let mut bad = diagnostics_request(&server, &user, &password);
         bad.dsn_status = MSSQL_SQLCMD_DSN_NO_SERVER + 1;
@@ -2225,6 +2838,7 @@ mod tests {
         declared.dedup();
         let mut exported: Vec<&str> = source
             .lines()
+            .filter(|line| line.trim().starts_with("pub "))
             .filter_map(|line| line.trim().split_once("extern \"C\" fn "))
             .map(|(_, rest)| rest.split('(').next().unwrap_or_default())
             .collect();
@@ -2299,6 +2913,15 @@ mod tests {
             ("MSSQL_SQLCMD_DSN_FOUND", MSSQL_SQLCMD_DSN_FOUND),
             ("MSSQL_SQLCMD_DSN_NOT_FOUND", MSSQL_SQLCMD_DSN_NOT_FOUND),
             ("MSSQL_SQLCMD_DSN_NO_SERVER", MSSQL_SQLCMD_DSN_NO_SERVER),
+            ("MSSQL_SQLCMD_INTENT_DEFAULT", MSSQL_SQLCMD_INTENT_DEFAULT),
+            (
+                "MSSQL_SQLCMD_INTENT_READ_WRITE",
+                MSSQL_SQLCMD_INTENT_READ_WRITE,
+            ),
+            (
+                "MSSQL_SQLCMD_INTENT_READ_ONLY",
+                MSSQL_SQLCMD_INTENT_READ_ONLY,
+            ),
         ];
         let defines: Vec<(&str, i32)> = header
             .lines()
@@ -2317,6 +2940,74 @@ mod tests {
                 defines.contains(&(short, value)),
                 "{name} = {value} in the header"
             );
+        }
+    }
+
+    /// The header declares the diagnostics request with the fields of the
+    /// Rust struct, in the same order: callers only ever see fields appended.
+    #[test]
+    fn the_header_request_has_the_rust_fields_in_order() {
+        fn between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
+            let from = text.find(start).expect(start) + start.len();
+            let to = from + text[from..].find(end).expect(end);
+            &text[from..to]
+        }
+        for name in [
+            "MssqlSqlcmdDiagnosticsRequest",
+            "MssqlSqlcmdDriverRecord",
+            "MssqlSqlcmdDriverResult",
+        ] {
+            let header = between(
+                include_str!("../include/mssql_sqlcmd.h"),
+                &format!("typedef struct {name} {{"),
+                &format!("}} {name};"),
+            );
+            // Each declaration ends at its `;`; comments, which may span lines,
+            // are dropped first.
+            let mut code = String::new();
+            let mut rest = header;
+            while let Some(start) = rest.find("/*") {
+                code.push_str(&rest[..start]);
+                rest = &rest[start + rest[start..].find("*/").expect("*/") + 2..];
+            }
+            code.push_str(rest);
+            let declared: Vec<&str> = code
+                .split(';')
+                .filter_map(|declaration| declaration.split_whitespace().last())
+                .map(|name| name.trim_start_matches('*'))
+                .collect();
+            let source = between(
+                include_str!("ffi.rs"),
+                &format!("pub struct {name} {{"),
+                "\n}",
+            );
+            let fields: Vec<&str> = source
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("pub "))
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, _)| name)
+                .collect();
+            assert_eq!(declared, fields);
+            if name == "MssqlSqlcmdDiagnosticsRequest" {
+                assert!(fields.ends_with(&[
+                    "driver_context",
+                    "application_intent",
+                    "multi_subnet_failover",
+                    "packet_size",
+                    "dedicated_admin",
+                    "workstation_name",
+                    "application_intent_source",
+                    "multi_subnet_failover_source",
+                    "packet_size_source",
+                    "dedicated_admin_source",
+                    "workstation_name_source",
+                    "application_intent_source_name",
+                    "multi_subnet_failover_source_name",
+                    "packet_size_source_name",
+                    "dedicated_admin_source_name",
+                    "workstation_name_source_name",
+                ]));
+            }
         }
     }
     #[test]

@@ -29,7 +29,7 @@ compactly:
                    { "ordinal": 1, "name": "price", "driverType": "decimal", "precision": 10, "scale": 2, "nullable": true } ],
       "rows": [ ["1", "9.99"], ["2", null] ],
       "rowsAffected": 2 },
-    { "type": "message", "number": 0, "severity": 0, "state": 1, "server": "db01", "line": 2, "sqlState": "01000", "text": "done" }
+    { "type": "message", "text": "done" }
   ]
 }
 ```
@@ -50,6 +50,15 @@ compactly:
   its duration. Its `text` is included only with `-e`, as text mode echoes it
   only with `-e`, so a password in, say, `CREATE LOGIN` is not written out by
   default.
+- **Performance statistics.** With `-p` or `-p1`, each non-empty batch also
+  carries `"statistics": { "packetSize": 4096, "transactions": 3,
+  "totalMs": 1, "averageMs": 1.0, "perSecond": 1000.0 }`.
+  Both options use this same object; neither prints a statistics line outside
+  the document. `GO n` is one batch with `transactions: n`; `:EXIT(query)` is
+  one transaction. Timings and rates use text mode's existing calculations,
+  including its minimum of 1 millisecond for total and average time.
+  `packetSize` is `null` when unavailable. Without either option, `statistics`
+  is absent. Empty input creates no batch or statistics.
 - **Result sets.** Columns are described as the driver describes them:
   `ordinal` (from 0) and `name` (`null` when unnamed) always; `driverType`,
   `size`, `precision`, `scale` and `nullable` when the driver exposes them, and
@@ -61,13 +70,15 @@ compactly:
   gets its own entry instead, `{ "type": "rowsAffected", "count": 3 }`.
 - **`FOR JSON` / `FOR XML`** output is ordinary result-set rows: one string
   per row the server returned, not parsed, combined or embedded.
-- **Messages and errors** carry what the console shows for them:
-  `number` (Msg), `severity` (Level), `state`, and when known `server`,
-  `procedure`, `line` and `source` (the driver, e.g. `Microsoft ODBC Driver 18 for
-  SQL Server`, or `Sqlcmd`, when the server did not send it). `sqlState` is the
-  ODBC SQLSTATE (`28000` for a refused login, `08001` for a connection failure,
-  `HYT00` for a timeout), the stable field to classify errors by. `text` is the
-  message itself.
+- **Messages and errors** carry what the console shows for them, in its order,
+  and nothing else. A message (`PRINT`, or severity 10 or less) is
+  `{ "type": "message", "text": ... }`. An error SQL Server sent has the
+  console's `Msg ..., Level ..., State ..., Server ..., Procedure ..., Line ...`
+  header as `number`, `severity`, `state`, `server`, `procedure` and `line`, then
+  its `text`. An error the driver or sqlcmd raised, printed by the console as
+  `Sqlcmd: Error: <source> : <text>`, has `source` (e.g. `Microsoft ODBC Driver
+  18 for SQL Server`, or `Sqlcmd`) and `text`. The ODBC SQLSTATE is not
+  written, as the console does not show it.
 
 `output` entries follow the order they began. A result set contains all its
 rows, so a message received between rows follows the entire result set rather
