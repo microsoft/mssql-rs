@@ -140,6 +140,10 @@ public:
     /// Throws on invalid UTF-8 or a failed platform conversion.
     static std::string Utf8ToNativeClient(const std::string& utf8,
                                           bool* usedDefault = nullptr);
+
+    /// Convert UTF-8 test text to an explicit Windows code page or supported iconv code page.
+    static std::string Utf8ToCodePage(const std::string& utf8, unsigned codePage,
+                                      bool* usedDefault = nullptr);
 };
 
 // ---------------------------------------------------------------------------

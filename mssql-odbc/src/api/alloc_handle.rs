@@ -12,8 +12,9 @@ use crate::api::odbc_types::{
     SQL_HANDLE_STMT, SQL_INVALID_HANDLE, SQL_NULL_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn,
     SqlSmallInt,
 };
-use crate::api::sqlstate::{ERR_ODBC_VERSION_NOT_SET, post_diag};
-use crate::error::free_errors;
+use crate::api::sqlstate::{ERR_ODBC_VERSION_NOT_SET, SQLSTATE_HY000, post_diag};
+use crate::conversion::client_encoding::ClientEncoding;
+use crate::error::{free_errors, post_sql_error};
 use crate::handles::desc::DescKind;
 use crate::handles::{
     DbcHandle, DescHandle, EnvHandle, HandleType, OdbcVersion, StmtHandle, handle_from_raw,
@@ -102,6 +103,25 @@ unsafe fn alloc_env(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
 /// `output_handle` must be a valid, aligned, writable pointer (validated by caller).
 /// `input_handle` must be a live `EnvHandle` created by `alloc_env`.
 unsafe fn alloc_dbc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> SqlReturn {
+    unsafe {
+        alloc_dbc_with_encoding(
+            input_handle,
+            output_handle,
+            ClientEncoding::for_new_connection,
+        )
+    }
+}
+
+/// [`alloc_dbc`] with the client-encoding source injected, so tests can reach
+/// the invalid-override failure without mutating the process environment.
+///
+/// # Safety
+/// Same as [`alloc_dbc`].
+unsafe fn alloc_dbc_with_encoding(
+    input_handle: SqlHandle,
+    output_handle: *mut SqlHandle,
+    resolve_encoding: impl FnOnce() -> Result<ClientEncoding, String>,
+) -> SqlReturn {
     if input_handle.is_null() {
         error!("SQLAllocHandle(DBC): input_handle (ENV) must not be null");
         return SQL_INVALID_HANDLE;
@@ -144,7 +164,21 @@ unsafe fn alloc_dbc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
         return SQL_ERROR;
     }
 
-    let dbc = Box::new(DbcHandle::new(input_handle, Arc::clone(&env.runtime)));
+    // Resolve before constructing the handle: nothing below may unwind while
+    // the ENV lock is held, or the poisoned lock fails every later allocation.
+    let client_encoding = match resolve_encoding() {
+        Ok(encoding) => encoding,
+        Err(message) => {
+            error!("SQLAllocHandle(DBC): {message}");
+            post_sql_error(&mut env_state, SQLSTATE_HY000, 0, message);
+            return SQL_ERROR;
+        }
+    };
+    let dbc = Box::new(DbcHandle::new(
+        input_handle,
+        Arc::clone(&env.runtime),
+        client_encoding,
+    ));
     let raw = handle_to_raw(dbc);
     env_state.connections.push(raw);
 
@@ -321,6 +355,35 @@ mod tests {
             env.inner.lock().unwrap().diag_records[0].sql_state,
             *b"HY010"
         );
+    }
+
+    /// An unusable client encoding must surface as a diagnostic rather than
+    /// unwind under the ENV lock, which would refuse every later connection.
+    #[test]
+    fn alloc_dbc_reports_client_encoding_failure_and_keeps_env_usable() {
+        let mut h = TestHandles::with_env();
+        let mut dbc: SqlHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                alloc_dbc_with_encoding(h.env, &mut dbc, || Err("unsupported code page".into()))
+            },
+            SQL_ERROR
+        );
+        assert!(dbc.is_null(), "no connection handle may be handed back");
+        let env = unsafe { handle_from_raw::<EnvHandle>(h.env) };
+        {
+            let state = env.inner.lock().expect("ENV lock must not be poisoned");
+            assert!(state.connections.is_empty());
+            let diag = state.diag_records.last().expect("expected a diagnostic");
+            assert_eq!(diag.sql_state, *b"HY000");
+            assert!(diag.message.contains("unsupported code page"));
+        }
+
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DBC, h.env, &mut dbc) },
+            SQL_SUCCESS
+        );
+        h.dbc = dbc;
     }
 
     /// The refusal above must be keyed on the declared version, not on the
