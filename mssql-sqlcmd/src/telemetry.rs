@@ -60,7 +60,9 @@ const BUILT_IN_CONNECTION_STRING: Option<&str> = None;
 const CUSTOM_EVENT_OTEL_NAME: &str = "ai.custom";
 const CUSTOM_EVENT_NAME_ATTRIBUTE: &str = "ai.customEvent.name";
 const APPLICATION_INSIGHTS_EVENT_ENVELOPE: &str = "Microsoft.ApplicationInsights.Event";
-/// The longest sqlcmd version accepted, in bytes; the C ABI checks the same bound.
+/// The longest sqlcmd version accepted. A valid version is ASCII, so this is its
+/// length both in UTF-8 bytes (`version_is_safe`) and in UTF-16 code units (the
+/// C ABI's check before it reads the text).
 pub(crate) const MAX_VERSION_LEN: usize = 64;
 /// The event is one span with one span event; a little room beyond that.
 const MAX_EVENTS_PER_SPAN: u32 = 8;
@@ -1343,11 +1345,12 @@ mod tests {
     enum Expect {
         /// The service accepted the event.
         Completed,
-        /// Rejected outright, with no retry.
+        /// Rejected outright, with no retry: a 4xx, or a 206 that took fewer
+        /// items than it received without itemizing an error for them.
         Failed,
         /// Throttled, a server error, or any error the exporter retries (a
-        /// transport failure, a filter failure, a response that does not add
-        /// up): it retries with a backoff, so a short wait ends first. Never a
+        /// transport failure, a filter failure, a malformed response): it
+        /// retries with a backoff, so a short wait ends first. Never a
         /// success.
         NotCompleted,
     }
