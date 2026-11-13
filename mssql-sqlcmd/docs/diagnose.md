@@ -80,7 +80,7 @@ with `-U` or `SQLCMDUSER`; connection input reports that as an informational
 finding. Native sqlcmd refuses, as an invalid invocation, a DSN with settings
 diagnose does not model yet (`Authentication`, `ServerCertificate`, a
 read-only `ApplicationIntent`, `MultiSubnetFailover=Yes`, or `RegPrecedence`),
-as it refuses `-G`, `-J`, `-K` and `-M`.
+as it refuses `-J`, `-K`, `-M`, and `-G` without `-U` or `-P`.
 
 A named instance whose port SQL Server Browser does not give (no usable port
 in its answer, for `tcp:host\instance` an answer that lists only a pipe
