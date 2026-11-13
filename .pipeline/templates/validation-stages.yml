@@ -687,6 +687,8 @@ stages:
     variables:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
     steps:
+      - checkout: self
+        retryCountOnTaskFailure: 3
       - template: cargo-authenticate-template.yml
         parameters:
           osType: Linux
@@ -709,6 +711,8 @@ stages:
     variables:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
     steps:
+      - checkout: self
+        retryCountOnTaskFailure: 3
       - template: cargo-authenticate-template.yml
         parameters:
           osType: Linux
@@ -731,6 +735,8 @@ stages:
     variables:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
     steps:
+      - checkout: self
+        retryCountOnTaskFailure: 3
       - template: cargo-authenticate-template.yml
         parameters:
           osType: Linux
@@ -783,6 +789,8 @@ stages:
     variables:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
     steps:
+      - checkout: self
+        retryCountOnTaskFailure: 3
       - template: cargo-authenticate-template.yml
         parameters:
           osType: Linux
@@ -806,6 +814,8 @@ stages:
     variables:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
     steps:
+      - checkout: self
+        retryCountOnTaskFailure: 3
       - template: cargo-authenticate-template.yml
         parameters:
           osType: Linux
