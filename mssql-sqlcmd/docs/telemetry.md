@@ -263,9 +263,8 @@ but a 200 or a fully accepted 206: a 204, a 4xx or 5xx, or a 206 that rejected
 the event) are all recorded as a failure, because the SDK's shutdown does not
 hand the export result back. The exporter retries throttling, server errors and
 every error the HTTP client returns: a transport failure and, because the filter
-reports through the same error, a filter failure or a response that is
-malformed (an item count or error index that cannot belong to the request). It
-backs off for up to about 35 seconds, and the last attempt decides the
+reports through the same error, a filter failure or a malformed response (see
+below). It backs off for up to about 35 seconds, and the last attempt decides the
 outcome, so a retry that succeeds is not reported as a failure. Nothing bounds
 that thread but the exporter's own retries; the process waits for it only as
 long as the bound passed to shutdown. If shutdown arrives first, for example
@@ -274,12 +273,15 @@ exporter is still retrying is also reported as a timeout. An all-filtered or
 malformed request is an error, not a synthetic success. An ingestion response is
 checked against the request first (item counts, and that every error index is
 present, unique and in range) before a partial one's indices are translated
-back to the original batch; a response that is malformed (it reports more
-accepted and failed items than were received, or an error index that is not in
-the request) is an error and is never taken as an acceptance. A 206 that
-accepted fewer items than were received without itemizing an error for them is a
-rejection that is not retried, because there is no item for the exporter to
-retry; it too is never an acceptance.
+back to the original batch. A 206 or 500 response is malformed when it is not
+a JSON object, lacks `itemsReceived`, `itemsAccepted` or `errors`, its
+`itemsReceived` is not the number of items sent, its accepted items plus
+itemized errors exceed that number, or an error lacks an index or has one that
+is repeated or outside the request. A malformed response is an error, retried
+like any other, and never taken as an acceptance. A 206 whose counts match the
+request but that accepted fewer items than it received without itemizing an
+error for them is a rejection that is not retried, because there is no item for
+the exporter to retry; it too is never an acceptance.
 
 Recording and shutdown are ordered by one lock: a call admitted before shutdown
 is sent by it, and a call after it is not recorded. Shutdown takes that lock

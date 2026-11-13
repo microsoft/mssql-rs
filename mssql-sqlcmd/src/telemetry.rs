@@ -1345,11 +1345,13 @@ mod tests {
     enum Expect {
         /// The service accepted the event.
         Completed,
-        /// Rejected outright, with no retry: a 4xx, or a 206 that took fewer
-        /// items than it received without itemizing an error for them.
+        /// Rejected outright, with no retry: a status the exporter does not retry
+        /// (204, 400 and 403 here; throttling, 429, is retried), or a 206 that
+        /// took fewer items than it received without itemizing an error for them.
         Failed,
         /// Throttled, a server error, or any error the exporter retries (a
-        /// transport failure, a filter failure, a malformed response): it
+        /// transport failure, a filter failure, a malformed response, see
+        /// `check_ingestion_response`): it
         /// retries with a backoff, so a short wait ends first. Never a
         /// success.
         NotCompleted,
