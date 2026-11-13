@@ -1107,6 +1107,30 @@ mod tests {
     }
 
     #[test]
+    fn null_bigbinary_uses_binary_compatibility_type() -> TestResult {
+        use mssql_tds::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
+        use mssql_tds::test_client_support::int_columns;
+
+        let mut metadata = int_columns(1);
+        let column = metadata.first_mut().ok_or("missing column")?;
+        column.data_type = TdsDataType::BigBinary;
+        column.type_info = TypeInfo::var_len(TdsDataType::BigBinary, 10)?;
+        let row = Row::from_schema(
+            RowSchema::from_metadata(&metadata),
+            vec![ColumnValues::Null],
+        );
+        ensure_equal(row.try_get_compat::<&[u8], _>(0usize)?, None)?;
+        ensure_equal(
+            matches!(
+                row.try_get_compat::<&str, _>(0usize),
+                Err(Error::Conversion(_))
+            ),
+            true,
+        )?;
+        Ok(())
+    }
+
+    #[test]
     fn empty_row_iteration_is_empty() {
         let row = make_row(&[], Vec::new());
         assert_eq!(row.cells().count(), 0);

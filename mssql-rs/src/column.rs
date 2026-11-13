@@ -73,14 +73,15 @@ impl From<TdsDataType> for ColumnType {
             TdsDataType::Decimal | TdsDataType::DecimalN => ColumnType::Decimaln,
             TdsDataType::Numeric | TdsDataType::NumericN => ColumnType::Numericn,
             TdsDataType::Money | TdsDataType::MoneyN => ColumnType::Money,
+            TdsDataType::Money4 => ColumnType::Money4,
             TdsDataType::Guid => ColumnType::Guid,
             TdsDataType::NVarChar => ColumnType::NVarchar,
             TdsDataType::VarChar | TdsDataType::BigVarChar => ColumnType::Varchar,
             TdsDataType::NChar => ColumnType::NChar,
-            TdsDataType::Char => ColumnType::Char,
+            TdsDataType::Char | TdsDataType::BigChar => ColumnType::Char,
             TdsDataType::NText => ColumnType::NText,
             TdsDataType::Text => ColumnType::Text,
-            TdsDataType::Binary => ColumnType::Binary,
+            TdsDataType::Binary | TdsDataType::BigBinary => ColumnType::Binary,
             TdsDataType::VarBinary | TdsDataType::BigVarBinary => ColumnType::VarBinary,
             TdsDataType::Image => ColumnType::Image,
             TdsDataType::Xml => ColumnType::Xml,
@@ -133,6 +134,10 @@ impl ColumnType {
                 4 => ColumnType::Money4,
                 8 => ColumnType::Money,
                 _ => ColumnType::Money,
+            },
+            TdsDataType::DateTimeN => match byte_length {
+                4 => ColumnType::Datetime4,
+                _ => ColumnType::Datetime,
             },
             other => ColumnType::from(other),
         }
@@ -533,6 +538,45 @@ mod tests {
             ColumnType::Decimaln
         );
         assert_eq!(ColumnType::from(TdsDataType::Image), ColumnType::Image);
+    }
+
+    #[test]
+    fn fixed_width_wire_types_preserve_column_types() {
+        use mssql_tds::datatypes::sqldatatypes::TypeInfo;
+
+        let cases = [
+            (
+                TdsDataType::BigChar,
+                TypeInfo::var_len_string(TdsDataType::BigChar, 10, None).expect("type info"),
+                ColumnType::Char,
+            ),
+            (
+                TdsDataType::BigBinary,
+                TypeInfo::var_len(TdsDataType::BigBinary, 10).expect("type info"),
+                ColumnType::Binary,
+            ),
+            (
+                TdsDataType::Money4,
+                TypeInfo::fixed_len(TdsDataType::Money4).expect("type info"),
+                ColumnType::Money4,
+            ),
+            (
+                TdsDataType::DateTimeN,
+                TypeInfo::var_len(TdsDataType::DateTimeN, 4).expect("type info"),
+                ColumnType::Datetime4,
+            ),
+            (
+                TdsDataType::DateTimeN,
+                TypeInfo::var_len(TdsDataType::DateTimeN, 8).expect("type info"),
+                ColumnType::Datetime,
+            ),
+        ];
+        for (tds_type, info, expected) in cases {
+            let mut meta = int_columns(1).remove(0);
+            meta.data_type = tds_type;
+            meta.type_info = info;
+            assert_eq!(Column::from_tds(&meta).column_type(), expected);
+        }
     }
 
     #[test]
