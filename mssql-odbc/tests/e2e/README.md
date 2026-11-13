@@ -84,7 +84,8 @@ MSSQL_TDS_TRACE_LEVEL="warn,mssqlodbc=trace" ./run_e2e.sh --verbose
 ### Small-stack connection regression
 
 On POSIX platforms, `small_stack_connect_test` connects and fetches a row through
-the Driver Manager on an explicitly sized pthread. Its separate executable also
+the Driver Manager on an explicitly sized pthread, and checks that a rejected
+login reports `28000` on the same stack. Its separate executable also
 covers cold driver/TLS initialization. The native stack size of the existing
 `ODBC_TEST_F` workers is unchanged.
 

@@ -244,8 +244,17 @@ impl<'a> SqlRpc<'a> {
 
     async fn write_named_parameters(&self, packet_writer: &mut PacketWriter<'_>) -> TdsResult<()> {
         if let Some(parameters) = &self.named_parameters {
+            let by_ordinal = self.value_binding == ValueBinding::ByOrdinal;
             let encoder = GenericEncoder::new();
             for parameter in parameters {
+                // Ordinal values are written positionally; nesting the async
+                // serializer per value costs more than the write itself.
+                if by_ordinal
+                    && parameter
+                        .try_write_positional_within_packet(packet_writer, self.db_collation)
+                {
+                    continue;
+                }
                 write_rpc_value(
                     parameter,
                     packet_writer,
@@ -312,7 +321,9 @@ impl<'a> SqlRpc<'a> {
     /// Below the boundary the async path cannot flush, so it changes only
     /// buffer bytes. The bound is strict because an exact fill is flushed at
     /// different points by different async primitives, which decides whether
-    /// `finalize` sends a header-only EOM.
+    /// `finalize` sends a header-only EOM. Each parameter is encoded once and
+    /// written while checking that bound; a parameter that is ineligible or
+    /// would reach the boundary rewinds the whole command.
     pub(crate) fn try_write_batch_command_within_packet(
         &self,
         packet_writer: &mut PacketWriter<'_>,
@@ -332,25 +343,24 @@ impl<'a> SqlRpc<'a> {
         {
             return Ok(false);
         }
-        let mut length = 1 + PROC_ID_LEN;
-        for parameter in parameters {
-            let Some(parameter_length) = parameter.positional_inline_len() else {
-                return Ok(false);
-            };
-            length += parameter_length;
-        }
-        if !packet_writer.has_space(length + 1) {
+        if !packet_writer.has_space(1 + PROC_ID_LEN + 1) {
             return Ok(false);
         }
-        self.validate_parameters()?;
-
         let start = packet_writer.position();
         packet_writer.write_bytes_within_packet(&[RPC_BATCH_DELIMITER]);
         packet_writer.write_bytes_within_packet(&self.proc_id_bytes(proc));
         for parameter in parameters {
-            parameter.write_positional_inline(packet_writer, self.db_collation);
+            if !parameter.try_write_positional_within_packet(packet_writer, self.db_collation) {
+                packet_writer.rewind_within_packet(start);
+                return Ok(false);
+            }
         }
-        debug_assert_eq!((packet_writer.position() - start) as usize, length);
+        // Run only for commands that fit, as before; ineligible ones are
+        // validated by the async path they fall back to.
+        if let Err(error) = self.validate_parameters() {
+            packet_writer.rewind_within_packet(start);
+            return Err(error);
+        }
         debug_assert!(packet_writer.has_space(1));
         Ok(true)
     }
@@ -452,6 +462,8 @@ impl Request for SqlRpc<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::CancelHandle;
+    use crate::datatypes::decoder::DecimalParts;
     use crate::datatypes::{sql_string::SqlString, sqltypes::SqlType};
     use crate::io::packet_writer::tests::MockNetworkWriter;
     use crate::message::parameters::rpc_parameters::StatusFlags;
@@ -1064,6 +1076,7 @@ mod tests {
                 vec![
                     param(SqlType::Int(Some(i32::MIN))),
                     param(SqlType::BigInt(Some(i64::MAX))),
+                    param(SqlType::TinyInt(Some(u8::MAX))),
                     param(SqlType::NVarchar(Some(utf16(&text)), 20)),
                 ],
                 true,
@@ -1072,6 +1085,7 @@ mod tests {
                 vec![
                     param(SqlType::Int(Some(i32::MAX))),
                     param(SqlType::BigInt(Some(i64::MIN))),
+                    by_ref(SqlType::SmallInt(Some(i16::MIN))),
                     param(SqlType::NVarchar(None, 10)),
                 ],
                 true,
@@ -1080,6 +1094,8 @@ mod tests {
                 vec![
                     param(SqlType::Int(None)),
                     param(SqlType::BigInt(None)),
+                    param(SqlType::TinyInt(None)),
+                    param(SqlType::SmallInt(None)),
                     param(SqlType::NVarchar(Some(utf16("")), 0)),
                     param(SqlType::NVarchar(None, 0)),
                 ],
@@ -1292,14 +1308,108 @@ mod tests {
         }
     }
 
+    /// TYPE_INFO for fixed-size types has one source shared by both paths, so
+    /// equality tests cannot catch a wrong byte there; pin the bytes instead.
+    #[test]
+    fn fixed_type_info_bytes_are_pinned() {
+        use crate::datatypes::column_values::{SqlDateTime2, SqlDateTimeOffset, SqlTime};
+        let decimal = Some(DecimalParts::new(true, 5, 2, 1));
+        type Case = (SqlType, Option<u8>, Option<u8>, &'static [u8]);
+        let cases: Vec<Case> = vec![
+            (SqlType::Bit(None), None, None, &[0x26, 1]),
+            (SqlType::TinyInt(Some(1)), None, None, &[0x26, 1]),
+            (SqlType::SmallInt(None), None, None, &[0x26, 2]),
+            (SqlType::Int(None), None, None, &[0x26, 4]),
+            (SqlType::BigInt(None), Some(9), Some(9), &[0x26, 8]),
+            (SqlType::Real(None), None, None, &[0x6D, 4]),
+            (SqlType::Float(None), None, None, &[0x6D, 8]),
+            (SqlType::Decimal(decimal), None, None, &[0x6C, 17, 5, 2]),
+            (
+                SqlType::Decimal(decimal),
+                Some(18),
+                Some(4),
+                &[0x6C, 17, 18, 4],
+            ),
+            (
+                SqlType::Numeric(decimal),
+                Some(18),
+                None,
+                &[0x6C, 17, 18, 2],
+            ),
+            (SqlType::Numeric(None), None, None, &[0x6C, 17, 1, 0]),
+            (SqlType::Money(None), None, None, &[0x6E, 8]),
+            (SqlType::SmallMoney(None), None, None, &[0x6E, 4]),
+            (SqlType::DateTime(None), None, None, &[0x6F, 8]),
+            (SqlType::SmallDateTime(None), None, None, &[0x6F, 4]),
+            (SqlType::Uuid(None), None, None, &[0x24, 16]),
+            (SqlType::Date(None), Some(9), Some(9), &[0x28]),
+            (
+                time_value::<SqlTime>(SqlType::Time, 3),
+                None,
+                None,
+                &[0x29, 3],
+            ),
+            (
+                time_value::<SqlTime>(SqlType::Time, 3),
+                None,
+                Some(5),
+                &[0x29, 5],
+            ),
+            (SqlType::Time(None), None, None, &[0x29, 7]),
+            (
+                time_value::<SqlDateTime2>(SqlType::DateTime2, 0),
+                Some(9),
+                None,
+                &[0x2A, 0],
+            ),
+            (SqlType::DateTime2(None), None, Some(2), &[0x2A, 2]),
+            (
+                time_value::<SqlDateTimeOffset>(SqlType::DateTimeOffset, 6),
+                None,
+                None,
+                &[0x2B, 6],
+            ),
+            (SqlType::DateTimeOffset(None), None, None, &[0x2B, 7]),
+        ];
+        let collation = db_collation();
+        for (value, precision, scale, expected) in cases {
+            let mut mock = MockNetworkWriter::new(4096);
+            let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+            block_on(value.write_type_info(&mut writer, &collation, precision, scale)).unwrap();
+            assert_eq!(
+                &writer.get_payload().into_inner()[8..],
+                expected,
+                "{value:?} {precision:?} {scale:?}"
+            );
+        }
+    }
+
     #[test]
     fn batch_fast_path_eligibility_and_lengths() {
         use crate::datatypes::sql_string::EncodingType;
         let inline = |value| param(value).positional_inline_len();
+        assert_eq!(inline(SqlType::TinyInt(Some(1))), Some(6));
+        assert_eq!(inline(SqlType::TinyInt(None)), Some(5));
+        assert_eq!(inline(SqlType::SmallInt(Some(1))), Some(7));
+        assert_eq!(inline(SqlType::SmallInt(None)), Some(5));
         assert_eq!(inline(SqlType::Int(Some(1))), Some(9));
         assert_eq!(inline(SqlType::Int(None)), Some(5));
         assert_eq!(inline(SqlType::BigInt(Some(1))), Some(13));
         assert_eq!(inline(SqlType::BigInt(None)), Some(5));
+        assert_eq!(inline(SqlType::Bit(Some(true))), Some(6));
+        assert_eq!(inline(SqlType::Real(Some(1.0))), Some(9));
+        assert_eq!(inline(SqlType::Float(None)), Some(5));
+        assert_eq!(inline(SqlType::Decimal(None)), Some(7));
+        assert_eq!(
+            inline(SqlType::Numeric(Some(DecimalParts::new(true, 5, 2, 1)))),
+            Some(24)
+        );
+        assert_eq!(inline(SqlType::Date(None)), Some(4));
+        assert_eq!(inline(SqlType::Uuid(Some(uuid::Uuid::nil()))), Some(21));
+        assert_eq!(inline(time_value(SqlType::Time, 7)), Some(10));
+        assert_eq!(inline(time_value(SqlType::DateTimeOffset, 0)), Some(13));
+        assert_eq!(inline(SqlType::VarBinary(Some(vec![1]), 10)), Some(8));
+        assert_eq!(inline(SqlType::VarBinary(None, 8000)), Some(7));
         assert_eq!(inline(SqlType::NVarchar(None, 4000)), Some(12));
         assert_eq!(inline(SqlType::NVarchar(Some(utf16("ab")), 2)), Some(16));
         assert_eq!(
@@ -1313,9 +1423,13 @@ mod tests {
             SqlType::NVarchar(Some(SqlString::new(vec![1], EncodingType::DelayedSet)), 10),
             SqlType::NVarcharMax(None),
             SqlType::Varchar(None, 10),
-            SqlType::SmallInt(Some(1)),
-            SqlType::Bit(Some(true)),
-            SqlType::VarBinary(Some(vec![1]), 10),
+            SqlType::VarBinary(Some(vec![1; 11]), 10),
+            SqlType::VarBinary(Some(vec![1]), 8001),
+            SqlType::VarBinaryMax(Some(vec![1])),
+            // Scale 8 is an async-path error.
+            time_value(SqlType::Time, 8),
+            time_value(SqlType::DateTime2, 8),
+            time_value(SqlType::DateTimeOffset, 8),
         ] {
             assert_eq!(inline(ineligible.clone()), None, "{ineligible:?}");
         }
@@ -1364,6 +1478,692 @@ mod tests {
                     .count(),
                 2000
             );
+        }
+    }
+
+    /// Fails or cancels the message at a chosen send.
+    #[derive(Clone, Copy, Debug)]
+    enum Fault {
+        None,
+        CancelledBeforeSend,
+        CancelDuringSend(usize),
+        FailSend(usize),
+    }
+
+    struct FaultyWriter {
+        size: u32,
+        data: Vec<u8>,
+        sends: usize,
+        fault: Fault,
+        cancel: CancelHandle,
+    }
+
+    #[async_trait]
+    impl crate::io::reader_writer::NetworkWriter for FaultyWriter {
+        async fn send(&mut self, data: &[u8]) -> TdsResult<()> {
+            self.sends += 1;
+            match self.fault {
+                Fault::FailSend(at) if at == self.sends => {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "injected",
+                    )));
+                }
+                Fault::CancelDuringSend(at) if at == self.sends => self.cancel.cancel(),
+                _ => {}
+            }
+            self.data.extend_from_slice(data);
+            Ok(())
+        }
+
+        fn packet_size(&self) -> u32 {
+            self.size
+        }
+
+        fn get_encryption_setting(&self) -> crate::core::NegotiatedEncryptionSetting {
+            unimplemented!()
+        }
+
+        fn note_reset_dispatched(&mut self) {}
+
+        fn take_reset_dispatched(&mut self) -> bool {
+            false
+        }
+    }
+
+    #[async_trait]
+    impl crate::connection::transport::network_transport::TransportSslHandler for FaultyWriter {
+        async fn enable_ssl(&mut self) -> TdsResult<()> {
+            unimplemented!()
+        }
+
+        async fn disable_ssl(&mut self) -> TdsResult<()> {
+            unimplemented!()
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum OrdinalMode {
+        /// Every value through `write_rpc_value`, as before the fast path.
+        Async,
+        /// The production sequence, recording which values it wrote inline.
+        Recorded,
+        /// `serialize_prefix` itself.
+        Production,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct OrdinalRun {
+        result: String,
+        wire: Vec<u8>,
+        send_attempted: bool,
+        send_incomplete: bool,
+        message_complete: bool,
+    }
+
+    /// Writes one `ValueBinding::ByOrdinal` RPC and finalizes it. Returns the
+    /// run and, for [`OrdinalMode::Recorded`], each value's start position and
+    /// whether it took the fast path.
+    fn run_ordinal(
+        packet_size: u32,
+        positional: &[RpcParameter],
+        values: &[RpcParameter],
+        mode: OrdinalMode,
+        fault: Fault,
+    ) -> (OrdinalRun, Vec<(usize, bool)>) {
+        let collation = db_collation();
+        let mut context = ExecutionContext::new();
+        context.set_transaction_descriptor(1);
+        let root = CancelHandle::new();
+        let request = root.child_handle();
+        if matches!(fault, Fault::CancelledBeforeSend) {
+            root.cancel();
+        }
+        let mut network = FaultyWriter {
+            size: packet_size,
+            data: Vec::new(),
+            sends: 0,
+            fault,
+            cancel: root,
+        };
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(RpcProcs::Execute),
+            Some(positional.to_vec()),
+            Some(values.to_vec()),
+            &collation,
+            &context,
+        )
+        .with_value_binding(ValueBinding::ByOrdinal);
+        let mut writer =
+            PacketWriter::new(PacketType::RpcRequest, &mut network, None, Some(&request));
+        let mut decisions = Vec::new();
+        let result = block_on(async {
+            if mode == OrdinalMode::Production {
+                rpc.serialize_prefix(&mut writer).await?;
+            } else {
+                rpc.validate_parameters()?;
+                write_headers(&rpc.headers, &mut writer).await?;
+                rpc.write_proc(&mut writer).await?;
+                rpc.write_positional_parameters(&mut writer).await?;
+                let encoder = GenericEncoder::new();
+                for value in rpc.named_parameters.iter().flatten() {
+                    let position = usize::try_from(writer.position()).unwrap();
+                    let fast = mode == OrdinalMode::Recorded
+                        && value.try_write_positional_within_packet(&mut writer, &collation);
+                    decisions.push((position, fast));
+                    if !fast {
+                        write_rpc_value(
+                            value,
+                            &mut writer,
+                            &collation,
+                            ValueBinding::ByOrdinal,
+                            &encoder,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            writer.finalize().await
+        });
+        let message = writer.suspend();
+        let run = OrdinalRun {
+            result: format!("{result:?}"),
+            wire: network.data,
+            send_attempted: message.send_attempted(),
+            send_incomplete: message.send_incomplete(),
+            message_complete: message.message_complete(),
+        };
+        (run, decisions)
+    }
+
+    /// Runs all three modes, asserts they agree, and returns the recorded run.
+    fn run_ordinal_all_modes(
+        packet_size: u32,
+        positional: &[RpcParameter],
+        values: &[RpcParameter],
+        fault: Fault,
+    ) -> (OrdinalRun, Vec<(usize, bool)>) {
+        let (slow, slow_decisions) =
+            run_ordinal(packet_size, positional, values, OrdinalMode::Async, fault);
+        let (fast, decisions) = run_ordinal(
+            packet_size,
+            positional,
+            values,
+            OrdinalMode::Recorded,
+            fault,
+        );
+        let (production, _) = run_ordinal(
+            packet_size,
+            positional,
+            values,
+            OrdinalMode::Production,
+            fault,
+        );
+        assert_eq!(fast, slow, "packet {packet_size}, {fault:?}");
+        assert_eq!(production, slow, "packet {packet_size}, {fault:?}");
+        assert!(slow_decisions.iter().all(|&(_, fast)| !fast));
+        for (index, &(position, _)) in decisions.iter().enumerate() {
+            assert_eq!(position, slow_decisions[index].0);
+        }
+        (fast, decisions)
+    }
+
+    fn named(index: usize, flags: StatusFlags, value: SqlType) -> RpcParameter {
+        RpcParameter::new(Some(format!("@P{index}")), flags, value)
+    }
+
+    fn tvp(cell: SqlType, column: SqlType) -> SqlType {
+        use crate::datatypes::sql_tvp::{TvpColumnDef, TvpTableData, TvpTypeName};
+        SqlType::Table(
+            TvpTypeName::new(Some("dbo".to_string()), "T".to_string()),
+            Some(TvpTableData::new(
+                vec![TvpColumnDef::new(column)],
+                vec![vec![cell]],
+            )),
+        )
+    }
+
+    /// A random ordinal value: mostly fast-path eligible integers and
+    /// NVARCHAR, with PLP, TVP, encrypted and other async-only values.
+    fn ordinal_value(
+        rng: &mut crate::io::packet_writer::tests::SplitMix64,
+        index: usize,
+    ) -> RpcParameter {
+        use crate::datatypes::sql_string::EncodingType;
+        let flags = if rng.below(4) == 0 {
+            StatusFlags::BY_REF_VALUE
+        } else {
+            StatusFlags::NONE
+        };
+        let bits = rng.next();
+        let value = match rng.below(24) {
+            0 | 1 => SqlType::TinyInt(Some(bits as u8)),
+            2 => SqlType::TinyInt(None),
+            3 | 4 => SqlType::SmallInt(Some(bits as i16)),
+            5 => SqlType::SmallInt(None),
+            6 | 7 => SqlType::Int(Some(bits as i32)),
+            8 => SqlType::Int(None),
+            9 => SqlType::BigInt(Some(bits as i64)),
+            10 => SqlType::BigInt(None),
+            11 => SqlType::NVarchar(Some(utf16(&"n".repeat(rng.below(12)))), 20),
+            12 => SqlType::VarBinary(Some(vec![bits as u8; rng.below(21)]), 20),
+            13 if bits & 1 == 0 => SqlType::NVarchar(None, 10),
+            13 => SqlType::VarBinary(None, 8000),
+            14 if bits & 1 == 0 => SqlType::NVarcharMax(Some(utf16("plp"))),
+            14 => SqlType::VarBinary(Some(vec![7; 3]), 8001),
+            15 => SqlType::Varchar(Some(utf16("abc")), 10),
+            16 => SqlType::NVarchar(Some(SqlString::new(b"ab".to_vec(), EncodingType::Utf8)), 10),
+            17..=20 => {
+                // Every fixed-size type and time scale, including the
+                // invalid scale the async path rejects.
+                let values = fixed_values(bits);
+                let value = values[rng.below(values.len())].clone();
+                if matches!(
+                    value,
+                    SqlType::Time(Some(ref time)) if time.scale > 7
+                ) || matches!(
+                    value,
+                    SqlType::DateTime2(Some(ref value)) if value.time.scale > 7
+                ) || matches!(
+                    value,
+                    SqlType::DateTimeOffset(Some(ref value)) if value.datetime2.time.scale > 7
+                ) {
+                    SqlType::Float(Some(1.5))
+                } else {
+                    value
+                }
+            }
+            21 => {
+                let mut parameter = encrypted_param();
+                parameter.name = Some(format!("@P{index}"));
+                return parameter;
+            }
+            22 => {
+                return with_metadata(
+                    named(index, flags, SqlType::Decimal(None)),
+                    (bits % 38) as u8 + 1,
+                    0,
+                );
+            }
+            _ => {
+                return named(
+                    index,
+                    StatusFlags::NONE,
+                    tvp(SqlType::Int(Some(7)), SqlType::Int(None)),
+                );
+            }
+        };
+        named(index, flags, value)
+    }
+
+    fn ordinal_values(seed: u64, count: usize) -> Vec<RpcParameter> {
+        let mut rng = crate::io::packet_writer::tests::SplitMix64(seed);
+        (1..=count)
+            .map(|index| ordinal_value(&mut rng, index))
+            .collect()
+    }
+
+    /// A TIME, DATETIME2 or DATETIMEOFFSET at `scale`.
+    fn time_value<T: TimeLike>(wrap: fn(Option<T>) -> SqlType, scale: u8) -> SqlType {
+        wrap(Some(T::at(crate::datatypes::column_values::SqlTime {
+            time_nanoseconds: 863_999_999_999 - u64::from(scale) * 7_654_321,
+            scale,
+        })))
+    }
+
+    trait TimeLike {
+        fn at(time: crate::datatypes::column_values::SqlTime) -> Self;
+    }
+
+    impl TimeLike for crate::datatypes::column_values::SqlTime {
+        fn at(time: Self) -> Self {
+            time
+        }
+    }
+
+    impl TimeLike for crate::datatypes::column_values::SqlDateTime2 {
+        fn at(time: crate::datatypes::column_values::SqlTime) -> Self {
+            Self {
+                days: 3_652_058,
+                time,
+            }
+        }
+    }
+
+    impl TimeLike for crate::datatypes::column_values::SqlDateTimeOffset {
+        fn at(time: crate::datatypes::column_values::SqlTime) -> Self {
+            Self {
+                datetime2: crate::datatypes::column_values::SqlDateTime2::at(time),
+                offset: -840,
+            }
+        }
+    }
+
+    /// Every fixed-size type, non-NULL and NULL, with extreme values, every
+    /// time scale and the edge scales the async path rejects.
+    fn fixed_values(bits: u64) -> Vec<SqlType> {
+        use crate::datatypes::column_values::{
+            SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney, SqlSmallDateTime,
+            SqlSmallMoney, SqlTime,
+        };
+        let mut values = vec![
+            SqlType::Bit(Some(bits & 1 == 1)),
+            SqlType::Bit(None),
+            SqlType::TinyInt(Some(bits as u8)),
+            SqlType::SmallInt(Some(bits as i16)),
+            SqlType::Int(Some(bits as i32)),
+            SqlType::BigInt(Some(bits as i64)),
+            SqlType::Real(Some(f32::from_bits(bits as u32))),
+            SqlType::Real(Some(f32::NAN)),
+            SqlType::Real(None),
+            SqlType::Float(Some(f64::from_bits(bits))),
+            SqlType::Float(Some(f64::NEG_INFINITY)),
+            SqlType::Float(None),
+            SqlType::Decimal(Some(DecimalParts::new(
+                false,
+                38,
+                10,
+                u128::from(bits) << 61,
+            ))),
+            SqlType::Numeric(Some(DecimalParts::new(
+                true,
+                5,
+                0,
+                u128::from(bits % 99_999),
+            ))),
+            SqlType::Decimal(None),
+            SqlType::Numeric(None),
+            SqlType::Money(Some(SqlMoney {
+                lsb_part: bits as i32,
+                msb_part: (bits >> 32) as i32,
+            })),
+            SqlType::Money(None),
+            SqlType::SmallMoney(Some(SqlSmallMoney {
+                int_val: bits as i32,
+            })),
+            SqlType::SmallMoney(None),
+            SqlType::Date(Some(SqlDate::unchecked_create(bits as u32 % 3_652_059))),
+            SqlType::Date(None),
+            SqlType::DateTime(Some(SqlDateTime {
+                days: bits as i32 % 2_958_464,
+                time: (bits >> 32) as u32 % 25_920_000,
+            })),
+            SqlType::DateTime(None),
+            SqlType::SmallDateTime(Some(SqlSmallDateTime {
+                days: bits as u16,
+                time: (bits >> 16) as u16 % 1440,
+            })),
+            SqlType::SmallDateTime(None),
+            SqlType::Uuid(Some(uuid::Uuid::from_u128(u128::from(bits) * 0x9E37_79B9))),
+            SqlType::Uuid(None),
+            SqlType::Time(None),
+            SqlType::DateTime2(None),
+            SqlType::DateTimeOffset(None),
+        ];
+        for scale in 0..=8 {
+            values.push(time_value::<SqlTime>(SqlType::Time, scale));
+            values.push(time_value::<SqlDateTime2>(SqlType::DateTime2, scale));
+            values.push(time_value::<SqlDateTimeOffset>(
+                SqlType::DateTimeOffset,
+                scale,
+            ));
+        }
+        values
+    }
+
+    /// TYPE_INFO overrides the parameter's metadata supplies, as for a typed
+    /// NULL decimal or time.
+    fn with_metadata(parameter: RpcParameter, precision: u8, scale: u8) -> RpcParameter {
+        use crate::message::parameters::rpc_parameters::RpcTypeMetadata;
+        parameter.with_type_metadata(RpcTypeMetadata {
+            precision: Some(precision),
+            scale: Some(scale),
+        })
+    }
+
+    /// Each fixed-size value, alone in a packet large enough not to flush,
+    /// encodes the same through `rpc_inline` as through the async serializer,
+    /// with and without metadata overrides.
+    #[test]
+    fn fixed_inline_values_match_the_async_serializer() {
+        let mut rng = crate::io::packet_writer::tests::SplitMix64(0x6669_7865_6432);
+        let mut inline_count = 0;
+        for _ in 0..64 {
+            for value in fixed_values(rng.next()) {
+                for parameter in [
+                    param(value.clone()),
+                    with_metadata(param(value.clone()), 18, 4),
+                    with_metadata(
+                        RpcParameter::new(None, StatusFlags::BY_REF_VALUE, value.clone()),
+                        38,
+                        7,
+                    ),
+                ] {
+                    let (fast, async_ok) = inline_matches_async(&parameter);
+                    assert_eq!(fast, async_ok, "{parameter:?}");
+                    inline_count += usize::from(fast);
+                }
+            }
+        }
+        assert!(inline_count > 64 * 30 * 3, "{inline_count}");
+    }
+
+    /// Writes `parameter` alone, in a packet large enough not to flush,
+    /// through the async serializer and through the sync path. The sync path
+    /// may take only values the async one encodes without error, and must
+    /// emit the same bytes. Returns whether it took the value and whether the
+    /// async path succeeded.
+    fn inline_matches_async(parameter: &RpcParameter) -> (bool, bool) {
+        let collation = db_collation();
+        let mut mock = MockNetworkWriter::new(32767);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let result = block_on(write_rpc_value(
+            parameter,
+            &mut writer,
+            &collation,
+            ValueBinding::ByOrdinal,
+            &GenericEncoder::new(),
+        ));
+        let slow = writer.get_payload().into_inner().split_off(8);
+        drop(writer);
+        let mut mock = MockNetworkWriter::new(32767);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let fast = parameter.try_write_positional_within_packet(&mut writer, &collation);
+        let mut inline = writer.get_payload().into_inner();
+        let inline = inline.split_off(inline.len().min(8));
+        assert!(!fast || result.is_ok(), "{parameter:?}: {result:?}");
+        if fast {
+            assert_eq!(inline, slow, "{parameter:?}");
+            assert_eq!(Some(inline.len()), parameter.positional_inline_len());
+        } else {
+            assert!(inline.is_empty());
+        }
+        (fast, result.is_ok())
+    }
+
+    /// VARBINARY(n) at every declared-length class, every data length around
+    /// n, NULL, and the over-length and PLP values the sync path declines.
+    #[test]
+    fn varbinary_inline_values_match_the_async_serializer() {
+        let mut inline = 0;
+        let mut declined = 0;
+        for max_len in [0u16, 1, 2, 255, 256, 7999, 8000, 8001, u16::MAX] {
+            let lengths = [
+                0,
+                1,
+                2,
+                usize::from(max_len).saturating_sub(1),
+                usize::from(max_len),
+                usize::from(max_len) + 1,
+            ];
+            let mut values: Vec<SqlType> = lengths
+                .iter()
+                .map(|&len| {
+                    SqlType::VarBinary(Some((0..len).map(|i| (i * 7) as u8).collect()), max_len)
+                })
+                .collect();
+            values.push(SqlType::VarBinary(None, max_len));
+            for value in values {
+                for parameter in [
+                    param(value.clone()),
+                    RpcParameter::new(None, StatusFlags::BY_REF_VALUE, value.clone()),
+                ] {
+                    let (fast, async_ok) = inline_matches_async(&parameter);
+                    let over_length = matches!(
+                        &value,
+                        SqlType::VarBinary(Some(bytes), _) if bytes.len() > usize::from(max_len)
+                    );
+                    // Over-length data is an async error only below PLP.
+                    assert_eq!(async_ok, !(over_length && max_len <= 8000), "{value:?}");
+                    assert_eq!(fast, max_len <= 8000 && !over_length, "{value:?}");
+                    if fast {
+                        inline += 1;
+                    } else {
+                        declined += 1;
+                    }
+                }
+            }
+        }
+        assert!(inline > 0 && declined > 0);
+        assert_eq!(
+            inline_matches_async(&param(SqlType::VarBinaryMax(Some(vec![1])))),
+            (false, true)
+        );
+    }
+
+    /// The `sp_execute` handle, then a pad that shifts every value by one byte
+    /// per step.
+    fn ordinal_prefix(shift: usize) -> Vec<RpcParameter> {
+        vec![
+            param(SqlType::Int(Some(1))),
+            param(SqlType::VarBinary(Some(vec![0xab; shift]), 8000)),
+        ]
+    }
+
+    #[test]
+    fn ordinal_values_match_async_wire_across_packet_boundaries() {
+        for packet_size in [512u32, 4096, 16192] {
+            let max_payload = usize::try_from(packet_size).unwrap() - 8;
+            let values = ordinal_values(u64::from(packet_size), 2 * max_payload / 9);
+            let mut boundary_ends = std::collections::BTreeSet::new();
+            let (mut fast_hits, mut eligible_values) = (0usize, 0usize);
+            for shift in 0..=100 {
+                let (run, decisions) = run_ordinal_all_modes(
+                    packet_size,
+                    &ordinal_prefix(shift),
+                    &values,
+                    Fault::None,
+                );
+                assert_eq!(run.result, "Ok(())");
+                assert!(run.message_complete);
+                for (value, &(position, fast)) in values.iter().zip(&decisions) {
+                    let Some(length) = value.positional_inline_len() else {
+                        assert!(!fast);
+                        continue;
+                    };
+                    let end = position + length;
+                    assert_eq!(
+                        fast,
+                        end < max_payload,
+                        "packet {packet_size}, shift {shift}"
+                    );
+                    if (max_payload - 2..=max_payload + 1).contains(&end) {
+                        boundary_ends.insert(end + 2 - max_payload);
+                    }
+                    fast_hits += usize::from(fast);
+                    eligible_values += 1;
+                }
+            }
+            assert_eq!(
+                boundary_ends.into_iter().collect::<Vec<_>>(),
+                [0, 1, 2, 3],
+                "values must end at max-2, max-1 (fast) and max, max+1 (fallback)"
+            );
+            assert!(
+                fast_hits * 10 > eligible_values * 9,
+                "packet {packet_size}: {fast_hits} of {eligible_values} eligible values inline"
+            );
+        }
+    }
+
+    /// The last value ends at max-2 .. max+1, so `finalize` decides between
+    /// one final packet and a header-only EOM after an exact fill.
+    #[test]
+    fn ordinal_values_match_trailing_eom_at_exact_fill() {
+        let pads = |bytes: usize| {
+            let mut prefix = vec![param(SqlType::Int(Some(1)))];
+            for part in 0..3 {
+                let part_bytes = bytes.saturating_sub(part * 8000).min(8000);
+                prefix.push(param(SqlType::VarBinary(
+                    Some(vec![0xab; part_bytes]),
+                    8000,
+                )));
+            }
+            prefix
+        };
+        let lasts = [
+            (StatusFlags::NONE, SqlType::TinyInt(Some(9))),
+            (StatusFlags::BY_REF_VALUE, SqlType::TinyInt(None)),
+            (StatusFlags::NONE, SqlType::SmallInt(Some(-9))),
+            (StatusFlags::NONE, SqlType::SmallInt(None)),
+            (StatusFlags::BY_REF_VALUE, SqlType::Int(Some(9))),
+            (StatusFlags::NONE, SqlType::BigInt(Some(-9))),
+            (StatusFlags::NONE, SqlType::NVarchar(Some(utf16("abc")), 3)),
+            (StatusFlags::NONE, SqlType::NVarchar(None, 3)),
+            (StatusFlags::NONE, SqlType::Bit(Some(true))),
+            (StatusFlags::BY_REF_VALUE, SqlType::Real(Some(-0.5))),
+            (StatusFlags::NONE, SqlType::Float(None)),
+            (
+                StatusFlags::NONE,
+                SqlType::Decimal(Some(DecimalParts::new(false, 20, 4, 12_345))),
+            ),
+            (StatusFlags::NONE, SqlType::Uuid(Some(uuid::Uuid::max()))),
+            (StatusFlags::NONE, time_value(SqlType::DateTimeOffset, 7)),
+            (StatusFlags::BY_REF_VALUE, time_value(SqlType::Time, 2)),
+            (
+                StatusFlags::NONE,
+                SqlType::VarBinary(Some(vec![0xcd; 3]), 3),
+            ),
+            (StatusFlags::BY_REF_VALUE, SqlType::VarBinary(None, 8000)),
+        ];
+        for (flags, last) in lasts {
+            let values = vec![
+                named(1, StatusFlags::NONE, SqlType::SmallInt(Some(1))),
+                named(2, flags, last.clone()),
+            ];
+            let (unsplit, _) =
+                run_ordinal(32767, &pads(0), &values, OrdinalMode::Async, Fault::None);
+            let base = unsplit.wire.len() - 8;
+            for packet_size in [512u32, 4096, 16192] {
+                let max_payload = usize::try_from(packet_size).unwrap() - 8;
+                for offset in -2isize..=1 {
+                    let end = max_payload.checked_add_signed(offset).unwrap();
+                    let (run, decisions) =
+                        run_ordinal_all_modes(packet_size, &pads(end - base), &values, Fault::None);
+                    assert_eq!(run.result, "Ok(())");
+                    let (position, fast) = decisions[1];
+                    assert_eq!(position + values[1].positional_inline_len().unwrap(), end);
+                    assert_eq!(fast, offset < 0, "{last:?}, packet {packet_size}, {offset}");
+                    if offset == 0 {
+                        // Unchecked async writes fill the packet without
+                        // flushing; checked ones flush and owe a bare EOM.
+                        let packet = usize::try_from(packet_size).unwrap();
+                        assert!([packet, packet + 8].contains(&run.wire.len()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// A cancel or network failure at a flush the async fallback reaches
+    /// leaves the same bytes, error and message state as the async path.
+    #[test]
+    fn ordinal_values_match_async_path_on_send_failure() {
+        let values = ordinal_values(0x66_6175_6c74, 400);
+        for fault in [
+            Fault::CancelledBeforeSend,
+            Fault::FailSend(1),
+            Fault::FailSend(2),
+            Fault::CancelDuringSend(1),
+            Fault::CancelDuringSend(3),
+        ] {
+            for shift in 0..=40 {
+                let (run, _) = run_ordinal_all_modes(512, &ordinal_prefix(shift), &values, fault);
+                assert!(run.result.starts_with("Err("), "{fault:?}: {}", run.result);
+                assert!(!run.message_complete);
+            }
+        }
+    }
+
+    /// A TVP that fails after earlier ordinal values have flushed.
+    #[test]
+    fn ordinal_values_match_async_path_on_tvp_error_after_flush() {
+        let invalid = tvp(
+            SqlType::Varchar(Some(utf16("too long")), 2),
+            SqlType::Varchar(None, 2),
+        );
+        for packet_size in [512u32, 4096] {
+            let mut values = ordinal_values(7, 2 * usize::try_from(packet_size).unwrap() / 9);
+            values.push(named(values.len() + 1, StatusFlags::NONE, invalid.clone()));
+            values.push(named(
+                values.len() + 1,
+                StatusFlags::NONE,
+                SqlType::Int(Some(1)),
+            ));
+            for shift in 0..=8 {
+                let (run, _) = run_ordinal_all_modes(
+                    packet_size,
+                    &ordinal_prefix(shift),
+                    &values,
+                    Fault::None,
+                );
+                assert!(run.result.starts_with("Err("), "{}", run.result);
+                assert!(
+                    run.send_attempted,
+                    "packet {packet_size}: no flush before the TVP"
+                );
+                assert!(!run.message_complete);
+            }
         }
     }
 }

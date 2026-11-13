@@ -259,6 +259,12 @@ wall-clock speedup for 10 concurrent connects; CI agents measure 1.88x-2.82x, so
 it fails without a GIL or driver regression
 ([#762](https://github.com/microsoft/mssql-rs/issues/762)). Remove it once the
 upstream test checks GIL release directly instead of a speedup ratio.
+The list also holds `test_arrow_reader_cancel_from_other_thread` while the
+Arrow reader close/`SQLCancel` race is fixed upstream
+([microsoft/mssql-python#890](https://github.com/microsoft/mssql-python/issues/890)).
+Remove that exclusion per
+[AB#50265](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/50265)
+once the Python-side fix is pinned.
 
 The macOS job owns the locally built Rust and source-matched ODBC wheels and
 installs upstream editable with `--no-deps`. Its `requirements.txt` supplies

@@ -18,7 +18,7 @@ use crate::{
     core::TdsResult,
     datatypes::sqldatatypes::TdsDataType,
     error::{Error, TvpParameterRef},
-    io::packet_writer::{PacketWriter, TdsPacketWriter},
+    io::packet_writer::{PacketWriter, TdsPacketWriter, TdsPacketWriterUnchecked},
     token::tokens::SqlCollation,
 };
 
@@ -814,31 +814,40 @@ impl RpcParameter {
         self.validate_before_send(db_collation)
     }
 
-    /// Encoded length of this parameter in positional form when the batched
-    /// `sp_execute` fast path can write it; see [`SqlType::rpc_inline`].
+    /// Encoded length of this parameter in positional form when the
+    /// synchronous fast paths can write it; see [`SqlType::rpc_inline`].
+    #[cfg(test)]
     pub(crate) fn positional_inline_len(&self) -> Option<usize> {
         self.inline_value().map(|value| 2 + value.encoded_len())
     }
 
-    /// Synchronous twin of [`Self::serialize`] for a positional parameter
-    /// whose [`Self::positional_inline_len`] the caller has already reserved
-    /// within the current packet. Writes nothing for an ineligible parameter.
-    pub(crate) fn write_positional_inline(
-        &self,
-        packet_writer: &mut PacketWriter<'_>,
-        db_collation: &SqlCollation,
-    ) {
-        if let Some(value) = self.inline_value() {
-            packet_writer.write_bytes_within_packet(&[0, self.options.bits()]);
-            value.write(packet_writer, db_collation);
+    fn inline_value(&self) -> Option<RpcInlineValue<'_>> {
+        match &self.value {
+            RpcValue::Materialized(value) if self.encrypted.is_none() => {
+                value.rpc_inline(self.type_metadata)
+            }
+            _ => None,
         }
     }
 
-    fn inline_value(&self) -> Option<RpcInlineValue<'_>> {
-        match &self.value {
-            RpcValue::Materialized(value) if self.encrypted.is_none() => value.rpc_inline(),
-            _ => None,
+    /// Writes this parameter in positional form without awaiting when it is
+    /// [`SqlType::rpc_inline`]-eligible and ends strictly before the packet
+    /// boundary. Otherwise returns `false` having written nothing, so the
+    /// caller's async [`Self::serialize`] owns every flush, error and EOM.
+    pub(crate) fn try_write_positional_within_packet(
+        &self,
+        packet_writer: &mut PacketWriter<'_>,
+        db_collation: &SqlCollation,
+    ) -> bool {
+        let Some(value) = self.inline_value() else {
+            return false;
+        };
+        if !packet_writer.has_space(2 + value.encoded_len() + 1) {
+            return false;
         }
+        packet_writer.write_bytes_within_packet(&[0, self.options.bits()]);
+        value.write(packet_writer, db_collation);
+        true
     }
 
     /// Serializes the RPC parameter into the provided `PacketWriter`.

@@ -86,8 +86,8 @@ if [ "$COVERAGE" = true ]; then
 fi
 
 # Build and install the module in development mode
-echo "Building mssql-py-core with maturin develop..."
-maturin develop
+echo "Building mssql-py-core with Azure async authentication dependencies..."
+maturin develop --extras azure-async
 
 # Build and install mssql-mock-tds-py (mock TDS server Python bindings)
 echo "Building mssql-mock-tds-py with maturin develop..."

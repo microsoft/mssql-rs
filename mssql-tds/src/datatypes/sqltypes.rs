@@ -171,14 +171,38 @@ pub(crate) const fn nvarchar_inline_max_bytes(chars: u16) -> Option<u16> {
     }
 }
 
-/// An RPC parameter `TYPE_INFO` and value that the batched `sp_execute` fast
-/// path writes without awaiting. Produced only by [`SqlType::rpc_inline`] for
-/// values whose async serialization cannot fail.
+// Longest fixed-size TYPE_INFO: DECIMAL's type, length, precision and scale.
+const MAX_FIXED_TYPE_INFO_LEN: usize = 4;
+// Longest fixed-size value: DECIMAL's sign byte and 16-byte magnitude.
+const MAX_FIXED_VALUE_LEN: usize = 17;
+const MAX_FIXED_INLINE_LEN: usize = MAX_FIXED_TYPE_INFO_LEN + 1 + MAX_FIXED_VALUE_LEN;
+
+/// What [`SqlType::write_fixed_value`] wrote.
+enum FixedValue {
+    /// Not a fixed-size type, or an encoding the async path rejects (a time
+    /// scale above 7); nothing usable was written.
+    Ineligible,
+    Null,
+    /// The value's length in bytes.
+    Bytes(usize),
+}
+
+/// An RPC parameter `TYPE_INFO` and value that the synchronous RPC fast paths
+/// write without awaiting. Produced only by [`SqlType::rpc_inline`] for values
+/// whose async serialization cannot fail.
 pub(crate) enum RpcInlineValue<'a> {
-    Int(Option<i32>),
-    BigInt(Option<i64>),
+    /// A fixed-size type, already encoded.
+    Fixed {
+        bytes: [u8; MAX_FIXED_INLINE_LEN],
+        len: u8,
+    },
     NVarchar {
         max_bytes: u16,
+        value: Option<&'a [u8]>,
+    },
+    /// `VARBINARY(max_len)`, `max_len <= 8000`, borrowing the value.
+    VarBinary {
+        max_len: u16,
         value: Option<&'a [u8]>,
     },
 }
@@ -186,37 +210,18 @@ pub(crate) enum RpcInlineValue<'a> {
 impl RpcInlineValue<'_> {
     pub(crate) fn encoded_len(&self) -> usize {
         match self {
-            Self::Int(value) => 2 + value.map_or(1, |_| 5),
-            Self::BigInt(value) => 2 + value.map_or(1, |_| 9),
+            Self::Fixed { len, .. } => usize::from(*len),
             Self::NVarchar { value, .. } => 8 + 2 + value.map_or(0, <[u8]>::len),
+            Self::VarBinary { value, .. } => 3 + 2 + value.map_or(0, <[u8]>::len),
         }
     }
 
     /// Must emit exactly the bytes `serialize_with_narrow_string_byte_limit`
     /// writes for the same value.
     pub(crate) fn write(&self, packet_writer: &mut PacketWriter<'_>, db_collation: &SqlCollation) {
-        const INTN: u8 = TdsDataType::IntN as u8;
         match *self {
-            Self::Int(value) => {
-                packet_writer.write_bytes_within_packet(&[INTN, 4]);
-                match value {
-                    Some(value) => {
-                        let [b0, b1, b2, b3] = value.to_le_bytes();
-                        packet_writer.write_bytes_within_packet(&[4, b0, b1, b2, b3]);
-                    }
-                    None => packet_writer.write_bytes_within_packet(&[NULL_LENGTH]),
-                }
-            }
-            Self::BigInt(value) => {
-                packet_writer.write_bytes_within_packet(&[INTN, 8]);
-                match value {
-                    Some(value) => {
-                        let [b0, b1, b2, b3, b4, b5, b6, b7] = value.to_le_bytes();
-                        packet_writer
-                            .write_bytes_within_packet(&[8, b0, b1, b2, b3, b4, b5, b6, b7]);
-                    }
-                    None => packet_writer.write_bytes_within_packet(&[NULL_LENGTH]),
-                }
+            Self::Fixed { ref bytes, len } => {
+                packet_writer.write_bytes_within_packet(&bytes[..usize::from(len)]);
             }
             Self::NVarchar { max_bytes, value } => {
                 packet_writer.write_bytes_within_packet(&SqlType::collated_type_info_bytes(
@@ -235,6 +240,23 @@ impl RpcInlineValue<'_> {
                             bytes.len(),
                         );
                         packet_writer.write_bytes_within_packet(&length.to_le_bytes());
+                        packet_writer.write_bytes_within_packet(bytes);
+                    }
+                    None => packet_writer.write_bytes_within_packet(&VARNULL.to_le_bytes()),
+                }
+            }
+            Self::VarBinary { max_len, value } => {
+                let [len_lo, len_hi] = max_len.to_le_bytes();
+                packet_writer.write_bytes_within_packet(&[
+                    TdsDataType::BigVarBinary as u8,
+                    len_lo,
+                    len_hi,
+                ]);
+                match value {
+                    Some(bytes) => {
+                        // Cannot truncate: `rpc_inline` bounds the value by `max_len`.
+                        packet_writer
+                            .write_bytes_within_packet(&(bytes.len() as u16).to_le_bytes());
                         packet_writer.write_bytes_within_packet(bytes);
                     }
                     None => packet_writer.write_bytes_within_packet(&VARNULL.to_le_bytes()),
@@ -296,15 +318,6 @@ impl SqlType {
             SqlType::Table(_, _) => TdsDataType::SqlTable,
             SqlType::Udt(_, _) => TdsDataType::Udt,
         }
-    }
-
-    fn get_fixed_length_size(&self) -> usize {
-        let fixed_length_type = FixedLengthTypes::try_from(self);
-        assert!(
-            fixed_length_type.is_ok(),
-            "SqlType is not a fixed length type."
-        );
-        fixed_length_type.unwrap().get_len()
     }
 
     /// Convert this SqlType to a ColumnValues (for value serialization) and a TdsTypeContext.
@@ -916,31 +929,227 @@ impl SqlType {
     /// Describes this value for [`RpcInlineValue::write`] when its async
     /// serialization is plain buffer writes that cannot fail. `None` keeps the
     /// value on [`Self::serialize_with_narrow_string_byte_limit`], which owns
-    /// every error: transcoding, odd UTF-16 length, over-length values and all
-    /// other types.
-    pub(crate) fn rpc_inline(&self) -> Option<RpcInlineValue<'_>> {
-        match self {
-            SqlType::Int(value) => Some(RpcInlineValue::Int(*value)),
-            SqlType::BigInt(value) => Some(RpcInlineValue::BigInt(*value)),
-            SqlType::NVarchar(value, chars) => {
-                let max_bytes = nvarchar_inline_max_bytes(*chars)?;
-                let value = match value {
-                    // Same source order as `serialize_string`; other encodings transcode there.
-                    Some(value) => {
-                        let bytes = value
-                            .as_utf16_bytes()
-                            .or_else(|| value.as_raw_wire_bytes())?;
-                        if bytes.len() % 2 != 0 || bytes.len() > usize::from(max_bytes) {
-                            return None;
-                        }
-                        Some(bytes)
+    /// every error: transcoding, odd UTF-16 length, over-length values, an
+    /// invalid time scale, over-length VARBINARY data and all other
+    /// variable-length types. `type_metadata` is the
+    /// parameter's, which that path passes to `write_type_info`.
+    pub(crate) fn rpc_inline(
+        &self,
+        type_metadata: Option<RpcTypeMetadata>,
+    ) -> Option<RpcInlineValue<'_>> {
+        if let SqlType::NVarchar(value, chars) = self {
+            let max_bytes = nvarchar_inline_max_bytes(*chars)?;
+            let value = match value {
+                // Same source order as `serialize_string`; other encodings transcode there.
+                Some(value) => {
+                    let bytes = value
+                        .as_utf16_bytes()
+                        .or_else(|| value.as_raw_wire_bytes())?;
+                    if bytes.len() % 2 != 0 || bytes.len() > usize::from(max_bytes) {
+                        return None;
                     }
-                    None => None,
-                };
-                Some(RpcInlineValue::NVarchar { max_bytes, value })
-            }
-            _ => None,
+                    Some(bytes)
+                }
+                None => None,
+            };
+            return Some(RpcInlineValue::NVarchar { max_bytes, value });
         }
+        if let SqlType::VarBinary(value, max_len) = self {
+            if *max_len > VAR_TDS_MAX_LENGTH {
+                return None;
+            }
+            let value = match value {
+                // Longer data is a `serialize_bytes` error.
+                Some(bytes) if bytes.len() > usize::from(*max_len) => return None,
+                Some(bytes) => Some(bytes.as_slice()),
+                None => None,
+            };
+            return Some(RpcInlineValue::VarBinary {
+                max_len: *max_len,
+                value,
+            });
+        }
+        let (type_info, type_info_len) = self.fixed_type_info(
+            type_metadata.and_then(|metadata| metadata.precision),
+            type_metadata.and_then(|metadata| metadata.scale),
+        )?;
+        let mut bytes = [0u8; MAX_FIXED_INLINE_LEN];
+        bytes[..MAX_FIXED_TYPE_INFO_LEN].copy_from_slice(&type_info);
+        let value_at = type_info_len + 1;
+        let len = match self.write_fixed_value(&mut bytes[value_at..]) {
+            FixedValue::Ineligible => return None,
+            FixedValue::Null => {
+                bytes[type_info_len] = NULL_LENGTH;
+                value_at
+            }
+            FixedValue::Bytes(value_len) => {
+                bytes[type_info_len] = value_len as u8;
+                value_at + value_len
+            }
+        };
+        Some(RpcInlineValue::Fixed {
+            bytes,
+            len: len as u8,
+        })
+    }
+
+    /// Writes a fixed-size value as `TdsValueSerializer` does for its RPC
+    /// context, little-endian. `out` may be written past the returned length.
+    fn write_fixed_value(&self, out: &mut [u8]) -> FixedValue {
+        fn le<const N: usize>(out: &mut [u8], bytes: [u8; N]) -> usize {
+            out[..N].copy_from_slice(&bytes);
+            N
+        }
+        // The time's wire bytes, then the 3-byte day count; returns the end.
+        fn time_then_days(out: &mut [u8], time: &SqlTime, days: Option<u32>) -> Option<usize> {
+            let (time, len) = TdsValueSerializer::time_wire_bytes(time).ok()?;
+            let len = usize::from(len);
+            le(out, time);
+            Some(match days {
+                Some(days) => {
+                    le(&mut out[len..], days.to_le_bytes());
+                    len + 3
+                }
+                None => len,
+            })
+        }
+        let len = match self {
+            SqlType::Bit(value) => value.map(|value| le(out, [u8::from(value)])),
+            SqlType::TinyInt(value) => value.map(|value| le(out, value.to_le_bytes())),
+            SqlType::SmallInt(value) => value.map(|value| le(out, value.to_le_bytes())),
+            SqlType::Int(value) => value.map(|value| le(out, value.to_le_bytes())),
+            SqlType::BigInt(value) => value.map(|value| le(out, value.to_le_bytes())),
+            SqlType::Real(value) => value.map(|value| le(out, value.to_bits().to_le_bytes())),
+            SqlType::Float(value) => value.map(|value| le(out, value.to_bits().to_le_bytes())),
+            // The RPC context fixes precision at 38, so the magnitude is always 16 bytes.
+            SqlType::Decimal(value) | SqlType::Numeric(value) => value.map(|value| {
+                out[0] = u8::from(value.is_positive);
+                for word in 0..4 {
+                    le(&mut out[1 + 4 * word..], value.word(word).to_le_bytes());
+                }
+                17
+            }),
+            SqlType::Money(value) => value.as_ref().map(|value| {
+                le(out, value.msb_part.to_le_bytes());
+                le(&mut out[4..], value.lsb_part.to_le_bytes()) + 4
+            }),
+            SqlType::SmallMoney(value) => value
+                .as_ref()
+                .map(|value| le(out, value.int_val.to_le_bytes())),
+            SqlType::Date(value) => value.as_ref().map(|value| {
+                le(out, value.get_days().to_le_bytes());
+                3
+            }),
+            SqlType::DateTime(value) => value.as_ref().map(|value| {
+                le(out, value.days.to_le_bytes());
+                le(&mut out[4..], value.time.to_le_bytes()) + 4
+            }),
+            SqlType::SmallDateTime(value) => value.as_ref().map(|value| {
+                le(out, value.days.to_le_bytes());
+                le(&mut out[2..], value.time.to_le_bytes()) + 2
+            }),
+            SqlType::Uuid(value) => value.map(|value| le(out, value.to_bytes_le())),
+            SqlType::Time(value) => match value {
+                Some(value) => {
+                    let Some(len) = time_then_days(out, value, None) else {
+                        return FixedValue::Ineligible;
+                    };
+                    Some(len)
+                }
+                None => None,
+            },
+            SqlType::DateTime2(value) => match value {
+                Some(value) => {
+                    let Some(len) = time_then_days(out, &value.time, Some(value.days)) else {
+                        return FixedValue::Ineligible;
+                    };
+                    Some(len)
+                }
+                None => None,
+            },
+            SqlType::DateTimeOffset(value) => match value {
+                Some(value) => {
+                    let Some(len) =
+                        time_then_days(out, &value.datetime2.time, Some(value.datetime2.days))
+                    else {
+                        return FixedValue::Ineligible;
+                    };
+                    Some(le(&mut out[len..], value.offset.to_le_bytes()) + len)
+                }
+                None => None,
+            },
+            _ => return FixedValue::Ineligible,
+        };
+        len.map_or(FixedValue::Null, FixedValue::Bytes)
+    }
+    /// `TYPE_INFO` of a fixed-size type and its length, or `None` for any
+    /// other type. The single source for both `write_type_info` and
+    /// [`Self::rpc_inline`]; see `write_type_info` for the overrides.
+    fn fixed_type_info(
+        &self,
+        precision_override: Option<u8>,
+        scale_override: Option<u8>,
+    ) -> Option<([u8; MAX_FIXED_TYPE_INFO_LEN], usize)> {
+        let nullable_type = self.get_nullable_type() as u8;
+        let time_scale =
+            |scale: Option<u8>| scale_override.or(scale).unwrap_or(DEFAULT_VARTIME_SCALE);
+        let (second, extra) = match self {
+            SqlType::Bit(_)
+            | SqlType::TinyInt(_)
+            | SqlType::SmallInt(_)
+            | SqlType::Int(_)
+            | SqlType::BigInt(_)
+            | SqlType::Real(_)
+            | SqlType::Float(_) => (
+                Some(FixedLengthTypes::try_from(self).ok()?.get_len() as u8),
+                None,
+            ),
+            // Overrides (used by TVP column metadata, whose templates carry a
+            // `None` value) take precedence over the value's own precision/scale,
+            // falling back to the TDS defaults (precision 1, scale 0).
+            SqlType::Decimal(value) | SqlType::Numeric(value) => {
+                let precision = precision_override
+                    .or_else(|| value.as_ref().map(|value| value.precision))
+                    .unwrap_or(1);
+                let scale = scale_override
+                    .or_else(|| value.as_ref().map(|value| value.scale))
+                    .unwrap_or(0);
+                (Some(DECIMAL_FIXED_SIZE), Some([precision, scale]))
+            }
+            SqlType::Money(_) | SqlType::DateTime(_) => (Some(8), None),
+            SqlType::SmallMoney(_) | SqlType::SmallDateTime(_) => (Some(4), None),
+            SqlType::Uuid(_) => (Some(16), None),
+            SqlType::Date(_) => (None, None),
+            SqlType::Time(value) => (
+                Some(time_scale(value.as_ref().map(SqlTime::get_scale))),
+                None,
+            ),
+            SqlType::DateTime2(value) => (
+                Some(time_scale(
+                    value.as_ref().map(|value| value.time.get_scale()),
+                )),
+                None,
+            ),
+            SqlType::DateTimeOffset(value) => (
+                Some(time_scale(
+                    value.as_ref().map(|value| value.datetime2.time.get_scale()),
+                )),
+                None,
+            ),
+            _ => return None,
+        };
+        let mut type_info = [nullable_type, 0, 0, 0];
+        let mut len = 1;
+        if let Some(second) = second {
+            type_info[1] = second;
+            len = 2;
+        }
+        if let Some([precision, scale]) = extra {
+            type_info[2] = precision;
+            type_info[3] = scale;
+            len = 4;
+        }
+        Some((type_info, len))
     }
 
     /// Write the TDS `TYPE_INFO` for this type: the type byte followed by its
@@ -951,8 +1160,9 @@ impl SqlType {
     /// `DateTimeOffset` (scale), the `precision_override`/`scale_override`
     /// arguments supply metadata that a `None`-valued type template cannot
     /// carry; when present they take precedence over the value's own
-    /// precision/scale. RPC callers supply them only for a typed NULL, where
-    /// they are derived from the same metadata as the SQL declaration.
+    /// precision/scale. RPC callers pass the parameter's type metadata, which
+    /// ODBC sets for non-NULL values too; it is derived from the same metadata
+    /// as the SQL declaration.
     pub(crate) async fn write_type_info(
         &self,
         packet_writer: &mut PacketWriter<'_>,
@@ -960,100 +1170,34 @@ impl SqlType {
         precision_override: Option<u8>,
         scale_override: Option<u8>,
     ) -> TdsResult<()> {
+        if let Some((type_info, len)) = self.fixed_type_info(precision_override, scale_override) {
+            return packet_writer.write_fixed_bytes(&type_info[..len]).await;
+        }
         let nullable_type = self.get_nullable_type();
 
         match self {
-            // Fixed-size integer types: type byte + max_size byte
             SqlType::Bit(_)
             | SqlType::TinyInt(_)
             | SqlType::SmallInt(_)
             | SqlType::Int(_)
             | SqlType::BigInt(_)
             | SqlType::Real(_)
-            | SqlType::Float(_) => {
-                let type_size = self.get_fixed_length_size();
-                packet_writer
-                    .write_fixed_bytes(&[nullable_type as u8, type_size as u8])
-                    .await?;
+            | SqlType::Float(_)
+            | SqlType::Decimal(_)
+            | SqlType::Numeric(_)
+            | SqlType::Money(_)
+            | SqlType::SmallMoney(_)
+            | SqlType::Uuid(_)
+            | SqlType::DateTime(_)
+            | SqlType::SmallDateTime(_)
+            | SqlType::Date(_)
+            | SqlType::Time(_)
+            | SqlType::DateTime2(_)
+            | SqlType::DateTimeOffset(_) => {
+                return Err(Error::ProtocolError(
+                    "fixed-size type has no TYPE_INFO".to_string(),
+                ));
             }
-
-            // Decimal/Numeric: type byte + 17 + precision + scale
-            SqlType::Decimal(opt) | SqlType::Numeric(opt) => {
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_byte_async(DECIMAL_FIXED_SIZE).await?;
-                // Overrides (used by TVP column metadata, whose templates carry a
-                // `None` value) take precedence over the value's own precision/scale,
-                // falling back to the TDS defaults (precision 1, scale 0).
-                let precision = precision_override
-                    .or_else(|| opt.as_ref().map(|v| v.precision))
-                    .unwrap_or(1);
-                let scale = scale_override
-                    .or_else(|| opt.as_ref().map(|v| v.scale))
-                    .unwrap_or(0);
-                packet_writer.write_byte_async(precision).await?;
-                packet_writer.write_byte_async(scale).await?;
-            }
-
-            // Money types: type byte + size byte
-            SqlType::Money(_) => {
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_byte_async(8u8).await?;
-            }
-            SqlType::SmallMoney(_) => {
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_byte_async(4u8).await?;
-            }
-
-            // UUID: type byte + 16
-            SqlType::Uuid(_) => {
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_byte_async(16u8).await?;
-            }
-
-            // DateTime: type byte + 8
-            SqlType::DateTime(_) => {
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_byte_async(8u8).await?;
-            }
-
-            // SmallDateTime: type byte + 4
-            SqlType::SmallDateTime(_) => {
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_byte_async(4u8).await?;
-            }
-
-            // Date: type byte only (no size byte)
-            SqlType::Date(_) => {
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-            }
-
-            // Time: type byte + scale
-            SqlType::Time(opt) => {
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                let scale = scale_override
-                    .or_else(|| opt.as_ref().map(|t| t.get_scale()))
-                    .unwrap_or(DEFAULT_VARTIME_SCALE);
-                packet_writer.write_byte_async(scale).await?;
-            }
-
-            // DateTime2: type byte + scale
-            SqlType::DateTime2(opt) => {
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                let scale = scale_override
-                    .or_else(|| opt.as_ref().map(|dt2| dt2.time.get_scale()))
-                    .unwrap_or(DEFAULT_VARTIME_SCALE);
-                packet_writer.write_byte_async(scale).await?;
-            }
-
-            // DateTimeOffset: type byte + scale
-            SqlType::DateTimeOffset(opt) => {
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                let scale = scale_override
-                    .or_else(|| opt.as_ref().map(|dto| dto.datetime2.time.get_scale()))
-                    .unwrap_or(DEFAULT_VARTIME_SCALE);
-                packet_writer.write_byte_async(scale).await?;
-            }
-
             // NVarchar: type byte + param_len(u16) + collation(5 bytes)
             SqlType::NVarchar(_, param_len) => {
                 let param_len = nvarchar_inline_max_bytes(*param_len).unwrap_or(MAX_U16_LENGTH);
@@ -2483,25 +2627,6 @@ mod coverage_tests {
             SqlType::SmallDateTime(None).get_nullable_type(),
             TdsDataType::DateTimeN
         );
-    }
-
-    // -- get_fixed_length_size --
-
-    #[test]
-    fn fixed_length_sizes() {
-        assert_eq!(SqlType::Bit(None).get_fixed_length_size(), 1);
-        assert_eq!(SqlType::TinyInt(None).get_fixed_length_size(), 1);
-        assert_eq!(SqlType::SmallInt(None).get_fixed_length_size(), 2);
-        assert_eq!(SqlType::Int(None).get_fixed_length_size(), 4);
-        assert_eq!(SqlType::BigInt(None).get_fixed_length_size(), 8);
-        assert_eq!(SqlType::Real(None).get_fixed_length_size(), 4);
-        assert_eq!(SqlType::Float(None).get_fixed_length_size(), 8);
-    }
-
-    #[test]
-    #[should_panic(expected = "SqlType is not a fixed length type")]
-    fn fixed_length_size_non_fixed_panics() {
-        SqlType::NVarchar(None, 50).get_fixed_length_size();
     }
 
     // -- to_column_value_and_context: null branches --
