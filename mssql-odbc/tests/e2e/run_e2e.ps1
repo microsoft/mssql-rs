@@ -401,8 +401,9 @@ function Restore-MtProfile {
 
 # A minidump names no binaries, so once the agent is gone it cannot be read
 # without the exact builds that produced it. When a stress run left dumps, copy
-# the Rust driver and every <name>_mt executable, each with its PDB, into
-# <dump dir>\symbols (msodbcsql's symbols come from the public symbol server).
+# the Rust driver and every executable an <name>_mt entry runs, each with its
+# PDB, into <dump dir>\symbols (msodbcsql's symbols come from the public symbol
+# server).
 function Save-MtSymbols([string]$DriverDll) {
     if (-not $script:MtStress -or -not (Test-Path $script:MtDumpDir)) { return }
     if (-not (Get-ChildItem -Path $script:MtDumpDir -Filter '*.dmp' -File -ErrorAction SilentlyContinue)) { return }
@@ -414,13 +415,14 @@ function Save-MtSymbols([string]$DriverDll) {
     if (Test-Path $buildDir) {
         Push-Location $buildDir
         try {
-            $entries = ctest -N -L mt -C Debug 2>$null | Select-String 'Test\s+#\d+:\s+(\S+)_mt\s*$'
+            # Take each executable from its CTest command: several entries can
+            # share one binary whose name differs from the test name.
+            $tests = (ctest --show-only=json-v1 -L mt -C Debug 2>$null | Out-String | ConvertFrom-Json).tests
         } finally {
             Pop-Location
         }
-        foreach ($entry in $entries) {
-            $binaries += Join-Path $buildDir "Debug\$($entry.Matches[0].Groups[1].Value).exe"
-        }
+        $binaries += @($tests | Where-Object { $_.command } | ForEach-Object { $_.command[0] }) |
+            Select-Object -Unique
     }
     foreach ($binary in $binaries) {
         foreach ($file in @($binary, [IO.Path]::ChangeExtension($binary, '.pdb'))) {
@@ -854,9 +856,13 @@ try {
         Push-Location $OdbcCrateDir
         try {
             if ($Release) {
-                Invoke-Checked "cargo build --release" { cargo build --release }
+                Invoke-Checked "cargo build --release --features e2e-test-client-code-page" {
+                    cargo build --release --features e2e-test-client-code-page
+                }
             } else {
-                Invoke-Checked "cargo build" { cargo build }
+                Invoke-Checked "cargo build --features e2e-test-client-code-page" {
+                    cargo build --features e2e-test-client-code-page
+                }
             }
         } finally {
             Pop-Location
