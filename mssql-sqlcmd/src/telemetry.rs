@@ -1130,6 +1130,32 @@ mod tests {
         assert!(requests.try_recv().is_err());
     }
 
+    /// A second `record_usage` is ignored: before the connection, the first
+    /// invocation's properties are the ones sent; after the export has started,
+    /// no second event is sent.
+    #[test]
+    fn the_first_invocation_wins() {
+        let invocation = |version, format| Invocation {
+            version: Some(version),
+            command: Command::Unspecified,
+            format,
+        };
+
+        let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
+        let requests = guard.capture_requests();
+        record_usage(invocation("18.5", FormatUse::Json));
+        record_usage(invocation("18.6", FormatUse::Missing));
+        record_server_info(&RawServerInfo::default());
+        // The export has started; a later invocation must not start another.
+        record_usage(invocation("18.7", FormatUse::Unrecognized));
+        assert_eq!(shutdown(Duration::from_secs(1)), FlushOutcome::Completed);
+
+        let properties = event_properties(&requests.try_recv().expect("one request"));
+        assert_eq!(properties[KEY_VERSION], "18.5");
+        assert_eq!(properties[KEY_FORMAT], "json");
+        assert!(requests.try_recv().is_err(), "one event only");
+    }
+
     #[test]
     fn opt_out_and_a_missing_destination_send_nothing_and_read_no_device_id() {
         for (connection_string, opt_out) in [(Some(TEST_CONNECTION_STRING), true), (None, false)] {
