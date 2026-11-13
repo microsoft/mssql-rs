@@ -12,9 +12,13 @@
 //! - [`diagnostics`] checks a connection stage by stage for
 //!   `sqlcmd diagnose`, and reports it as text or JSON. It connects with
 //!   `mssql-tds`, which is 64-bit only, so 32-bit builds leave it out.
+//! - [`telemetry`] exports one privacy-safe Application Insights usage event per
+//!   run, built from [`caller`], [`device_id`] and [`server_info`].
 //! - On Linux, `openssl_runtime` loads OpenSSL when it is first used instead
 //!   of linking it, so native sqlcmd runs with OpenSSL 1.1, 3 or 4.
 
+pub mod caller;
+pub mod device_id;
 #[cfg(target_pointer_width = "64")]
 pub mod diagnostics;
 pub mod ffi;
@@ -22,3 +26,5 @@ pub mod formatter;
 pub mod i18n;
 #[cfg(all(target_pointer_width = "64", target_os = "linux"))]
 mod openssl_runtime;
+pub mod server_info;
+pub mod telemetry;
