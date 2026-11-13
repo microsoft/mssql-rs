@@ -448,7 +448,11 @@ impl DbcHandle {
             .store(value, Ordering::Relaxed);
     }
 
-    pub(crate) fn new(parent_env: *mut c_void, runtime: Arc<SharedRuntime>) -> Self {
+    pub(crate) fn new(
+        parent_env: *mut c_void,
+        runtime: Arc<SharedRuntime>,
+        client_encoding: ClientEncoding,
+    ) -> Self {
         Self {
             trace: Arc::default(),
             object_type: HandleType::Dbc,
@@ -458,7 +462,7 @@ impl DbcHandle {
             data_classification_version: AtomicU8::new(0),
             inner: Mutex::new(DbcState {
                 diag_records: Default::default(),
-                client_encoding: ClientEncoding::system_default(),
+                client_encoding,
                 connection_state: ConnectionState::Disconnected,
                 statements: Vec::new(),
                 descriptors: Vec::new(),
