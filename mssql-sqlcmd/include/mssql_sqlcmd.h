@@ -92,7 +92,7 @@ typedef struct MssqlSqlcmdMessage {
     MssqlSqlcmdText server;    /* the server that sent it */
     MssqlSqlcmdText procedure; /* the stored procedure it came from */
     MssqlSqlcmdText source;    /* who reported it when not the server: the driver, or "Sqlcmd" */
-    MssqlSqlcmdText sql_state; /* the ODBC SQLSTATE */
+    MssqlSqlcmdText sql_state; /* reserved for query output; ignored */
     MssqlSqlcmdText text;      /* required */
 } MssqlSqlcmdMessage;
 
@@ -124,6 +124,18 @@ int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_json_begin_batch(
     MssqlSqlcmdJsonDocument* document,
     MssqlSqlcmdText text);
 int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_json_end_batch(MssqlSqlcmdJsonDocument* document);
+
+/* The -p/-p1 values for the latest batch, even after end_batch.
+   packet_size is 0 when unknown. transactions must be positive, and rates
+   finite and non-negative; otherwise returns MSSQL_SQLCMD_INVALID_STATE.
+   No batch yet also returns MSSQL_SQLCMD_INVALID_STATE. */
+int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_json_set_batch_statistics(
+    MssqlSqlcmdJsonDocument* document,
+    uint32_t packet_size,
+    uint32_t transactions,
+    uint64_t total_ms,
+    double average_ms,
+    double per_second);
 
 /* columns may be NULL when column_count is 0. The previous result set must have
    been ended: starting one while another is open is MSSQL_SQLCMD_INVALID_STATE,
@@ -216,6 +228,46 @@ void MSSQL_SQLCMD_CALL mssql_sqlcmd_free_text(const uint16_t* text, size_t len);
                                         the other settings it supplied carry
                                         MSSQL_SQLCMD_SOURCE_DSN */
 
+/* application_intent, as -K sets it. */
+#define MSSQL_SQLCMD_INTENT_DEFAULT 0    /* not given: read-write */
+#define MSSQL_SQLCMD_INTENT_READ_WRITE 1
+#define MSSQL_SQLCMD_INTENT_READ_ONLY 2  /* -K ReadOnly */
+/* One diagnostic record of sqlcmd's own driver connection, as sqlcmd reads it. */
+typedef struct MssqlSqlcmdDriverRecord {
+    MssqlSqlcmdText sql_state; /* the ODBC SQLSTATE */
+    int32_t native_error;      /* SQL Server's error number or the driver's; 0 for none */
+    int32_t severity;          /* SQL Server's severity; -1 for a record the driver raised */
+    int32_t state;             /* SQL Server's state; -1 for none */
+    MssqlSqlcmdText message;   /* without the driver's [vendor][component] prefix */
+    MssqlSqlcmdText line;      /* the line sqlcmd prints for it; NULL or empty for none */
+} MssqlSqlcmdDriverRecord;
+
+/* What sqlcmd's own driver connection did; filled by the callback. */
+typedef struct MssqlSqlcmdDriverResult {
+    int32_t connected;         /* non-zero when the connection succeeded */
+    int64_t connect_ms;        /* connection/setup from callback entry; excludes query/disconnect */
+    int32_t query_failed;      /* non-zero when the query ran and failed */
+    int64_t query_ms;          /* minimal query only; excludes disconnect/result cleanup */
+    const MssqlSqlcmdText* values; /* the query's first row; a NULL data is SQL NULL */
+    size_t value_count;
+    const MssqlSqlcmdDriverRecord* records; /* the connection's, then the query's */
+    size_t record_count;
+    MssqlSqlcmdText driver_name; /* e.g. "Microsoft ODBC Driver 18 for SQL Server" */
+    size_t connect_record_count; /* prefix of records from connecting; <= record_count */
+} MssqlSqlcmdDriverResult;
+
+/* sqlcmd's own driver connection: connects with sqlcmd's driver and settings
+   within timeout_seconds, runs query when it is not NULL or empty, disconnects,
+   and fills *result. Returns MSSQL_SQLCMD_OK (a failed connection is a result,
+   not an error). Called at most once per diagnosis, on the thread that called
+   mssql_sqlcmd_diagnostics_run; what *result points to must stay valid until
+   that call returns. */
+typedef int32_t (MSSQL_SQLCMD_CALL *MssqlSqlcmdDriverConnect)(
+    void* context,
+    MssqlSqlcmdText query,
+    int32_t timeout_seconds,
+    MssqlSqlcmdDriverResult* result);
+
 typedef struct MssqlSqlcmdDiagnosticsRequest {
     MssqlSqlcmdText server;   /* -S; required unless invalid_reason is given */
     MssqlSqlcmdText database; /* -d; NULL or empty for the login's default */
@@ -249,6 +301,30 @@ typedef struct MssqlSqlcmdDiagnosticsRequest {
     MssqlSqlcmdText dsn;      /* -D: the data source name given to -S; NULL or
                                  empty without -D */
     int32_t dsn_status;       /* MSSQL_SQLCMD_DSN_* */
+    /* sqlcmd's own driver connection, or NULL. When given, the connection
+       attempt and session validation are made through it and decide the
+       result; mssql-tds then only adds evidence where the driver's errors
+       leave the cause open. */
+    MssqlSqlcmdDriverConnect driver_connect;
+    void* driver_context;       /* passed to driver_connect as it is */
+    /* Appended in 0.1.x: a caller that leaves them zeroed gets the defaults. */
+    int32_t application_intent; /* -K: MSSQL_SQLCMD_INTENT_*; 0 when not given */
+    int32_t multi_subnet_failover; /* -M: non-zero for MultiSubnetFailover */
+    int32_t packet_size;        /* -a: bytes, 512 to 32767; 0 for the default */
+    int32_t dedicated_admin;    /* -A: non-zero for a dedicated administrator
+                                   connection (admin: before the server,
+                                   unless dsn names it) */
+    MssqlSqlcmdText workstation_name; /* -H; its source distinguishes omitted from explicitly empty */
+    int32_t application_intent_source;
+    int32_t multi_subnet_failover_source;
+    int32_t packet_size_source;
+    int32_t dedicated_admin_source;
+    int32_t workstation_name_source;
+    MssqlSqlcmdText application_intent_source_name;
+    MssqlSqlcmdText multi_subnet_failover_source_name;
+    MssqlSqlcmdText packet_size_source_name;
+    MssqlSqlcmdText dedicated_admin_source_name;
+    MssqlSqlcmdText workstation_name_source_name;
 } MssqlSqlcmdDiagnosticsRequest;
 
 /* Diagnoses the connection up to request->depth (name resolution, SQL Server

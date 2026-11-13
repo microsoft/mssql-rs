@@ -62,11 +62,13 @@
 //!   the contract but not produced by native sqlcmd), and `operationOutcome`
 //!   what the run's operation came to (`succeeded`, `failed`, `canceled`,
 //!   `notExecuted`). sqlcmd's exit code is unchanged by `--format json`.
-//! - Messages and errors carry what the console shows for them: `number`
-//!   (Msg), `severity` (Level), `state`, `server`, `procedure`, `line`, the
-//!   reporting `source` when it is not the server (the driver, or sqlcmd), and
-//!   the ODBC `sqlState`, then their `text`. No failure category is derived
-//!   from them; the SQLSTATE and number are the stable fields to classify by.
+//! - Messages and errors carry what the console shows for them, and nothing
+//!   else. An informational message (`PRINT`, severity 10 or less) is its
+//!   `text`. An error SQL Server sent has the console's header, `number` (Msg),
+//!   `severity` (Level), `state`, `server`, `procedure` and `line`, then its
+//!   `text`; one the driver or sqlcmd raised has its `source` (the console's
+//!   `Sqlcmd: Error: <source> :`) and its `text`. No failure category is
+//!   derived from them.
 //! - Columns are described as the driver describes them: `ordinal` and `name`
 //!   always (`null` for an unnamed column), and `driverType`, `size`,
 //!   `precision`, `scale` and `nullable` when the driver exposes them. Type
@@ -159,8 +161,8 @@ pub struct Connection {
 
 /// How the run ended, besides its exit code. With the exit code it decides
 /// `executionStatus` and `operationOutcome`. No failure category is derived:
-/// each error carries the number, state and SQLSTATE the server or driver gave
-/// it, which callers can classify by, and new error numbers need no update here.
+/// each error carries what the console shows for it (a server error's number
+/// and state), and new error numbers need no update here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RunEnd {
     /// sqlcmd ran to its end; the exit code says whether the work succeeded.
@@ -219,14 +221,16 @@ pub struct Message {
     /// Who reported it, when it did not come from the server: the driver (e.g.
     /// `Microsoft ODBC Driver 18 for SQL Server`) or `Sqlcmd` itself.
     pub source: Option<String>,
-    /// The ODBC SQLSTATE, e.g. `28000` for a refused login, when there is one.
-    pub sql_state: Option<String>,
     pub text: String,
 }
 
 /// Why a call could not be applied to the document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatError {
+    /// Statistics arrived before a batch was started.
+    NoBatch,
+    /// Statistics must describe at least one transaction and finite rates.
+    InvalidStatistics,
     /// A row or count arrived when no result set was open.
     NoResultSet,
     /// A result set was started while another was still open.
@@ -238,6 +242,8 @@ pub enum FormatError {
 impl std::fmt::Display for FormatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            FormatError::NoBatch => write!(f, "no batch has been started"),
+            FormatError::InvalidStatistics => write!(f, "invalid batch statistics"),
             FormatError::NoResultSet => write!(f, "no result set is open"),
             FormatError::ResultSetOpen => write!(f, "a result set is already open"),
             FormatError::ColumnCountMismatch { expected, actual } => {
@@ -252,13 +258,14 @@ impl std::fmt::Display for FormatError {
 
 impl std::error::Error for FormatError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Output {
     Batch {
         index: u32,
         text: Option<String>,
         started: Instant,
         duration_ms: Option<u64>,
+        statistics: Option<BatchStatistics>,
     },
     ResultSet {
         columns: Vec<Column>,
@@ -267,6 +274,18 @@ enum Output {
     },
     RowsAffected(i64),
     Message(Message),
+}
+
+/// The values native sqlcmd prints for `-p`, using its existing timing rules.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchStatistics {
+    /// The negotiated packet size, or unknown when the driver did not expose it.
+    pub packet_size: Option<u32>,
+    pub transactions: u32,
+    pub total_ms: u64,
+    pub average_ms: f64,
+    pub per_second: f64,
 }
 
 /// Collects one invocation's output, in order, and renders it as JSON.
@@ -287,6 +306,8 @@ pub struct JsonDocument {
     current_result_set: Option<usize>,
     /// Index in `output` of the batch that is running.
     current_batch: Option<usize>,
+    /// Most recently started batch, retained after it ends for `-p`.
+    last_batch: Option<usize>,
     batches: u32,
 }
 
@@ -319,6 +340,7 @@ impl JsonDocument {
             output: Vec::new(),
             current_result_set: None,
             current_batch: None,
+            last_batch: None,
             batches: 0,
         }
     }
@@ -361,12 +383,34 @@ impl JsonDocument {
         self.current_result_set = None;
         self.batches += 1;
         self.current_batch = Some(self.output.len());
+        self.last_batch = self.current_batch;
         self.output.push(Output::Batch {
             index: self.batches,
             text,
             started: now,
             duration_ms: None,
+            statistics: None,
         });
+    }
+
+    /// Attaches `-p` values to the latest batch, including one already ended.
+    pub fn set_batch_statistics(&mut self, statistics: BatchStatistics) -> Result<(), FormatError> {
+        if statistics.transactions == 0
+            || !statistics.average_ms.is_finite()
+            || statistics.average_ms < 0.0
+            || !statistics.per_second.is_finite()
+            || statistics.per_second < 0.0
+        {
+            return Err(FormatError::InvalidStatistics);
+        }
+        let Some(Output::Batch {
+            statistics: slot, ..
+        }) = self.last_batch.and_then(|index| self.output.get_mut(index))
+        else {
+            return Err(FormatError::NoBatch);
+        };
+        *slot = Some(statistics);
+        Ok(())
     }
 
     /// Ends the running batch, recording how long it took. Does nothing when
@@ -694,6 +738,8 @@ enum OutputView<'a> {
         duration_ms: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        statistics: Option<BatchStatistics>,
     },
     ResultSet {
         columns: Vec<ColumnView<'a>>,
@@ -717,10 +763,12 @@ impl<'a> OutputView<'a> {
                 text,
                 started,
                 duration_ms,
+                statistics,
             } => OutputView::Batch {
                 index: *index,
                 duration_ms: duration_ms.or_else(|| now.map(|now| millis_between(*started, now))),
                 text: text.as_deref(),
+                statistics: *statistics,
             },
             Output::ResultSet {
                 columns,
@@ -777,15 +825,19 @@ impl<'a> ColumnView<'a> {
     }
 }
 
-/// A message or error: the fields the console shows (Msg, Level, State,
-/// Server, Procedure, Line, and who reported it), then the SQLSTATE and the
-/// text.
+/// A message or error, as the console shows it: a message is its text; an
+/// error SQL Server sent has the console's header (Msg, Level, State, Server,
+/// Procedure, Line) and its text; one the driver or sqlcmd raised has its
+/// source (`Sqlcmd: Error: <source> :`) and its text.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MessageView<'a> {
-    number: i32,
-    severity: i32,
-    state: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    number: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    severity: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     server: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -794,22 +846,22 @@ struct MessageView<'a> {
     line: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sql_state: Option<&'a str>,
     text: &'a str,
 }
 
 impl<'a> MessageView<'a> {
     fn new(message: &'a Message) -> Self {
+        // The header the console prints for an error SQL Server sent; an error
+        // the driver or sqlcmd raised is printed with its source instead.
+        let server_error = message.is_error && message.source.is_none();
         Self {
-            number: message.number,
-            severity: message.severity,
-            state: message.state,
-            server: message.server.as_deref(),
-            procedure: message.procedure.as_deref(),
-            line: message.line,
-            source: message.source.as_deref(),
-            sql_state: message.sql_state.as_deref(),
+            number: server_error.then_some(message.number),
+            severity: server_error.then_some(message.severity),
+            state: server_error.then_some(message.state),
+            server: message.server.as_deref().filter(|_| server_error),
+            procedure: message.procedure.as_deref().filter(|_| server_error),
+            line: message.line.filter(|_| server_error),
+            source: message.source.as_deref().filter(|_| message.is_error),
             text: &message.text,
         }
     }
@@ -980,7 +1032,7 @@ mod tests {
     }
 
     /// A non-zero exit code fails the operation; the document names no failure
-    /// category, since each error already carries its number and SQLSTATE.
+    /// category, since each error already carries what the console shows.
     #[test]
     fn a_non_zero_exit_code_fails_the_operation_without_a_category() {
         let (document, start) = document();
@@ -1138,11 +1190,13 @@ mod tests {
              [\"1\", null],\n        [\"2\", \"b\"]\n      ],\n      \"rowsAffected\": 2\n    }\n  ]\n}\n"
         );
     }
-    /// A message carries what the console shows (Msg, Level, State, Server,
-    /// Procedure, Line, and the driver or sqlcmd when it reported it), then
-    /// the SQLSTATE, in that order; anything absent is left out.
+    /// Messages and errors carry what the console shows for them, in its
+    /// order: an error SQL Server sent its header (Msg, Level, State, Server,
+    /// Procedure, Line) and text, one the driver raised its source and text, a
+    /// message its text. The SQLSTATE, which the console does not show, is not
+    /// written.
     #[test]
-    fn messages_carry_the_console_fields_and_the_sqlstate() {
+    fn messages_and_errors_carry_what_the_console_shows() {
         let (mut document, start) = document();
         document.add_message(Message {
             is_error: true,
@@ -1151,14 +1205,12 @@ mod tests {
             state: 1,
             server: Some("db01".to_string()),
             line: Some(1),
-            sql_state: Some("28000".to_string()),
             text: "Login failed for user 'sa'.".to_string(),
             ..Message::default()
         });
         document.add_message(Message {
             is_error: true,
             source: Some("Microsoft ODBC Driver 18 for SQL Server".to_string()),
-            sql_state: Some("08001".to_string()),
             text: "TCP Provider: No connection could be made.".to_string(),
             ..Message::default()
         });
@@ -1168,7 +1220,6 @@ mod tests {
             severity: 0,
             state: 1,
             server: Some("db01".to_string()),
-            sql_state: Some("01000".to_string()),
             text: "hello".to_string(),
             ..Message::default()
         });
@@ -1179,13 +1230,37 @@ mod tests {
             output(&rendered),
             "[\n    {\n      \"type\": \"error\",\n      \"number\": 18456,\n      \"severity\": 14,\n      \
              \"state\": 1,\n      \"server\": \"db01\",\n      \"line\": 1,\n      \
-             \"sqlState\": \"28000\",\n      \"text\": \"Login failed for user 'sa'.\"\n    },\n    \
-             {\n      \"type\": \"error\",\n      \"number\": 0,\n      \"severity\": 0,\n      \
-             \"state\": 0,\n      \"source\": \"Microsoft ODBC Driver 18 for SQL Server\",\n      \
-             \"sqlState\": \"08001\",\n      \"text\": \"TCP Provider: No connection could be made.\"\n    },\n    \
-             {\n      \"type\": \"message\",\n      \"number\": 0,\n      \"severity\": 0,\n      \
-             \"state\": 1,\n      \"server\": \"db01\",\n      \"sqlState\": \"01000\",\n      \
-             \"text\": \"hello\"\n    }\n  ]\n}\n"
+             \"text\": \"Login failed for user 'sa'.\"\n    },\n    \
+             {\n      \"type\": \"error\",\n      \
+             \"source\": \"Microsoft ODBC Driver 18 for SQL Server\",\n      \
+             \"text\": \"TCP Provider: No connection could be made.\"\n    },\n    \
+             {\n      \"type\": \"message\",\n      \"text\": \"hello\"\n    }\n  ]\n}\n"
+        );
+    }
+
+    /// An informational message is its text, as the console prints it: a
+    /// RAISERROR message's number, procedure and line are not shown there,
+    /// and are not written either.
+    #[test]
+    fn an_informational_message_is_its_text() {
+        let (mut document, start) = document();
+        document.add_message(Message {
+            is_error: false,
+            number: 50000,
+            severity: 0,
+            state: 3,
+            server: Some("db01".to_string()),
+            procedure: Some("usp_report".to_string()),
+            line: Some(12),
+            text: "rows checked".to_string(),
+            ..Message::default()
+        });
+        let rendered = document
+            .render_at("v", &connection(), 0, RunEnd::Finished, after(start, 1))
+            .unwrap();
+        assert_eq!(
+            output(&rendered),
+            "[\n    {\n      \"type\": \"message\",\n      \"text\": \"rows checked\"\n    }\n  ]\n}\n"
         );
     }
 
@@ -1231,6 +1306,88 @@ mod tests {
             .render_at("v", &connection(), 0, RunEnd::Finished, after(start, 1))
             .unwrap();
         assert!(rendered.ends_with("\"output\": []\n}\n"), "{rendered}");
+    }
+
+    #[test]
+    fn statistics_belong_to_the_latest_batch_even_after_it_ends() {
+        let (mut document, start) = document();
+        let statistics = BatchStatistics {
+            packet_size: Some(4096),
+            transactions: 3,
+            total_ms: 1,
+            average_ms: 1.0,
+            per_second: 1000.0,
+        };
+        assert_eq!(
+            document.set_batch_statistics(statistics),
+            Err(FormatError::NoBatch)
+        );
+        document.begin_batch(None);
+        document.end_batch();
+        document.set_batch_statistics(statistics).unwrap();
+        document.begin_batch(None);
+        document.end_batch();
+        document
+            .set_batch_statistics(BatchStatistics {
+                packet_size: None,
+                transactions: 1,
+                ..statistics
+            })
+            .unwrap();
+        document.begin_batch(None);
+        let rendered = document
+            .render_at("v", &connection(), 0, RunEnd::Finished, after(start, 1))
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(
+            json["output"][0]["statistics"],
+            serde_json::json!({
+                "packetSize":4096, "transactions":3, "totalMs":1, "averageMs":1.0, "perSecond":1000.0
+            })
+        );
+        assert!(json["output"][1]["statistics"]["packetSize"].is_null());
+        assert_eq!(json["output"][1]["statistics"]["transactions"], 1);
+        assert!(json["output"][2].get("statistics").is_none());
+    }
+
+    #[test]
+    fn statistics_reject_invalid_numbers_without_changing_the_batch() {
+        let (mut document, start) = document();
+        document.begin_batch(None);
+        let statistics = BatchStatistics {
+            packet_size: None,
+            transactions: 1,
+            total_ms: 1,
+            average_ms: 1.0,
+            per_second: 1000.0,
+        };
+        assert_eq!(
+            document.set_batch_statistics(BatchStatistics {
+                transactions: 0,
+                ..statistics
+            }),
+            Err(FormatError::InvalidStatistics)
+        );
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            assert_eq!(
+                document.set_batch_statistics(BatchStatistics {
+                    average_ms: value,
+                    ..statistics
+                }),
+                Err(FormatError::InvalidStatistics)
+            );
+            assert_eq!(
+                document.set_batch_statistics(BatchStatistics {
+                    per_second: value,
+                    ..statistics
+                }),
+                Err(FormatError::InvalidStatistics)
+            );
+        }
+        let rendered = document
+            .render_at("v", &connection(), 0, RunEnd::Finished, after(start, 1))
+            .unwrap();
+        assert!(!rendered.contains("statistics"));
     }
 
     /// Under `SET NOCOUNT ON` a result set has no count.

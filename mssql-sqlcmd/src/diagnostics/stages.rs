@@ -233,6 +233,17 @@ impl StageRecorder {
         Self::default()
     }
 
+    /// Forgets the stages recorded so far: a second connection's stages are
+    /// not mixed with the first's.
+    pub fn clear(&self) {
+        if let Ok(mut running) = self.running.lock()
+            && let Ok(mut steps) = self.steps.lock()
+        {
+            running.clear();
+            steps.clear();
+        }
+    }
+
     /// The stages recorded so far, in the order they ended, which is the order
     /// they ran in (login, which contains the TLS handshake when encryption
     /// starts at login, follows it). A stage whose span is still open ends
@@ -372,6 +383,48 @@ where
 mod tests {
     use super::*;
     use tracing_subscriber::layer::SubscriberExt;
+
+    #[test]
+    fn clear_forgets_open_and_closed_stages_and_ignores_late_closes() {
+        let recorder = StageRecorder::new();
+        let subscriber =
+            tracing_subscriber::registry().with(recorder.clone().with_filter(ConnectStagesOnly));
+        tracing::subscriber::with_default(subscriber, || {
+            let dns = tracing::info_span!(
+                target: connect_stage::TARGET,
+                connect_stage::DNS,
+                ok = tracing::field::Empty
+            );
+            dns.record(connect_stage::OK, true);
+            drop(dns);
+            let tcp = tracing::info_span!(
+                target: connect_stage::TARGET,
+                connect_stage::TCP,
+                ok = tracing::field::Empty
+            );
+            assert_eq!(recorder.steps().len(), 2);
+
+            recorder.clear();
+            assert!(recorder.steps().is_empty());
+
+            let tls = tracing::info_span!(
+                target: connect_stage::TARGET,
+                connect_stage::TLS,
+                ok = tracing::field::Empty
+            );
+            tls.record(connect_stage::OK, true);
+            drop(tls);
+            tcp.record(connect_stage::OK, true);
+            drop(tcp);
+
+            let steps = recorder.steps();
+            assert_eq!(steps.len(), 1);
+            assert_eq!(steps[0].stage, Stage::Tls);
+            assert_eq!(steps[0].ok, Some(true));
+            recorder.clear();
+            assert!(recorder.steps().is_empty());
+        });
+    }
 
     /// A concurrency check, not a test of the single lock: stages that close
     /// on other threads while `steps` reads are each read once, and every
