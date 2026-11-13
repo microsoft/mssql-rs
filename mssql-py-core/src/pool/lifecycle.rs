@@ -653,6 +653,41 @@ impl<C: Send + 'static> SlotGuard<C> {
         self.cached.as_mut().map(|entry| &mut entry.value)
     }
 
+    pub(super) fn take_value(&mut self) -> Option<C> {
+        self.cached.take().map(|entry| entry.value)
+    }
+
+    pub(super) fn candidate_limit(&self) -> PoolResult<usize> {
+        let _state = lock(&self.pool.state)?;
+        let mut count = usize::from(self.cached.is_some());
+        let mut failed = false;
+        self.pool.slots.retain(|slot, _| {
+            match lock(&slot.cached) {
+                Ok(cached) => count += usize::from(cached.is_some()),
+                Err(_) => failed = true,
+            }
+            true
+        });
+        if failed {
+            return Err(PoolError::Internal {
+                reason: "poisoned idle slot",
+            });
+        }
+        Ok(count)
+    }
+
+    pub(super) async fn retry(self) -> PoolResult<Self> {
+        let request = self.pool.request(AcquireControl::new(
+            self.control.deadline(),
+            self.control.cancellation().clone(),
+        ))?;
+        if request.generation != self.generation {
+            return Err(PoolError::Closed);
+        }
+        drop(self);
+        request.await
+    }
+
     pub(super) fn install(&mut self, value: C) -> PoolResult<()> {
         if self.cached.is_some() {
             return Err(PoolError::Internal {

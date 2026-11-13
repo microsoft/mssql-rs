@@ -833,6 +833,7 @@ impl TdsConnectionProvider {
                 })?
                 .enabled,
             connect_timeout_ms,
+            context.abort_on_drop,
             diagnosis,
         )
         .await?;

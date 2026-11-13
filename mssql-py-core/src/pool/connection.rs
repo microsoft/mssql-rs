@@ -5,7 +5,11 @@ use std::fmt;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use mssql_tds::connection::{client_context::ClientContext, tds_client::TdsClient};
+use mssql_tds::connection::{
+    client_context::{ClientContext, ColumnEncryptionSetting, TdsAuthenticationMethod},
+    tds_client::TdsClient,
+};
+use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::CancelHandle;
 
 use super::error::{OpenError, PoolError, PoolResult};
@@ -92,7 +96,8 @@ pub(crate) struct ConnectSpec {
 
 impl ConnectSpec {
     /// Takes ownership of effective options without repeating caller validation.
-    pub(crate) fn new(context: ClientContext, expected_auth: AuthBinding) -> Self {
+    pub(crate) fn new(mut context: ClientContext, expected_auth: AuthBinding) -> Self {
+        context.abort_on_drop = true;
         Self {
             context,
             expected_auth,
@@ -104,6 +109,35 @@ impl ConnectSpec {
     }
     pub(crate) fn expected_auth(&self) -> &AuthBinding {
         &self.expected_auth
+    }
+
+    pub(super) fn validate_pool(&self) -> PoolResult<()> {
+        let context = self.context();
+        if context.connect_retry_count != 0 {
+            return Err(PoolError::InvalidRequest {
+                field: "connect_retry_count",
+                reason: "pooled sessions require zero",
+            });
+        }
+        if context.tds_authentication_method != TdsAuthenticationMethod::Password
+            || context.access_token.is_some()
+            || !context.auth_method_map.is_empty()
+            || !context.change_password.is_empty()
+        {
+            return Err(PoolError::InvalidRequest {
+                field: "authentication",
+                reason: "only SQL password login is enabled for pooled sessions",
+            });
+        }
+        if context.column_encryption_setting != ColumnEncryptionSetting::Disabled {
+            return Err(PoolError::InvalidRequest {
+                field: "column_encryption",
+                reason: "pooled cache isolation is not yet verified",
+            });
+        }
+        context
+            .validate()
+            .map_err(|error| PoolError::Open(OpenError::Tds(Box::new(error))))
     }
 }
 
@@ -126,6 +160,44 @@ impl OpenedConnection {
     pub(crate) fn client_mut(&mut self) -> &mut TdsClient {
         &mut self.client
     }
+
+    pub(super) fn verify_auth(&self, spec: &ConnectSpec) -> PoolResult<()> {
+        self.auth.verify_binding(spec.expected_auth())?;
+        if self.auth.expiry != TokenExpiry::NonToken {
+            return Err(PoolError::InvalidRequest {
+                field: "authentication",
+                reason: "token pooling is not enabled",
+            });
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct SqlConnectionFactory;
+
+#[async_trait]
+impl ConnectionFactory for SqlConnectionFactory {
+    async fn open(
+        &self,
+        spec: &ConnectSpec,
+        cancel: &CancelHandle,
+    ) -> Result<OpenedConnection, OpenError> {
+        let client = TdsConnectionProvider {}
+            .create_client(
+                spec.context().clone(),
+                &spec.context().data_source,
+                Some(cancel),
+            )
+            .await
+            .map_err(|error| OpenError::Tds(Box::new(error)))?;
+        Ok(OpenedConnection::new(
+            client,
+            AuthMetadata {
+                binding: spec.expected_auth().clone(),
+                expiry: TokenExpiry::NonToken,
+            },
+        ))
+    }
 }
 
 /// Opens physical connections with per-call options, not shared request state.
@@ -145,6 +217,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    #[test]
+    fn pooled_specs_require_synchronous_transport_discard() {
+        let context = ClientContext::with_data_source("tcp:localhost,1433");
+        assert!(!context.abort_on_drop);
+        let binding = AuthBinding::new(vec![1].into_boxed_slice()).unwrap();
+        let spec = ConnectSpec::new(context, binding);
+        assert!(spec.context().abort_on_drop);
+        assert!(spec.context().clone().abort_on_drop);
+    }
 
     #[test]
     fn keys_and_bindings_are_opaque_and_distinct() {
@@ -226,6 +308,26 @@ mod tests {
             ));
         }
         assert_eq!(*calls.lock().unwrap(), ["first-server", "second-server"]);
+    }
+
+    #[tokio::test]
+    async fn sql_factory_honors_cancelled_login_without_opening_a_transport() {
+        let mut context = ClientContext::with_data_source("tcp:localhost,1433");
+        context.user_name = "test-user".into();
+        context.password = "test-password".into();
+        context.connect_retry_count = 0;
+        let spec = ConnectSpec::new(
+            context,
+            AuthBinding::new(vec![1].into_boxed_slice()).unwrap(),
+        );
+        spec.validate_pool().unwrap();
+        let cancel = CancelHandle::new();
+        cancel.cancel();
+        assert!(matches!(
+            SqlConnectionFactory.open(&spec, &cancel).await,
+            Err(OpenError::Tds(error))
+                if matches!(*error, mssql_tds::error::Error::OperationCancelledError(_))
+        ));
     }
 
     #[test]

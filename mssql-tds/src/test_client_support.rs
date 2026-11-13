@@ -212,6 +212,8 @@ pub(crate) struct TokenReplayTransport {
     known_dead: bool,
     /// Packets written to the wire, headers included, when capture is on.
     sent: Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
+    read_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    dropped: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl TokenReplayTransport {
@@ -226,6 +228,17 @@ impl TokenReplayTransport {
             reset_dispatched: false,
             known_dead: false,
             sent: None,
+            read_gate: None,
+            dropped: None,
+        }
+    }
+
+    async fn wait_for_read(&self) {
+        if let Some(gate) = &self.read_gate {
+            gate.acquire()
+                .await
+                .expect("scripted read gate open")
+                .forget();
         }
     }
 
@@ -263,6 +276,14 @@ impl TokenReplayTransport {
             nbc_null_bitmap: None,
             decryptor: decryptor.clone(),
         }))
+    }
+}
+
+impl Drop for TokenReplayTransport {
+    fn drop(&mut self) {
+        if let Some(dropped) = &self.dropped {
+            dropped.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -312,6 +333,7 @@ impl TdsTokenStreamReader for TokenReplayTransport {
         _remaining_request_timeout: Option<Duration>,
         _cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<Tokens> {
+        self.wait_for_read().await;
         if let Some(tok) = self.pending_tokens.pop_front() {
             if matches!(tok, Tokens::ColMetadata(_))
                 && let Some(rows) = self.pending_rowsets.pop_front()
@@ -331,6 +353,7 @@ impl TdsTokenStreamReader for TokenReplayTransport {
         _plan: ColumnPolicy,
         _writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
+        self.wait_for_read().await;
         if let Some(tok) = self.pending_tokens.pop_front() {
             return Ok(RowReadResult::Token(tok));
         }
@@ -346,6 +369,7 @@ impl TdsTokenStreamReader for TokenReplayTransport {
         _remaining_request_timeout: Option<Duration>,
         _cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<RowHeader> {
+        self.wait_for_read().await;
         if let Some(row) = self.position_int_row(context)? {
             return Ok(RowHeader::Positioned(row));
         }
@@ -493,6 +517,19 @@ pub fn tds_client_from_tokens_capturing(
     let mut transport = TokenReplayTransport::new(tokens.into_iter().map(|t| t.0).collect());
     transport.sent = Some(std::sync::Arc::clone(&sent));
     (client_over(transport), sent)
+}
+
+/// Consumes one permit per token read and counts synchronous transport destruction.
+pub fn tds_client_from_tokens_gated(
+    tokens: Vec<ScriptedToken>,
+    gate: std::sync::Arc<tokio::sync::Semaphore>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> TdsClient {
+    let mut transport =
+        TokenReplayTransport::new(tokens.into_iter().map(|token| token.0).collect());
+    transport.read_gate = Some(gate);
+    transport.dropped = Some(dropped);
+    client_over(transport)
 }
 
 fn client_over(transport: TokenReplayTransport) -> TdsClient {
