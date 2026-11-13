@@ -6237,6 +6237,37 @@ impl TdsClient {
                 self.cancel_handle.as_ref(),
             )
             .await;
+        self.accept_response_token(start, result)
+    }
+
+    /// [`next_response_token`](Self::next_response_token) for a procedure-tail
+    /// token the look-ahead found whole in the buffer. Reading it needs no I/O,
+    /// so it runs without the cancel handle: a cancellation that lands now is
+    /// seen by the next look-ahead, instead of sending ATTENTION for bytes
+    /// already received.
+    async fn next_buffered_tail_token(
+        &mut self,
+        parser_context: &ParserContext,
+    ) -> TdsResult<Tokens> {
+        if let Some(token) = self.parked_token.take() {
+            return Ok(*token);
+        }
+        let start = self.request_timeout_start();
+        let result = self
+            .transport
+            .receive_token(parser_context, self.remaining_request_timeout, None)
+            .await;
+        self.accept_response_token(start, result)
+    }
+
+    /// Charges a read to the request's timeout and observes the token it
+    /// returned, settling the read when it failed.
+    #[inline]
+    fn accept_response_token(
+        &mut self,
+        start: Option<Instant>,
+        result: TdsResult<Tokens>,
+    ) -> TdsResult<Tokens> {
         if let Some(start) = start {
             self.update_remaining_timeout(start);
         }
@@ -6607,16 +6638,12 @@ impl TdsClient {
     /// Whether the next token is a whole token of the failed statement's
     /// procedure tail, waiting for one until `deadline` at most. Nothing is
     /// read, and the time waited is not charged to the request's timeout. A
-    /// cancellation before or during the wait ends the look-ahead even when the
-    /// tail has arrived: reading it would send ATTENTION and fail the
-    /// completion, where the caller settles the cancellation and keeps the
-    /// statement's error alone.
+    /// cancellation, signalled before or during the wait, ends the look-ahead
+    /// even when the tail has arrived, leaving the batch for the caller to
+    /// settle; the wait returns at once once it is signalled.
     async fn procedure_tail_token_by(&mut self, deadline: Instant) -> TdsResult<bool> {
         if self.parked_token.is_some() {
             return Ok(true);
-        }
-        if self.request_cancelled() {
-            return Ok(false);
         }
         let wait = deadline.saturating_duration_since(Instant::now());
         match self
@@ -6624,15 +6651,13 @@ impl TdsClient {
             .wanted_token_within(wait, self.cancel_handle.as_ref(), is_procedure_tail_token)
             .await
         {
-            Ok(arrived) => Ok(arrived && !self.request_cancelled()),
+            Ok(arrived) => Ok(arrived
+                && !self
+                    .cancel_handle
+                    .as_ref()
+                    .is_some_and(|handle| handle.cancel_token.is_cancelled())),
             Err(error) => Err(self.fail_read(error)),
         }
-    }
-
-    fn request_cancelled(&self) -> bool {
-        self.cancel_handle
-            .as_ref()
-            .is_some_and(|handle| handle.cancel_token.is_cancelled())
     }
 
     async fn complete_failed_statement_inner(
@@ -6655,7 +6680,11 @@ impl TdsClient {
                     return Ok(true);
                 }
             }
-            let token = self.next_response_token(&parser_context).await?;
+            let token = if in_procedure_tail {
+                self.next_buffered_tail_token(&parser_context).await?
+            } else {
+                self.next_response_token(&parser_context).await?
+            };
             match token {
                 Tokens::DoneInProc(done) if !in_procedure_tail => {
                     self.settle_failed_statement_done(&done, true)?;
@@ -10548,6 +10577,9 @@ mod tests {
         /// Cancelled by `wanted_token_within` before it reports the next token,
         /// as when a cancellation lands while the procedure tail arrives.
         cancel_during_wait: Option<tokio_util::sync::CancellationToken>,
+        /// Cancelled by `receive_token`, before it checks its handle, when this
+        /// many tokens remain, as when a cancellation lands as that token is read.
+        cancel_on_receive_at: Option<(usize, tokio_util::sync::CancellationToken)>,
     }
 
     impl TestTransport {
@@ -10592,6 +10624,7 @@ mod tests {
                 response_pause_at: None,
                 response_waits: Arc::new(std::sync::Mutex::new(Vec::new())),
                 cancel_during_wait: None,
+                cancel_on_receive_at: None,
             }
         }
 
@@ -10681,6 +10714,11 @@ mod tests {
                 .push(remaining_request_timeout);
             if self.receive_should_hang {
                 std::future::pending::<()>().await;
+            }
+            if let Some((remaining, cancel)) = &self.cancel_on_receive_at
+                && *remaining == self.pending_tokens.len()
+            {
+                cancel.cancel();
             }
             // Mirrors the production readers, which run every read under the
             // handle. Without this a cancelled read looks identical to a healthy
@@ -14100,6 +14138,44 @@ mod tests {
 
         assert!(client.complete_failed_statement().await.unwrap());
         assert!(client.has_open_batch());
+        assert_eq!(client.get_return_status(), None);
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(matches!(
+            client.advance().await,
+            Err(crate::error::Error::OperationCancelledError(_))
+        ));
+    }
+
+    /// A tail token the look-ahead found whole is read without the cancel
+    /// handle, so a cancellation that lands during that read ends the
+    /// look-ahead before the next token, rather than sending ATTENTION for
+    /// bytes already received.
+    #[tokio::test]
+    async fn a_cancellation_during_a_procedure_tail_read_ends_the_look_ahead_after_it() {
+        let cancellation = CancelHandle::new();
+        let transport = TestTransport {
+            cancel_on_receive_at: Some((2, cancellation.cancel_token.clone())),
+            ..TestTransport::with_tokens(vec![
+                Tokens::Error(error_token_with_severity(16)),
+                done_in_proc_more(),
+                return_status(-6),
+                done_proc_no_more(),
+            ])
+        };
+        let attentions = Arc::clone(&transport.attentions);
+        let mut client = create_test_client_with_transport(transport);
+        client
+            .execute(
+                "q".to_string(),
+                ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+            )
+            .await
+            .unwrap_err();
+        client.cancel_handle = Some(cancellation.child_handle());
+
+        assert!(client.complete_failed_statement().await.unwrap());
+        assert!(client.has_open_batch());
+        assert_eq!(client.get_return_status(), Some(-6));
         assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(matches!(
             client.advance().await,
