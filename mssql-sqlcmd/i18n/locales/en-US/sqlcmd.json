@@ -1761,8 +1761,8 @@
     },
     {
       "id": "diagnose.limitation.admin_named_instance_dac_unsupported",
-      "message": "The dedicated administrator connection to a named instance gets its port from SQL Server Browser's DAC request, which the client does not make, so its endpoint and connection are not checked.",
-      "translation": "The dedicated administrator connection to a named instance gets its port from SQL Server Browser's DAC request, which the client does not make, so its endpoint and connection are not checked.",
+      "message": "The dedicated administrator connection to a named instance gets its port from SQL Server Browser's DAC request, which the diagnostic client does not make. Its endpoint evidence is unavailable; sqlcmd's own driver, when supplied, still checks the connection.",
+      "translation": "The dedicated administrator connection to a named instance gets its port from SQL Server Browser's DAC request, which the diagnostic client does not make. Its endpoint evidence is unavailable; sqlcmd's own driver, when supplied, still checks the connection.",
       "placeholders": []
     },
     {
@@ -2946,6 +2946,473 @@
           "expr": "function"
         }
       ]
+    },
+    {
+      "id": "diagnose.detail.diagnostic_client",
+      "message": "mssql-tds {outcome}",
+      "translation": "mssql-tds {outcome}",
+      "placeholders": [
+        {
+          "id": "outcome",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "outcome"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.diagnostic_client_phases",
+      "message": "mssql-tds {outcome}: {phases}",
+      "translation": "mssql-tds {outcome}: {phases}",
+      "placeholders": [
+        {
+          "id": "outcome",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "outcome"
+        },
+        {
+          "id": "phases",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "phases"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.diagnostic_client_connected",
+      "message": "The diagnostic client (mssql-tds) connected to the same server with the same settings while sqlcmd's own driver connection failed. This difference does not establish the cause or rule out a server-side policy or a transient network failure.",
+      "translation": "The diagnostic client (mssql-tds) connected to the same server with the same settings while sqlcmd's own driver connection failed. This difference does not establish the cause or rule out a server-side policy or a transient network failure.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.driver_connection_failed",
+      "message": "sqlcmd's own connection through {driver} failed: {error}",
+      "translation": "sqlcmd's own connection through {driver} failed: {error}",
+      "placeholders": [
+        {
+          "id": "driver",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "driver"
+        },
+        {
+          "id": "error",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "error"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.driver_connection_failed_unnamed",
+      "message": "sqlcmd's own connection through its driver failed: {error}",
+      "translation": "sqlcmd's own connection through its driver failed: {error}",
+      "placeholders": [
+        {
+          "id": "error",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "error"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.driver_session_query_failed",
+      "message": "The session was opened but a minimal query failed: {error}",
+      "translation": "The session was opened but a minimal query failed: {error}",
+      "placeholders": [
+        {
+          "id": "error",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "error"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.server_refused_own_connection",
+      "message": "SQL Server refused sqlcmd's own connection but accepted the diagnostic client's (mssql-tds) with the same login and settings: the server treats the two connections differently.",
+      "translation": "SQL Server refused sqlcmd's own connection but accepted the diagnostic client's (mssql-tds) with the same login and settings: the server treats the two connections differently.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.server_rule_refuses_own_connection",
+      "message": "A server-side rule that treats the two clients differently, such as a logon trigger or a Resource Governor classifier, refuses sqlcmd's connection.",
+      "translation": "A server-side rule that treats the two clients differently, such as a logon trigger or a Resource Governor classifier, refuses sqlcmd's connection.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.spn_not_canonicalized",
+      "message": "The SPN's host name could not be canonicalized within the {seconds} s time limit, so the SPN is requested and shown with the host name as given.",
+      "translation": "The SPN's host name could not be canonicalized within the {seconds} s time limit, so the SPN is requested and shown with the host name as given.",
+      "placeholders": [
+        {
+          "id": "seconds",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "seconds"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.server.database_suffix",
+      "message": ", database {database}",
+      "translation": ", database {database}",
+      "placeholders": [
+        {
+          "id": "database",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "database"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.skip.own_connection_not_tcp",
+      "message": "sqlcmd's own connection did not use TCP",
+      "translation": "sqlcmd's own connection did not use TCP",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.error.driver_connection_could_not_run",
+      "message": "sqlcmd's driver connection could not run (status {status})",
+      "translation": "sqlcmd's driver connection could not run (status {status})",
+      "placeholders": [
+        {
+          "id": "status",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "status"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.limitation.multi_subnet_failover_evidence",
+      "message": "sqlcmd's own connection used MultiSubnetFailover (-M); the diagnostic client's (mssql-tds) evidence comes from connecting to the server's addresses over TCP one at a time, not to all of them at once.",
+      "translation": "sqlcmd's own connection used MultiSubnetFailover (-M); the diagnostic client's (mssql-tds) evidence comes from connecting to the server's addresses over TCP one at a time, not to all of them at once.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.multi_subnet_failover",
+      "message": "With MultiSubnetFailover (-M) sqlcmd connects to all of the server's addresses at once; the diagnostic client (mssql-tds) did not use -M: it connected over TCP to the addresses one at a time.",
+      "translation": "With MultiSubnetFailover (-M) sqlcmd connects to all of the server's addresses at once; the diagnostic client (mssql-tds) did not use -M: it connected over TCP to the addresses one at a time.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.settings.application_intent",
+      "message": "application intent",
+      "translation": "application intent",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.settings.multi_subnet_failover",
+      "message": "MultiSubnetFailover",
+      "translation": "MultiSubnetFailover",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.settings.packet_size",
+      "message": "packet size",
+      "translation": "packet size",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.settings.dedicated_admin",
+      "message": "dedicated administrator connection",
+      "translation": "dedicated administrator connection",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.settings.workstation",
+      "message": "workstation name",
+      "translation": "workstation name",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.depth.read_only_intent",
+      "message": "; read-only application intent",
+      "translation": "; read-only application intent",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.depth.multi_subnet_failover",
+      "message": "; MultiSubnetFailover",
+      "translation": "; MultiSubnetFailover",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.depth.packet_size",
+      "message": "; packet size {bytes} bytes",
+      "translation": "; packet size {bytes} bytes",
+      "placeholders": [
+        {
+          "id": "bytes",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "bytes"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.depth.dedicated_admin",
+      "message": "; dedicated administrator connection",
+      "translation": "; dedicated administrator connection",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.depth.workstation",
+      "message": "; workstation {name}",
+      "translation": "; workstation {name}",
+      "placeholders": [
+        {
+          "id": "name",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "name"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.transport.dedicated_admin",
+      "message": "the dedicated administrator connection",
+      "translation": "the dedicated administrator connection",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.multi_subnet_failover_needs_tcp",
+      "message": "-M (MultiSubnetFailover) connects only over TCP, and the client refuses it with {protocol}, so no connection is made.",
+      "translation": "-M (MultiSubnetFailover) connects only over TCP, and the client refuses it with {protocol}, so no connection is made.",
+      "placeholders": [
+        {
+          "id": "protocol",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "protocol"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.dsn_multi_subnet_failover_needs_tcp",
+      "message": "The DSN {dsn} sets MultiSubnetFailover=Yes, which connects only over TCP, and the client refuses it with {protocol}, so no connection is made.",
+      "translation": "The DSN {dsn} sets MultiSubnetFailover=Yes, which connects only over TCP, and the client refuses it with {protocol}, so no connection is made.",
+      "placeholders": [
+        {
+          "id": "dsn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "dsn"
+        },
+        {
+          "id": "protocol",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "protocol"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.dedicated_admin_ignored_with_dsn",
+      "message": "-A is ignored with -D: the DSN {dsn} names the server, and sqlcmd does not make the connection a dedicated administrator connection.",
+      "translation": "-A is ignored with -D: the DSN {dsn} names the server, and sqlcmd does not make the connection a dedicated administrator connection.",
+      "placeholders": [
+        {
+          "id": "dsn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "dsn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.dedicated_admin_with_prefix",
+      "message": "With -A sqlcmd puts admin: before the server given to -S, which already has the protocol prefix {prefix}:, so the client takes that prefix as part of the server name.",
+      "translation": "With -A sqlcmd puts admin: before the server given to -S, which already has the protocol prefix {prefix}:, so the client takes that prefix as part of the server name.",
+      "placeholders": [
+        {
+          "id": "prefix",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "prefix"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.dedicated_admin_with_pipe",
+      "message": "With -A sqlcmd puts admin: before the server given to -S, which is a pipe path, so the client opens the named pipe, not a dedicated administrator connection.",
+      "translation": "With -A sqlcmd puts admin: before the server given to -S, which is a pipe path, so the client opens the named pipe, not a dedicated administrator connection.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.dedicated_admin_with_port",
+      "message": "With -A sqlcmd puts admin: before the server given to -S, which has a port; the dedicated administrator connection takes none, so the client refuses it.",
+      "translation": "With -A sqlcmd puts admin: before the server given to -S, which has a port; the dedicated administrator connection takes none, so the client refuses it.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.session_transport_lost",
+      "message": "The session was opened, but its connection was lost during a minimal query ({loss}); the evidence does not show which side, or which device between them, ended it.",
+      "translation": "The session was opened, but its connection was lost during a minimal query ({loss}); the evidence does not show which side, or which device between them, ended it.",
+      "placeholders": [
+        {
+          "id": "loss",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "loss"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.limitation.transport_loss_intermittent",
+      "message": "A transport loss can be intermittent: this diagnosis made one attempt, and reproducing the loss or analyzing how often it occurs is outside it.",
+      "translation": "A transport loss can be intermittent: this diagnosis made one attempt, and reproducing the loss or analyzing how often it occurs is outside it.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.detail.login_completed",
+      "message": "login completed",
+      "translation": "login completed",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.detail.last_successful_operation",
+      "message": "last successful operation: {operation}",
+      "translation": "last successful operation: {operation}",
+      "placeholders": [
+        {
+          "id": "operation",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "operation"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.retries",
+      "message": "retries: {retries}",
+      "translation": "retries: {retries}",
+      "placeholders": [
+        {
+          "id": "retries",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "retries"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.transport_loss",
+      "message": "transport loss: {loss}",
+      "translation": "transport loss: {loss}",
+      "placeholders": [
+        {
+          "id": "loss",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "loss"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.transport_loss_os",
+      "message": "transport loss: {loss} (OS error {code})",
+      "translation": "transport loss: {loss} (OS error {code})",
+      "placeholders": [
+        {
+          "id": "loss",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "loss"
+        },
+        {
+          "id": "code",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.observations.header",
+      "message": "Out-of-scope observations (do not affect the diagnostic outcome):",
+      "translation": "Out-of-scope observations (do not affect the diagnostic outcome):",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.observation.transport_recurrence",
+      "message": "A connection loss was observed during session validation. This single attempt does not establish whether the loss recurs or what caused it.",
+      "translation": "A connection loss was observed during session validation. This single attempt does not establish whether the loss recurs or what caused it.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.observation.transport_handoff",
+      "message": "For recurrence and source analysis, use specialist network and SQL Server tracing. Correlate evidence from both sides; do not infer a cause from this report alone.",
+      "translation": "For recurrence and source analysis, use specialist network and SQL Server tracing. Correlate evidence from both sides; do not infer a cause from this report alone.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.skip.own_connection_succeeded",
+      "message": "the preliminary diagnostic-client checks did not prevent sqlcmd's own connection from succeeding; its transport was not exposed",
+      "translation": "the preliminary diagnostic-client checks did not prevent sqlcmd's own connection from succeeding; its transport was not exposed",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.skip.diagnostic_stage_not_observed",
+      "message": "the diagnostic client stopped before this stage; sqlcmd's own driver makes the connection attempt",
+      "translation": "the diagnostic client stopped before this stage; sqlcmd's own driver makes the connection attempt",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.error.no_driver_records",
+      "message": "The driver returned no diagnostic message.",
+      "translation": "The driver returned no diagnostic message.",
+      "placeholders": []
     }
   ]
 }
