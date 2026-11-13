@@ -13751,9 +13751,10 @@ mod tests {
     /// as ERROR and COUNT are independent flags.
     #[tokio::test]
     async fn completing_a_failed_row_set_accepts_an_error_flagged_done_proc() {
-        for (status, cur_cmd, row_count) in [
-            (DoneStatus::ERROR, CurrentCommand::None, 0),
+        for (case, status, cur_cmd, row_count) in [
+            ("uncounted", DoneStatus::ERROR, CurrentCommand::None, 0),
             (
+                "counted",
                 DoneStatus::ERROR | DoneStatus::COUNT,
                 CurrentCommand::Insert,
                 1,
@@ -13772,9 +13773,12 @@ mod tests {
             ])
             .await;
 
-            assert!(!client.complete_failed_statement().await.unwrap());
-            assert!(!client.has_open_batch());
-            assert!(!client.is_connection_dead());
+            assert!(
+                !client.complete_failed_statement().await.expect(case),
+                "{case}"
+            );
+            assert!(!client.has_open_batch(), "{case}");
+            assert!(!client.is_connection_dead(), "{case}");
         }
     }
 
@@ -14024,7 +14028,7 @@ mod tests {
             return_status(-6),
             done_proc_no_more(),
         ]);
-        for transport in [delayed, buffered] {
+        for (case, transport) in [("delayed", delayed), ("buffered", buffered)] {
             let attentions = Arc::clone(&transport.attentions);
             let mut client = create_test_client_with_transport(transport);
             client
@@ -14033,18 +14037,28 @@ mod tests {
                     ExecuteOptions::new().on_error(BatchErrorMode::Continue),
                 )
                 .await
-                .unwrap_err();
+                .expect_err(case);
             let cancellation = CancelHandle::new();
             client.cancel_handle = Some(cancellation.child_handle());
             cancellation.cancel();
 
-            assert!(client.complete_failed_statement().await.unwrap());
-            assert!(client.has_open_batch());
-            assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
-            assert!(matches!(
-                client.advance().await,
-                Err(crate::error::Error::OperationCancelledError(_))
-            ));
+            assert!(
+                client.complete_failed_statement().await.expect(case),
+                "{case}"
+            );
+            assert!(client.has_open_batch(), "{case}");
+            assert_eq!(
+                attentions.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{case}"
+            );
+            assert!(
+                matches!(
+                    client.advance().await,
+                    Err(crate::error::Error::OperationCancelledError(_))
+                ),
+                "{case}"
+            );
         }
     }
 
