@@ -60,7 +60,8 @@ const BUILT_IN_CONNECTION_STRING: Option<&str> = None;
 const CUSTOM_EVENT_OTEL_NAME: &str = "ai.custom";
 const CUSTOM_EVENT_NAME_ATTRIBUTE: &str = "ai.customEvent.name";
 const APPLICATION_INSIGHTS_EVENT_ENVELOPE: &str = "Microsoft.ApplicationInsights.Event";
-const MAX_VERSION_LEN: usize = 64;
+/// The longest sqlcmd version accepted, in bytes; the C ABI checks the same bound.
+pub(crate) const MAX_VERSION_LEN: usize = 64;
 /// The event is one span with one span event; a little room beyond that.
 const MAX_EVENTS_PER_SPAN: u32 = 8;
 /// The longest the process waits for the event at exit, whatever the caller
@@ -90,7 +91,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub fn from_abi(value: i32) -> Self {
+    pub const fn from_abi(value: i32) -> Self {
         match value {
             crate::ffi::MSSQL_SQLCMD_COMMAND_DIAGNOSE => Self::Diagnose,
             _ => Self::Unspecified,
@@ -109,7 +110,7 @@ pub enum FormatUse {
 }
 
 impl FormatUse {
-    pub fn from_abi(value: i32) -> Self {
+    pub const fn from_abi(value: i32) -> Self {
         match value {
             crate::ffi::MSSQL_SQLCMD_FORMAT_JSON => Self::Json,
             crate::ffi::MSSQL_SQLCMD_FORMAT_UNRECOGNIZED => Self::Unrecognized,
@@ -151,7 +152,7 @@ pub enum FlushOutcome {
 #[derive(Debug)]
 struct EventOnlyClient<C> {
     inner: C,
-    internal_failure: Arc<AtomicBool>,
+    delivered: Arc<AtomicBool>,
 }
 
 #[cfg(test)]
@@ -183,11 +184,8 @@ impl HttpClient for AbiTestClient {
 }
 
 impl<C> EventOnlyClient<C> {
-    fn new(inner: C, internal_failure: Arc<AtomicBool>) -> Self {
-        Self {
-            inner,
-            internal_failure,
-        }
+    fn new(inner: C, delivered: Arc<AtomicBool>) -> Self {
+        Self { inner, delivered }
     }
 }
 
@@ -200,7 +198,7 @@ where
         let filtered = match filter_event_request(request) {
             Ok(filtered) => filtered,
             Err(error) => {
-                self.internal_failure.store(true, Ordering::Release);
+                self.delivered.store(false, Ordering::Release);
                 return Err(error);
             }
         };
@@ -212,21 +210,22 @@ where
         let response = match self.inner.send_bytes(request).await {
             Ok(response) => response,
             Err(error) => {
-                self.internal_failure.store(true, Ordering::Release);
+                self.delivered.store(false, Ordering::Release);
                 return Err(error);
             }
         };
         // The exporter retries throttling and server errors itself, and its
         // shutdown does not hand the result back, so the outcome is kept here.
         // Each attempt overwrites the last, so the attempt the exporter stops on
-        // decides: a 503 that a retry answers with 200 is a delivery.
+        // decides: a 503 that a retry answers with 200 is a delivery. It starts
+        // false, so an export that never reaches this client is not a delivery.
         match check_ingestion_response(response, &original_indices, original_count) {
             Ok((response, accepted)) => {
-                self.internal_failure.store(!accepted, Ordering::Release);
+                self.delivered.store(accepted, Ordering::Release);
                 Ok(response)
             }
             Err(error) => {
-                self.internal_failure.store(true, Ordering::Release);
+                self.delivered.store(false, Ordering::Release);
                 Err(error)
             }
         }
@@ -236,7 +235,7 @@ where
 #[derive(Clone, Debug)]
 struct TelemetryProvider {
     provider: SdkTracerProvider,
-    internal_failure: Arc<AtomicBool>,
+    delivered: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -756,10 +755,10 @@ fn export_once(properties: &[(&'static str, String)]) -> FlushOutcome {
     // The simple exporter has already sent the event, retries included, when the
     // span ended; shutting down only releases the provider.
     emit_usage(&provider.provider, properties, SystemTime::now());
-    if provider.provider.shutdown().is_err() || provider.internal_failure.load(Ordering::Acquire) {
-        FlushOutcome::Failed
-    } else {
+    if provider.provider.shutdown().is_ok() && provider.delivered.load(Ordering::Acquire) {
         FlushOutcome::Completed
+    } else {
+        FlushOutcome::Failed
     }
 }
 
@@ -829,10 +828,10 @@ fn provider_with_client<C>(
 where
     C: HttpClient + 'static,
 {
-    let internal_failure = Arc::new(AtomicBool::new(false));
+    let delivered = Arc::new(AtomicBool::new(false));
     let exporter = Exporter::new_from_connection_string(
         connection_string,
-        EventOnlyClient::new(client, Arc::clone(&internal_failure)),
+        EventOnlyClient::new(client, Arc::clone(&delivered)),
     )?;
     // One event, exported when its span ends, on this thread: nothing is queued
     // behind a timer. The SDK reads OTEL_* variables for its defaults, so the
@@ -846,7 +845,7 @@ where
             .with_sampler(Sampler::AlwaysOn)
             .with_max_events_per_span(MAX_EVENTS_PER_SPAN)
             .build(),
-        internal_failure,
+        delivered,
     })
 }
 
@@ -1371,7 +1370,7 @@ mod tests {
             match expect {
                 Completed => assert_eq!(outcome, FlushOutcome::Completed, "{status} {body}"),
                 Failed => assert_eq!(outcome, FlushOutcome::Failed, "{status} {body}"),
-                NotCompleted => assert_ne!(outcome, FlushOutcome::Completed, "{status} {body}"),
+                NotCompleted => assert_eq!(outcome, FlushOutcome::TimedOut, "{status} {body}"),
             }
         }
     }
@@ -1442,17 +1441,13 @@ mod tests {
             let inner = InMemoryClient::succeeding();
             *inner.0.responses.lock().expect("response lock") =
                 attempts.iter().map(|status| reply(*status)).collect();
-            let internal_failure = Arc::new(AtomicBool::new(false));
-            let client = EventOnlyClient::new(inner, Arc::clone(&internal_failure));
+            let delivered = Arc::new(AtomicBool::new(false));
+            let client = EventOnlyClient::new(inner, Arc::clone(&delivered));
             for _ in &attempts {
                 let request = track_request(&[event_envelope()]);
                 poll_ready(client.send_bytes(request)).expect("the response is passed on");
             }
-            assert_eq!(
-                internal_failure.load(Ordering::Acquire),
-                failed,
-                "{attempts:?}"
-            );
+            assert_eq!(delivered.load(Ordering::Acquire), !failed, "{attempts:?}");
         }
     }
 
@@ -1468,12 +1463,12 @@ mod tests {
         let inner = InMemoryClient::succeeding();
         *inner.0.responses.lock().expect("response lock") =
             VecDeque::from([Err(filter_error("connection reset")), ok()]);
-        let internal_failure = Arc::new(AtomicBool::new(false));
-        let client = EventOnlyClient::new(inner, Arc::clone(&internal_failure));
+        let delivered = Arc::new(AtomicBool::new(false));
+        let client = EventOnlyClient::new(inner, Arc::clone(&delivered));
         assert!(poll_ready(client.send_bytes(track_request(&[event_envelope()]))).is_err());
-        assert!(internal_failure.load(Ordering::Acquire));
+        assert!(!delivered.load(Ordering::Acquire));
         assert!(poll_ready(client.send_bytes(track_request(&[event_envelope()]))).is_ok());
-        assert!(!internal_failure.load(Ordering::Acquire));
+        assert!(delivered.load(Ordering::Acquire));
     }
 
     /// A call that is admitted before shutdown is sent by it, and one that comes
@@ -1593,7 +1588,7 @@ mod tests {
         ] {
             assert!(!text.contains(leaked), "{leaked}");
         }
-        assert!(!provider.internal_failure.load(Ordering::Acquire));
+        assert!(provider.delivered.load(Ordering::Acquire));
     }
 
     /// A send slower than the cap is cut off at the cap, whatever the caller
@@ -1897,43 +1892,42 @@ mod tests {
     }
 
     #[test]
-    fn client_records_all_filtered_payload_as_an_internal_failure() {
+    fn client_does_not_record_an_all_filtered_payload_as_delivered() {
         let request = track_request(&[dependency_envelope()]);
-        let internal_failure = Arc::new(AtomicBool::new(false));
-        let client =
-            EventOnlyClient::new(InMemoryClient::succeeding(), Arc::clone(&internal_failure));
+        let delivered = Arc::new(AtomicBool::new(false));
+        let client = EventOnlyClient::new(InMemoryClient::succeeding(), Arc::clone(&delivered));
 
         assert!(poll_ready(client.send_bytes(request)).is_err());
-        assert!(internal_failure.load(Ordering::Acquire));
+        assert!(!delivered.load(Ordering::Acquire));
     }
 
     #[test]
-    fn client_records_a_transport_failure_as_an_internal_failure() {
+    fn client_does_not_record_a_transport_failure_as_delivered() {
         let inner = InMemoryClient::succeeding();
         *inner.0.responses.lock().expect("response lock") =
             VecDeque::from([Err(filter_error("connection refused"))]);
-        let internal_failure = Arc::new(AtomicBool::new(false));
-        let client = EventOnlyClient::new(inner, Arc::clone(&internal_failure));
+        let delivered = Arc::new(AtomicBool::new(false));
+        let client = EventOnlyClient::new(inner, Arc::clone(&delivered));
 
         assert!(poll_ready(client.send_bytes(track_request(&[event_envelope()]))).is_err());
-        assert!(internal_failure.load(Ordering::Acquire));
+        assert!(!delivered.load(Ordering::Acquire));
     }
 
     #[test]
-    fn client_records_a_rejection_as_an_internal_failure_but_passes_the_response_on() {
+    fn client_does_not_record_a_rejection_as_delivered_but_passes_the_response_on() {
         let inner = InMemoryClient::succeeding();
         *inner.0.responses.lock().expect("response lock") =
             VecDeque::from([Ok(Response::builder()
                 .status(403)
                 .body(Bytes::new())
                 .expect("valid response"))]);
-        let internal_failure = Arc::new(AtomicBool::new(false));
-        let client = EventOnlyClient::new(inner, Arc::clone(&internal_failure));
+        let delivered = Arc::new(AtomicBool::new(false));
+        let client = EventOnlyClient::new(inner, Arc::clone(&delivered));
 
         let response = poll_ready(client.send_bytes(track_request(&[event_envelope()])))
             .expect("the exporter still sees the response");
         assert_eq!(response.status().as_u16(), 403);
-        assert!(internal_failure.load(Ordering::Acquire));
+        assert!(!delivered.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1942,13 +1936,12 @@ mod tests {
     }
 
     #[test]
-    fn client_records_malformed_compression_as_an_internal_failure() {
-        let internal_failure = Arc::new(AtomicBool::new(false));
-        let client =
-            EventOnlyClient::new(InMemoryClient::succeeding(), Arc::clone(&internal_failure));
+    fn client_does_not_record_malformed_compression_as_delivered() {
+        let delivered = Arc::new(AtomicBool::new(false));
+        let client = EventOnlyClient::new(InMemoryClient::succeeding(), Arc::clone(&delivered));
         let request = track_request_with(Bytes::from_static(b"not gzip"));
         assert!(poll_ready(client.send_bytes(request)).is_err());
-        assert!(internal_failure.load(Ordering::Acquire));
+        assert!(!delivered.load(Ordering::Acquire));
     }
 
     #[test]
@@ -2068,19 +2061,19 @@ mod tests {
     }
 
     #[test]
-    fn client_records_malformed_partial_response_as_an_internal_failure() {
+    fn client_does_not_record_malformed_partial_response_as_delivered() {
         let inner = InMemoryClient::succeeding();
         *inner.0.responses.lock().expect("response lock") =
             VecDeque::from([Ok(Response::builder()
                 .status(206)
                 .body(Bytes::from_static(b"not JSON"))
                 .expect("valid response"))]);
-        let internal_failure = Arc::new(AtomicBool::new(false));
-        let client = EventOnlyClient::new(inner, Arc::clone(&internal_failure));
+        let delivered = Arc::new(AtomicBool::new(false));
+        let client = EventOnlyClient::new(inner, Arc::clone(&delivered));
 
         let request = track_request(&[dependency_envelope(), event_envelope()]);
 
         assert!(poll_ready(client.send_bytes(request)).is_err());
-        assert!(internal_failure.load(Ordering::Acquire));
+        assert!(!delivered.load(Ordering::Acquire));
     }
 }

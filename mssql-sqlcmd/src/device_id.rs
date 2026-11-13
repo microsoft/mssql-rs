@@ -187,12 +187,17 @@ fn default_store() -> Option<Box<dyn Store>> {
 
 #[cfg(windows)]
 fn default_store() -> Option<Box<dyn Store>> {
-    Some(Box::new(RegistryStore))
+    Some(Box::new(RegistryStore {
+        subkey: registry::default_subkey(),
+    }))
 }
 
-/// The ID in the registry, as on Windows.
+/// The ID in the registry, as on Windows. The subkey is a field so that tests
+/// can use a scratch key instead of the shared one.
 #[cfg(windows)]
-struct RegistryStore;
+struct RegistryStore {
+    subkey: Vec<u16>,
+}
 
 #[cfg(windows)]
 mod registry {
@@ -217,7 +222,7 @@ mod registry {
         text.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    fn key_path() -> Vec<u16> {
+    pub(super) fn default_subkey() -> Vec<u16> {
         wide("SOFTWARE\\Microsoft\\DeveloperTools")
     }
 
@@ -341,14 +346,13 @@ mod registry {
 
     impl OpenKey {
         /// The key for reading, or `None` when it does not exist.
-        fn open_read() -> io::Result<Option<Self>> {
-            let path = key_path();
+        fn open_read(subkey: &[u16]) -> io::Result<Option<Self>> {
             let mut key: HKEY = std::ptr::null_mut();
-            // SAFETY: `path` is NUL-terminated and `key` is a valid out pointer.
+            // SAFETY: `subkey` is NUL-terminated and `key` is a valid out pointer.
             let status = unsafe {
                 RegOpenKeyExW(
                     HKEY_CURRENT_USER,
-                    path.as_ptr(),
+                    subkey.as_ptr(),
                     0,
                     KEY_READ | KEY_WOW64_64KEY,
                     &mut key,
@@ -364,14 +368,13 @@ mod registry {
         }
 
         /// The key for writing, created if it does not exist.
-        fn create() -> io::Result<Self> {
-            let path = key_path();
+        fn create(subkey: &[u16]) -> io::Result<Self> {
             let mut key: HKEY = std::ptr::null_mut();
-            // SAFETY: `path` is NUL-terminated and `key` is a valid out pointer.
+            // SAFETY: `subkey` is NUL-terminated and `key` is a valid out pointer.
             let status = unsafe {
                 RegCreateKeyExW(
                     HKEY_CURRENT_USER,
-                    path.as_ptr(),
+                    subkey.as_ptr(),
                     0,
                     std::ptr::null(),
                     REG_OPTION_NON_VOLATILE,
@@ -398,17 +401,17 @@ mod registry {
 
     impl Store for RegistryStore {
         fn read(&self) -> io::Result<Option<String>> {
-            let Some(key) = OpenKey::open_read()? else {
+            let Some(key) = OpenKey::open_read(&self.subkey)? else {
                 return Ok(None);
             };
-            let key = key.0;
+            let hkey = key.0;
             let name = wide("deviceid");
             let mut kind = 0u32;
             let mut size = 0u32;
-            // SAFETY: `key` is open; a null data pointer asks for the size.
+            // SAFETY: `hkey` is open; a null data pointer asks for the size.
             let status = unsafe {
                 RegQueryValueExW(
-                    key,
+                    hkey,
                     name.as_ptr(),
                     std::ptr::null(),
                     &mut kind,
@@ -433,7 +436,7 @@ mod registry {
             // SAFETY: `data` holds `capacity` bytes.
             let status = unsafe {
                 RegQueryValueExW(
-                    key,
+                    hkey,
                     name.as_ptr(),
                     std::ptr::null(),
                     &mut kind,
@@ -474,7 +477,7 @@ mod registry {
 
     impl RegistryStore {
         fn set_value(&self, id: &str) -> io::Result<()> {
-            let key = OpenKey::create()?;
+            let key = OpenKey::create(&self.subkey)?;
             let name = wide("deviceid");
             let value = wide(id);
             // SAFETY: `value` is NUL-terminated and its byte length is passed.
@@ -548,6 +551,143 @@ mod registry {
                 elapsed < std::time::Duration::from_millis(1_200),
                 "{elapsed:?}"
             );
+        }
+    }
+
+    /// The store against a scratch key under `HKCU\Software`, so the shared ID is
+    /// never touched.
+    #[cfg(test)]
+    mod store_tests {
+        use super::*;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use windows_sys::Win32::System::Registry::{REG_DWORD, RegDeleteTreeW};
+
+        const ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        const OTHER_ID: &str = "1b4e28ba-2fa1-11d2-883f-0016d3cca427";
+
+        struct Scratch(RegistryStore);
+
+        impl Scratch {
+            fn new() -> Self {
+                static NEXT: AtomicU32 = AtomicU32::new(0);
+                let name = format!(
+                    "Software\\mssql-sqlcmd-tests-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                );
+                Self(RegistryStore {
+                    subkey: wide(&name),
+                })
+            }
+
+            fn set_raw(&self, kind: u32, bytes: &[u8]) {
+                let key = OpenKey::create(&self.0.subkey).expect("create the scratch key");
+                let name = wide("deviceid");
+                // SAFETY: `bytes` is valid for its length; `key` is open.
+                let status = unsafe {
+                    RegSetValueExW(
+                        key.0,
+                        name.as_ptr(),
+                        0,
+                        kind,
+                        bytes.as_ptr(),
+                        bytes.len() as u32,
+                    )
+                };
+                assert_eq!(status, ERROR_SUCCESS);
+            }
+        }
+
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                // SAFETY: `subkey` is NUL-terminated.
+                unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, self.0.subkey.as_ptr()) };
+            }
+        }
+
+        /// The first-run lock is shared by every process of the user, so another
+        /// test can hold it for a moment; a lock timeout is retried.
+        fn create_if_absent(store: &RegistryStore, id: &str) -> String {
+            for _ in 0..20 {
+                match store.create_if_absent(id) {
+                    Ok(stored) => return stored,
+                    Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            panic!("the first-run lock was never free");
+        }
+
+        #[test]
+        fn a_missing_key_reads_as_absent() {
+            assert_eq!(Scratch::new().0.read().expect("read"), None);
+        }
+
+        #[test]
+        fn the_first_id_is_stored_and_kept() {
+            let scratch = Scratch::new();
+            assert_eq!(create_if_absent(&scratch.0, ID), ID);
+            assert_eq!(scratch.0.read().expect("read").as_deref(), Some(ID));
+            assert_eq!(create_if_absent(&scratch.0, OTHER_ID), ID);
+        }
+
+        #[test]
+        fn a_value_that_is_not_a_string_is_an_error() {
+            let scratch = Scratch::new();
+            scratch.set_raw(REG_DWORD, &7u32.to_le_bytes());
+            let error = scratch.0.read().expect_err("a DWORD is not an ID");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+
+        #[test]
+        fn an_oversized_value_is_an_error() {
+            let scratch = Scratch::new();
+            let value: Vec<u8> = wide(&"a".repeat(3000))
+                .iter()
+                .flat_map(|unit| unit.to_le_bytes())
+                .collect();
+            scratch.set_raw(REG_SZ, &value);
+            let error = scratch.0.read().expect_err("too long to be an ID");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+
+        /// A `REG_SZ` stored without its terminator, which other writers do, reads
+        /// as the whole text; one with extra data after the terminator, as the
+        /// text up to it.
+        #[test]
+        fn the_terminator_is_optional_and_ends_the_text() {
+            let scratch = Scratch::new();
+            let units = |text: &str| -> Vec<u8> {
+                text.encode_utf16()
+                    .flat_map(|unit| unit.to_le_bytes())
+                    .collect()
+            };
+            scratch.set_raw(REG_SZ, &units(ID));
+            assert_eq!(scratch.0.read().expect("read").as_deref(), Some(ID));
+            let mut padded = units(ID);
+            padded.extend_from_slice(&[0, 0, b'x', 0]);
+            scratch.set_raw(REG_SZ, &padded);
+            assert_eq!(scratch.0.read().expect("read").as_deref(), Some(ID));
+        }
+
+        /// Several first runs at once agree on the one ID that was stored.
+        #[test]
+        fn racing_first_runs_agree_on_one_id() {
+            let scratch = Scratch::new();
+            let ids: Vec<String> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..6)
+                    .map(|n| {
+                        let store = &scratch.0;
+                        scope.spawn(move || create_if_absent(store, &format!("{n}-{ID}")))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("thread"))
+                    .collect()
+            });
+            let stored = scratch.0.read().expect("read").expect("an ID is stored");
+            assert!(ids.iter().all(|id| *id == stored), "{ids:?} vs {stored}");
         }
     }
 }

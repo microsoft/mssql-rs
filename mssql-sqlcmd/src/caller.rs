@@ -25,7 +25,7 @@ pub enum CallerType {
 }
 
 impl CallerType {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Human => "human",
             Self::Agent => "agent",

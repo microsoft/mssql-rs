@@ -19,8 +19,11 @@ sqlcmd version, the operating system and architecture where it runs, the command
 and output format used, whether it appears to be run by a person, an AI agent or
 a pipeline, a random device identifier shared with other Microsoft developer
 tools, and the edition, version, operating system family and platform of the SQL
-Server it connects to. It does not include queries, results, server, database or
-user names, connection strings, credentials or file paths. To turn it off, set
+Server it connects to. Application Insights also derives the approximate
+location (city, state or province, and country or region) of the machine from
+the IP address the data is sent from, and then discards the address. The data
+does not include queries, results, server, database or user names, connection
+strings, credentials or file paths. To turn it off, set
 the environment variable `SQLCMD_TELEMETRY_OPTOUT=1`. See the
 [Microsoft Privacy Statement](https://privacy.microsoft.com/privacystatement).
 
@@ -200,6 +203,13 @@ collects or exports:
 - arbitrary free-form strings
 - hardware identifiers
 
+The client sends no IP address or location. The service adds them: Application
+Insights geolocates each item from the sender's IP address on arrival, fills the
+client city, state or province, and country or region columns of `AppEvents`, and
+stores the IP as `0.0.0.0`. The client strips every envelope tag, so it cannot
+send a location of its own. Whether to keep this location, or suppress it by
+sending a fixed `ai.location.ip` tag, is a decision for the privacy review.
+
 ## Failure behavior and latency
 
 Every step is best effort; failures are only debug tracing and never write to
@@ -302,5 +312,8 @@ The transport uses `opentelemetry`, `opentelemetry_sdk`,
 repository's native-TLS convention, and `uuid` for the device ID. The Application
 Insights exporter is a community crate that states it is not an official
 Microsoft product, so shipping approval for it remains an owning-team decision.
+It is pinned to the exact version the request filter and response checks were
+written against (`=0.46.0`); a bump needs those re-checked, because they depend
+on the crate's internal request and response handling.
 The implementation is validated with in-memory HTTP clients, unit tests, and
 runs of the real native sqlcmd; it does not claim live DataX delivery.

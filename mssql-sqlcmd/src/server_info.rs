@@ -20,6 +20,7 @@
 /// `(Intel X86)`, `(ARM64)`); the `<X64>` after the OS name is the OS's, which
 /// differs for a 32-bit instance under WOW64.
 macro_rules! server_info_columns {
+    // The `nvarchar(128)` below is `MAX_TEXT_UNITS`; a test keeps them equal.
     () => {
         concat!(
             "CONVERT(nvarchar(128), SERVERPROPERTY('ProductVersion')), ",
@@ -31,6 +32,10 @@ macro_rules! server_info_columns {
         )
     };
 }
+
+/// The longest text a server column may return, in UTF-16 code units; the C ABI
+/// rejects longer ones.
+pub(crate) const MAX_TEXT_UNITS: usize = 128;
 
 /// What a query that already selects the engine edition appends.
 pub const EXTRA_COLUMNS: &str = server_info_columns!();
@@ -261,6 +266,16 @@ mod tests {
         // Four columns in all: edition, version, OS and architecture.
         assert_eq!(query.matches("SERVERPROPERTY(").count(), 2);
         assert_eq!(query.matches("CASE WHEN").count(), 2);
+        assert!(query.contains(&format!("nvarchar({MAX_TEXT_UNITS})")));
+    }
+
+    /// The order is a contract with `raw_server_info_from_row` and with native
+    /// sqlcmd's `MssqlSqlcmdServerInfo`: version, then OS, then architecture.
+    #[test]
+    fn the_columns_come_in_the_order_the_readers_expect() {
+        let at = |needle: &str| EXTRA_COLUMNS.find(needle).expect(needle);
+        assert!(at("'ProductVersion'") < at("'%on Linux%'"));
+        assert!(at("'%on Linux%'") < at("'%(X64)%'"));
     }
 
     /// The architecture is the build's `(X64)`, not the OS's `<X64>`, so a 32-bit

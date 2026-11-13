@@ -17,7 +17,7 @@ bytes = "1"
 flate2 = "1"
 http = "1"
 opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
-opentelemetry-application-insights = { version = "0.46", default-features = false, features = ["trace"] }
+opentelemetry-application-insights = { version = "=0.46.0", default-features = false, features = ["trace"] }
 opentelemetry-http = { version = "0.33", default-features = false, features = ["reqwest-blocking"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "native-tls"] }

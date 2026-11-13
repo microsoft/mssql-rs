@@ -148,7 +148,7 @@ pub unsafe extern "C" fn mssql_sqlcmd_telemetry_record_usage(
     format: i32,
 ) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        let version = if sqlcmd_version.len <= 64 {
+        let version = if sqlcmd_version.len <= telemetry::MAX_VERSION_LEN {
             // SAFETY: forwarded from the caller's guarantees.
             unsafe { read_text(sqlcmd_version) }
         } else {
@@ -208,7 +208,7 @@ pub unsafe extern "C" fn mssql_sqlcmd_telemetry_record_connection(
     // SAFETY: non-null, and valid per the caller's guarantee.
     let info = unsafe { &*info };
     let read = |text: MssqlSqlcmdText| {
-        if text.len <= 128 {
+        if text.len <= crate::server_info::MAX_TEXT_UNITS {
             // SAFETY: forwarded from the caller's guarantees.
             unsafe { read_text(text) }
         } else {
