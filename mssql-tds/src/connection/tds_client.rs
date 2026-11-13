@@ -13559,6 +13559,34 @@ mod tests {
         assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
     }
 
+    /// A DONE reporting its own update count after the failed statement's
+    /// DONEINPROC is a result, not part of the procedure's tail, so its count
+    /// reaches `advance`.
+    #[tokio::test]
+    async fn completing_a_failed_statement_leaves_a_counted_done_for_advance() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            done_in_proc_more(),
+            done_more_with_count(3),
+            done_no_more(),
+        ]);
+        client
+            .execute(
+                "q".to_string(),
+                ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(client.complete_failed_statement().await.unwrap());
+        assert_eq!(
+            client.advance().await.unwrap(),
+            StatementResult::NoRows {
+                rows_affected: Some(3)
+            }
+        );
+    }
+
     /// A statement inside `EXEC` or `sp_executesql` ends with DONEINPROC, and
     /// the procedure's RETURNSTATUS and DONEPROC complete it too. The order is
     /// SQL Server's for `EXEC('RAISERROR(''e'', 16, 1)')`, including the
@@ -13708,25 +13736,35 @@ mod tests {
     }
 
     /// One error can flag the DONEPROC that closes the procedure as well; the
-    /// returned error accounts for it.
+    /// returned error accounts for it, even when that DONEPROC carries a count,
+    /// as ERROR and COUNT are independent flags.
     #[tokio::test]
     async fn completing_a_failed_row_set_accepts_an_error_flagged_done_proc() {
-        let mut client = failed_row_set_client(vec![
-            int_col_metadata(1),
-            Tokens::Error(error_token_with_severity(16)),
-            failed_done_in_proc(),
-            return_status(-6),
-            Tokens::DoneProc(DoneToken {
-                status: DoneStatus::ERROR,
-                cur_cmd: CurrentCommand::None,
-                row_count: 0,
-            }),
-        ])
-        .await;
+        for (status, cur_cmd, row_count) in [
+            (DoneStatus::ERROR, CurrentCommand::None, 0),
+            (
+                DoneStatus::ERROR | DoneStatus::COUNT,
+                CurrentCommand::Insert,
+                1,
+            ),
+        ] {
+            let mut client = failed_row_set_client(vec![
+                int_col_metadata(1),
+                Tokens::Error(error_token_with_severity(16)),
+                failed_done_in_proc(),
+                return_status(-6),
+                Tokens::DoneProc(DoneToken {
+                    status,
+                    cur_cmd,
+                    row_count,
+                }),
+            ])
+            .await;
 
-        assert!(!client.complete_failed_statement().await.unwrap());
-        assert!(!client.has_open_batch());
-        assert!(!client.is_connection_dead());
+            assert!(!client.complete_failed_statement().await.unwrap());
+            assert!(!client.has_open_batch());
+            assert!(!client.is_connection_dead());
+        }
     }
 
     /// Whatever follows the procedure, or the failed statement inside it, is
