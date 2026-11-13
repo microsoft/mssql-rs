@@ -82,7 +82,7 @@ The example trusts the server certificate for local development. Remove
 Parameter conversion is fallible: `ToSql::to_sql`, `IntoSql::into_sql`,
 `Query::bind`, `IntoRow::into_row`, and `query::build_params` return `Result`. Dates outside SQL
 Server's supported range return `Error::Conversion` instead of panicking;
-offset datetimes are checked in UTC. See the
+offset datetimes require valid UTC and local dates and whole-minute offsets within ±14 hours. See the
 [data API compatibility guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-rs/docs/data-api-compatibility.md)
 for details.
 

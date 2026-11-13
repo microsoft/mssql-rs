@@ -67,7 +67,8 @@ Unlike Tiberius's infallible parameter conversion, native `ToSql::to_sql`,
 `IntoRow::into_row` return `Result`, as does native `query::build_params`.
 Propagate their errors with `?`.
 Dates outside 0001-01-01 through 9999-12-31 return `Error::Conversion`;
-offset datetime conversions check the UTC date. Failed parameter conversion
+offset datetime conversions check both UTC and local dates and require whole-minute
+offsets within ±14 hours. Failed parameter conversion
 does not start a query or invalidate the connection.
 
 Conversions cover primitives, strings and bytes, UUID, `rust_decimal`,

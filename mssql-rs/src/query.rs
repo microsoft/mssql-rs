@@ -213,8 +213,8 @@ pub trait ToSql: Send + Sync {
     /// # Errors
     ///
     /// Date-bearing values outside SQL Server's range (0001-01-01 through
-    /// 9999-12-31) return a conversion error. For offset datetimes, this range
-    /// applies to the UTC date.
+    /// 9999-12-31) return a conversion error. Offset datetimes must have both
+    /// UTC and local dates in range and a whole-minute offset within ±14 hours.
     fn to_sql(&self) -> Result<SqlType>;
 
     fn debug_fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -506,6 +506,29 @@ mod chrono_to_sql {
         SqlDate::create(days).map_err(|_error| date_range_error())
     }
 
+    pub(super) fn datetime_offset_to_sql(
+        datetime2: SqlDateTime2,
+        offset_seconds: i32,
+    ) -> Result<SqlDateTimeOffset> {
+        if offset_seconds % 60 != 0 || !(-14 * 3600..=14 * 3600).contains(&offset_seconds) {
+            return Err(Error::Conversion(
+                "datetimeoffset requires a whole-minute offset within -14:00..=+14:00".into(),
+            ));
+        }
+
+        let utc_seconds = i64::try_from(datetime2.time.time_nanoseconds / 10_000_000)
+            .map_err(|_error| date_range_error())?;
+        let local_days = i64::from(datetime2.days)
+            + (utc_seconds + i64::from(offset_seconds)).div_euclid(86_400);
+        let local_days = u32::try_from(local_days).map_err(|_error| date_range_error())?;
+        SqlDate::create(local_days).map_err(|_error| date_range_error())?;
+
+        Ok(SqlDateTimeOffset {
+            datetime2,
+            offset: (offset_seconds / 60) as i16,
+        })
+    }
+
     fn naive_time_to_sql(t: &NaiveTime) -> SqlTime {
         // SqlTime.time_nanoseconds is actually in 100-nanosecond units (mirrors
         // the FromSql side in row.rs).
@@ -547,11 +570,10 @@ mod chrono_to_sql {
             // Storage matches FromSql: dt2 holds the UTC components, offset is
             // the original tz offset in minutes.
             let datetime2 = naive_dt_to_sql(&self.naive_utc())?;
-            let offset = (self.offset().local_minus_utc() / 60) as i16;
-            Ok(SqlType::DateTimeOffset(Some(SqlDateTimeOffset {
+            Ok(SqlType::DateTimeOffset(Some(datetime_offset_to_sql(
                 datetime2,
-                offset,
-            })))
+                self.offset().local_minus_utc(),
+            )?)))
         }
     }
 
@@ -570,7 +592,7 @@ mod chrono_to_sql {
 mod time_to_sql {
     use super::{Result, SqlType, ToSql, chrono_to_sql};
     use mssql_tds::datatypes::column_values::{
-        DEFAULT_VARTIME_SCALE, SqlDate, SqlDateTime2, SqlDateTimeOffset, SqlTime,
+        DEFAULT_VARTIME_SCALE, SqlDate, SqlDateTime2, SqlTime,
     };
     use time::{Date, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
 
@@ -623,10 +645,12 @@ mod time_to_sql {
             let utc = self
                 .checked_to_offset(UtcOffset::UTC)
                 .ok_or_else(chrono_to_sql::date_range_error)?;
-            Ok(SqlType::DateTimeOffset(Some(SqlDateTimeOffset {
-                datetime2: primitive_dt_to_sql(PrimitiveDateTime::new(utc.date(), utc.time()))?,
-                offset: (offset.whole_seconds() / 60) as i16,
-            })))
+            Ok(SqlType::DateTimeOffset(Some(
+                chrono_to_sql::datetime_offset_to_sql(
+                    primitive_dt_to_sql(PrimitiveDateTime::new(utc.date(), utc.time()))?,
+                    offset.whole_seconds(),
+                )?,
+            )))
         }
     }
 }
@@ -668,12 +692,9 @@ mod jiff_to_sql {
         })
     }
 
-    fn timestamp_to_sql(timestamp: Timestamp, offset_minutes: i16) -> Result<SqlDateTimeOffset> {
+    fn timestamp_to_sql(timestamp: Timestamp, offset_seconds: i32) -> Result<SqlDateTimeOffset> {
         let utc = TimeZone::UTC.to_datetime(timestamp);
-        Ok(SqlDateTimeOffset {
-            datetime2: datetime_to_sql(utc)?,
-            offset: offset_minutes,
-        })
+        chrono_to_sql::datetime_offset_to_sql(datetime_to_sql(utc)?, offset_seconds)
     }
 
     impl ToSql for civil::Date {
@@ -704,7 +725,7 @@ mod jiff_to_sql {
         fn to_sql(&self) -> Result<SqlType> {
             Ok(SqlType::DateTimeOffset(Some(timestamp_to_sql(
                 self.timestamp(),
-                (self.offset().seconds() / 60) as i16,
+                self.offset().seconds(),
             )?)))
         }
     }
@@ -1357,6 +1378,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chrono_datetimeoffset_validates_offset_and_local_date() {
+        use chrono::{FixedOffset, TimeZone, Utc};
+
+        let utc = Utc
+            .with_ymd_and_hms(2024, 1, 1, 12, 0, 0)
+            .single()
+            .expect("valid datetime");
+        for seconds in [-50_400, 50_400] {
+            let value = utc.with_timezone(&FixedOffset::east_opt(seconds).expect("valid offset"));
+            assert!(matches!(
+                value.to_sql(),
+                Ok(SqlType::DateTimeOffset(Some(dto))) if i32::from(dto.offset) * 60 == seconds
+            ));
+        }
+        for seconds in [-54_000, -50_460, -30, 30, 50_460, 54_000] {
+            let value = utc.with_timezone(&FixedOffset::east_opt(seconds).expect("valid offset"));
+            assert!(matches!(value.to_sql(), Err(Error::Conversion(_))));
+        }
+        for (year, month, day, hour, offset) in [(1, 1, 1, 0, -3600), (9999, 12, 31, 23, 3600)] {
+            let value = Utc
+                .with_ymd_and_hms(year, month, day, hour, 0, 0)
+                .single()
+                .expect("valid UTC datetime")
+                .with_timezone(&FixedOffset::east_opt(offset).expect("valid offset"));
+            assert!(matches!(value.to_sql(), Err(Error::Conversion(_))));
+        }
+        for (year, month, day, hour, offset) in [(1, 1, 1, 1, -3600), (9999, 12, 31, 22, 3600)] {
+            let value = Utc
+                .with_ymd_and_hms(year, month, day, hour, 0, 0)
+                .single()
+                .expect("valid UTC datetime")
+                .with_timezone(&FixedOffset::east_opt(offset).expect("valid offset"));
+            assert!(matches!(
+                value.to_sql(),
+                Ok(SqlType::DateTimeOffset(Some(_)))
+            ));
+        }
+    }
+
     #[cfg(feature = "time")]
     #[test]
     fn time_date_conversions_check_range_and_offset_utc_date() {
@@ -1386,6 +1447,37 @@ mod tests {
         assert!(matches!(offset_date.to_sql(), Err(Error::Conversion(_))));
     }
 
+    #[cfg(feature = "time")]
+    #[test]
+    fn time_datetimeoffset_validates_offset_and_local_date() {
+        use time::{Date, Month, UtcOffset};
+
+        let local = Date::from_calendar_date(2024, Month::January, 1)
+            .expect("valid date")
+            .midnight();
+        for seconds in [-50_400, 50_400] {
+            let value =
+                local.assume_offset(UtcOffset::from_whole_seconds(seconds).expect("offset"));
+            assert!(matches!(
+                value.to_sql(),
+                Ok(SqlType::DateTimeOffset(Some(dto))) if i32::from(dto.offset) * 60 == seconds
+            ));
+        }
+        for seconds in [-54_000, -50_460, -30, 30, 50_460, 54_000] {
+            let value =
+                local.assume_offset(UtcOffset::from_whole_seconds(seconds).expect("offset"));
+            assert!(matches!(value.to_sql(), Err(Error::Conversion(_))));
+        }
+        let utc = Date::from_calendar_date(1, Month::January, 1)
+            .expect("minimum SQL date")
+            .midnight()
+            .assume_utc();
+        let local = utc
+            .checked_to_offset(UtcOffset::from_hms(-1, 0, 0).expect("offset"))
+            .expect("time supports the local date");
+        assert!(matches!(local.to_sql(), Err(Error::Conversion(_))));
+    }
+
     #[cfg(feature = "jiff")]
     #[test]
     fn jiff_date_conversions_check_range_and_timestamp_utc_date() {
@@ -1403,6 +1495,34 @@ mod tests {
         let zoned = timestamp.to_zoned(jiff::tz::TimeZone::fixed(jiff::tz::offset(1)));
         assert_eq!(zoned.year(), 1);
         assert!(matches!(zoned.to_sql(), Err(Error::Conversion(_))));
+    }
+
+    #[cfg(feature = "jiff")]
+    #[test]
+    fn jiff_datetimeoffset_validates_offset_and_local_date() {
+        let timestamp: jiff::Timestamp = "2024-01-01T12:00:00Z".parse().expect("timestamp");
+        for seconds in [-50_400, 50_400] {
+            let value = timestamp.to_zoned(
+                jiff::tz::Offset::from_seconds(seconds)
+                    .expect("offset")
+                    .to_time_zone(),
+            );
+            assert!(matches!(
+                value.to_sql(),
+                Ok(SqlType::DateTimeOffset(Some(dto))) if i32::from(dto.offset) * 60 == seconds
+            ));
+        }
+        for seconds in [-54_000, -50_460, -30, 30, 50_460, 54_000] {
+            let value = timestamp.to_zoned(
+                jiff::tz::Offset::from_seconds(seconds)
+                    .expect("offset")
+                    .to_time_zone(),
+            );
+            assert!(matches!(value.to_sql(), Err(Error::Conversion(_))));
+        }
+        let timestamp: jiff::Timestamp = "0001-01-01T00:00:00Z".parse().expect("timestamp");
+        let value = timestamp.to_zoned(jiff::tz::TimeZone::fixed(jiff::tz::offset(-1)));
+        assert!(matches!(value.to_sql(), Err(Error::Conversion(_))));
     }
 
     #[cfg(feature = "time")]
