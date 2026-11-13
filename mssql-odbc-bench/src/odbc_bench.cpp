@@ -862,6 +862,23 @@ const std::array<WorkloadSpec, kWorkloadCount>& workloads() {
     return specs;
 }
 
+// Small calls where per-call driver overhead, not payload, decides latency. Batch
+// sizes put one sample at roughly 0.8-2 s locally on both msodbcsql18 and
+// mssql-odbc: long enough to average scheduler jitter, short enough that the
+// scenario adds about a minute to an initial pass.
+const std::array<LatencySpec, kLatencyWorkloadCount>& latency_workloads() {
+    static const std::array<LatencySpec, kLatencyWorkloadCount> specs = {{
+        // The shortest non-prepared round trip.
+        {"latency/exec_direct_select1", LatencyCall::exec_direct, 0, 5'000},
+        // The ORM shape: prepare once, then execute with a new parameter each call.
+        {"latency/prepared_select_param", LatencyCall::prepared_param, 0, 5'000},
+        // Statement text large enough that client-side scanning and UTF-16
+        // handling dominate; the trailing comment keeps server work trivial.
+        {"latency/exec_direct_16k_text", LatencyCall::exec_direct, 16'384, 2'000},
+    }};
+    return specs;
+}
+
 // Resolve one explicit configuration contract shared by both executables.
 Config Config::from_environment() {
     Config config;
@@ -920,14 +937,32 @@ Config Config::from_environment() {
         // Reject an unknown scenario instead of silently registering nothing: a
         // leg that measures zero benchmarks would fail the comparator's
         // benchmark-set check much further downstream.
-        const bool known = config.scenario == "write" || std::any_of(
-            workloads().begin(), workloads().end(), [&config](const WorkloadSpec& spec) {
-                return config.scenario == spec.scenario;
-            });
+        const bool known =
+            config.scenario == "write" || config.scenario == "latency" ||
+            std::any_of(workloads().begin(), workloads().end(),
+                        [&config](const WorkloadSpec& spec) {
+                            return config.scenario == spec.scenario;
+                        });
         if (!known) {
             throw std::runtime_error(
                 "ODBC_BENCH_SCENARIO must be one of narrow, wide, rowset, varwidth, "
-                "getdata, write, or unset");
+                "getdata, write, latency, or unset");
+        }
+    }
+    const auto latency_calls = environment_value("ODBC_BENCH_LATENCY_CALLS");
+    if (!latency_calls.empty()) {
+        if (latency_calls.size() > 7 ||
+            !std::all_of(latency_calls.begin(), latency_calls.end(),
+                         [](unsigned char character) {
+                             return std::isdigit(character) != 0;
+                         })) {
+            throw std::runtime_error(
+                "ODBC_BENCH_LATENCY_CALLS must be an integer between 1 and 1000000");
+        }
+        config.latency_calls = std::stoul(latency_calls);
+        if (config.latency_calls == 0 || config.latency_calls > 1'000'000) {
+            throw std::runtime_error(
+                "ODBC_BENCH_LATENCY_CALLS must be an integer between 1 and 1000000");
         }
     }
     if (config.write_mode != "parameter_array" && config.write_mode != "sequential") {
@@ -1039,6 +1074,13 @@ SQLHSTMT OdbcSession::statement() const {
 
 SQLHSTMT OdbcSession::admin_statement() const {
     return admin_stmt_;
+}
+
+SQLHSTMT OdbcSession::allocate_statement() {
+    SQLHSTMT stmt = SQL_NULL_HSTMT;
+    require_exact_success(SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &stmt),
+                          "SQLAllocHandle(SQL_HANDLE_STMT owned)", SQL_HANDLE_DBC, dbc_);
+    return stmt;
 }
 
 // Drain all results so the administrative statement is clean for its next use.
@@ -1173,6 +1215,19 @@ void print_benchmark_sql(std::ostream& output) {
                << workload.scenario << ", rowset " << workload.rowset_size << ")\n";
         output << select_sql(*workload.table, columns_for(*workload.table))
                << ";\nGO\n";
+    }
+    for (const auto& workload : latency_workloads()) {
+        output << "-- workload " << workload.benchmark_name
+               << " (scenario latency, no table): " << workload.calls_per_sample
+               << " calls per sample of "
+               << (workload.call == LatencyCall::prepared_param
+                       ? "prepared SELECT ? with one INT parameter"
+                       : "SELECT 1");
+        if (workload.text_chars != 0) {
+            output << " padded by a block comment to " << workload.text_chars
+                   << " characters";
+        }
+        output << '\n';
     }
 }
 
@@ -2582,6 +2637,192 @@ private:
     SQLLEN sequential_offset_ = 0;
 };
 
+class LatencyRunner::Impl {
+public:
+    Impl(OdbcSession& session, const LatencySpec& spec, std::size_t calls_override)
+        : spec_(spec),
+          calls_(calls_override != 0 ? calls_override : spec.calls_per_sample),
+          text_(statement_text(spec)),
+          stmt_(session.allocate_statement()) {
+        try {
+            if (calls_ == 0) {
+                throw std::logic_error("latency workload has no calls per sample");
+            }
+            // Bindings survive SQLCloseCursor, so binding once is what an
+            // application that reuses a cursor does.
+            require_exact_success(
+                SQLBindCol(stmt_, 1, SQL_C_SLONG, &value_, sizeof(value_), &indicator_),
+                "SQLBindCol(latency)", SQL_HANDLE_STMT, stmt_);
+            if (spec_.call == LatencyCall::prepared_param) {
+                require_exact_success(SQLPrepareW(stmt_, text_.data(), SQL_NTS),
+                                      "SQLPrepareW(latency)", SQL_HANDLE_STMT, stmt_);
+                require_exact_success(
+                    SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                     0, 0, &parameter_, sizeof(parameter_),
+                                     &parameter_indicator_),
+                    "SQLBindParameter(latency)", SQL_HANDLE_STMT, stmt_);
+            }
+        } catch (...) {
+            SQLFreeHandle(SQL_HANDLE_STMT, stmt_);
+            throw;
+        }
+    }
+
+    ~Impl() {
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt_);
+    }
+
+    Impl(const Impl&) = delete;
+    Impl& operator=(const Impl&) = delete;
+
+    const char* name() const {
+        return spec_.benchmark_name;
+    }
+
+    void preflight() {
+        verify_result_shape();
+        const auto metrics = run(std::min(kWarmupCalls, calls_));
+        std::cerr << "Preflight passed for " << name() << ": " << metrics.calls
+                  << " warm-up calls at "
+                  << metrics.total_seconds * 1e6 / static_cast<double>(metrics.calls)
+                  << " us/call; " << calls_ << " calls per sample, "
+                  << text_.size() - 1 << " statement characters\n";
+    }
+
+    RetrievalMetrics execute() {
+        return run(calls_);
+    }
+
+private:
+    // Enough to fault in driver code, settle the server plan cache, and warm the
+    // socket path before the first timed sample; capped at one sample.
+    static constexpr std::size_t kWarmupCalls = 500;
+    static constexpr SQLINTEGER kMaxParameter = 1'000'000'000;
+
+    static std::vector<SQLWCHAR> statement_text(const LatencySpec& spec) {
+        std::string text =
+            spec.call == LatencyCall::prepared_param ? "SELECT ?" : "SELECT 1";
+        if (spec.text_chars != 0) {
+            if (spec.call != LatencyCall::exec_direct ||
+                spec.text_chars < text.size() + 5) {
+                throw std::logic_error("latency padding needs a direct SELECT 1 and room");
+            }
+            // The filler the local r7 measurements used, so lab and local per-call
+            // numbers describe the same text. It contains no '?', '{', or "*/".
+            constexpr std::string_view kFiller = "padding-text-0123456789abcdef ";
+            text += " /*";
+            while (text.size() < spec.text_chars - 2) {
+                text += kFiller;
+            }
+            text.resize(spec.text_chars - 2);
+            text += "*/";
+        }
+        std::vector<SQLWCHAR> wide;
+        wide.reserve(text.size() + 1);
+        for (const char character : text) {
+            wide.push_back(static_cast<SQLWCHAR>(static_cast<unsigned char>(character)));
+        }
+        wide.push_back(0);
+        return wide;
+    }
+
+    SQLINTEGER submit() {
+        value_ = 0;
+        indicator_ = kIndicatorSentinel;
+        if (spec_.call == LatencyCall::exec_direct) {
+            require_exact_success(SQLExecDirectW(stmt_, text_.data(), SQL_NTS),
+                                  "SQLExecDirectW(latency)", SQL_HANDLE_STMT, stmt_);
+            return 1;
+        }
+        // A new value per call, so a stale buffer or a reused result cannot pass.
+        parameter_ = next_parameter_;
+        next_parameter_ = next_parameter_ == kMaxParameter ? 1 : next_parameter_ + 1;
+        require_exact_success(SQLExecute(stmt_), "SQLExecute(latency)", SQL_HANDLE_STMT,
+                              stmt_);
+        return parameter_;
+    }
+
+    void fetch_row(SQLINTEGER expected) {
+        require_exact_success(SQLFetch(stmt_), "SQLFetch(latency)", SQL_HANDLE_STMT, stmt_);
+        if (value_ != expected || indicator_ != static_cast<SQLLEN>(sizeof(value_))) {
+            std::ostringstream message;
+            message << name() << " fetched " << value_ << " (indicator " << indicator_
+                    << "); expected " << expected;
+            throw std::runtime_error(message.str());
+        }
+    }
+
+    void close_cursor() {
+        require_exact_success(SQLCloseCursor(stmt_), "SQLCloseCursor(latency)",
+                              SQL_HANDLE_STMT, stmt_);
+    }
+
+    // The timed loop fetches exactly one row and closes, so prove once that the
+    // result really is one INT column and one row on this driver.
+    void verify_result_shape() {
+        try {
+            const SQLINTEGER expected = submit();
+            SQLSMALLINT columns = 0;
+            require_exact_success(SQLNumResultCols(stmt_, &columns),
+                                  "SQLNumResultCols(latency)", SQL_HANDLE_STMT, stmt_);
+            SQLSMALLINT type = 0;
+            SQLULEN size = 0;
+            SQLSMALLINT digits = 0;
+            SQLSMALLINT nullable = 0;
+            require_exact_success(
+                SQLDescribeCol(stmt_, 1, nullptr, 0, nullptr, &type, &size, &digits,
+                               &nullable),
+                "SQLDescribeCol(latency)", SQL_HANDLE_STMT, stmt_);
+            if (columns != 1 || type != SQL_INTEGER) {
+                throw std::runtime_error(std::string(name()) +
+                                         " did not return one INT column");
+            }
+            fetch_row(expected);
+            const SQLRETURN rc = SQLFetch(stmt_);
+            if (rc != SQL_NO_DATA) {
+                throw_odbc_error("SQLFetch(latency final)", rc, SQL_HANDLE_STMT, stmt_);
+            }
+            close_cursor();
+        } catch (...) {
+            SQLFreeStmt(stmt_, SQL_CLOSE);
+            throw;
+        }
+    }
+
+    RetrievalMetrics run(std::size_t calls) {
+        double total_seconds = 0.0;
+        try {
+            const auto start = std::chrono::steady_clock::now();
+            for (std::size_t call = 0; call < calls; ++call) {
+                fetch_row(submit());
+                close_cursor();
+            }
+            total_seconds = seconds_between(start, std::chrono::steady_clock::now());
+        } catch (...) {
+            SQLFreeStmt(stmt_, SQL_CLOSE);
+            throw;
+        }
+        RetrievalMetrics metrics;
+        metrics.rows = calls;
+        metrics.cells = calls;
+        metrics.logical_bytes = calls * sizeof(SQLINTEGER);
+        metrics.total_seconds = total_seconds;
+        metrics.metadata_bind_seconds = -1.0;
+        metrics.calls = calls;
+        return metrics;
+    }
+
+    const LatencySpec& spec_;
+    std::size_t calls_;
+    std::vector<SQLWCHAR> text_;
+    SQLHSTMT stmt_;
+    SQLINTEGER value_ = 0;
+    SQLLEN indicator_ = kIndicatorSentinel;
+    SQLINTEGER parameter_ = 0;
+    SQLLEN parameter_indicator_ = sizeof(SQLINTEGER);
+    SQLINTEGER next_parameter_ = 1;
+};
+
 // Allocate descriptors once per catalog workload; each iteration still rebinds.
 WorkloadRunner::WorkloadRunner(OdbcSession& session, const WorkloadSpec& spec)
     : impl_(std::make_unique<Impl>(session, spec)) {}
@@ -2618,6 +2859,24 @@ void ParameterArrayWriteRunner::preflight() {
 }
 
 RetrievalMetrics ParameterArrayWriteRunner::execute() {
+    return impl_->execute();
+}
+
+LatencyRunner::LatencyRunner(OdbcSession& session, const LatencySpec& spec,
+                             std::size_t calls_override)
+    : impl_(std::make_unique<Impl>(session, spec, calls_override)) {}
+
+LatencyRunner::~LatencyRunner() = default;
+
+const char* LatencyRunner::name() const {
+    return impl_->name();
+}
+
+void LatencyRunner::preflight() {
+    impl_->preflight();
+}
+
+RetrievalMetrics LatencyRunner::execute() {
     return impl_->execute();
 }
 

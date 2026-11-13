@@ -13,6 +13,7 @@
 
 namespace {
 
+using mssql::odbc::bench::LatencyRunner;
 using mssql::odbc::bench::RetrievalMetrics;
 using mssql::odbc::bench::WorkloadRunner;
 
@@ -28,11 +29,18 @@ void set_counters(benchmark::State& state, const RetrievalMetrics& metrics) {
         static_cast<double>(metrics.cells) / metrics.total_seconds;
     state.counters["logical_bytes_per_second"] =
         static_cast<double>(metrics.logical_bytes) / metrics.total_seconds;
-    state.counters["execute_ms"] = metrics.execute_seconds * 1000.0;
-    if (metrics.metadata_bind_seconds >= 0.0) {
-        state.counters["metadata_bind_ms"] = metrics.metadata_bind_seconds * 1000.0;
+    if (metrics.calls != 0) {
+        // A latency sample has no phase timestamps; per-call time is its headline.
+        state.counters["calls"] = static_cast<double>(metrics.calls);
+        state.counters["us_per_call"] =
+            metrics.total_seconds * 1e6 / static_cast<double>(metrics.calls);
+    } else {
+        state.counters["execute_ms"] = metrics.execute_seconds * 1000.0;
+        if (metrics.metadata_bind_seconds >= 0.0) {
+            state.counters["metadata_bind_ms"] = metrics.metadata_bind_seconds * 1000.0;
+        }
+        state.counters["fetch_ms"] = metrics.fetch_seconds * 1000.0;
     }
-    state.counters["fetch_ms"] = metrics.fetch_seconds * 1000.0;
     if (metrics.execute_calls != 0) {
         state.counters["execute_calls"] = static_cast<double>(metrics.execute_calls);
     }
@@ -42,6 +50,34 @@ void set_counters(benchmark::State& state, const RetrievalMetrics& metrics) {
     state.counters["get_data_calls"] = static_cast<double>(metrics.get_data_calls);
     state.SetItemsProcessed(static_cast<std::int64_t>(metrics.rows));
     state.SetBytesProcessed(static_cast<std::int64_t>(metrics.logical_bytes));
+}
+
+// One sample per iteration with manual time, so only the runner's own timing
+// boundary counts. After the first failure every later benchmark is skipped.
+template <typename Measure>
+void register_measurement(const char* name, Measure measure, std::string& benchmark_error) {
+    benchmark::RegisterBenchmark(
+        name,
+        [measure, &benchmark_error](benchmark::State& state) {
+            if (!benchmark_error.empty()) {
+                state.SkipWithError(benchmark_error.c_str());
+                return;
+            }
+            try {
+                for (auto _ : state) {
+                    (void)_;
+                    const auto metrics = measure();
+                    state.SetIterationTime(metrics.total_seconds);
+                    set_counters(state, metrics);
+                }
+            } catch (const std::exception& error) {
+                benchmark_error = error.what();
+                state.SkipWithError(benchmark_error.c_str());
+            }
+        })
+        ->Iterations(1)
+        ->UseManualTime()
+        ->Unit(benchmark::kMillisecond);
 }
 
 }  // namespace
@@ -72,28 +108,9 @@ int main(int argc, char** argv) {
         std::string benchmark_error;
         for (auto& runner : runners) {
             WorkloadRunner* const current = runner.get();
-            benchmark::RegisterBenchmark(
-                current->spec().benchmark_name,
-                [current, &benchmark_error](benchmark::State& state) {
-                    if (!benchmark_error.empty()) {
-                        state.SkipWithError(benchmark_error.c_str());
-                        return;
-                    }
-                    try {
-                        for (auto _ : state) {
-                            (void)_;
-                            const auto metrics = current->retrieve();
-                            state.SetIterationTime(metrics.total_seconds);
-                            set_counters(state, metrics);
-                        }
-                    } catch (const std::exception& error) {
-                        benchmark_error = error.what();
-                        state.SkipWithError(benchmark_error.c_str());
-                    }
-                })
-                ->Iterations(1)
-                ->UseManualTime()
-                ->Unit(benchmark::kMillisecond);
+            register_measurement(
+                current->spec().benchmark_name, [current] { return current->retrieve(); },
+                benchmark_error);
         }
 
         std::unique_ptr<mssql::odbc::bench::ParameterArrayWriteRunner> write_runner;
@@ -103,28 +120,22 @@ int main(int argc, char** argv) {
                     session, config.write_mode);
             write_runner->preflight();
             auto* const current = write_runner.get();
-            benchmark::RegisterBenchmark(
-                current->name(),
-                [current, &benchmark_error](benchmark::State& state) {
-                    if (!benchmark_error.empty()) {
-                        state.SkipWithError(benchmark_error.c_str());
-                        return;
-                    }
-                    try {
-                        for (auto _ : state) {
-                            (void)_;
-                            const auto metrics = current->execute();
-                            state.SetIterationTime(metrics.total_seconds);
-                            set_counters(state, metrics);
-                        }
-                    } catch (const std::exception& error) {
-                        benchmark_error = error.what();
-                        state.SkipWithError(benchmark_error.c_str());
-                    }
-                })
-                ->Iterations(1)
-                ->UseManualTime()
-                ->Unit(benchmark::kMillisecond);
+            register_measurement(
+                current->name(), [current] { return current->execute(); }, benchmark_error);
+        }
+
+        std::vector<std::unique_ptr<LatencyRunner>> latency_runners;
+        if (config.scenario.empty() || config.scenario == "latency") {
+            for (const auto& spec : mssql::odbc::bench::latency_workloads()) {
+                auto runner =
+                    std::make_unique<LatencyRunner>(session, spec, config.latency_calls);
+                runner->preflight();
+                auto* const current = runner.get();
+                latency_runners.push_back(std::move(runner));
+                register_measurement(
+                    current->name(), [current] { return current->execute(); },
+                    benchmark_error);
+            }
         }
 
         benchmark::RunSpecifiedBenchmarks();

@@ -505,7 +505,7 @@ $script:ScipyVersion = '1.15.3'
 # Scenario catalog. The C++ harness filters its workloads by scenario, and every
 # downstream step - ordering, comparison, confirmation - iterates this list, so a
 # new scenario needs no other change here.
-$Scenarios = @('narrow', 'wide', 'rowset', 'varwidth', 'getdata', 'write')
+$Scenarios = @('narrow', 'wide', 'rowset', 'varwidth', 'getdata', 'write', 'latency')
 $script:OdbcInstRoot = 'HKLM:\Software\ODBC\ODBCINST.INI'
 $script:DriversRegKey = "$script:OdbcInstRoot\ODBC Drivers"
 $script:Repetitions = Get-PositiveIntEnv -Name 'ODBC_BENCH_REPETITIONS' -Default 5
