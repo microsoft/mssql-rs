@@ -520,7 +520,7 @@ if ($ConfirmQuorum -gt $ConfirmRuns) {
 $ImprovementMax = Get-PositiveIntEnv -Name 'ODBC_BENCH_IMPROVEMENT_VERIFY_MAX' -Default 3
 $RegressionRatio = Get-RatioEnv -Name 'ODBC_BENCH_REGRESSION_RATIO' -Default 1.05
 $ImprovementRatio = Get-RatioEnv -Name 'ODBC_BENCH_IMPROVEMENT_VERIFY_RATIO' `
-    -Default $RegressionRatio
+    -Default 1.01
 # A confirmed candidate-vs-pinned-baseline regression fails the run by default;
 # set ODBC_BENCH_FAIL_ON_REGRESSION=0 to publish the report without gating.
 $GateEnabled = $env:ODBC_BENCH_FAIL_ON_REGRESSION -ne '0'
