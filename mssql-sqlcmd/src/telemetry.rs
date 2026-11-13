@@ -1350,6 +1350,12 @@ mod tests {
                 NotCompleted,
             ),
             (206, "not json", NotCompleted),
+            // Nothing itemized to retry, so the exporter gives up: a failure.
+            (
+                206,
+                r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[]}"#,
+                Failed,
+            ),
         ] {
             let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
             let requests = guard.capture_requests();
@@ -1403,6 +1409,10 @@ mod tests {
                 r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[{"index":0}]}"#
             )
             .expect("ok")
+        );
+        // An undercount with no itemized errors is not an acceptance either.
+        assert!(
+            !accepted(206, r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[]}"#).expect("ok")
         );
         // A 500 is a rejection even with a well-formed body.
         assert!(
