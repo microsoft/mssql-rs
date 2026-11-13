@@ -332,6 +332,21 @@ async fn dropping_compat_stream_after_metadata_preserves_reuse() {
 }
 
 #[tokio::test]
+async fn cancelling_bulk_during_prior_result_cleanup_retires_connection() {
+    let Some(mut client) = live_client().await else {
+        return;
+    };
+    drop(delayed_results(&mut client).await);
+    cancel_after_poll(
+        client
+            .bulk_insert("#unused")
+            .send([mssql_rs::TokenRow::new()]),
+    )
+    .await;
+    assert_retired(&mut client);
+}
+
+#[tokio::test]
 async fn compat_columns_sql_error_preserves_reuse() {
     let Some(mut client) = live_client().await else {
         return;

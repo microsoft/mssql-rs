@@ -74,6 +74,12 @@ Conversions cover primitives, strings and bytes, UUID, `rust_decimal`,
 `chrono`, and the `time` and `jiff` types when their features are enabled.
 Native vector, variant, and table parameters use `ColumnData::Native` rather
 than a Tiberius-equivalent representation.
+An absent `Option<serde_json::Value>` binds as a nullable string, like JSON
+`null`; use `ColumnData::Json` explicitly to request SQL Server's native JSON type.
+
+`BigVarBin` identifies TDS `BigVarBinary` columns, including `varbinary(max)`.
+`Column::char_length()` returns `None` for `varchar(max)` and `nvarchar(max)`;
+`byte_length()` continues to expose the TDS wire-length sentinel.
 
 ## Dynamic queries and affected rows
 

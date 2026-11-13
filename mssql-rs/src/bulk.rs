@@ -442,6 +442,7 @@ impl<'a> BulkInsert<'a> {
     {
         let mut operation = Operation::new(self.client)?;
         let result = async {
+            operation.close_query().await.map_err(Error::Tds)?;
             let mut bulk = TdsBulkCopy::new(&mut operation, self.table_name)
                 .batch_size(self.options.batch_size)
                 .check_constraints(self.options.check_constraints)

@@ -10,8 +10,9 @@
 pub mod common;
 
 use async_trait::async_trait;
-use mssql_rs::Client;
+use futures_util::StreamExt;
 use mssql_rs::bulk::BulkLoadRow;
+use mssql_rs::{Client, IntoRow};
 use mssql_tds::core::TdsResult;
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sql_string::SqlString;
@@ -62,6 +63,47 @@ impl BulkLoadRow for IntRow {
         }
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn bulk_insert_drains_abandoned_query_stream() {
+    let cfg = common::live_config_or_exit();
+    let mut client = Client::connect(&cfg).await.expect("connect failed");
+    client
+        .simple_query("CREATE TABLE #BulkAfterStream (n INT NOT NULL)")
+        .await
+        .expect("create table");
+
+    for compatibility in [false, true] {
+        {
+            let mut stream = client.simple_query_streamed("SELECT 1 AS n UNION ALL SELECT 2");
+            let first = stream.next().await.expect("first row").expect("read row");
+            assert_eq!(first.get::<i32, _>("n"), Some(1));
+        }
+        if compatibility {
+            let mut request = client
+                .bulk_insert("#BulkAfterStream")
+                .await
+                .expect("bulk request");
+            request
+                .send(2i32.into_row().expect("valid row"))
+                .await
+                .expect("add row");
+            request.finalize().await.expect("finish bulk insert");
+        } else {
+            client
+                .bulk_insert("#BulkAfterStream")
+                .send([IntRow(vec![1])])
+                .await
+                .expect("bulk insert");
+        }
+    }
+    let rows = client
+        .simple_query("SELECT COUNT(*) AS n FROM #BulkAfterStream")
+        .await
+        .expect("count inserted rows")
+        .into_first_result();
+    assert_eq!(rows.first().expect("count row").get::<i32, _>("n"), Some(2));
 }
 
 #[tokio::test]

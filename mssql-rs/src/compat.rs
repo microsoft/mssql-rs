@@ -270,6 +270,35 @@ mod tests {
     use super::*;
     use crate::Error;
 
+    #[test]
+    fn optional_json_binding_uses_portable_string_parameters() {
+        use mssql_tds::datatypes::sqltypes::SqlType;
+
+        let mut query = Query::new("SELECT @P1, @P2, @P3");
+        query
+            .bind(None::<serde_json::Value>)
+            .expect("bind absent JSON");
+        query
+            .bind(Some(serde_json::Value::Null))
+            .expect("bind JSON null");
+        query
+            .bind(Some(serde_json::json!({"value": 1})))
+            .expect("bind JSON object");
+        let params: Vec<_> = query
+            .params
+            .iter()
+            .map(|value| crate::query::ToSql::to_sql(value).expect("convert parameter"))
+            .collect();
+        assert!(matches!(
+            params.first(),
+            Some(SqlType::NVarchar(None, 4000))
+        ));
+        assert!(matches!(params.get(1), Some(SqlType::NVarchar(None, 4000))));
+        assert!(matches!(
+            params.get(2),
+            Some(SqlType::NVarchar(Some(_), 4000))
+        ));
+    }
     fn schema() -> Arc<RowSchema> {
         RowSchema::from_metadata(&[])
     }

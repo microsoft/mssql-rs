@@ -52,6 +52,50 @@ fn invalid_dates_fail_compatibility_binding_and_row_conversion() {
     query.bind(valid).expect("valid parameter");
 }
 
+#[tokio::test]
+async fn optional_json_uses_portable_query_and_execute_parameters() {
+    let Some(mut client) = connect().await else {
+        return;
+    };
+    client
+        .simple_query("CREATE TABLE #OptionalJson (value NVARCHAR(MAX) NULL)")
+        .await
+        .expect("create temp table");
+    for (value, expected) in [
+        (None, None),
+        (Some(serde_json::Value::Null), None),
+        (Some(serde_json::json!({"v": 1})), Some("{\"v\":1}")),
+    ] {
+        let mut query = Query::new("SELECT @P1 AS value");
+        query
+            .bind(value.clone())
+            .expect("bind JSON query parameter");
+        let rows = query
+            .query(&mut client)
+            .await
+            .expect("query")
+            .into_first_result()
+            .await
+            .expect("read result");
+        assert_eq!(
+            rows.first().expect("result row").get::<&str, _>("value"),
+            expected
+        );
+        let mut insert = Query::new("INSERT INTO #OptionalJson (value) VALUES (@P1)");
+        insert.bind(value).expect("bind JSON insert parameter");
+        insert.execute(&mut client).await.expect("insert JSON");
+    }
+    let rows = client
+        .simple_query(
+            "SELECT COUNT(*) AS n FROM #OptionalJson \
+             WHERE value IS NULL OR value = N'{\"v\":1}'",
+        )
+        .await
+        .expect("count inserted values")
+        .into_first_result();
+    assert_eq!(rows.first().expect("count row").get::<i32, _>("n"), Some(3));
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Status {
     UnchangedPass,

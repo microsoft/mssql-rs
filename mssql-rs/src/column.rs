@@ -82,7 +82,8 @@ impl From<TdsDataType> for ColumnType {
             TdsDataType::NText => ColumnType::NText,
             TdsDataType::Text => ColumnType::Text,
             TdsDataType::Binary | TdsDataType::BigBinary => ColumnType::Binary,
-            TdsDataType::VarBinary | TdsDataType::BigVarBinary => ColumnType::VarBinary,
+            TdsDataType::VarBinary => ColumnType::VarBinary,
+            TdsDataType::BigVarBinary => ColumnType::BigVarBin,
             TdsDataType::Image => ColumnType::Image,
             TdsDataType::Xml => ColumnType::Xml,
             TdsDataType::Json => ColumnType::Json,
@@ -294,8 +295,11 @@ impl Column {
 
     /// Declared column character length (e.g. `255` for `NVARCHAR(255)`).
     /// For unicode types (NVARCHAR/NCHAR/NTEXT) this is `byte_length / 2`.
-    /// For non-string types, returns `None`.
+    /// For `max` and non-string types, returns `None`.
     pub fn char_length(&self) -> Option<usize> {
+        if self.is_plp {
+            return None;
+        }
         match self.column_type {
             ColumnType::NVarchar | ColumnType::NChar | ColumnType::NText => {
                 Some(self.byte_length / 2)
@@ -502,6 +506,41 @@ mod tests {
             Column::test_column("i", ColumnType::Int4, 4).char_length(),
             None
         );
+    }
+
+    #[test]
+    fn variable_width_metadata_preserves_binary_types_and_max_lengths() {
+        use mssql_tds::datatypes::sqldatatypes::TypeInfo;
+
+        assert_eq!(
+            ColumnType::from(TdsDataType::VarBinary),
+            ColumnType::VarBinary
+        );
+        for length in [32, usize::from(u16::MAX)] {
+            let mut meta = int_columns(1).remove(0);
+            meta.data_type = TdsDataType::BigVarBinary;
+            meta.type_info = if length == usize::from(u16::MAX) {
+                TypeInfo::partial_len(meta.data_type, length, None).expect("max binary metadata")
+            } else {
+                TypeInfo::var_len(meta.data_type, length).expect("binary metadata")
+            };
+            let column = Column::from_tds(&meta);
+            assert_eq!(column.column_type(), ColumnType::BigVarBin);
+            assert_eq!(column.is_plp(), length == usize::from(u16::MAX));
+        }
+        for (tds_type, expected_length) in
+            [(TdsDataType::BigVarChar, 32), (TdsDataType::NVarChar, 16)]
+        {
+            let mut meta = int_columns(1).remove(0);
+            meta.data_type = tds_type;
+            meta.type_info = TypeInfo::var_len_string(tds_type, 32, None).expect("string metadata");
+            assert_eq!(Column::from_tds(&meta).char_length(), Some(expected_length));
+            meta.type_info = TypeInfo::partial_len(tds_type, usize::from(u16::MAX), None)
+                .expect("max string metadata");
+            let column = Column::from_tds(&meta);
+            assert!(column.is_plp());
+            assert_eq!(column.char_length(), None);
+        }
     }
 
     #[test]

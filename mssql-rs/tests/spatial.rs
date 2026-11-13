@@ -108,7 +108,7 @@ async fn spatial_buffered_and_streamed_reads_preserve_native_serialization() {
                     .get(5)
                     .expect("expected ordinary binary column metadata")
                     .column_type(),
-                ColumnType::VarBinary
+                ColumnType::BigVarBin
             );
             assert_eq!(row.get::<&[u8], _>("ordinary_bytes"), Some(&[1, 2, 3][..]));
             assert_eq!(row.get::<&str, _>("tail"), Some("after"));

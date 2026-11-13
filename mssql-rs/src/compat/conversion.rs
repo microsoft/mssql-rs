@@ -459,7 +459,7 @@ impl_into_sql_native!(
     f64 => ColumnData::F64(None),
     Uuid => ColumnData::Guid(None),
     rust_decimal::Decimal => ColumnData::Numeric(None),
-    serde_json::Value => ColumnData::Json(None),
+    serde_json::Value => ColumnData::String(None),
     chrono::NaiveDate => ColumnData::Date(None),
     chrono::NaiveTime => ColumnData::Time(None),
     chrono::NaiveDateTime => ColumnData::DateTime2(None),
