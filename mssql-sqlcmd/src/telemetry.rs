@@ -77,20 +77,6 @@ pub const KEY_FORMAT: &str = "sqlcmdcli_format";
 pub const KEY_DEVICE_ID: &str = "sqlcmdcli_devdeviceid";
 pub const KEY_CALLER_TYPE: &str = "sqlcmdcli_caller_type";
 
-/// The properties an event may carry. Anything else fails the event.
-const APPROVED_KEYS: [&str; 11] = [
-    KEY_VERSION,
-    KEY_OS,
-    KEY_ARCH,
-    KEY_COMMAND,
-    KEY_FORMAT,
-    KEY_DEVICE_ID,
-    KEY_CALLER_TYPE,
-    server_info::KEY_ENGINE_EDITION,
-    server_info::KEY_SERVER_VERSION,
-    server_info::KEY_SERVER_OS,
-    server_info::KEY_SERVER_PLATFORM,
-];
 /// Present on every event.
 const REQUIRED_KEYS: [&str; 2] = [KEY_OS, KEY_ARCH];
 
@@ -328,10 +314,9 @@ fn validate_and_sanitize_event(envelope: &mut JsonValue) -> Result<(), HttpError
         ));
     };
     if properties.iter().any(|(key, value)| {
-        !APPROVED_KEYS.contains(&key.as_str())
-            || !value
-                .as_str()
-                .is_some_and(|value| property_is_valid(key, value))
+        !value
+            .as_str()
+            .is_some_and(|value| property_is_valid(key, value))
     }) || REQUIRED_KEYS
         .iter()
         .any(|key| !properties.contains_key(*key))
@@ -618,6 +603,10 @@ fn arch_value() -> &'static str {
 
 /// Whether `value` is one `key` may carry. Applied to every property before an
 /// event is built and again when the request is filtered.
+///
+/// This is also the allowlist of keys: a key that is not matched here falls to
+/// `server_info::value_is_valid`, whose default is `false`, so an unlisted key
+/// is never valid. There is deliberately no second list of keys to keep in step.
 fn property_is_valid(key: &str, value: &str) -> bool {
     match key {
         KEY_VERSION => version_is_safe(value),
