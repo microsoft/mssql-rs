@@ -142,6 +142,21 @@ stages:
       CARGO_TARGET_DIR: C:\cargo_target_dir
       ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
     steps:
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          $elevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          Write-Host "Azure VM probe: elevated=$elevated"
+          $tags = @((Get-CimInstance -ClassName Win32_SystemEnclosure -ErrorAction Stop).SMBIOSAssetTag)
+          $expected = '7783-7084-3265-9085-8269-3286-77'
+          $matches = $tags -contains $expected
+          Write-Host "Azure VM probe: enclosureCount=$($tags.Count); azurePublicCloudTagMatch=$matches"
+          if (-not $matches) {
+            throw 'The Windows agent did not return the documented Azure public-cloud SMBIOS asset tag.'
+          }
+          Write-Host "Azure VM probe: SMBIOSAssetTag=$expected"
+        displayName: 'Probe Azure public-cloud SMBIOS asset tag (throwaway experiment)'
       - template: sql-setup-template.yml
         parameters:
           buildTarget: Windows
