@@ -450,6 +450,12 @@ mod tests {
                 false,
             ),
             (206, r#"{"itemsReceived":1,"itemsAccepted":"1"}"#, false),
+            (
+                206,
+                r#"{"itemsReceived":1,"itemsAccepted":-1,"errors":[]}"#,
+                false,
+            ),
+            (206, r#"{"itemsReceived":1.0,"itemsAccepted":1.5}"#, false),
             (206, r#"{"itemsReceived":1}"#, false),
             (206, "not json", false),
             (206, "[]", false),
