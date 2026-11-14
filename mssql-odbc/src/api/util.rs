@@ -125,13 +125,10 @@ pub(crate) unsafe fn copy_utf16le_with_nul(
     }
     let units = bytes.len() / 2;
     let copied = units.min(buf_len - 1);
-    for (index, unit) in bytes.chunks_exact(2).take(copied).enumerate() {
+    for (index, unit) in bytes.as_chunks::<2>().0.iter().take(copied).enumerate() {
         // SAFETY: index and the terminator are within the caller's capacity;
         // application buffers need not be aligned.
-        unsafe {
-            dst.add(index)
-                .write_unaligned(u16::from_le_bytes([unit[0], unit[1]]))
-        };
+        unsafe { dst.add(index).write_unaligned(u16::from_le_bytes(*unit)) };
     }
     unsafe { dst.add(copied).write_unaligned(0) };
     copied < units

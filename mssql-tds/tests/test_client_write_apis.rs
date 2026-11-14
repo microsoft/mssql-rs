@@ -557,7 +557,7 @@ mod streamed_plp_write {
             assert!(
                 matches!(&row[0], ColumnValues::Null),
                 "expected SQL NULL, got {:?}",
-                &row[0]
+                row[0]
             );
         }
         client.close_query().await?;
@@ -618,7 +618,7 @@ mod streamed_plp_write {
             assert!(
                 matches!(&row[0], ColumnValues::Null),
                 "expected SQL NULL from a streamed-NULL parameter, got {:?}",
-                &row[0]
+                row[0]
             );
         }
         client.close_query().await?;

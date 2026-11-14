@@ -1120,9 +1120,12 @@ mod platform {
         let mut end = 0;
         while end < capacity {
             let byte = *bytes.get(end).ok_or(ConvError::Internal)?;
-            let is_lead = info.LeadByte.chunks_exact(2).any(|range| {
-                matches!(range, [start, stop] if *start != 0 && (*start..=*stop).contains(&byte))
-            });
+            let is_lead = info
+                .LeadByte
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .any(|&[start, stop]| start != 0 && (start..=stop).contains(&byte));
             let width = if is_lead { 2 } else { 1 };
             if width > capacity - end {
                 break;

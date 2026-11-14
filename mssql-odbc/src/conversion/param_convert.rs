@@ -1303,8 +1303,10 @@ impl AppText {
 fn decode_utf16le(bytes: &[u8]) -> String {
     char::decode_utf16(
         bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]])),
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair)),
     )
     .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
     .collect()
@@ -1412,8 +1414,10 @@ fn trim_blank_overflow(text: AppText, limit: usize) -> Result<AppText, ParamBuil
         AppText::Utf16(mut bytes) => {
             let keep = bytes.len().saturating_sub(overflow * size_of::<u16>());
             if bytes[keep..]
-                .chunks_exact(size_of::<u16>())
-                .any(|unit| unit != BLANK_UTF16)
+                .as_chunks::<{ size_of::<u16>() }>()
+                .0
+                .iter()
+                .any(|unit| *unit != BLANK_UTF16)
             {
                 return Err(ParamBuildError::StringTruncation);
             }
@@ -6202,8 +6206,10 @@ mod tests {
         let transcode = DaeTranscode::new(SQL_C_CHAR, SQL_WVARCHAR, utf8_collation());
         let wide = run_transcode(&transcode, &["caf\u{e9}".as_bytes()]).0;
         let wide_units: Vec<u16> = wide
-            .chunks_exact(2)
-            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| u16::from_le_bytes(*p))
             .collect();
         assert_eq!(String::from_utf16(&wide_units).unwrap(), "caf\u{e9}");
     }

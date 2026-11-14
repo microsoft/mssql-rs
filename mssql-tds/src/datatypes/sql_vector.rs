@@ -96,8 +96,10 @@ impl SqlVector {
         let data = match base_type_enum {
             VectorBaseType::Float32 => {
                 let f32_values: Vec<f32> = raw_bytes
-                    .chunks_exact(4)
-                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|chunk| f32::from_le_bytes(*chunk))
                     .collect();
                 VectorData::Float32(f32_values)
             }
@@ -106,8 +108,10 @@ impl SqlVector {
                 // Since JavaScript and Python standard APIs do not commonly support native Float16 memory views,
                 // we decode these half-precision bits (via the `half` crate) into standard f32 memory representations.
                 let f32_values: Vec<f32> = raw_bytes
-                    .chunks_exact(2)
-                    .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|chunk| half::f16::from_le_bytes(*chunk).to_f32())
                     .collect();
                 VectorData::Float16(f32_values)
             }

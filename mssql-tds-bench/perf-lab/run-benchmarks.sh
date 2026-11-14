@@ -113,8 +113,8 @@ ensure_packages
 # --- Toolchain ---
 # Reuse the repo's canonical rustup installer (the same script the real CI stages
 # use, shipped to the VM at .pipeline/scripts/) rather than a second, drifting
-# copy. It passes no --default-toolchain, so the repo's rust-toolchain.toml
-# (channel = "1.95") drives the version the benches build under.
+# copy. It passes no --default-toolchain, so the channel in the repo's
+# rust-toolchain.toml drives the version the benches build under.
 if ! command -v cargo >/dev/null 2>&1; then
     echo ">>> Installing Rust toolchain via .pipeline/scripts/install-rustup.sh..."
     bash "$REPO_ROOT/.pipeline/scripts/install-rustup.sh"
