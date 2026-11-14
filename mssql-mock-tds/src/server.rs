@@ -241,8 +241,10 @@ impl ConnectionProcessor {
             // Access tokens in TDS are UTF-16LE encoded
             if bytes.len() % 2 == 0 {
                 let u16_chars: Vec<u16> = bytes
-                    .chunks_exact(2)
-                    .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|chunk| u16::from_le_bytes(*chunk))
                     .collect();
                 String::from_utf16(&u16_chars).ok()
             } else {
@@ -956,8 +958,10 @@ impl ConnectionInfo {
         self.received_token.as_ref().and_then(|bytes| {
             if bytes.len() % 2 == 0 {
                 let u16_chars: Vec<u16> = bytes
-                    .chunks_exact(2)
-                    .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|chunk| u16::from_le_bytes(*chunk))
                     .collect();
                 String::from_utf16(&u16_chars).ok()
             } else {

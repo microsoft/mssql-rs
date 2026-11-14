@@ -25,8 +25,8 @@ Manager; the harness never links to the Rust driver.
 | `ODBC_BENCH_ENCRYPT` | `Mandatory` | `Encrypt` value |
 | `ODBC_BENCH_PACKET_SIZE` | `16192` | Cross-platform encrypted-lab value honored exactly by Microsoft ODBC 18.6.2.1 and both Rust builds; set through both ODBC attribute and connection keyword, then read back |
 | `ODBC_BENCH_PACKET_SIZE_KEYWORD` | `PacketSize` | `PacketSize` or Microsoft driver spelling `Packet Size` |
-| `ODBC_BENCH_SCENARIO` | all | Run only `narrow`, `wide`, `rowset`, `varwidth`, `getdata`, or `write` |
-| `ODBC_BENCH_WRITE_MODE` | `parameter_array` | Use one parameter-array execute, or `sequential` for a driver without array support |
+| `ODBC_BENCH_SCENARIO` | all | Run only `narrow`, `wide`, `rowset`, `varwidth`, `getdata`, `write`, or `pywrite` |
+| `ODBC_BENCH_WRITE_MODE` | `parameter_array` | Use one parameter-array execute, or `sequential` for a driver without array support. Applies to `write` only; `pywrite` always uses one parameter-array execute |
 
 Missing required values, connection errors, absent/invalid tables, ODBC
 warnings during retrieval, and correctness failures make the process fail.
@@ -89,6 +89,8 @@ leg reads the same tables:
 - `dbo.mssql_odbc_bench_mixedlob_200k_c16`
 - `dbo.mssql_odbc_bench_variant_20k_c4`
 - `dbo.mssql_odbc_bench_param_array`
+- `dbo.mssql_odbc_bench_pyshape_c3`
+- `dbo.mssql_odbc_bench_pyshape_c10`
 
 `mssql_odbc_bench_admin print-sql` prints the exact DDL, generator, and
 projection SQL for the whole catalog without connecting, which is the offline way
@@ -106,7 +108,7 @@ After both legs:
 
 ## Workloads
 
-Fourteen measurements over nine tables, all of them C++ calls into the driver.
+Sixteen measurements over eleven tables, all of them C++ calls into the driver.
 Every id encodes the data shape, the row and column counts, and the access shape,
 and is identical on all three driver legs. The shapes are drawn from what
 `mssql-python` asks a driver to do; nothing here runs Python.
@@ -223,10 +225,48 @@ outside the timed region.
 Preflight and every sample verify `SQLRowCount`, all parameter status entries,
 `SQL_ATTR_PARAMS_PROCESSED_PTR`, row count, numeric sums, and total text length.
 The dedicated perf runners use parameter arrays for the candidate and pinned
-msodbcsql legs. The checked-in Rust baseline predates parameter-array execution
-and rejects `SQL_ATTR_PARAMSET_SIZE > 1`, so it runs the explicitly reported
-sequential mode instead; the result is a sequential-baseline comparison, not a
+msodbcsql legs, and select the explicitly reported sequential mode for the
+pinned Rust baseline; the result is a sequential-baseline comparison, not a
 claim that the pinned baseline executed a parameter array.
+
+### `pywrite` — `mssql-python` `executemany` shape
+
+- `write/insert_1000_c3_pyshape/executemany`
+- `write/insert_1000_c10_pyshape/executemany`
+
+Each sample replays one `mssql-python` `Cursor.executemany` call on a 1,000-row
+batch, with the ODBC calls and bindings of `cursor.py` and `BindParameterArray`
+in `ddbc_bindings.cpp`. Unlike `write`, which binds `INT`, `NVARCHAR` as
+`SQL_C_WCHAR`, and `BIGINT`, `mssql-python` narrows each integer column to the
+smallest type that fits and binds ASCII `str` and money-range `Decimal` as
+`SQL_C_CHAR` → `SQL_VARCHAR`, a different driver encode path.
+
+| Column | Python value | C type → SQL type (size, digits) |
+|---|---|---|
+| `id` 1..1000 | `int` | `SQL_C_SHORT` → `SQL_SMALLINT` (5, 0) |
+| `qty` 0..99 (c10) | `int` | `SQL_C_TINYINT` → `SQL_TINYINT` (3, 0) |
+| `ref` 100000.. (c10) | `int` | `SQL_C_LONG` → `SQL_INTEGER` (10, 0), `BufferLength` 0 |
+| `name`, and `city`, `note` (c10) | ASCII `str` | `SQL_C_CHAR` → `SQL_VARCHAR` (longest value, 0), byte-length indicator |
+| `created`, and `updated` (c10) | naive `datetime` | `SQL_C_TYPE_TIMESTAMP` → `SQL_TYPE_TIMESTAMP` (26, 6) |
+| `price`, `total` (c10) | money-range `Decimal` | `SQL_C_CHAR` → `SQL_VARCHAR` (longest `format(d, "f")`, 0) |
+
+The timed region is the whole call: `SQLFreeHandle` of the previous call's
+statement and `SQLAllocHandle` (`_reset_cursor`), `SQLPrepareW`, one column-wise
+`SQLBindParameter` per column, `SQLSetStmtAttrW(SQL_ATTR_PARAMSET_SIZE)`, one
+`SQLExecute`, `SQLGetDiagRecW`, `SQLRowCount`, `SQLNumResultCols`, and `SQLRowCount`
+again. The wide entry points are called explicitly, as `mssql-python` does, on
+every platform.
+`execute_ms` reports `SQLExecute` alone. As in `mssql-python`, no status array,
+processed pointer, or bind type is set, and every call binds different buffer
+addresses. Autocommit is off. Truncation, commit, and validation are untimed;
+Python-side type detection and conversion are not measured.
+
+`ODBC_BENCH_WRITE_MODE` does not apply, so every driver leg, including the
+pinned baseline, runs this sequence. Preflight and every sample check the row
+and result-column counts and the absence of diagnostics, then read the written
+rows back in `id` order and compare every cell with the value generated for that
+row: integers, exact text, decimals scaled by 10,000, and datetimes as
+microseconds from 2026-01-01. A value attached to the wrong row fails the run.
 
 ## Measurement boundaries
 
@@ -241,7 +281,8 @@ access shape:
 | `bound_rowset_*` | `SQLExecDirect`, `SQLNumResultCols`, every `SQLDescribeCol`, every `SQLBindCol`, all `SQLFetchScroll` calls |
 | `bind_cycle_*` | the same, but describe + bind + row-array set + fetch + row-array reset + `SQLFreeStmt(SQL_UNBIND)` repeated once per rowset |
 | `getdata/*` | `SQLExecDirect`, the initial describe, then per row: `SQLFetch`, and per column a `SQLDescribeCol` plus its `SQLGetData` calls (including LOB continuations and the variant probe/`SQLColAttribute` pair) |
-| `write/*` | one parameter-array `SQLExecute`, or 2,000 sequential `SQLExecute` calls on the pinned Rust baseline |
+| `write/insert_2000_c3/*` | one parameter-array `SQLExecute`, or 2,000 sequential `SQLExecute` calls on the pinned Rust baseline |
+| `write/*_pyshape/*` | the whole `executemany` call: statement free and allocate, prepare, bind, one parameter-array `SQLExecute`, diagnostics, and row/column counts |
 
 The per-cell `SQLDescribeCol` in the row-at-a-time shape is not an accident: it
 mirrors `SQLGetData_wrap`, which re-describes every column on every row, so it is

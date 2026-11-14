@@ -2343,8 +2343,8 @@ unsafe fn deliver_bound_plp(
             if even != bytes.len() {
                 pending_byte = Some(bytes[even]);
             }
-            for pair in bytes[..even].chunks_exact(2) {
-                let unit = u16::from_le_bytes([pair[0], pair[1]]);
+            for pair in bytes[..even].as_chunks::<2>().0 {
+                let unit = u16::from_le_bytes(*pair);
                 if out_units.len() < capacity_elements {
                     out_units.push(unit);
                 } else {
@@ -3529,8 +3529,10 @@ mod tests {
             // The raw UTF-16 carrier provides arbitrary even-sized payloads.
             // One-byte scratch reads independently force every source split.
             let chunks = source
-                .chunks_exact(2)
-                .map(|pair| vec![u16::from_le_bytes([pair[0], pair[1]])])
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| vec![u16::from_le_bytes(*pair)])
                 .collect();
             let response = QueryResponse::new(
                 vec![
