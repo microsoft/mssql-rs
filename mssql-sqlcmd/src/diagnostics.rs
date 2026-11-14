@@ -59,6 +59,7 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 
 use crate::i18n;
+use crate::server_info::RawServerInfo;
 use redact::Category;
 use stages::{ConnectStagesOnly, Stage, StageRecorder, Step};
 use target::{Protocol, Target};
@@ -3935,13 +3936,22 @@ impl Diagnosis {
     async fn session_validation(&mut self, client: &mut TdsClient) {
         let mut check = Check::new(CheckId::SessionValidation, Coverage::Passed);
         check.deadline_ms = Some(self.request.timeout_ms());
+        // Decided before the clock starts: it validates the telemetry
+        // destination, which is not part of what this check measures.
+        let collect = crate::telemetry::enabled();
         let sent_unix_ms = unix_ms_now();
         let started = Instant::now();
-        let result = tokio::time::timeout(self.request.timeout(), session_probe(client)).await;
+        let result =
+            tokio::time::timeout(self.request.timeout(), session_probe(client, collect)).await;
         check.duration_ms = Some(millis(started));
         let received_unix_ms = unix_ms_now();
         let error = match result {
-            Ok(Ok(probe)) => {
+            Ok(Ok((probe, server_info))) => {
+                // After the timing is taken, so telemetry cannot skew the
+                // reported duration or the clock offset.
+                if let Some(raw) = server_info {
+                    crate::telemetry::record_server_info(&raw);
+                }
                 self.session_probed(check, &probe, sent_unix_ms, received_unix_ms);
                 return;
             }
@@ -4306,24 +4316,42 @@ struct SessionProbe {
 /// The minimal session operation: the engine edition and the server's UTC
 /// clock, in one query. The clock is read as days plus milliseconds, which
 /// every supported version can compute (`DATEDIFF_BIG` needs 2016).
-async fn session_probe(client: &mut TdsClient) -> Result<SessionProbe, Error> {
+///
+/// With `collect`, the server properties for usage telemetry ride in the same
+/// query, so they cost no round trip; they are returned for the caller to
+/// record, so that nothing about telemetry happens inside the timed query.
+/// Without it the query is unchanged.
+async fn session_probe(
+    client: &mut TdsClient,
+    collect: bool,
+) -> Result<(SessionProbe, Option<RawServerInfo>), Error> {
+    let extra = if collect {
+        format!(", {}", crate::server_info::EXTRA_COLUMNS)
+    } else {
+        String::new()
+    };
     let mut result = client
         .execute(
-            "SELECT CONVERT(int, SERVERPROPERTY('EngineEdition')), \
-             DATEDIFF(day, '19700101', t.now), \
-             DATEDIFF(millisecond, CONVERT(datetime2, CONVERT(date, t.now)), t.now) \
-             FROM (SELECT SYSUTCDATETIME() AS now) AS t"
-                .to_string(),
+            format!(
+                "SELECT CONVERT(int, SERVERPROPERTY('EngineEdition')), \
+                 DATEDIFF(day, '19700101', t.now), \
+                 DATEDIFF(millisecond, CONVERT(datetime2, CONVERT(date, t.now)), t.now){extra} \
+                 FROM (SELECT SYSUTCDATETIME() AS now) AS t"
+            ),
             (),
         )
         .await?;
     let mut probe = None;
+    let mut server_info = None;
     loop {
         match result {
             StatementResult::Rows => {
                 while let Some(row) = client.next_row().await? {
                     if probe.is_none() {
                         probe = probe_from_row(&row);
+                        if collect {
+                            server_info = raw_server_info_from_row(&row);
+                        }
                     }
                 }
             }
@@ -4332,8 +4360,37 @@ async fn session_probe(client: &mut TdsClient) -> Result<SessionProbe, Error> {
         }
         result = client.advance().await?;
     }
-    probe.ok_or_else(|| {
+    let probe = probe.ok_or_else(|| {
         Error::ProtocolError("the session validation query returned no row".to_string())
+    })?;
+    Ok((probe, server_info))
+}
+
+/// The text of a string column, or `None` for `NULL` or another type.
+fn text_column(value: Option<&ColumnValues>) -> Option<String> {
+    match value {
+        Some(ColumnValues::String(text)) => Some(text.to_utf8_string()),
+        _ => None,
+    }
+}
+
+/// The columns before the telemetry ones: the engine edition and the two clock
+/// columns. The columns `server_info::EXTRA_COLUMNS` adds follow them, in the
+/// order of `RawServerInfo`: version, OS, architecture.
+const SESSION_PROBE_COLUMNS: usize = 3;
+
+/// The server properties that follow the probe's own columns, or `None` for a
+/// row without an engine edition. A `NULL` column, as for the OS and
+/// architecture on Azure SQL Database, is an absent value.
+fn raw_server_info_from_row(row: &[ColumnValues]) -> Option<RawServerInfo> {
+    let Some(ColumnValues::Int(edition)) = row.first() else {
+        return None;
+    };
+    Some(RawServerInfo {
+        engine_edition: *edition,
+        product_version: text_column(row.get(SESSION_PROBE_COLUMNS)),
+        os: text_column(row.get(SESSION_PROBE_COLUMNS + 1)),
+        arch: text_column(row.get(SESSION_PROBE_COLUMNS + 2)),
     })
 }
 
@@ -11463,6 +11520,83 @@ pub(crate) mod tests {
         );
         assert_eq!(probe_from_row(&[ColumnValues::Null]), None);
         assert_eq!(probe_from_row(&[]), None);
+    }
+
+    fn text(value: &str) -> ColumnValues {
+        ColumnValues::String(
+            mssql_tds::datatypes::sql_string::SqlString::from_utf8_string(value.to_string()),
+        )
+    }
+
+    /// The telemetry columns are read from where `EXTRA_COLUMNS` puts them: after
+    /// the probe's three, as version, OS and architecture.
+    #[test]
+    fn the_server_properties_are_read_from_the_columns_after_the_probes() {
+        let row = [
+            ColumnValues::Int(2),
+            ColumnValues::Int(20_000),
+            ColumnValues::Int(3_723_456),
+            text("17.0.5015.4"),
+            text("windows"),
+            text("x64"),
+        ];
+        assert_eq!(
+            raw_server_info_from_row(&row),
+            Some(RawServerInfo {
+                engine_edition: 2,
+                product_version: Some("17.0.5015.4".to_string()),
+                os: Some("windows".to_string()),
+                arch: Some("x64".to_string()),
+            })
+        );
+        // The same row selects the probe's own columns unchanged.
+        assert_eq!(
+            probe_from_row(&row).map(|probe| probe.engine_edition),
+            Some(2)
+        );
+    }
+
+    /// Azure SQL Database has no OS or architecture in `@@VERSION`, so they are
+    /// `NULL` and come out absent while the rest is kept.
+    #[test]
+    fn null_os_and_architecture_are_absent_values() {
+        let row = [
+            ColumnValues::Int(5),
+            ColumnValues::Int(20_000),
+            ColumnValues::Int(1),
+            text("12.0.2000.8"),
+            ColumnValues::Null,
+            ColumnValues::Null,
+        ];
+        assert_eq!(
+            raw_server_info_from_row(&row),
+            Some(RawServerInfo {
+                engine_edition: 5,
+                product_version: Some("12.0.2000.8".to_string()),
+                os: None,
+                arch: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_row_without_an_edition_or_telemetry_columns_gives_no_properties_it_cannot_read() {
+        assert_eq!(raw_server_info_from_row(&[]), None);
+        assert_eq!(raw_server_info_from_row(&[ColumnValues::Null]), None);
+        // A probe row without the extra columns (telemetry off) has none to read.
+        assert_eq!(
+            raw_server_info_from_row(&[
+                ColumnValues::Int(2),
+                ColumnValues::Int(20_000),
+                ColumnValues::Int(1),
+            ]),
+            Some(RawServerInfo {
+                engine_edition: 2,
+                ..RawServerInfo::default()
+            })
+        );
+        // A string where a number is expected is not an edition.
+        assert_eq!(raw_server_info_from_row(&[text("2")]), None);
     }
     /// How a failed session query is classified: SQL Server's own error is
     /// diagnosed and about the server; a timeout, the network or the client

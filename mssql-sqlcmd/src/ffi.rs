@@ -34,6 +34,8 @@ use crate::diagnostics::{
 };
 use crate::formatter::json::{Column, Connection, JsonDocument, Message, RunEnd};
 use crate::i18n;
+use crate::server_info::RawServerInfo;
+use crate::telemetry::{self, FlushOutcome};
 
 /// The call succeeded.
 pub const MSSQL_SQLCMD_OK: i32 = 0;
@@ -49,6 +51,8 @@ pub const MSSQL_SQLCMD_INTERNAL_ERROR: i32 = 3;
 pub const MSSQL_SQLCMD_INVALID_ARGUMENT: i32 = 4;
 /// This build does not have the feature: diagnostics in a 32-bit build.
 pub const MSSQL_SQLCMD_UNSUPPORTED: i32 = 5;
+/// Telemetry flush did not complete before its bounded timeout.
+pub const MSSQL_SQLCMD_TELEMETRY_TIMEOUT: i32 = 6;
 
 /// [`mssql_sqlcmd_json_render`]'s `end`: sqlcmd ran to its end, and the exit
 /// code says whether the work succeeded.
@@ -57,6 +61,19 @@ pub const MSSQL_SQLCMD_RUN_FINISHED: i32 = 0;
 pub const MSSQL_SQLCMD_RUN_CANCELED: i32 = 1;
 /// The command line was rejected; nothing ran.
 pub const MSSQL_SQLCMD_RUN_INVALID_INVOCATION: i32 = 2;
+
+/// [`mssql_sqlcmd_telemetry_record_usage`]'s `command`: not a command measured by name.
+pub const MSSQL_SQLCMD_COMMAND_NONE: i32 = 0;
+/// `sqlcmd diagnose`.
+pub const MSSQL_SQLCMD_COMMAND_DIAGNOSE: i32 = 1;
+/// [`mssql_sqlcmd_telemetry_record_usage`]'s `format`: `--format` was not given.
+pub const MSSQL_SQLCMD_FORMAT_ABSENT: i32 = 0;
+/// `--format json`.
+pub const MSSQL_SQLCMD_FORMAT_JSON: i32 = 1;
+/// `--format` with a value that is not supported.
+pub const MSSQL_SQLCMD_FORMAT_UNRECOGNIZED: i32 = 2;
+/// `--format` with no value.
+pub const MSSQL_SQLCMD_FORMAT_MISSING: i32 = 3;
 
 /// The crate version, NUL-terminated: the release of the library a caller
 /// linked. Test packages (`-dev`, `-nightly`) built from the same crate version
@@ -111,6 +128,116 @@ pub unsafe extern "C" fn mssql_sqlcmd_set_locale(locale: MssqlSqlcmdText) -> i32
         }
     }))
     .unwrap_or(MSSQL_SQLCMD_INTERNAL_ERROR)
+}
+
+/// Records what this sqlcmd run is, for its one usage event.
+///
+/// `command` is `MSSQL_SQLCMD_COMMAND_*` and `format` is
+/// `MSSQL_SQLCMD_FORMAT_*`; an unknown value is the "not given" case. The
+/// version is included only when it is a bounded version-like value. Does
+/// nothing unless telemetry is enabled. On Windows, a first run (no device ID
+/// yet) can wait up to 500 ms here while another first run creates it. Best
+/// effort: a panic is caught and never crosses the ABI.
+///
+/// # Safety
+/// `sqlcmd_version` must satisfy [`read_text`]'s pointer and length requirements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mssql_sqlcmd_telemetry_record_usage(
+    sqlcmd_version: MssqlSqlcmdText,
+    command: i32,
+    format: i32,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let version = if sqlcmd_version.len <= telemetry::MAX_VERSION_LEN {
+            // SAFETY: forwarded from the caller's guarantees.
+            unsafe { read_text(sqlcmd_version) }
+        } else {
+            None
+        };
+        telemetry::record_usage(telemetry::Invocation {
+            version: version.as_deref(),
+            command: telemetry::Command::from_abi(command),
+            format: telemetry::FormatUse::from_abi(format),
+        });
+    }));
+}
+
+/// Whether this run reports telemetry. Native sqlcmd reads the server
+/// properties only when this is nonzero.
+#[unsafe(no_mangle)]
+pub extern "C" fn mssql_sqlcmd_telemetry_enabled() -> i32 {
+    catch_unwind(AssertUnwindSafe(|| i32::from(telemetry::enabled()))).unwrap_or(0)
+}
+
+/// The SQL that reads the server properties: one `SELECT` of four columns, in
+/// the order of [`MssqlSqlcmdServerInfo`]'s fields. A static, NUL-terminated
+/// UTF-8 string the caller must not free. Native sqlcmd appends it to a batch it
+/// already sends, so no round trip is added. It is
+/// [`crate::server_info::QUERY`], the one definition the diagnose path's
+/// columns come from too.
+#[unsafe(no_mangle)]
+pub extern "C" fn mssql_sqlcmd_telemetry_server_info_query() -> *const std::ffi::c_char {
+    crate::server_info::QUERY.as_ptr()
+}
+
+/// The row [`mssql_sqlcmd_telemetry_server_info_query`] returns, as native sqlcmd
+/// read it. A `NULL` column is a null `data` with zero length. Every text is at
+/// most 128 UTF-16 code units.
+#[repr(C)]
+pub struct MssqlSqlcmdServerInfo {
+    /// `EngineEdition`, or a negative value when the row was not read.
+    pub engine_edition: i32,
+    pub product_version: MssqlSqlcmdText,
+    pub os: MssqlSqlcmdText,
+    pub arch: MssqlSqlcmdText,
+}
+
+/// Records the server properties of the first successful connection, which
+/// completes the usage event and starts sending it.
+///
+/// # Safety
+/// `info` must point to a valid [`MssqlSqlcmdServerInfo`] whose texts satisfy
+/// [`read_text`]'s pointer and length requirements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mssql_sqlcmd_telemetry_record_connection(
+    info: *const MssqlSqlcmdServerInfo,
+) -> i32 {
+    if info.is_null() {
+        return MSSQL_SQLCMD_NULL_ARGUMENT;
+    }
+    // SAFETY: non-null, and valid per the caller's guarantee.
+    let info = unsafe { &*info };
+    let read = |text: MssqlSqlcmdText| {
+        if text.len <= crate::server_info::MAX_TEXT_UNITS {
+            // SAFETY: forwarded from the caller's guarantees.
+            unsafe { read_text(text) }
+        } else {
+            None
+        }
+    };
+    match catch_unwind(AssertUnwindSafe(|| {
+        telemetry::record_server_info(&RawServerInfo {
+            engine_edition: info.engine_edition,
+            product_version: read(info.product_version),
+            os: read(info.os),
+            arch: read(info.arch),
+        });
+    })) {
+        Ok(()) => MSSQL_SQLCMD_OK,
+        Err(_) => MSSQL_SQLCMD_INTERNAL_ERROR,
+    }
+}
+
+/// Flushes and shuts down telemetry within `timeout_ms`, capped at half a second.
+#[unsafe(no_mangle)]
+pub extern "C" fn mssql_sqlcmd_telemetry_shutdown(timeout_ms: u32) -> i32 {
+    match catch_unwind(AssertUnwindSafe(|| {
+        telemetry::shutdown(std::time::Duration::from_millis(u64::from(timeout_ms)))
+    })) {
+        Ok(FlushOutcome::Completed) => MSSQL_SQLCMD_OK,
+        Ok(FlushOutcome::TimedOut) => MSSQL_SQLCMD_TELEMETRY_TIMEOUT,
+        Ok(FlushOutcome::Failed) | Err(_) => MSSQL_SQLCMD_INTERNAL_ERROR,
+    }
 }
 
 /// A UTF-16 string with an explicit length. It need not be NUL-terminated and
@@ -2211,6 +2338,15 @@ mod tests {
         );
     }
 
+    /// The exported query is the NUL-terminated one `server_info` defines.
+    #[test]
+    fn the_exported_server_info_query_is_the_one_server_info_defines() {
+        // SAFETY: the function returns a pointer to a static NUL-terminated string.
+        let exported =
+            unsafe { std::ffi::CStr::from_ptr(mssql_sqlcmd_telemetry_server_info_query()) };
+        assert_eq!(exported, crate::server_info::QUERY);
+    }
+
     /// The header declares exactly the functions this module exports, and its
     /// constants have the values of the Rust ones.
     #[test]
@@ -2241,12 +2377,28 @@ mod tests {
                 MSSQL_SQLCMD_INVALID_ARGUMENT,
             ),
             ("MSSQL_SQLCMD_UNSUPPORTED", MSSQL_SQLCMD_UNSUPPORTED),
+            (
+                "MSSQL_SQLCMD_TELEMETRY_TIMEOUT",
+                MSSQL_SQLCMD_TELEMETRY_TIMEOUT,
+            ),
             ("MSSQL_SQLCMD_RUN_FINISHED", MSSQL_SQLCMD_RUN_FINISHED),
             ("MSSQL_SQLCMD_RUN_CANCELED", MSSQL_SQLCMD_RUN_CANCELED),
             (
                 "MSSQL_SQLCMD_RUN_INVALID_INVOCATION",
                 MSSQL_SQLCMD_RUN_INVALID_INVOCATION,
             ),
+            ("MSSQL_SQLCMD_COMMAND_NONE", MSSQL_SQLCMD_COMMAND_NONE),
+            (
+                "MSSQL_SQLCMD_COMMAND_DIAGNOSE",
+                MSSQL_SQLCMD_COMMAND_DIAGNOSE,
+            ),
+            ("MSSQL_SQLCMD_FORMAT_ABSENT", MSSQL_SQLCMD_FORMAT_ABSENT),
+            ("MSSQL_SQLCMD_FORMAT_JSON", MSSQL_SQLCMD_FORMAT_JSON),
+            (
+                "MSSQL_SQLCMD_FORMAT_UNRECOGNIZED",
+                MSSQL_SQLCMD_FORMAT_UNRECOGNIZED,
+            ),
+            ("MSSQL_SQLCMD_FORMAT_MISSING", MSSQL_SQLCMD_FORMAT_MISSING),
             (
                 "MSSQL_SQLCMD_AUTH_SQL_PASSWORD",
                 MSSQL_SQLCMD_AUTH_SQL_PASSWORD,
