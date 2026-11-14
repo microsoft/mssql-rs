@@ -671,8 +671,66 @@ mod tests {
     use mssql_tds::error::{Error, SqlErrorInfo, SqlServerDiagnostics, TimeoutErrorType};
     use pyo3::prelude::*;
 
-    use super::map_connect_error;
+    use super::{PyAsyncConnection, close_client, map_connect_error};
     use crate::async_errors::{DatabaseError, OperationalError};
+    use crate::async_handle::LogicalConnection;
+
+    #[test]
+    fn context_exit_after_handle_revocation_closes_without_io() {
+        let (client, transport) =
+            mssql_tds::test_client_support::tds_client_from_tokens_capturing(Vec::new());
+        let connection = std::sync::Arc::new(LogicalConnection::new(client));
+        drop(
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(connection.take_for_close())
+                .unwrap(),
+        );
+        let state = connection.state.clone();
+        let wrapper = PyAsyncConnection {
+            tds_client: Some(connection),
+            tracing_dispatch: None,
+            autocommit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_state: state.clone(),
+            default_query_timeout: 0,
+        };
+        Python::attach(|py| {
+            let globals = pyo3::types::PyDict::new(py);
+            globals
+                .set_item("conn", Py::new(py, wrapper).unwrap())
+                .unwrap();
+            py.run(
+                cr"import asyncio
+async def run():
+    assert await conn.__aexit__(None, None, None) is None
+    assert conn.closed
+    assert await conn.close() is None
+asyncio.run(run())",
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            state.lifecycle(),
+            crate::async_session::ConnectionLifecycle::Closed
+        );
+        assert_eq!(std::sync::Arc::strong_count(&transport), 1);
+        assert!(transport.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_after_handle_revocation_is_a_noop() {
+        let (client, transport) =
+            mssql_tds::test_client_support::tds_client_from_tokens_capturing(Vec::new());
+        let connection = std::sync::Arc::new(LogicalConnection::new(client));
+        drop(connection.take_for_close().await.unwrap());
+
+        assert!(close_client(connection.clone(), false).await);
+        assert!(close_client(connection.clone(), true).await);
+        assert_eq!(std::sync::Arc::strong_count(&transport), 1);
+        assert!(transport.lock().unwrap().is_empty());
+        assert!(connection.take_for_close().await.is_none());
+    }
 
     #[test]
     fn connect_transport_errors_are_independent_of_auth_mode() {
