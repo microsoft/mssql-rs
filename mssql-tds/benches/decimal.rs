@@ -85,8 +85,10 @@ fn decode_previous(buf: &[u8], at: &mut usize, precision: u8, scale: u8) -> Opti
     *at += magnitude_len;
 
     let int_parts: Vec<i32> = magnitude
-        .chunks_exact(4)
-        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| i32::from_le_bytes(*c))
         .collect();
 
     Some(PreviousParts {

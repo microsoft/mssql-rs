@@ -64,6 +64,9 @@ extends:
         scanOutputDirectoryOnly: true
       credscan:
         enabled: true
+      suppression:
+        suppressionFile: '$(Build.SourcesDirectory)\.gdn\.gdnsuppress'
+        suppressionSet: default
       policheck:
         enabled: true
 

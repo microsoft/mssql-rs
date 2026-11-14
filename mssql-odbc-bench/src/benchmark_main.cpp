@@ -44,6 +44,33 @@ void set_counters(benchmark::State& state, const RetrievalMetrics& metrics) {
     state.SetBytesProcessed(static_cast<std::int64_t>(metrics.logical_bytes));
 }
 
+// Register a write runner that owns its own timing; `execute()` is one sample.
+template <typename Runner>
+void register_write(Runner* runner, std::string& benchmark_error) {
+    benchmark::RegisterBenchmark(
+        runner->name(),
+        [runner, &benchmark_error](benchmark::State& state) {
+            if (!benchmark_error.empty()) {
+                state.SkipWithError(benchmark_error.c_str());
+                return;
+            }
+            try {
+                for (auto _ : state) {
+                    (void)_;
+                    const auto metrics = runner->execute();
+                    state.SetIterationTime(metrics.total_seconds);
+                    set_counters(state, metrics);
+                }
+            } catch (const std::exception& error) {
+                benchmark_error = error.what();
+                state.SkipWithError(benchmark_error.c_str());
+            }
+        })
+        ->Iterations(1)
+        ->UseManualTime()
+        ->Unit(benchmark::kMillisecond);
+}
+
 }  // namespace
 
 // Register only the selected scenario after an untimed correctness preflight, then
@@ -102,29 +129,21 @@ int main(int argc, char** argv) {
                 std::make_unique<mssql::odbc::bench::ParameterArrayWriteRunner>(
                     session, config.write_mode);
             write_runner->preflight();
-            auto* const current = write_runner.get();
-            benchmark::RegisterBenchmark(
-                current->name(),
-                [current, &benchmark_error](benchmark::State& state) {
-                    if (!benchmark_error.empty()) {
-                        state.SkipWithError(benchmark_error.c_str());
-                        return;
-                    }
-                    try {
-                        for (auto _ : state) {
-                            (void)_;
-                            const auto metrics = current->execute();
-                            state.SetIterationTime(metrics.total_seconds);
-                            set_counters(state, metrics);
-                        }
-                    } catch (const std::exception& error) {
-                        benchmark_error = error.what();
-                        state.SkipWithError(benchmark_error.c_str());
-                    }
-                })
-                ->Iterations(1)
-                ->UseManualTime()
-                ->Unit(benchmark::kMillisecond);
+            register_write(write_runner.get(), benchmark_error);
+        }
+
+        std::vector<std::unique_ptr<mssql::odbc::bench::ExecuteManyWriteRunner>>
+            execute_many_runners;
+        if (config.scenario.empty() ||
+            config.scenario == mssql::odbc::bench::kExecuteManyScenario) {
+            for (const auto shape : {mssql::odbc::bench::ExecuteManyShape::c3,
+                                     mssql::odbc::bench::ExecuteManyShape::c10}) {
+                auto runner = std::make_unique<mssql::odbc::bench::ExecuteManyWriteRunner>(
+                    session, shape);
+                runner->preflight();
+                register_write(runner.get(), benchmark_error);
+                execute_many_runners.push_back(std::move(runner));
+            }
         }
 
         benchmark::RunSpecifiedBenchmarks();
