@@ -4981,6 +4981,7 @@ pub(crate) mod tests {
             server_name: None,
             proc_name: None,
             line_number: None,
+            ..Default::default()
         });
         Error::SqlServerError { diagnostics }
     }

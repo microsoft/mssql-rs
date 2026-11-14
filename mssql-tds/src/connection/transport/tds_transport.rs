@@ -4,7 +4,7 @@
 //! TdsTransport trait provides an abstraction over the transport layer for TDS communication.
 //! This allows for different implementations (real network, mock for testing/fuzzing, etc.)
 
-use crate::core::TdsResult;
+use crate::core::{CancelHandle, TdsResult};
 use crate::io::reader_writer::NetworkWriter;
 use crate::io::token_stream::{ParserContext, TdsTokenStreamReader};
 use async_trait::async_trait;
@@ -109,6 +109,21 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     /// server will send nothing further for it.
     fn response_fully_received(&self) -> bool {
         false
+    }
+
+    /// Waits at most `wait` for the next token of the current response to be
+    /// buffered whole, reading none of it, and returns whether it is one
+    /// `wanted` accepts. The wait ending, or a cancellation, is not a failure
+    /// and interrupts nothing. A transport that cannot tell returns `true`, so
+    /// the caller reads on.
+    #[cfg_attr(not(any(test, feature = "test-util", fuzzing)), allow(dead_code))]
+    async fn wanted_token_within(
+        &mut self,
+        _wait: Duration,
+        _cancel_handle: Option<&CancelHandle>,
+        _wanted: fn(u8) -> bool,
+    ) -> TdsResult<bool> {
+        Ok(true)
     }
 
     /// Marks the connection as known-dead so [`connection_known_dead`] reports

@@ -24,7 +24,7 @@ use crate::api::odbc_types::{
     SqlWChar,
 };
 use crate::api::util::{copy_with_nul, write_if_some};
-use crate::error::{DiagRecord, HasDiagnostics};
+use crate::error::{DiagRecord, HasDiagnostics, sort_diagnostics};
 use crate::handles::{DbcHandle, DescHandle, EnvHandle, HandleType, StmtHandle, handle_from_raw};
 
 /// Implementation of [`SQLGetDiagRecW`](super::exports::SQLGetDiagRecW).
@@ -365,16 +365,17 @@ unsafe fn diag_record_count(
     handle_type: SqlSmallInt,
     handle: SqlHandle,
 ) -> Result<SqlInteger, SqlReturn> {
-    unsafe { with_locked_diag_records(handle_type, handle, |records| records.len() as SqlInteger) }
+    unsafe {
+        with_locked_diag_records(handle_type, handle, |state| {
+            state.diag_records().len() as SqlInteger
+        })
+    }
 }
 
 /// Clones the requested record out from under the handle's diag mutex.
 /// Returns `Ok(None)` if the index is past the end of the list.
 /// Returns `Err(SQL_INVALID_HANDLE)` for unsupported handle types.
 ///
-/// TODO: For ODBC 3.x parity with msodbcsql, diagnostic records should be
-/// sorted by priority before indexing (as msodbcsql does). We currently
-/// return in posting order.
 /// TODO: Add an OOM-resilient fallback diagnostic path for out-of-memory:
 /// store a non-allocating OOM flag on the handle and return
 /// static HY001 text for record 1 without heap allocation.
@@ -388,7 +389,12 @@ unsafe fn snapshot_record(
     rec_number: SqlSmallInt,
 ) -> Result<Option<DiagRecord>, SqlReturn> {
     let idx = (rec_number - 1) as usize;
-    unsafe { with_locked_diag_records(handle_type, handle, |records| records.get(idx).cloned()) }
+    unsafe {
+        with_locked_diag_records(handle_type, handle, |state| {
+            sort_diagnostics(state);
+            state.diag_records().get(idx).cloned()
+        })
+    }
 }
 
 /// Dispatches to the correct handle type, locks its state, and passes the
@@ -400,7 +406,7 @@ unsafe fn snapshot_record(
 unsafe fn with_locked_diag_records<T>(
     handle_type: SqlSmallInt,
     handle: SqlHandle,
-    f: impl Fn(&[DiagRecord]) -> T,
+    mut f: impl FnMut(&mut dyn HasDiagnostics) -> T,
 ) -> Result<T, SqlReturn> {
     match handle_type {
         SQL_HANDLE_ENV => {
@@ -410,11 +416,11 @@ unsafe fn with_locked_diag_records<T>(
                 HandleType::Env,
                 "with_locked_diag_records: handle is not ENV"
             );
-            let guard = h.inner.lock().map_err(|_| {
+            let mut guard = h.inner.lock().map_err(|_| {
                 error!("with_locked_diag_records: ENV mutex poisoned");
                 SQL_ERROR
             })?;
-            Ok(f(guard.diag_records()))
+            Ok(f(&mut *guard))
         }
         SQL_HANDLE_DBC => {
             let h = unsafe { handle_from_raw::<DbcHandle>(handle) };
@@ -423,11 +429,11 @@ unsafe fn with_locked_diag_records<T>(
                 HandleType::Dbc,
                 "with_locked_diag_records: handle is not DBC"
             );
-            let guard = h.inner.lock().map_err(|_| {
+            let mut guard = h.inner.lock().map_err(|_| {
                 error!("with_locked_diag_records: DBC mutex poisoned");
                 SQL_ERROR
             })?;
-            Ok(f(guard.diag_records()))
+            Ok(f(&mut *guard))
         }
         SQL_HANDLE_STMT => {
             let h = unsafe { handle_from_raw::<StmtHandle>(handle) };
@@ -436,11 +442,11 @@ unsafe fn with_locked_diag_records<T>(
                 HandleType::Stmt,
                 "with_locked_diag_records: handle is not STMT"
             );
-            let guard = h.inner.lock().map_err(|_| {
+            let mut guard = h.inner.lock().map_err(|_| {
                 error!("with_locked_diag_records: STMT mutex poisoned");
                 SQL_ERROR
             })?;
-            Ok(f(guard.diag_records()))
+            Ok(f(&mut *guard))
         }
         SQL_HANDLE_DESC => {
             let h = unsafe { handle_from_raw::<DescHandle>(handle) };
@@ -449,11 +455,11 @@ unsafe fn with_locked_diag_records<T>(
                 HandleType::Desc,
                 "with_locked_diag_records: handle is not DESC"
             );
-            let guard = h.inner.lock().map_err(|_| {
+            let mut guard = h.inner.lock().map_err(|_| {
                 error!("with_locked_diag_records: DESC mutex poisoned");
                 SQL_ERROR
             })?;
-            Ok(f(guard.diag_records()))
+            Ok(f(&mut *guard))
         }
         _ => {
             error!(
@@ -622,6 +628,58 @@ mod tests {
         assert_eq!(utf16_to_string(&msg), "Invalid attribute value");
         assert_eq!(text_len, "Invalid attribute value".len() as SqlSmallInt);
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    #[test]
+    fn record_reads_sort_lazily_by_resource_priority() {
+        let handles = crate::test_support::TestHandles::with_env();
+        let env = handles.env;
+        let env_ref = unsafe { handle_from_raw::<EnvHandle>(env) };
+        {
+            let mut state = env_ref.inner.lock().unwrap();
+            state.diag_records.push(DiagRecord::with_sort_key(
+                *b"42000",
+                50000,
+                SQL_NO_ROW_NUMBER,
+                40136,
+                "server error",
+            ));
+            state.diag_records.push(DiagRecord::with_sort_key(
+                *b"01003",
+                8153,
+                SQL_NO_ROW_NUMBER,
+                0,
+                "server warning",
+            ));
+        }
+        assert_eq!(
+            unsafe { diag_record_count(SQL_HANDLE_ENV, env) }.unwrap(),
+            2
+        );
+        assert_eq!(
+            env_ref.inner.lock().unwrap().diag_records[0].native_error,
+            50000
+        );
+
+        let mut state = [0u16; 6];
+        let mut native: SqlInteger = 0;
+        let mut msg = [0u16; 64];
+        let mut text_len: SqlSmallInt = 0;
+        let ret = unsafe {
+            sql_get_diag_rec_w(
+                SQL_HANDLE_ENV,
+                env,
+                1,
+                state.as_mut_ptr(),
+                &mut native,
+                msg.as_mut_ptr(),
+                msg.len() as SqlSmallInt,
+                &mut text_len,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(utf16_to_string(&state), "01003");
+        assert_eq!(native, 8153);
     }
 
     #[test]

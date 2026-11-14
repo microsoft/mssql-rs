@@ -77,6 +77,28 @@ impl AnyTransport {
         }
     }
 
+    /// See [`TdsTransport::wanted_token_within`].
+    pub(crate) async fn wanted_token_within(
+        &mut self,
+        wait: Duration,
+        cancel_handle: Option<&CancelHandle>,
+        wanted: fn(u8) -> bool,
+    ) -> TdsResult<bool> {
+        match self {
+            Self::Network(transport) => {
+                transport
+                    .wanted_token_within(wait, cancel_handle, wanted)
+                    .await
+            }
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(transport) => {
+                transport
+                    .wanted_token_within(wait, cancel_handle, wanted)
+                    .await
+            }
+        }
+    }
+
     /// Whether a DATACLASSIFICATION token can follow COLMETADATA on this
     /// connection. Lets callers skip the look-ahead, and its future, entirely
     /// when the feature was not negotiated.

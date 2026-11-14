@@ -1247,6 +1247,47 @@ mod query_result_reads {
         assert_still_usable(&mut connection).await;
     }
 
+    /// A statement inside `EXEC` fails while a later one is still running.
+    /// Completing it gives up on the procedure's tail after a short
+    /// look-ahead that is not charged to the request's timeout, so the batch
+    /// outlives a timeout shorter than the later statement's delay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completing_a_failed_statement_leaves_a_procedure_still_running() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+
+        let started = std::time::Instant::now();
+        match connection
+            .execute(
+                "SET NOCOUNT ON; EXEC(N'RAISERROR(''first'',16,1) WITH NOWAIT; \
+                 WAITFOR DELAY ''00:00:02.500''; SELECT 842 AS v;');"
+                    .to_string(),
+                ExecuteOptions::new()
+                    .on_error(BatchErrorMode::Continue)
+                    .timeout_secs(2),
+            )
+            .await
+        {
+            Err(SqlServerError { diagnostics }) => {
+                assert_eq!(messages(&diagnostics), vec!["first"]);
+            }
+            other => panic!("expected the statement error, got {other:?}"),
+        }
+        assert!(connection.complete_failed_statement().await.unwrap());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the error waited for the procedure's tail"
+        );
+
+        assert_eq!(connection.advance().await.unwrap(), StatementResult::Rows);
+        match connection.next_row().await.unwrap().as_deref() {
+            Some([ColumnValues::Int(842)]) => {}
+            other => panic!("expected the later row, got {other:?}"),
+        }
+        assert!(connection.next_row().await.unwrap().is_none());
+        assert_eq!(connection.advance().await.unwrap(), StatementResult::End);
+        assert_still_usable(&mut connection).await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_error_within_batch() {
         let mut connection = begin_connection(&build_tcp_datasource()).await;

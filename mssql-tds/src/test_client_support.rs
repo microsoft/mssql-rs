@@ -212,6 +212,10 @@ pub(crate) struct TokenReplayTransport {
     known_dead: bool,
     /// Packets written to the wire, headers included, when capture is on.
     sent: Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
+    /// Queued-token count at which the response stalls past the request's
+    /// timeout: a read there times out, while a short wait for more of it finds
+    /// nothing, after which the rest has arrived.
+    pause_at: Option<usize>,
 }
 
 impl TokenReplayTransport {
@@ -226,6 +230,7 @@ impl TokenReplayTransport {
             reset_dispatched: false,
             known_dead: false,
             sent: None,
+            pause_at: None,
         }
     }
 
@@ -263,6 +268,27 @@ impl TokenReplayTransport {
             nbc_null_bitmap: None,
             decryptor: decryptor.clone(),
         }))
+    }
+
+    fn stalled(&self) -> bool {
+        self.pause_at == Some(self.pending_tokens.len())
+    }
+
+    fn stall_timeout() -> crate::error::Error {
+        crate::error::Error::TimeoutError(crate::error::TimeoutErrorType::String(
+            "the scripted response stalled past the request timeout".to_string(),
+        ))
+    }
+}
+
+/// The wire type of a scripted token. DONEPROC and DONEINPROC share
+/// [`DoneToken`], whose own type is DONE.
+pub(crate) fn scripted_token_type(token: &Tokens) -> u8 {
+    use crate::token::tokens::{Token, TokenType};
+    match token {
+        Tokens::DoneProc(_) => TokenType::DoneProc as u8,
+        Tokens::DoneInProc(_) => TokenType::DoneInProc as u8,
+        other => other.token_type() as u8,
     }
 }
 
@@ -312,6 +338,9 @@ impl TdsTokenStreamReader for TokenReplayTransport {
         _remaining_request_timeout: Option<Duration>,
         _cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<Tokens> {
+        if self.stalled() {
+            return Err(Self::stall_timeout());
+        }
         if let Some(tok) = self.pending_tokens.pop_front() {
             if matches!(tok, Tokens::ColMetadata(_))
                 && let Some(rows) = self.pending_rowsets.pop_front()
@@ -331,6 +360,9 @@ impl TdsTokenStreamReader for TokenReplayTransport {
         _plan: ColumnPolicy,
         _writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
+        if self.stalled() {
+            return Err(Self::stall_timeout());
+        }
         if let Some(tok) = self.pending_tokens.pop_front() {
             return Ok(RowReadResult::Token(tok));
         }
@@ -454,6 +486,21 @@ impl TdsTransport for TokenReplayTransport {
     fn abort_transport(&mut self) {
         self.known_dead = true;
     }
+    async fn wanted_token_within(
+        &mut self,
+        _wait: Duration,
+        _cancel_handle: Option<&CancelHandle>,
+        wanted: fn(u8) -> bool,
+    ) -> TdsResult<bool> {
+        if self.stalled() {
+            self.pause_at = None;
+            return Ok(false);
+        }
+        Ok(self
+            .pending_tokens
+            .front()
+            .is_none_or(|token| wanted(scripted_token_type(token))))
+    }
     async fn send_attention_with_timeout(
         &mut self,
         _context: &ParserContext,
@@ -568,6 +615,33 @@ pub fn tds_client_from_int_rowsets_with_trailing_tokens(
         ClientContext::with_data_source("tcp:localhost,1433"),
         Vec::new(),
     )
+}
+
+/// Replays `tokens`, serving the next entry of `rowsets` as the integer rows of
+/// each COLMETADATA. No DONE is added, so a row set can end with any tokens,
+/// such as a failed statement's ERROR.
+pub fn tds_client_from_tokens_with_int_rowsets(
+    tokens: Vec<ScriptedToken>,
+    rowsets: Vec<Vec<Vec<i32>>>,
+) -> TdsClient {
+    let mut transport = TokenReplayTransport::new(tokens.into_iter().map(|t| t.0).collect());
+    transport.pending_rowsets = rowsets.into();
+    client_over(transport)
+}
+
+/// [`tds_client_from_tokens_with_int_rowsets`] whose response stalls before
+/// `tokens[pause_before]`, as while a later statement outlasts the request's
+/// timeout: reading on times out, while a short wait for more finds nothing,
+/// after which the rest has arrived.
+pub fn tds_client_pausing_before(
+    tokens: Vec<ScriptedToken>,
+    rowsets: Vec<Vec<Vec<i32>>>,
+    pause_before: usize,
+) -> TdsClient {
+    let mut transport = TokenReplayTransport::new(tokens.into_iter().map(|t| t.0).collect());
+    transport.pause_at = transport.pending_tokens.len().checked_sub(pause_before);
+    transport.pending_rowsets = rowsets.into();
+    client_over(transport)
 }
 
 /// Builds an integer-row client whose buffered whole-row attempt writes only
@@ -754,6 +828,25 @@ pub fn done_in_proc_more() -> ScriptedToken {
     ScriptedToken(Tokens::DoneInProc(DoneToken {
         status: DoneStatus::MORE,
         cur_cmd: CurrentCommand::Select,
+        row_count: 0,
+    }))
+}
+
+/// The `DONEINPROC` ending a statement that failed inside `EXEC` or
+/// `sp_executesql`; the procedure's RETURNSTATUS and DONEPROC still follow.
+pub fn done_in_proc_more_error() -> ScriptedToken {
+    ScriptedToken(Tokens::DoneInProc(DoneToken {
+        status: DoneStatus::MORE | DoneStatus::ERROR,
+        cur_cmd: CurrentCommand::Select,
+        row_count: 0,
+    }))
+}
+
+/// A `DONEPROC` closing a procedure called from a batch that goes on.
+pub fn done_proc_more() -> ScriptedToken {
+    ScriptedToken(Tokens::DoneProc(DoneToken {
+        status: DoneStatus::MORE,
+        cur_cmd: CurrentCommand::None,
         row_count: 0,
     }))
 }

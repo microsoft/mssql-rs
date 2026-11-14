@@ -485,7 +485,7 @@ mod tests {
 
     fn empty_state() -> DescState {
         DescState {
-            diag_records: Vec::new(),
+            diag_records: Default::default(),
             header: DescHeader::default(),
             records: Vec::new(),
             data_classification: None,

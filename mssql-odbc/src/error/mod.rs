@@ -4,6 +4,8 @@
 pub(crate) mod diag;
 
 pub(crate) use diag::DiagRecord;
+pub(crate) use diag::DiagRecords;
 pub(crate) use diag::HasDiagnostics;
 pub(crate) use diag::free_errors;
 pub(crate) use diag::post_sql_error;
+pub(crate) use diag::sort_diagnostics;

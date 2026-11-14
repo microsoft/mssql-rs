@@ -894,6 +894,7 @@ mod tests {
             server_name: server_name.map(str::to_string),
             proc_name: None,
             line_number: None,
+            ..Default::default()
         }
     }
 

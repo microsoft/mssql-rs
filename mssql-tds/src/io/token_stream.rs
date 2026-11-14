@@ -518,6 +518,50 @@ pub(crate) fn buffered_control_token(bytes: &[u8]) -> Option<(Tokens, usize)> {
     Some((token, 1 + DONE_PAYLOAD_LEN))
 }
 
+/// How much of the next token the buffered bytes hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BufferedToken {
+    /// None of it has arrived.
+    Absent,
+    /// A token of this type has arrived whole.
+    Whole(u8),
+    /// A token of this type has begun to arrive.
+    Partial(u8),
+    /// A token of this type has begun; only parsing it finds its end.
+    Unsized(u8),
+}
+
+/// Measures the next token in `bytes` from its header, without parsing it.
+/// Only the tokens that end a procedure, and the connection state that can
+/// arrive among them, are measured; any other type is
+/// [`BufferedToken::Unsized`].
+pub(crate) fn measure_buffered_token(bytes: &[u8]) -> BufferedToken {
+    let Some(&kind) = bytes.first() else {
+        return BufferedToken::Absent;
+    };
+    let length = match kind {
+        kind if kind == TokenType::Done as u8
+            || kind == TokenType::DoneProc as u8
+            || kind == TokenType::DoneInProc as u8 =>
+        {
+            Some(1 + DONE_PAYLOAD_LEN)
+        }
+        kind if kind == TokenType::ReturnStatus as u8 => Some(1 + RETURN_STATUS_PAYLOAD_LEN),
+        kind if kind == TokenType::EnvChange as u8 => bytes
+            .get(1..3)
+            .map(|length| 3 + usize::from(u16::from_le_bytes([length[0], length[1]]))),
+        kind if kind == TokenType::SessionState as u8 => bytes.get(1..5).map(|length| {
+            let length = u32::from_le_bytes([length[0], length[1], length[2], length[3]]);
+            usize::try_from(length).map_or(usize::MAX, |length| length.saturating_add(5))
+        }),
+        _ => return BufferedToken::Unsized(kind),
+    };
+    match length {
+        Some(length) if bytes.len() >= length => BufferedToken::Whole(kind),
+        _ => BufferedToken::Partial(kind),
+    }
+}
+
 pub(crate) fn log_received_token(token_type: &TokenType, token_type_byte: u8) {
     debug!(
         "Received token type: {:?} ({})",
@@ -1813,6 +1857,49 @@ mod tests {
                 assert_eq!(reader.read_byte().await.unwrap(), 0xa5);
             }
         }
+    }
+
+    /// Every prefix of a token that can end a procedure, or of connection state
+    /// among them, measures as partial until the token is whole; any other type
+    /// is unsized from its first byte.
+    #[test]
+    fn measuring_a_buffered_token_finds_where_it_ends() {
+        let tokens = [
+            [vec![TokenType::DoneProc as u8], vec![0; DONE_PAYLOAD_LEN]].concat(),
+            [
+                vec![TokenType::ReturnStatus as u8],
+                vec![0; RETURN_STATUS_PAYLOAD_LEN],
+            ]
+            .concat(),
+            vec![TokenType::EnvChange as u8, 3, 0, 1, 2, 3],
+            vec![TokenType::SessionState as u8, 2, 0, 0, 0, 7, 8],
+        ];
+        for token in tokens {
+            let kind = token[0];
+            for prefix in 1..token.len() {
+                assert_eq!(
+                    measure_buffered_token(&token[..prefix]),
+                    BufferedToken::Partial(kind)
+                );
+            }
+            assert_eq!(measure_buffered_token(&token), BufferedToken::Whole(kind));
+            let followed = [token, vec![0xa5]].concat();
+            assert_eq!(
+                measure_buffered_token(&followed),
+                BufferedToken::Whole(kind)
+            );
+        }
+        assert_eq!(measure_buffered_token(&[]), BufferedToken::Absent);
+        let metadata = TokenType::ColMetadata as u8;
+        assert_eq!(
+            measure_buffered_token(&[metadata]),
+            BufferedToken::Unsized(metadata)
+        );
+        let session = TokenType::SessionState as u8;
+        assert_eq!(
+            measure_buffered_token(&[session, 0xff, 0xff, 0xff, 0xff]),
+            BufferedToken::Partial(session)
+        );
     }
 
     #[tokio::test]
