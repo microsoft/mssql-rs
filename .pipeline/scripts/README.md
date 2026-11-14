@@ -121,9 +121,9 @@ template checks and skips executable cases only when Bash is not installed.
 
 ### stamp-crate-versions.ps1
 
-Stamps the selected crates (by default `mssql-tds` and `mssql-mock-tds`) from the
-first selected crate's source version and aligns the mock crate's inline
-`mssql-tds` dependency. Official builds retain the source SemVer, including
+Stamps the selected crates (by default `mssql-tds`, `mssql-mock-tds`, and `mssql-rs`) from the
+first selected crate's source version and aligns their inline `mssql-tds`
+dependencies. Official builds retain the source SemVer, including
 prerelease/build metadata. Non-official scheduled builds append
 `-nightly.YYYYMMDD`; other non-official builds append `-dev.YYYYMMDD.BuildId`.
 Existing prerelease suffixes are retained. Non-official source build metadata
@@ -147,10 +147,11 @@ double-quoted, single-line SemVer. Core components must fit Cargo's unsigned
 64-bit representation. Duplicate declarations, inherited versions, quoted
 package keys/table names, multiline package strings and already stamped source
 versions fail explicitly. The mock crate requires one single-line inline
-`mssql-tds` entry in `[dependencies]`, with bare keys, no escaped values and one
-literal SemVer `version`; quoted keys and multiline strings in any of the mock
-crate's dependency sections (including dev/build and target-specific sections)
-are unsupported. Ordinary indentation, comments and LF/CRLF are preserved.
+`mssql-tds` entry in `[dependencies]`; `mssql-rs` requires one each in
+`[dependencies]` and `[dev-dependencies]`. Each uses bare keys, no escaped values
+and one literal SemVer `version`. Quoted keys and multiline strings in their
+dependency sections (including dev/build and target-specific sections) are
+unsupported. Ordinary indentation, comments and LF/CRLF are preserved.
 Quoted dependency-name segments in dependency subtable headers are also
 unsupported. Target table kinds must be bare (for example
 `[target.'cfg(windows)'.dev-dependencies]`, not a quoted `dev-dependencies`

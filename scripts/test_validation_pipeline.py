@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -205,6 +206,33 @@ def test_kerberos_archive_flag_matches_bash_comparison():
     # Template expressions render booleans as True/False.
     assert "USE_ARCHIVE: '${{ lower(parameters.useArchive) }}'" in template
     assert 'if [ "$USE_ARCHIVE" = "true" ]; then' in template
+
+
+@pytest.mark.skipif(
+    any(shutil.which(tool) is None for tool in ("cargo", "cargo-nextest")),
+    reason="needs Cargo and nextest",
+)
+def test_nextest_config_works_without_driver_crate(tmp_path):
+    (tmp_path / "Cargo.toml").write_text(
+        '[workspace]\nmembers = ["mssql-tds"]\nresolver = "2"\n', encoding="utf-8"
+    )
+    crate = tmp_path / "mssql-tds"
+    (crate / "src").mkdir(parents=True)
+    (crate / "Cargo.toml").write_text(
+        '[package]\nname = "mssql-tds"\nversion = "0.1.0"\nedition = "2021"\n',
+        encoding="utf-8",
+    )
+    (crate / "src" / "lib.rs").write_text(
+        "#[test]\nfn kerberos_fixture() {}\n", encoding="utf-8"
+    )
+    (tmp_path / ".config").mkdir()
+    shutil.copyfile(_ROOT / ".config" / "nextest.toml", tmp_path / ".config" / "nextest.toml")
+    result = subprocess.run(
+        ["cargo", "nextest", "list", "--offline", "--profile", "ci"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "kerberos_fixture" in result.stdout
 
 
 # Stands in for docker against one fake container whose filesystem is
@@ -979,6 +1007,13 @@ def test_pipeline_tests_run_in_shared_validation(selector):
     assert not step.get("continueOnError", False)
 
 
+def test_windows_validation_has_room_for_driver_test_suite():
+    stages = load_template("validation-stages.yml")["stages"]
+    build = next(stage for stage in stages if stage["stage"] == "Build")
+    windows = next(job for job in build["jobs"] if job.get("job") == "Build_Windows")
+    assert windows["timeoutInMinutes"] == 90
+
+
 def test_release_automation_bash_oracles_run_on_linux():
     stages = load_template("validation-stages.yml")["stages"]
     build = next(stage for stage in stages if stage["stage"] == "Build")
@@ -1338,13 +1373,15 @@ def test_build_template_test_overlap_parameters():
     prebuild = steps[keys.index(prebuild_key)][prebuild_key][0]
     assert prebuild["script"] == (
         "cargo llvm-cov nextest -E 'none()' --no-tests=pass --frozen --no-report "
-        "--all-targets --package mssql-tds --package mssqlodbc --package mssql-sqlcmd "
+        "--all-targets --package mssql-tds --package mssql-rs --package mssqlodbc "
+        "--package mssql-sqlcmd --features "
+        "mssql-rs/arrow,mssql-rs/jiff,mssql-rs/serde,mssql-rs/time "
         "--profile ci"
     )
     assert prebuild["condition"] == _PR
     run = next(
         step for step in steps if isinstance(step, dict)
-        and step.get("displayName") == "Run tests (mssql-tds and mssqlodbc packages)"
+        and step.get("displayName") == "Run tests (Rust workspace driver packages)"
     )
     before = keys.index("${{ parameters.beforeTestSteps }}")
     assert keys.index(prebuild_key) < before < steps.index(run)
@@ -1546,7 +1583,67 @@ def test_alpine_gssapi_compilation_still_runs_on_prs():
         encoding="utf-8"
     )
     assert "cargo nextest archive" in script
-    assert "--features gssapi" in script
+    assert "--features mssql-tds/gssapi," in script
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "command", "expected_count"),
+    [
+        (".pipeline/scripts/containerized-build.sh", "cargo nextest archive", 1),
+        ("scripts/dockerentry/alpine-build.sh", "cargo nextest archive", 1),
+        (".pipeline/scripts/containerized-test.sh", "cargo llvm-cov nextest", 1),
+        (".pipeline/scripts/containerized-test.sh", "cargo llvm-cov report", 1),
+        (".pipeline/templates/build-template.yml", "cargo llvm-cov nextest", 2),
+        (".pipeline/templates/build-template.yml", "cargo llvm-cov report", 2),
+    ],
+)
+def test_rust_driver_is_included_in_ci_archives_and_pr_tests(
+    relative_path, command, expected_count
+):
+    source = (_ROOT / relative_path).read_text(encoding="utf-8")
+    commands = [line for line in source.splitlines() if command in line]
+    assert len(commands) == expected_count
+    for selected in commands:
+        assert "--package mssql-tds" in selected
+        assert "--package mssql-rs" in selected
+        if command == "cargo llvm-cov report":
+            assert "--features" not in selected
+        else:
+            for feature in ("arrow", "jiff", "serde", "time"):
+                assert f"mssql-rs/{feature}" in selected
+        if command == "cargo nextest archive":
+            # Archive filtersets require a newer nextest than the pipeline pins.
+            assert not re.search(r"(?:^|\s)(?:-E|--filterset)(?:\s|=)", selected)
+
+
+@pytest.mark.parametrize(
+    "entrypoint", ["alpine.sh", "azlinux3.sh", "deb-bookworm.sh", "rhel.sh", "sles.sh"]
+)
+def test_archive_consumers_exclude_compile_fixtures(entrypoint):
+    script = (_ROOT / "scripts" / "dockerentry" / entrypoint).read_text(encoding="utf-8")
+    command = next(line for line in script.splitlines() if "cargo nextest run" in line)
+    assert '--archive-file "$ARCHIVE_NAME"' in command
+    assert "-E 'not (test(connectivity) | (package(mssql-rs) & binary(data_api_compile)))'" in command
+
+
+def test_compile_fixtures_run_in_build_container_for_non_pr_builds():
+    script = (_ROOT / ".pipeline" / "scripts" / "containerized-build.sh").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r'if \[ "\$IS_PR_BUILD" != "true" \]; then\n(.*?)\nfi', script, re.S)
+    assert match
+    command = match.group(1)
+    assert "cargo nextest run" in command
+    assert "--package mssql-rs" in command
+    assert "--test data_api_compile" in command
+    for feature in ("arrow", "jiff", "serde", "time"):
+        assert f"mssql-rs/{feature}" in command
+
+
+def test_standalone_driver_forwards_core_default_features():
+    manifest = tomllib.loads((_ROOT / "mssql-rs" / "Cargo.toml").read_text(encoding="utf-8"))
+    assert manifest["dependencies"]["mssql-tds"]["default-features"] is False
+    assert "mssql-tds/default" in manifest["features"]["default"]
 
 
 def test_mssql_python_odbc_failures_are_advisory_only_in_ci():

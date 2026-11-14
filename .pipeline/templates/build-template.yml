@@ -173,16 +173,16 @@ steps:
   # `none()` builds and lists every test binary without running any. With
   # --no-report, cargo-llvm-cov keeps the build for the run step.
   - ${{ if eq(parameters.prebuildTests, true) }}:
-    - script: cargo llvm-cov nextest -E 'none()' --no-tests=pass --frozen --no-report --all-targets --package mssql-tds --package mssqlodbc --package mssql-sqlcmd --profile ci
-      displayName: Build tests (mssql-tds and mssqlodbc packages)
+    - script: cargo llvm-cov nextest -E 'none()' --no-tests=pass --frozen --no-report --all-targets --package mssql-tds --package mssql-rs --package mssqlodbc --package mssql-sqlcmd --features mssql-rs/arrow,mssql-rs/jiff,mssql-rs/serde,mssql-rs/time --profile ci
+      displayName: Build tests (Rust workspace driver packages)
       condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
 
   - ${{ parameters.beforeTestSteps }}
 
   - script: |
         export CERT_HOST_NAME="sql1"
-        cargo llvm-cov nextest ${{ parameters.testFilter }} --frozen --no-report --all-targets --package mssql-tds --package mssqlodbc --package mssql-sqlcmd --no-fail-fast --profile ci --success-output immediate
-    displayName: Run tests (mssql-tds and mssqlodbc packages)
+        cargo llvm-cov nextest ${{ parameters.testFilter }} --frozen --no-report --all-targets --package mssql-tds --package mssql-rs --package mssqlodbc --package mssql-sqlcmd --features mssql-rs/arrow,mssql-rs/jiff,mssql-rs/serde,mssql-rs/time --no-fail-fast --profile ci --success-output immediate
+    displayName: Run tests (Rust workspace driver packages)
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
     env:
       SQL_PASSWORD: $(SQL_PASSWORD)
@@ -207,7 +207,7 @@ steps:
         SQL_PASSWORD: $(SQL_PASSWORD)
 
   # Coverage is not published to the ADO coverage tab from the individual OS
-  # jobs. Each OS produces its own mssql-tds Rust Cobertura report as a per-OS
+  # jobs. Each OS produces its own Rust Cobertura report as a per-OS
   # artifact; the Coverage stage merges the Windows/Linux/macOS Rust reports
   # with the mssql-py-core Python report and publishes the single combined
   # report to the ADO coverage tab, because ADO does not merge coverage across
@@ -216,10 +216,10 @@ steps:
   # `test-util` feature) used to drive a `TdsClient` from scripted tokens in
   # unit tests; it is not product code, so it is excluded from coverage.
   - ${{ if eq(parameters.backgroundCoverageReport, false) }}:
-    - script: cargo llvm-cov report --package mssql-tds --package mssqlodbc --package mssql-sqlcmd --ignore-filename-regex 'test_client_support\.rs' --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
+    - script: cargo llvm-cov report --package mssql-tds --package mssql-rs --package mssqlodbc --package mssql-sqlcmd --ignore-filename-regex 'test_client_support\.rs' --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
       condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
       workingDirectory: "$(Build.SourcesDirectory)"
-      displayName: Save code coverage in Cobertura format (mssql-tds and mssqlodbc)
+      displayName: Save Rust coverage in Cobertura format
 
     - task: PublishPipelineArtifact@1
       condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
@@ -229,10 +229,10 @@ steps:
         artifactName: "CoberturaCoverageRust_${{ parameters.osType }}"
 
   - ${{ if eq(parameters.backgroundCoverageReport, true) }}:
-    - script: bash .pipeline/scripts/background-step.sh start "$(Agent.TempDirectory)/rust-cobertura" cargo llvm-cov report --package mssql-tds --package mssqlodbc --package mssql-sqlcmd --ignore-filename-regex 'test_client_support\.rs' --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
+    - script: bash .pipeline/scripts/background-step.sh start "$(Agent.TempDirectory)/rust-cobertura" cargo llvm-cov report --package mssql-tds --package mssql-rs --package mssqlodbc --package mssql-sqlcmd --ignore-filename-regex 'test_client_support\.rs' --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
       condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
       workingDirectory: "$(Build.SourcesDirectory)"
-      displayName: Start Cobertura coverage report in the background (mssql-tds and mssqlodbc)
+      displayName: Start Rust coverage report in the background
 
 # ODBC C++ e2e suite (Windows only). The gtest suite loads the Rust ODBC driver
 # DLL through the Windows Driver Manager as separate processes, so its execution

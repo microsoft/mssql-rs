@@ -42,7 +42,7 @@ parameters:
   default: false
 
 - name: collectRustCoverage
-  displayName: Publish the mssql-tds Rust Cobertura coverage as a per-OS artifact for merging
+  displayName: Publish Rust workspace Cobertura coverage as a per-OS artifact for merging
   type: boolean
   default: false
 
@@ -380,14 +380,14 @@ steps:
       publishRunAttachments: true
 
 # Coverage is not published to the ADO coverage tab from this job. The Linux
-# mssql-tds Rust Cobertura report is published as a per-OS artifact; the
+# Rust workspace Cobertura report is published as a per-OS artifact; the
 # Coverage stage merges the Windows/Linux/macOS Rust reports with the
 # mssql-py-core Python report and publishes the single combined report to the
 # ADO coverage tab, because ADO does not merge coverage across stages/jobs.
 - ${{ if eq(parameters.collectRustCoverage, true) }}:
   - task: PublishPipelineArtifact@1
     condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
-    displayName: Publish mssql-tds Linux Cobertura coverage artifact
+    displayName: Publish Rust workspace Linux Cobertura coverage artifact
     continueOnError: true
     inputs:
       targetPath: $(Build.SourcesDirectory)/target/cobertura.xml

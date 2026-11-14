@@ -1,0 +1,104 @@
+[package]
+name = "mssql-rs"
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Microsoft Rust Driver for SQL Server with a Tiberius-style API"
+repository = "https://github.com/microsoft/mssql-rs"
+keywords = ["sql-server", "tds", "mssql", "tiberius", "database"]
+categories = ["database"]
+license = "MIT"
+license-file = "../LICENSE"
+exclude = ["**/.env*"]
+
+[lints.clippy]
+# Panic prevention
+string_slice = "warn"
+indexing_slicing = "warn"
+unwrap_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+get_unwrap = "warn"
+unwrap_in_result = "warn"
+unchecked_time_subtraction = "warn"
+panic_in_result_fn = "warn"
+
+# Futures and error handling
+let_underscore_future = "warn"
+let_underscore_must_use = "warn"
+unused_result_ok = "warn"
+map_err_ignore = "warn"
+assertions_on_result_states = "warn"
+
+# Async safety
+await_holding_lock = "warn"
+await_holding_refcell_ref = "warn"
+large_futures = "warn"
+
+# Memory safety
+mem_forget = "warn"
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+unnecessary_safety_doc = "warn"
+unnecessary_safety_comment = "warn"
+
+# Numeric correctness
+float_cmp = "warn"
+float_cmp_const = "warn"
+lossy_float_literal = "warn"
+cast_sign_loss = "warn"
+invalid_upcast_comparisons = "warn"
+
+# Avoidable mistakes
+rc_mutex = "warn"
+debug_assert_with_mut_call = "warn"
+iter_not_returning_iterator = "warn"
+expl_impl_clone_on_copy = "warn"
+infallible_try_from = "warn"
+dbg_macro = "warn"
+
+# Keep lint exceptions explicit and justified
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+
+[features]
+default = ["mssql-tds/default"]
+time = ["dep:time"]
+jiff = ["dep:jiff"]
+serde = ["dep:serde"]
+arrow = ["dep:arrow-array", "dep:arrow-schema"]
+_bench = []
+
+[dependencies]
+mssql-tds = { path = "../mssql-tds", version = "0.4.0", default-features = false }
+deadpool = { version = "0.12", features = ["rt_tokio_1"] }
+chrono = "0.4"
+rust_decimal = "1"
+uuid = "1"
+tokio = { version = "1", features = ["net"] }
+serde_json = "1"
+serde = { version = "1", optional = true }
+time = { version = "0.3", optional = true }
+jiff = { version = "0.2", optional = true, default-features = false }
+arrow-array = { version = "55", optional = true, default-features = false }
+arrow-schema = { version = "55", optional = true, default-features = false }
+async-trait = "0.1"
+thiserror = "2"
+futures-core = "0.3"
+async-stream = "0.3"
+
+[dev-dependencies]
+mssql-tds = { path = "../mssql-tds", version = "0.4.0", default-features = false, features = ["test-util"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+dotenv = "0.15"
+tokio = { version = "1", features = ["full"] }
+trybuild = "1"
+
+[[bench]]
+name = "row_streaming"
+harness = false
+required-features = ["_bench"]
