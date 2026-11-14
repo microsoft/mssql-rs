@@ -1045,6 +1045,12 @@ impl TdsClient {
                     );
                     return Ok(());
                 }
+                Err(
+                    error @ (Error::OperationCancelledError(_) | Error::TokenAcquisitionCancelled),
+                ) => {
+                    info!(attempt, "Reconnection cancelled");
+                    return Err(error);
+                }
                 Err(e) => {
                     info!(attempt, error = %e, "Reconnection attempt failed");
                     last_error = Some(e);

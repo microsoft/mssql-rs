@@ -107,6 +107,20 @@ timeout per packet.
 For interrupted-send retirement and transport-failure recovery, see
 [Response lifecycle](client-guide.md#response-lifecycle).
 
+## Session recovery cancellation
+
+Cancellation is terminal for the current recovery operation, regardless of the
+remaining connection retry count. Recovery returns `Error::OperationCancelledError`
+or `Error::TokenAcquisitionCancelled` unchanged rather than retrying or wrapping
+it in `Error::SessionRecoveryFailed`. The request waiting for recovery is not
+submitted.
+
+An `EntraIdTokenFactory` whose provider cancels token acquisition independently of
+the request's `CancelHandle` should return `Error::TokenAcquisitionCancelled`.
+This preserves the cancellation's origin for language bindings without changing
+their existing mapping of explicit command cancellation. Other recovery failures
+retain their existing retry behavior.
+
 ## DNS fallback caching
 
 LOGIN7 advertises DNS caching (`0x0B`). Each TCP connection keeps its resolved
