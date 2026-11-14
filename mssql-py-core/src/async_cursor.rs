@@ -11,7 +11,7 @@
 //!
 //! Sibling of `cursor.rs` (the synchronous surface). A [`PyAsyncCursor`] is
 //! bound to a single [`crate::async_connection::PyAsyncConnection`] and
-//! shares that connection's `TdsClient` via an `Arc<tokio::sync::Mutex<_>>`.
+//! retains its revocable logical parent rather than owning the physical client.
 //! All I/O methods will submit their futures to the shared process-wide
 //! Tokio runtime and return Python awaitables through
 //! `pyo3_async_runtimes::tokio::future_into_py`.
@@ -25,7 +25,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
-use mssql_tds::connection::tds_client::TdsClient;
 use mssql_tds::error::Error;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -37,6 +36,7 @@ use crate::async_description::DescriptionState;
 use crate::async_errors::ProgrammingError;
 use crate::async_execute::{ExecuteResources, PreparedState, release_prepared_statements};
 use crate::async_fetch::{BufferedResults, FetchState};
+use crate::async_handle::LogicalConnection;
 use crate::async_session::{
     AsyncConnectionState, ClaimError, CursorCloseClaim, CursorId, SessionOperationGuard,
 };
@@ -70,7 +70,7 @@ fn clear_result_state(
 
 /// Python-independent resources required to drain and release a cursor.
 struct CursorCleanup {
-    client: Arc<Mutex<TdsClient>>,
+    client: Arc<LogicalConnection>,
     prepared_state: Arc<Mutex<PreparedState>>,
     session_state: Arc<AsyncConnectionState>,
     cursor_id: CursorId,
@@ -90,11 +90,26 @@ impl CursorCleanup {
         );
     }
 
+    /// Borrow through the close claim; a revoked parent needs only local cursor cleanup.
     async fn run(self, claim: CursorCloseClaim) -> Result<(), Error> {
         let mut cleanup_guard =
             SessionOperationGuard::new(self.session_state.clone(), claim.operation_id);
         let (result, has_open_batch) = {
-            let mut client = self.client.lock().await;
+            let mut client = match self.client.lock_operation(claim.operation_id).await {
+                Ok(client) => client,
+                Err(ClaimError::Closing | ClaimError::Closed) => {
+                    cleanup_guard.settle(false);
+                    self.clear_result_state();
+                    self.closed.store(true, Ordering::Release);
+                    return Ok(());
+                }
+                Err(error) => {
+                    cleanup_guard.settle(false);
+                    return Err(Error::UsageError(format!(
+                        "Cursor cleanup rejected: {error:?}"
+                    )));
+                }
+            };
             let result = async {
                 if claim.drain_previous {
                     client.close_query().await?;
@@ -123,6 +138,7 @@ struct FinalizerCleanup {
     completion_guard: FinalizerCompletionGuard,
 }
 
+/// Abandon session ownership if a scheduled finalizer never finishes its cleanup.
 struct FinalizerCompletionGuard {
     session_state: Arc<AsyncConnectionState>,
     cursor_id: CursorId,
@@ -173,11 +189,8 @@ impl Drop for FinalizerCompletionGuard {
 /// This API is a preview and may change between minor releases.
 #[pyclass]
 pub struct PyAsyncCursor {
-    /// Cloned from the parent `PyAsyncConnection`. The `Arc` keeps the
-    /// client alive across cursor and connection lifetimes; the async mutex
-    /// serializes wire access across `.await` points.
-    #[allow(dead_code)] // Consumed by upcoming async execute/fetch/close APIs.
-    tds_client: Arc<Mutex<TdsClient>>,
+    /// Keeps the logical parent alive, but cannot bypass explicit connection close.
+    tds_client: Arc<LogicalConnection>,
     tracing_dispatch: Option<tracing::Dispatch>,
     prepared_state: Arc<Mutex<PreparedState>>,
     /// Shared with the parent connection for future execute-time transaction handling.
@@ -206,11 +219,11 @@ pub struct PyAsyncCursor {
 }
 
 impl PyAsyncCursor {
-    /// Construct a new cursor bound to the given TDS client.
+    /// Construct a cursor retaining its logical connection.
     ///
     /// Called only from `PyAsyncConnection::cursor`.
     pub(crate) fn new(
-        tds_client: Arc<Mutex<TdsClient>>,
+        tds_client: Arc<LogicalConnection>,
         tracing_dispatch: Option<tracing::Dispatch>,
         autocommit: Arc<AtomicBool>,
         session_state: Arc<AsyncConnectionState>,
@@ -238,6 +251,7 @@ impl PyAsyncCursor {
         }
     }
 
+    /// Retain the logical parent for cleanup without giving the finalizer physical ownership.
     fn cleanup(&self) -> CursorCleanup {
         CursorCleanup {
             client: self.tds_client.clone(),
@@ -252,6 +266,7 @@ impl PyAsyncCursor {
         }
     }
 
+    /// Capture fetch state and parent lifetime before releasing the Python borrow.
     pub(crate) fn fetch_resources(&self) -> PyResult<crate::async_fetch::FetchResources> {
         if self.closed.load(Ordering::Acquire) {
             return Err(PyRuntimeError::new_err("Cursor is closed"));
@@ -268,6 +283,7 @@ impl PyAsyncCursor {
         ))
     }
 
+    /// Snapshot execution inputs while retaining revocable, not raw-client, access.
     pub(crate) fn execute_resources(&self) -> PyResult<ExecuteResources> {
         if self.closed.load(Ordering::Acquire) {
             return Err(PyRuntimeError::new_err("Cursor is closed"));

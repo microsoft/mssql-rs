@@ -38,6 +38,11 @@ do not require OpenSSL.
 
 For SDK authors integrating the native runtime:
 
+- Async cursors retain their logical connection when the connection wrapper is
+  collected. Explicit `await connection.close()` revokes cursor access;
+  `await cursor.close()` leaves the parent and sibling cursors usable. The last
+  logical owner discards any remaining direct client. This does not enable
+  connection pooling or add concurrent-close coordination.
 - [Connection settings](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md#connection-policy-and-migration)
   for native connection options and defaults.
 - [Bulk-copy behavior](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/docs/bulk-copy.md)

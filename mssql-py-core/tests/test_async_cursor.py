@@ -19,6 +19,101 @@ async def connect(client_context, *, autocommit=True):
         )
 
 
+@pytest.mark.parametrize(
+    "context_fixture",
+    ["mock_client_context", pytest.param("client_context", marks=pytest.mark.integration)],
+)
+def test_retained_cursor_survives_connection_wrapper_collection(
+    request, context_fixture
+):
+    async def run():
+        conn = await connect(request.getfixturevalue(context_fixture))
+        cursor = conn.cursor()
+        del conn
+        gc.collect()
+
+        try:
+            await cursor.execute("SELECT 1", use_prepare=False)
+            assert await cursor.fetchone() is not None
+        finally:
+            await cursor.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "context_fixture",
+    ["mock_client_context", pytest.param("client_context", marks=pytest.mark.integration)],
+)
+def test_cursor_close_preserves_parent_and_sibling(request, context_fixture):
+    async def run():
+        conn = await connect(request.getfixturevalue(context_fixture))
+        try:
+            first = conn.cursor()
+            sibling = conn.cursor()
+            await first.execute("SELECT 1", use_prepare=False)
+            await first.close()
+
+            assert not conn.closed
+            await sibling.execute("SELECT 1", use_prepare=False)
+            assert await sibling.fetchone() is not None
+            await sibling.close()
+            assert await conn.commit() is None
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "context_fixture",
+    ["mock_client_context", pytest.param("client_context", marks=pytest.mark.integration)],
+)
+@pytest.mark.parametrize(
+    "operation", ["execute", "executemany", "fetchone", "fetchmany", "fetchall", "nextset"]
+)
+def test_retained_cursor_rejects_work_after_connection_close(
+    request, context_fixture, operation
+):
+    async def run():
+        conn = await connect(request.getfixturevalue(context_fixture))
+        cursor = conn.cursor()
+        await conn.close()
+
+        arguments = {
+            "execute": ("SELECT 1",),
+            "executemany": ("SELECT ?", [(1,)]),
+        }
+        with pytest.raises(RuntimeError, match="Connection is closed"):
+            await getattr(cursor, operation)(*arguments.get(operation, ()))
+        assert await cursor.close() is None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "context_fixture",
+    ["mock_client_context", pytest.param("client_context", marks=pytest.mark.integration)],
+)
+@pytest.mark.parametrize("operation", ["fetchone", "fetchmany", "fetchall", "nextset"])
+def test_buffered_cursor_rejects_work_after_connection_close(
+    request, context_fixture, operation
+):
+    async def run():
+        conn = await connect(request.getfixturevalue(context_fixture))
+        cursor = conn.cursor()
+        try:
+            await cursor.executemany("SELECT ?", [(1,), (2,)], use_prepare=False)
+        finally:
+            await conn.close()
+
+        with pytest.raises(RuntimeError, match="Connection is closed"):
+            await getattr(cursor, operation)()
+        assert await cursor.close() is None
+
+    asyncio.run(run())
+
+
 @pytest.mark.integration
 def test_cursor_close_drains_results_and_rejects_further_use(client_context):
     async def run():

@@ -15,6 +15,7 @@ mod async_entra_token_factory;
 mod async_errors;
 mod async_execute;
 mod async_fetch;
+mod async_handle;
 mod async_parameters;
 mod async_runtime;
 mod async_session;
