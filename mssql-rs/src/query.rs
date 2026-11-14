@@ -101,10 +101,9 @@ impl QueryResult {
     ///
     /// **Rows are pre-collected.** Unlike tiberius (which streams from the
     /// wire), this yields rows that have already been buffered into memory
-    /// during the originating `query()` / `simple_query()` call. The
-    /// streaming API is preserved for migration ergonomics, but wire-level
-    /// streaming will require the `Client::query_streamed` follow-up
-    /// tracked in <https://github.com/saurabh500/mssql-tiberius-bridge/issues/20>.
+    /// during the originating `query()` / `simple_query()` call. For wire-level
+    /// streaming, use [`Client::query_streamed`](crate::Client::query_streamed)
+    /// or [`Client::simple_query_streamed`](crate::Client::simple_query_streamed).
     ///
     /// # Example
     ///
@@ -153,7 +152,7 @@ impl QueryResult {
 /// callers used with tiberius' `into_row_stream()`.
 ///
 /// **Note:** rows are pre-buffered (see
-/// [`QueryResult::into_row_stream`] for the limitation and roadmap).
+/// [`QueryResult::into_row_stream`] for details).
 pub struct RowStream {
     sets: std::vec::IntoIter<Vec<Row>>,
     current: std::vec::IntoIter<Row>,
