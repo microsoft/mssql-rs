@@ -1183,7 +1183,13 @@ mod client_based_iterators {
                 );
             }
             assert_eq!(first_row_c2.len(), 18_000);
-            assert!(first_row_c2.chunks_exact(2).all(|c| c == [b'X', 0]));
+            assert!(
+                first_row_c2
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .all(|c| *c == [b'X', 0])
+            );
 
             let c4 = client.read_row_column(3).await?;
             assert_eq!(
@@ -1214,7 +1220,13 @@ mod client_based_iterators {
                 );
             }
             assert_eq!(second_row_c2.len(), 18_000);
-            assert!(second_row_c2.chunks_exact(2).all(|c| c == [b'Y', 0]));
+            assert!(
+                second_row_c2
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .all(|c| *c == [b'Y', 0])
+            );
 
             let c4b = client.read_row_column(3).await?;
             assert_eq!(

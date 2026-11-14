@@ -547,8 +547,10 @@ mod tests {
         assert_eq!(output.0[75], 0xaa);
         assert_eq!(&output.0[73..75], &[0, 0]);
         let text: Vec<_> = output.0[1..73]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_le_bytes(*chunk))
             .collect();
         assert_eq!(
             String::from_utf16(&text).unwrap(),

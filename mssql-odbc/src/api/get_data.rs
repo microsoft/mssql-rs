@@ -627,8 +627,10 @@ fn captured_can_copy_narrow(state: &mut StmtState) -> bool {
 fn is_utf16_ascii(bytes: &[u8]) -> bool {
     bytes.len().is_multiple_of(2)
         && bytes
-            .chunks_exact(2)
-            .all(|unit| unit[0].is_ascii() && unit[1] == 0)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|&[low, high]| low.is_ascii() && high == 0)
 }
 
 /// Delivers a buffered string straight into the application buffer when the
@@ -689,7 +691,7 @@ unsafe fn try_write_complete_buffered_string(
             );
             if !target_value_ptr.is_null() {
                 let target = target_value_ptr.cast::<u8>();
-                for (index, unit) in bytes.chunks_exact(2).enumerate() {
+                for (index, unit) in bytes.as_chunks::<2>().0.iter().enumerate() {
                     target.add(index).write_unaligned(unit[0]);
                 }
                 target.add(utf16_ascii_len).write_unaligned(0);
@@ -1210,8 +1212,10 @@ fn prepare_captured_plp_text(
     } else {
         let units = value
             .bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair));
         let chars = char::decode_utf16(units).map(|ch| ch.unwrap_or(char::REPLACEMENT_CHARACTER));
         reserve_typed_plp_bytes(&mut bytes, chars.clone().map(char::len_utf8).sum())?;
         for ch in chars {
@@ -3823,8 +3827,8 @@ pub(crate) fn utf16le_chunk_to_utf8(
     if let Some(high) = pending_high_surrogate.take() {
         units.push(high);
     }
-    for pair in bytes[..even].chunks_exact(2) {
-        units.push(u16::from_le_bytes([pair[0], pair[1]]));
+    for pair in bytes[..even].as_chunks::<2>().0 {
+        units.push(u16::from_le_bytes(*pair));
     }
 
     // Hold back a trailing lone high surrogate so it can pair with the low
@@ -4167,8 +4171,10 @@ fn xml_to_text(bytes: &[u8]) -> Result<String, TextError> {
         return Err(TextError::Malformed);
     }
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     String::from_utf16(&units).map_err(|_| TextError::Malformed)
 }
@@ -12888,10 +12894,10 @@ mod tests {
                 trace_cp1252_plp(chunks.clone(), &steps, &[], &[], max_calls, true);
             let (verbatim, verbatim_path) =
                 trace_cp1252_plp(chunks.clone(), &steps, &[], &[], max_calls, false);
-            assert_eq!(converted_path, Some(false).filter(|_| size <= bytes.len()));
+            assert_eq!(converted_path, (size <= bytes.len()).then_some(false));
             assert_eq!(
                 verbatim_path,
-                Some(cfg!(windows)).filter(|_| size <= bytes.len())
+                (size <= bytes.len()).then_some(cfg!(windows))
             );
             assert_eq!(verbatim, converted, "buffer size {size}");
             assert_eq!(verbatim[0].1, bytes.len() as SqlLen);
