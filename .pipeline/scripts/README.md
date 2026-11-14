@@ -384,10 +384,19 @@ step timeout. That bound sits above the slowest healthy boot observed (509s over
 113 runs in 2026-08; re-measured 2026-09 at max 453s over 123 runs) — the real
 failures give up within seconds, so a shorter bound would only kill
 slow-but-healthy boots. `COLIMA_BUDGET_SECONDS` then caps the retries as a whole.
+The default 840s budget leaves room for a clean retry after one full 540s
+attempt; every attempt is capped by the remaining budget. Previously the
+480s total budget could expire before the first attempt's timeout.
+The foreground template allows 20 minutes, leaving margin for package seeding
+and failed-VM cleanup outside the boot-attempt budget.
+
+The macOS PR test job runs pooled TLS hard-discard and graceful-Drop regressions
+before waiting for Colima/SQL Server. These use their own local test servers,
+so container startup failures cannot skip their runtime coverage.
 
 **Environment overrides:** `TOOLCHAIN_DIR` (required), `COLIMA_CPU`,
 `COLIMA_MEMORY`, `COLIMA_DISK`, `COLIMA_START_ATTEMPTS` (3),
-`COLIMA_START_TIMEOUT_SECONDS` (540), `COLIMA_BUDGET_SECONDS` (480).
+`COLIMA_START_TIMEOUT_SECONDS` (540), `COLIMA_BUDGET_SECONDS` (840).
 
 ### build-macos-docker-toolchain.py
 Assembles the macOS docker toolchain payload for one architecture: the install

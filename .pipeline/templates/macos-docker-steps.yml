@@ -51,6 +51,6 @@ steps:
   - script: bash .pipeline/scripts/start-colima-macos.sh
     displayName: 'Install and start Colima-based Docker'
     condition: ${{ parameters.condition }}
-    timeoutInMinutes: 15
+    timeoutInMinutes: 20
     env:
       TOOLCHAIN_DIR: '$(Agent.TempDirectory)/docker-toolchain'

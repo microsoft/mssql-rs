@@ -30,9 +30,9 @@ COLIMA_START_ATTEMPTS=${COLIMA_START_ATTEMPTS:-3}
 # slowest healthy boot seen over 113 runs (509s; p95 366s) — the observed
 # failures give up within seconds, so anything past this is stuck, not slow.
 COLIMA_START_TIMEOUT_SECONDS=${COLIMA_START_TIMEOUT_SECONDS:-540}
-# The macOS job only gets 60 minutes, so cap the retries by wall clock rather
-# than letting three boots of an unhealthy agent eat the test budget.
-COLIMA_BUDGET_SECONDS=${COLIMA_BUDGET_SECONDS:-480}
+# Leave time for a clean retry after one full 540s boot attempt, within the
+# foreground template's 20-minute backstop.
+COLIMA_BUDGET_SECONDS=${COLIMA_BUDGET_SECONDS:-840}
 # The payload to run from. Required: there is no second way to get a docker CLI
 # onto the agent, and a run that quietly found one some other way would not be
 # the run we tested.
@@ -114,15 +114,12 @@ attempts=0
 
 while [ "$attempts" -lt "$COLIMA_START_ATTEMPTS" ]; do
   limit=$COLIMA_START_TIMEOUT_SECONDS
-  # The first attempt always gets a full slot; later ones take what is left.
-  if [ "$attempts" -gt 0 ]; then
-    left=$((deadline - $(date +%s)))
-    if [ "$left" -le 30 ]; then
-      echo "##[warning]colima retry budget (${COLIMA_BUDGET_SECONDS}s) exhausted after $attempts attempt(s)"
-      break
-    fi
-    [ "$left" -lt "$limit" ] && limit=$left
+  left=$((deadline - $(date +%s)))
+  if [ "$left" -le 30 ]; then
+    echo "##[warning]colima retry budget (${COLIMA_BUDGET_SECONDS}s) exhausted after $attempts attempt(s)"
+    break
   fi
+  [ "$left" -lt "$limit" ] && limit=$left
 
   attempts=$((attempts + 1))
   echo "##[group]colima start (attempt $attempts/$COLIMA_START_ATTEMPTS, ${limit}s limit)"

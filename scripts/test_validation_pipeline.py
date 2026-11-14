@@ -1175,6 +1175,118 @@ def _background_step(tmp_path, *args, timeout=30):
         timeout=timeout,
     )
 
+def test_macos_tls_regressions_run_before_sql_readiness():
+    stages = load_template("validation-stages.yml")["stages"]
+    build = next(stage for stage in stages if stage["stage"] == "Build")
+    job = next(job for job in build["jobs"] if job.get("job") == "Test_MacOS")
+    template = next(step for step in job["steps"] if step.get("template") == "build-template.yml")
+    steps = template["parameters"]["beforeTestSteps"]
+    regressions = next(
+        step for step in steps
+        if step.get("displayName") == "Run macOS pooled TLS teardown regressions"
+    )
+    wait = next(step for step in steps if step.get("displayName") == "Wait for Colima and SQL Server")
+    assert steps.index(regressions) < steps.index(wait)
+    assert regressions["condition"] == _PR
+    assert not regressions.get("continueOnError", False)
+    command = regressions["script"]
+    assert "--package mssql-tds" in command
+    assert "--no-tests=pass" not in command
+    for name in (
+        "pooled_drop_aborts_a_stalled_stream_before_returning",
+        "pooled_connect_attempt_drop_aborts_before_returning",
+        "dropping_a_stream_the_server_stopped_reading_still_ends_it",
+    ):
+        assert f"test({name})" in command
+
+
+def test_colima_foreground_backstop_leaves_cleanup_time():
+    template = load_template("macos-docker-steps.yml")
+    steps = next(
+        step["${{ if eq(parameters.startColima, true) }}"]
+        for step in template["steps"]
+        if "${{ if eq(parameters.startColima, true) }}" in step
+    )
+    boot = next(step for step in steps if "start-colima-macos.sh" in step.get("script", ""))
+    script = (_ROOT / ".pipeline" / "scripts" / "start-colima-macos.sh").read_text()
+    budget = int(re.search(r"COLIMA_BUDGET_SECONDS:-([0-9]+)", script).group(1))
+    assert boot["timeoutInMinutes"] * 60 >= budget + 300
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize(
+    ("elapsed", "budget", "expected_limits", "expected_status"),
+    [
+        (587, None, ["540", "253"], 0),
+        (850, None, ["540"], 1),
+        (101, "100", ["100"], 1),
+    ],
+)
+def test_colima_retry_preserves_remaining_boot_budget(
+    tmp_path, elapsed, budget, expected_limits, expected_status
+):
+    script = _ROOT / ".pipeline" / "scripts" / "start-colima-macos.sh"
+    shutil.copyfile(script, tmp_path / script.name)
+    (tmp_path / "run-bounded.sh").write_text(
+        'run_bounded() {\n'
+        '  echo "$1" >> limits\n'
+        '  if [ ! -f clock ]; then\n'
+        f'    echo {1000 + elapsed} > clock\n'
+        '    return 124\n'
+        '  fi\n'
+        '  return 0\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    bin_dir = tmp_path / "toolchain" / "bin"
+    bin_dir.mkdir(parents=True)
+    for name, body in {
+        "docker": "exit 0",
+        "colima": 'echo "colima test"; [ "$1" != delete ] || echo deleted >> deletes',
+        "limactl": "exit 0",
+        "date": "cat clock 2>/dev/null || echo 1000",
+        "sleep": "exit 0",
+        "python3": (
+            'case "$4:$5" in\n'
+            '  arch:) echo test ;;\n'
+            '  payload_format:) echo 1 ;;\n'
+            '  identity:) echo fixture ;;\n'
+            '  image:cache_filename) echo guest ;;\n'
+            '  image:filename) echo guest.img ;;\n'
+            '  *) exit 1 ;;\n'
+            'esac'
+        ),
+    }.items():
+        path = bin_dir / name
+        path.write_text(f"#!/bin/bash\n{body}\n", encoding="utf-8")
+        path.chmod(0o755)
+    image_dir = bin_dir.parent / "image"
+    image_dir.mkdir()
+    (image_dir / "guest.img").write_bytes(b"fixture")
+    (bin_dir.parent / "manifest.json").write_text(
+        json.dumps({
+            "arch": "test", "payload_format": 1, "identity": "fixture",
+            "image": {"cache_filename": "guest", "filename": "guest.img"},
+        }),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.update(
+        TOOLCHAIN_DIR="toolchain", HOME="home",
+        COLIMA_START_TIMEOUT_SECONDS="540", COLIMA_START_ATTEMPTS="3",
+    )
+    if budget is None:
+        env.pop("COLIMA_BUDGET_SECONDS", None)
+    else:
+        env["COLIMA_BUDGET_SECONDS"] = budget
+    result = subprocess.run(
+        [_BASH, script.name], cwd=tmp_path, env=env,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == expected_status, result.stdout + result.stderr
+    assert (tmp_path / "limits").read_text().splitlines() == expected_limits
+    assert (tmp_path / "deletes").read_text().splitlines() == ["deleted"]
+
 
 @pytest.mark.skipif(_BASH is None, reason="Bash is required")
 @pytest.mark.parametrize("code", [0, 3])
