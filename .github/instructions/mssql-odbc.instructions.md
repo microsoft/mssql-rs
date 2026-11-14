@@ -588,6 +588,19 @@ on; these guarantees were verified against msodbcsql's behavior.
   the first of the three reasons the macro is admissible; see §2.1 for the other
   two and for the preference against skipping when the test exists solely to pin
   one registered divergence.
+- The Linux distro-container e2e legs (Alpine, Debian, Azure Linux, RHEL 8) run
+  only on post-merge builds (`ne(variables['Build.Reason'], 'PullRequest')` in
+  `.pipeline/templates/validation-stages.yml`), so PR validation cannot catch a
+  host-libc dependency in a test. Probe such a dependency and `GTEST_SKIP()`
+  naming the gap, as `client_code_page_test` does through
+  `ODBCTestUtils::HasCodePageConverter`, and install what the leg can supply in
+  `scripts/dockerentry/odbc-e2e-*.sh`. Before merging, replay the affected leg
+  locally in its image against the CI build artifact.
+- Bound a live e2e wait or retry loop by a wall-clock deadline that restarts on
+  every success, not by a retry count or any budget that accumulates over the
+  run. Round-trip latency differs across CI legs (the Linux ARM legs use a
+  shared remote SQL host), so a count that passes against a local container
+  fails there; see `BusyWait` in `shared_connection_busy_test.cpp`.
 - Write new behavioral e2e tests with `ODBC_TEST_F` (from
   `odbc_concurrent_test.h`) instead of `TEST_F`. The body is unchanged; the macro
   also runs it across threads (`/CrossThread`, `/SharedEnv`, `/SharedStmt`), so
