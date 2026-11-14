@@ -261,7 +261,6 @@ async fn bulk_insert_with_columns_and_named_mapping() {
         .expect("bulk_insert_with_columns failed");
     assert_eq!(r.rows_affected, 1);
 
-    // map_column (by-name helper) path
     client
         .execute(
             "CREATE TABLE #DriverBulkPeopleByName (id INT NOT NULL, name NVARCHAR(100) NOT NULL)",
@@ -273,19 +272,22 @@ async fn bulk_insert_with_columns_and_named_mapping() {
         id: 7,
         name: "Linus".into(),
     }];
-    let r2 = client
+    let error = client
         .bulk_insert("#DriverBulkPeopleByName")
-        .map_column("source-id-ignored-by-ordinal-fallback", "id")
-        .map_column("source-name-ignored-by-ordinal-fallback", "name")
-        // Also exercise add_column_mapping directly (re-adding "id" by ordinal)
+        .map_column("source-id", "id")
+        .map_column("source-name", "name")
         .add_column_mapping(mssql_rs::ColumnMapping::by_ordinal(0, "id"))
         .send(rows2)
-        .await;
-    // The by-name source mappings won't actually match a source-column-name
-    // for our raw `BulkLoadRow` impl (we have no source schema). The point
-    // here is purely to cover the driver-side builder forwarding paths;
-    // we accept either Ok or Err — only the call site must execute.
-    drop(r2);
+        .await
+        .expect_err("source-name mappings should be rejected");
+    assert!(
+        matches!(
+            error,
+            mssql_rs::Error::Tds(mssql_tds::error::Error::UsageError(ref message))
+                if message.contains("Source column name mappings are not supported")
+        ),
+        "unexpected error: {error:?}"
+    );
 }
 
 /// Exercises `BulkInsert::new` + `map_column_by_ordinal` against `inner_mut()`
