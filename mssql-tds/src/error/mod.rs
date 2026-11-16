@@ -219,6 +219,11 @@ pub enum Error {
     #[error("Operation Cancelled Error: {0}")]
     OperationCancelledError(String),
 
+    /// An Entra token provider cancelled acquisition independently of the
+    /// command's `CancelHandle`. Recovery must not retry this acquisition.
+    #[error("Entra token acquisition cancelled")]
+    TokenAcquisitionCancelled,
+
     /// One or more errors returned by SQL Server, plus any informational
     /// messages that accompanied them.
     ///

@@ -182,6 +182,12 @@ The listener is bound before spawning, so no startup sleep is needed.
 `run_with_shutdown` stops accepting connections; it does not join existing
 connection tasks. Close test clients before signalling shutdown.
 
+Connection snapshots are available through `connection_store()` during login
+and request processing, not just at teardown. For close-after-query tests, wait
+for `ConnectionStore::is_transport_closed(conn_id)` before issuing the operation
+that should trigger recovery. This flag is published after the handler has
+released its transport; a received-request count alone does not establish closure.
+
 ### TLS in library tests
 
 Load a PKCS#12 identity on any supported platform, then choose the TLS constructor:

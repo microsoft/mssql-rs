@@ -42,6 +42,13 @@ pub(crate) fn map_tds_error(
 ) -> PyErr {
     let message = format!("{context}: {error}");
     match error {
+        TdsError::TokenAcquisitionCancelled => Python::attach(|py| {
+            py.import("asyncio")?
+                .getattr("CancelledError")?
+                .call0()
+                .map(PyErr::from_value)
+        })
+        .unwrap_or_else(|error| error),
         TdsError::SqlServerError { mut diagnostics } => {
             diagnostics.info_messages.extend(statement_info_messages);
             database_error_with_diagnostics(message, diagnostics)
@@ -183,6 +190,30 @@ mod tests {
 
         Python::attach(|py| assert!(error.is_instance_of::<OperationalError>(py)));
         assert!(error.to_string().contains("deadline exceeded"));
+    }
+
+    #[test]
+    fn provider_cancellation_does_not_change_explicit_cancellation_mapping() {
+        Python::attach(|py| {
+            let cancelled = py
+                .import("asyncio")
+                .unwrap()
+                .getattr("CancelledError")
+                .unwrap();
+            let provider = map_tds_error(
+                "query failed",
+                TdsError::TokenAcquisitionCancelled,
+                Vec::new(),
+            );
+            assert!(provider.is_instance(py, &cancelled));
+            let explicit = map_tds_error(
+                "query failed",
+                TdsError::OperationCancelledError(TdsError::TokenAcquisitionCancelled.to_string()),
+                Vec::new(),
+            );
+            assert!(explicit.is_instance_of::<OperationalError>(py));
+            assert!(!explicit.is_instance(py, &cancelled));
+        });
     }
 
     #[test]
