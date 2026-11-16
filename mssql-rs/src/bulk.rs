@@ -202,9 +202,9 @@ pub(crate) async fn write_adapter_value(
     column_index: usize,
     mut value: ColumnValues,
 ) -> TdsResult<()> {
-    let metadata = writer.column_metadata(column_index).ok_or_else(|| {
-        TdsError::UsageError(format!("Bulk column index {column_index} is out of bounds"))
-    })?;
+    let Some(metadata) = writer.column_metadata(column_index) else {
+        return writer.write_column_value(column_index, &value).await;
+    };
     normalize_adapter_value(&mut value, metadata)?;
     writer.write_column_value(column_index, &value).await
 }
