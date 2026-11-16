@@ -13761,7 +13761,7 @@ pub(crate) mod tests {
         dbms_ver[driver::column::VERSION] = Some("17.00.4085".to_string());
         assert_eq!(driver_server_info(&outcome(dbms_ver, false)), edition_only);
         let mut short = driver_row("TCP");
-        short.truncate(3);
+        short.truncate(driver::column::VERSION);
         assert_eq!(driver_server_info(&outcome(short, false)), edition_only);
         let mut null_version = driver_row("TCP");
         null_version[driver::column::VERSION] = None;
