@@ -1075,6 +1075,39 @@ mod tests {
         assert_eq!(state.records[1].native_error, 207);
     }
 
+    /// An unmapped error sorts by the resource its severity tier posts under:
+    /// msodbcsql's `compare` orders `IDS_37_000` (40136, severity 11-18) ahead
+    /// of `IDS_S1_000_01` (40146, above 18) within a row (`sqlcerr.cpp:1390-1400,
+    /// 2161-2174`), so a set's severity-16 error comes first even when its
+    /// severity-19 error arrived earlier.
+    #[test]
+    fn unmapped_server_errors_sort_by_severity_tier() {
+        let error = |ordinal, number, class| SqlErrorInfo {
+            diagnostic_ordinal: ordinal,
+            parameter_set: Some(0),
+            class,
+            ..sql_error(number, "failure")
+        };
+        for number in [1204, 50000] {
+            assert_eq!(sqlstate_for_sql_error(number), None, "{number}");
+        }
+        let mut state = FakeState::default();
+
+        post_tds_error(
+            &mut state,
+            &TdsError::from_sql_errors(vec![error(0, 1204, 19), error(1, 50000, 16)]),
+            SQLSTATE_HY000,
+        );
+        crate::error::sort_diagnostics(&mut state);
+
+        let order: Vec<_> = state
+            .records
+            .iter()
+            .map(|record| record.native_error)
+            .collect();
+        assert_eq!(order, [50000, 1204]);
+    }
+
     /// A parameter array's server messages sort set by set, then by priority,
     /// then in arrival order: set 1's unmapped error stays ahead of set 2's
     /// mapped one, and set 2's mapped warning, which arrived first, stays ahead
