@@ -572,13 +572,10 @@ mod tests {
             let mut value =
                 ColumnValues::Numeric(DecimalParts::new(false, 10, source_scale, magnitude));
             normalize_adapter_value(&mut value, &metadata).expect("exact conversion");
-            let ColumnValues::Numeric(parts) = value else {
-                panic!("expected numeric")
-            };
-            assert_eq!(parts.magnitude(), expected);
-            assert_eq!(parts.scale, 2);
-            assert_eq!(parts.precision, 5);
-            assert!(!parts.is_positive);
+            assert_eq!(
+                value,
+                ColumnValues::Numeric(DecimalParts::new(false, 5, 2, expected))
+            );
         }
         for (magnitude, source_scale) in [(123401, 3), (100000, 2), (u128::MAX, 1)] {
             let mut value =
@@ -600,11 +597,13 @@ mod tests {
                 scale: 7,
             });
             normalize_adapter_value(&mut value, &metadata).expect("time");
-            let ColumnValues::Time(time) = value else {
-                panic!("expected time")
-            };
-            assert_eq!(time.scale, scale);
-            assert_eq!(time.time_nanoseconds, 123_456_789);
+            assert_eq!(
+                value,
+                ColumnValues::Time(mssql_tds::datatypes::column_values::SqlTime {
+                    time_nanoseconds: 123_456_789,
+                    scale,
+                })
+            );
         }
     }
 

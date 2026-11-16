@@ -1303,7 +1303,7 @@ mod tests {
             false,
             30,
             0,
-            792_281_625_142_643_375_935_439_503_36,
+            79_228_162_514_264_337_593_543_950_336,
         ));
         assert_eq!(rust_decimal::Decimal::from_sql(&value), None);
     }
