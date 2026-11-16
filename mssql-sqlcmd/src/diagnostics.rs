@@ -4030,7 +4030,7 @@ impl Diagnosis {
         let edition = outcome.engine_edition();
         // Retries are the driver's own, which sqlcmd does not see.
         session_fields(&mut check, edition.is_some(), None);
-        if outcome.query_failed || edition.is_none() {
+        if edition.is_none() {
             let records = driver_records(outcome, CheckId::SessionValidation);
             let first = first_driver_message(outcome, CheckId::SessionValidation);
             // SQL Server's own error has its severity; the driver's own have
@@ -13758,13 +13758,13 @@ pub(crate) mod tests {
             edition_only
         );
         let mut dbms_ver = driver_row("TCP");
-        dbms_ver[3] = Some("17.00.4085".to_string());
+        dbms_ver[driver::column::VERSION] = Some("17.00.4085".to_string());
         assert_eq!(driver_server_info(&outcome(dbms_ver, false)), edition_only);
         let mut short = driver_row("TCP");
         short.truncate(3);
         assert_eq!(driver_server_info(&outcome(short, false)), edition_only);
         let mut null_version = driver_row("TCP");
-        null_version[3] = None;
+        null_version[driver::column::VERSION] = None;
         assert_eq!(
             driver_server_info(&outcome(null_version, false)),
             edition_only
@@ -13773,10 +13773,10 @@ pub(crate) mod tests {
         assert_eq!(driver_server_info(&outcome(driver_row("TCP"), true)), None);
         assert_eq!(driver_server_info(&outcome(Vec::new(), false)), None);
         let mut garbled = driver_row("TCP");
-        garbled[0] = Some("two".to_string());
+        garbled[driver::column::ENGINE_EDITION] = Some("two".to_string());
         assert_eq!(driver_server_info(&outcome(garbled, false)), None);
         let mut missing = driver_row("TCP");
-        missing[0] = None;
+        missing[driver::column::ENGINE_EDITION] = None;
         assert_eq!(driver_server_info(&outcome(missing, false)), None);
     }
 
@@ -13791,7 +13791,7 @@ pub(crate) mod tests {
         use crate::telemetry::{Command, FlushOutcome, FormatUse, Invocation};
 
         let mut dbms_ver_row = driver_row("TCP");
-        dbms_ver_row[3] = Some("17.00.4085".to_string());
+        dbms_ver_row[driver::column::VERSION] = Some("17.00.4085".to_string());
         for (query_failed, row) in [(false, dbms_ver_row), (true, Vec::new())] {
             let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
             let requests = guard.capture_requests();

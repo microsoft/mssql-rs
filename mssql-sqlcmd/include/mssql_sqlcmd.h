@@ -305,11 +305,12 @@ typedef struct MssqlSqlcmdDriverResult {
     int32_t query_failed;      /* non-zero when the query ran and failed */
     int64_t query_ms;          /* minimal query only; excludes disconnect/result cleanup */
     const MssqlSqlcmdText* values; /* the query's first row; a NULL data is SQL NULL.
-                                      After the query's own three columns come the
-                                      details native already knows: the version in
-                                      its own form (ODBC's SQL_DBMS_VER, such as
-                                      17.00.4085, not ProductVersion), transport,
-                                      server name and database */
+                                      Values 3 to 6 are optional and positional: the
+                                      server version as SQL_DBMS_VER gives it (e.g.
+                                      17.00.4085, not ProductVersion), the transport
+                                      (e.g. TCP), the server name and the database.
+                                      Pass NULL data for one that is not known;
+                                      value_count may end after the last one given */
     size_t value_count;
     const MssqlSqlcmdDriverRecord* records; /* the connection's, then the query's */
     size_t record_count;

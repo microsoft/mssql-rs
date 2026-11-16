@@ -883,6 +883,11 @@ pub struct MssqlSqlcmdDriverResult {
     /// Minimal-query duration, excluding disconnect and result cleanup.
     pub query_ms: i64,
     /// The query's first row, one text per column; a null `data` is SQL NULL.
+    /// Values 3 to 6 (`driver::column::VERSION` to `DATABASE`) are optional and
+    /// positional: the server version as `SQL_DBMS_VER` gives it (e.g.
+    /// `17.00.4085`, not `ProductVersion`), the transport (e.g. `TCP`), the
+    /// server name and the database. A caller passes a null `data` for one that
+    /// is not known, and `value_count` may end after the last one given.
     pub values: *const MssqlSqlcmdText,
     pub value_count: usize,
     /// The connection's records, then the query's, in order.
