@@ -5,9 +5,11 @@
 //!
 //! The event is a single `Microsoft.ApplicationInsights.Event` item, POSTed as a
 //! one-element JSON array to `{ingestion endpoint}/v2/track`, which is the
-//! public ingestion API. There is one attempt and no retry: the process waits
-//! for the answer for at most [`crate::telemetry::MAX_FLUSH_TIMEOUT`], so a
-//! retry could never complete in time.
+//! public ingestion API. There is one attempt and no retry, to keep the client
+//! small: a transient failure loses the event, even in a run that connected
+//! early enough for a second attempt to finish before exit. A run that never
+//! connects has only the exit window
+//! ([`crate::telemetry::MAX_FLUSH_TIMEOUT`]) anyway, which could not fit one.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -70,7 +72,7 @@ impl Destination {
 
         Some(Self {
             instrumentation_key: key.to_owned(),
-            track_url: track_url(&endpoint)?,
+            track_url: parse_track_url(&endpoint)?,
         })
     }
 
@@ -108,7 +110,7 @@ impl Destination {
 /// nothing else a request URL should not carry. Checked on the text first
 /// because URL parsing is lenient: `https:///path` would parse with `path` as
 /// the host.
-fn track_url(endpoint: &str) -> Option<Url> {
+fn parse_track_url(endpoint: &str) -> Option<Url> {
     if endpoint.len() > MAX_ENDPOINT_LEN {
         return None;
     }
@@ -207,36 +209,10 @@ fn accepted(reply: &Reply) -> bool {
 /// (`2024-11-04T16:00:00.000Z`), which the service requires. A time before the
 /// epoch is written as the epoch.
 fn rfc3339_millis(time: SystemTime) -> String {
-    let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let seconds = since_epoch.as_secs();
-    let (year, month, day) = civil_from_days(seconds / 86_400);
-    let in_day = seconds % 86_400;
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
-        in_day / 3_600,
-        in_day % 3_600 / 60,
-        in_day % 60,
-        since_epoch.subsec_millis()
-    )
-}
-
-/// The proleptic Gregorian date of a day count from 1970-01-01.
-fn civil_from_days(days: u64) -> (u64, u64, u64) {
-    let shifted = days + 719_468;
-    let era = shifted / 146_097;
-    let day_of_era = shifted % 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_index = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 {
-        month_index + 3
-    } else {
-        month_index - 9
-    };
-    let year = year_of_era + era * 400 + u64::from(month <= 2);
-    (year, month, day)
+    let unix_ms = time.duration_since(UNIX_EPOCH).map_or(0, |elapsed| {
+        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+    });
+    crate::formatter::json::utc_timestamp(unix_ms)
 }
 
 #[cfg(test)]

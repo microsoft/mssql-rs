@@ -418,7 +418,9 @@ fn start_export(session: &mut Session) {
 }
 
 /// Sends the one event, once, and reports whether the service took it. There is
-/// no retry: the process waits for this at most [`MAX_FLUSH_TIMEOUT`].
+/// deliberately no retry, to keep the client small: a transient failure loses the
+/// event (see the module documentation of `ingestion`). The process waits for
+/// this at most [`MAX_FLUSH_TIMEOUT`].
 fn export_once(properties: &[(&'static str, String)]) -> FlushOutcome {
     let Some(destination) = destination().as_deref().and_then(Destination::parse) else {
         return FlushOutcome::Failed;

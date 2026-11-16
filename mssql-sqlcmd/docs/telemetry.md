@@ -208,8 +208,8 @@ collects or exports:
 The client sends no IP address or location. The service adds them: Application
 Insights geolocates each item from the sender's IP address on arrival, fills the
 client city, state or province, and country or region columns of `AppEvents`, and
-stores the IP as `0.0.0.0`. The client strips every envelope tag, so it cannot
-send a location of its own. Whether to keep this location, or suppress it by
+stores the IP as `0.0.0.0`. The client sends no envelope tags, so it sends no
+location of its own. Whether to keep this location, or suppress it by
 sending a fixed `ai.location.ip` tag, is a decision for the privacy review.
 
 ## Failure behavior and latency
@@ -256,9 +256,13 @@ silently, after the destination, so without OpenSSL telemetry is off: no device
 ID, no server query, nothing sent or printed. Only a TLS connection the user
 asked for reports the missing library.
 
-The event is sent once, by its own thread, with one POST and no retry: the
-process waits for the answer for at most the bound passed to shutdown, so a
-retry could never complete in time. Only a 200, or a 206 that reports one item
+The event is sent once, by its own thread, with one POST and no retry. This is
+a deliberate simplification, to keep the client small: a transient failure (a
+throttle, a server error, a dropped connection) loses the event, even in a run
+that connected early enough for a second attempt to finish before exit. A run
+that never connects has only the exit window anyway, which could not fit a
+retry. The process waits for the answer for at most the bound passed to
+shutdown. Only a 200, or a 206 that reports one item
 received and one accepted, is a delivery. Every other answer is a failure: a
 transport error, any other status (a 204, a throttle, a 4xx or 5xx), or a 206
 that did not accept the event or whose body cannot be read. Redirects are not
