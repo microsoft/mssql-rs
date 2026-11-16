@@ -124,8 +124,8 @@ static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
 /// What a test transport was asked to send.
 #[cfg(test)]
 pub(crate) struct Captured {
-    pub(crate) url: String,
-    pub(crate) body: Vec<u8>,
+    url: String,
+    body: Vec<u8>,
 }
 
 #[cfg(test)]

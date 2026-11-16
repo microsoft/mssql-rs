@@ -131,12 +131,15 @@ paths use it.
 
 When native sqlcmd supplies its own driver connection to `diagnose`, the
 diagnostic connection stops at the transport and the session probe does not
-run. The row of the driver's own query is then the only place the properties are
-read: the engine edition, and the version when native sqlcmd appended it. The
-operating system and architecture are not in that row, so the server OS and
-platform are omitted for such a run, as they are on Azure SQL Database. The
-telemetry columns are not appended to the callback's query, because native's own
-columns sit at fixed positions after the first three and would be read as them.
+run. The row of the driver's own query is then the only place a property is
+read, and only the engine edition is reported from it. The row has no operating
+system or architecture, so the server OS and platform are omitted for such a
+run, as they are on Azure SQL Database. It has no `ProductVersion` either: the
+version native sqlcmd appends is its own form (ODBC's `SQL_DBMS_VER`, such as
+`17.00.4085`), which differs from the `17.0.4085.2` the other paths send, so it
+is left out rather than report two values for one version. The telemetry
+columns are not appended to the callback's query, because native's own columns
+sit at fixed positions after the first three and would be read as them.
 
 Platform and OS are read from `@@VERSION` because `xp_msver` is unavailable on
 Azure SQL Database and `sys.dm_os_host_info` fails there; both stay omitted on

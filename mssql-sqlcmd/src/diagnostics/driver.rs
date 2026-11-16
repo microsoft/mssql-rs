@@ -48,6 +48,10 @@ pub(crate) mod column {
     pub const ENGINE_EDITION: usize = 0;
     pub const DAYS: usize = 1;
     pub const MILLISECONDS: usize = 2;
+    /// The server version as native sqlcmd already knows it, in its own form
+    /// (ODBC's `SQL_DBMS_VER`, e.g. `17.00.4085`), not
+    /// `SERVERPROPERTY('ProductVersion')` (`17.0.4085.2`). Native does not query
+    /// for it. Usage telemetry does not report it.
     pub const VERSION: usize = 3;
     pub const TRANSPORT: usize = 4;
     pub const SERVER_NAME: usize = 5;
@@ -99,6 +103,16 @@ pub struct DriverOutcome {
 impl DriverOutcome {
     pub(crate) fn cell(&self, column: usize) -> Option<&str> {
         self.row.get(column).and_then(Option::as_deref)
+    }
+
+    /// The engine edition in the session query's row, or `None` when it has
+    /// none: the one definition of a usable row, for the report and for usage
+    /// telemetry.
+    pub(crate) fn engine_edition(&self) -> Option<i32> {
+        if self.query_failed {
+            return None;
+        }
+        self.cell(column::ENGINE_EDITION)?.trim().parse().ok()
     }
 }
 
