@@ -121,6 +121,34 @@ def test_provider_cancellation_stops_recovery_before_query_submission(
                 assert len(closed) == (expected_calls if owned else 0)
                 if owned:
                     assert len({id(credential) for credential in closed}) == expected_calls
+
+                if outcome in ("cancel-once", "cancel-always"):
+                    await asyncio.wait_for(wait_for_recovery_logins(), 3)
+                    connections = mock_tds_server.get_connections()
+                    recovery = [info for info in connections if info.recovery_login]
+                    assert len(recovery) == expected_calls - 1
+                    assert sum(info.request_count for info in connections) == 1
+                    assert all(
+                        info.request_count == 0 and not info.authenticated
+                        for info in recovery
+                    )
+                    assert not mock_tds_server.has_received_token(
+                        f"recovery-token-{expected_calls + 1}"
+                    )
+
+                    follow_up = cursor.execute("SELECT 1", use_prepare=use_prepare)
+                    if outcome == "cancel-once":
+                        await asyncio.wait_for(follow_up, 5)
+                        assert await cursor.fetchone() == (1,)
+                        assert await cursor.fetchone() is None
+                    else:
+                        with pytest.raises(asyncio.CancelledError):
+                            await asyncio.wait_for(follow_up, 5)
+                    expected_calls += 1
+                    assert len(calls) == expected_calls
+                    assert len(closed) == (expected_calls if owned else 0)
+                    if owned:
+                        assert len({id(credential) for credential in closed}) == expected_calls
             finally:
                 await asyncio.wait_for(cursor.close(), 5)
         finally:
@@ -130,7 +158,7 @@ def test_provider_cancellation_stops_recovery_before_query_submission(
         connections = mock_tds_server.get_connections()
         recovery = [info for info in connections if info.recovery_login]
         assert len(recovery) == expected_calls - 1
-        if outcome != "success":
+        if outcome not in ("success", "cancel-once"):
             assert sum(info.request_count for info in connections) == 1
             assert all(info.request_count == 0 and not info.authenticated for info in recovery)
             assert not mock_tds_server.has_received_token(
@@ -138,5 +166,15 @@ def test_provider_cancellation_stops_recovery_before_query_submission(
             )
         else:
             await asyncio.wait_for(wait_for_request(True), 3)
+            if outcome == "cancel-once":
+                assert sum(info.request_count for info in connections) == 2
+                cancelled_recovery = [
+                    info for info in recovery if not info.authenticated
+                ]
+                assert len(cancelled_recovery) == 1
+                assert cancelled_recovery[0].request_count == 0
+                assert mock_tds_server.has_received_token(
+                    f"recovery-token-{expected_calls}"
+                )
 
     asyncio.run(run())

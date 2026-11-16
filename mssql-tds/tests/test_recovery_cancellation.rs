@@ -21,31 +21,38 @@ enum RecoveryFailure {
     ProviderCancellation,
     FactoryCancellation,
     CommandCancellation,
+    FinalAttemptCommandCancellation,
     ConnectionError,
 }
 
 #[derive(Clone)]
-struct FailOnceCredential {
+struct RecoveryCredential {
     calls: Arc<AtomicUsize>,
     failure: RecoveryFailure,
+    failure_call: usize,
     recovery_started: Arc<Notify>,
 }
 
 #[async_trait]
-impl EntraIdTokenFactory for FailOnceCredential {
+impl EntraIdTokenFactory for RecoveryCredential {
     async fn create_token(
         &self,
         _spn: String,
         _sts_url: String,
         _auth_method: TdsAuthenticationMethod,
     ) -> TdsResult<Vec<u8>> {
-        if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call > 0 && call < self.failure_call {
+            return Err(Error::ConnectionError("retryable recovery failure".into()));
+        }
+        if call == self.failure_call {
             return Err(match self.failure {
                 RecoveryFailure::ProviderCancellation => Error::TokenAcquisitionCancelled,
                 RecoveryFailure::FactoryCancellation => {
                     Error::OperationCancelledError("credential cancelled".into())
                 }
-                RecoveryFailure::CommandCancellation => {
+                RecoveryFailure::CommandCancellation
+                | RecoveryFailure::FinalAttemptCommandCancellation => {
                     self.recovery_started.notify_one();
                     return std::future::pending().await;
                 }
@@ -67,9 +74,16 @@ async fn recovery_stops_on_cancellation_but_retries_connection_errors() {
         RecoveryFailure::ProviderCancellation,
         RecoveryFailure::FactoryCancellation,
         RecoveryFailure::CommandCancellation,
+        RecoveryFailure::FinalAttemptCommandCancellation,
         RecoveryFailure::ConnectionError,
     ] {
         for retry_count in [1, 3] {
+            let failure_call =
+                if matches!(failure, RecoveryFailure::FinalAttemptCommandCancellation) {
+                    retry_count as usize + 1
+                } else {
+                    1
+                };
             let server = MockTdsServer::new("127.0.0.1:0").await.unwrap();
             let addr = server.local_addr();
             let registry = server.query_registry();
@@ -95,9 +109,10 @@ async fn recovery_stops_on_cancellation_but_retries_connection_errors() {
                 TdsAuthenticationMethod::ActiveDirectoryTokenCredential;
             context.auth_method_map.insert(
                 TdsAuthenticationMethod::ActiveDirectoryTokenCredential,
-                Box::new(FailOnceCredential {
+                Box::new(RecoveryCredential {
                     calls: calls.clone(),
                     failure,
+                    failure_call,
                     recovery_started: recovery_started.clone(),
                 }),
             );
@@ -132,7 +147,11 @@ async fn recovery_stops_on_cancellation_but_retries_connection_errors() {
                     ..Default::default()
                 },
             );
-            let result = if matches!(failure, RecoveryFailure::CommandCancellation) {
+            let result = if matches!(
+                failure,
+                RecoveryFailure::CommandCancellation
+                    | RecoveryFailure::FinalAttemptCommandCancellation
+            ) {
                 let (result, ()) = tokio::join!(execute, async {
                     recovery_started.notified().await;
                     cancel.cancel();
@@ -154,7 +173,8 @@ async fn recovery_stops_on_cancellation_but_retries_connection_errors() {
                 }
             }
 
-            assert_eq!(calls.load(Ordering::SeqCst), if retried { 3 } else { 2 });
+            let recovery_attempts = failure_call + usize::from(retried);
+            assert_eq!(calls.load(Ordering::SeqCst), recovery_attempts + 1);
             assert_eq!(client.connection_recovery_count(), u32::from(retried));
             assert_eq!(
                 client.requests_admitted(),
@@ -169,7 +189,7 @@ async fn recovery_stops_on_cancellation_but_retries_connection_errors() {
                         .values()
                         .map(|info| info.transaction_descriptor_headers.len())
                         .sum();
-                    if store.count() == (if retried { 3 } else { 2 })
+                    if store.count() == recovery_attempts + 1
                         && requests == (if retried { 2 } else { 1 })
                     {
                         break;
@@ -191,7 +211,7 @@ async fn recovery_stops_on_cancellation_but_retries_connection_errors() {
                             .is_some_and(|info| info.recovery_login)
                     })
                     .collect();
-                assert_eq!(recovery.len(), if retried { 2 } else { 1 });
+                assert_eq!(recovery.len(), recovery_attempts);
                 assert!(recovery[0].1.transaction_descriptor_headers.is_empty());
                 assert!(!recovery[0].1.authenticated);
             }

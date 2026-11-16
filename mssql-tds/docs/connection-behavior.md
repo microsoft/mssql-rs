@@ -117,9 +117,8 @@ submitted.
 
 An `EntraIdTokenFactory` whose provider cancels token acquisition independently of
 the request's `CancelHandle` should return `Error::TokenAcquisitionCancelled`.
-This preserves the cancellation's origin for language bindings without changing
-their existing mapping of explicit command cancellation. Other recovery failures
-retain their existing retry behavior.
+This distinguishes provider cancellation from command cancellation for language
+bindings. Other recovery failures follow the configured retry policy.
 
 ## DNS fallback caching
 

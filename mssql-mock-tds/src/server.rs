@@ -982,7 +982,6 @@ impl ConnectionStore {
 
     /// Upsert connection info keyed by the connection's unique id.
     /// Called during login, request processing, and connection teardown.
-    /// A snapshot does not indicate that the transport has closed.
     pub fn store(&mut self, processor: &ConnectionProcessor) {
         let info = ConnectionInfo {
             addr: processor.addr(),
