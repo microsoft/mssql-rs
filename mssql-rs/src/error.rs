@@ -48,7 +48,8 @@ pub enum Error {
     /// A connection pool error occurred.
     Pool(String),
 
-    /// A prepared statement belongs to another client or a reset session.
+    /// A prepared statement belongs to another client, a reset session, or a
+    /// connection replaced by recovery.
     ///
     /// Prepare a new statement on the current client before using it.
     InvalidPreparedStatement,
@@ -68,7 +69,7 @@ impl fmt::Display for Error {
             Error::InvalidPreparedStatement => {
                 write!(
                     f,
-                    "Prepared statement belongs to a different or reset client session"
+                    "Prepared statement belongs to a different, reset, or recovered client session"
                 )
             }
         }
@@ -134,7 +135,7 @@ mod tests {
             (Error::Pool("closed".into()), "Pool error: closed"),
             (
                 Error::InvalidPreparedStatement,
-                "Prepared statement belongs to a different or reset client session",
+                "Prepared statement belongs to a different, reset, or recovered client session",
             ),
         ];
         for (error, expected) in cases {

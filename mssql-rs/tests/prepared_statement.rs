@@ -13,6 +13,71 @@ pub mod common;
 use mssql_rs::Client;
 
 #[tokio::test]
+async fn prepared_handles_do_not_survive_transparent_recovery() {
+    let cfg = common::live_config_or_exit();
+    let mut client = Client::connect(&cfg).await.expect("connect");
+    let old_query = client
+        .prepare("SELECT 41 AS n", &[])
+        .await
+        .expect("prepare");
+    let old_execute = client
+        .prepare("SELECT 42 AS n", &[])
+        .await
+        .expect("prepare");
+    let old_close = client
+        .prepare("SELECT 43 AS n", &[])
+        .await
+        .expect("prepare");
+    let original_connection = client.inner_mut().client_connection_id();
+    let spid = client
+        .simple_query("SELECT @@SPID AS id")
+        .await
+        .expect("spid")
+        .into_first_result()
+        .first()
+        .expect("spid row")
+        .get::<i16, _>("id")
+        .expect("spid value");
+    let mut killer = Client::connect(&cfg).await.expect("killer connection");
+    killer
+        .execute(format!("KILL {spid}"), &[])
+        .await
+        .expect("kill original connection");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert!(matches!(
+        old_query.query(&mut client, &[]).await,
+        Err(mssql_rs::Error::InvalidPreparedStatement)
+    ));
+    assert_ne!(
+        client.inner_mut().client_connection_id(),
+        original_connection
+    );
+    let fresh = client
+        .prepare("SELECT 99 AS n", &[])
+        .await
+        .expect("prepare after recovery");
+    assert!(matches!(
+        old_execute.execute(&mut client, &[]).await,
+        Err(mssql_rs::Error::InvalidPreparedStatement)
+    ));
+    assert!(matches!(
+        old_close.close(&mut client).await,
+        Err(mssql_rs::Error::InvalidPreparedStatement)
+    ));
+    let rows = fresh
+        .query(&mut client, &[])
+        .await
+        .expect("fresh statement")
+        .into_first_result();
+    assert_eq!(rows.first().expect("row").get::<i32, _>("n"), Some(99));
+    fresh
+        .close(&mut client)
+        .await
+        .expect("close fresh statement");
+}
+
+#[tokio::test]
 async fn prepare_select_arithmetic_runs_many_times_with_single_plan() {
     let cfg = common::live_config_or_exit();
     let mut client = Client::connect(&cfg).await.expect("connect");

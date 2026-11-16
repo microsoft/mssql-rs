@@ -558,7 +558,7 @@ impl Client {
         params: &[&dyn ToSql],
     ) -> Result<QueryResult> {
         self.ensure_usable()?;
-        stmt.validate_session(&self.prepared_session)?;
+        stmt.validate_session(&self.prepared_session, self.inner.client_connection_id())?;
         let rpc_params = if params.is_empty() {
             None
         } else {
@@ -571,14 +571,21 @@ impl Client {
         let result = async {
             operation.close_query().await.map_err(Error::Tds)?;
             operation
-                .execute_stored_procedure(
+                .execute_stored_procedure_on_connection(
                     "sp_execute".into(),
                     Some(stmt.handle_parameter()),
                     rpc_params,
                     (),
+                    stmt.connection_id(),
                 )
                 .await
-                .map_err(Error::Tds)?;
+                .map_err(|error| {
+                    if operation.client_connection_id() != stmt.connection_id() {
+                        Error::InvalidPreparedStatement
+                    } else {
+                        Error::Tds(error)
+                    }
+                })?;
             Self::collect_results(&mut operation).await
         }
         .await;
@@ -596,7 +603,7 @@ impl Client {
         params: &[&dyn ToSql],
     ) -> Result<ExecuteResult> {
         self.ensure_usable()?;
-        stmt.validate_session(&self.prepared_session)?;
+        stmt.validate_session(&self.prepared_session, self.inner.client_connection_id())?;
         let rpc_params = if params.is_empty() {
             None
         } else {
@@ -609,14 +616,21 @@ impl Client {
         let result = async {
             operation.close_query().await.map_err(Error::Tds)?;
             let result = operation
-                .execute_stored_procedure(
+                .execute_stored_procedure_on_connection(
                     "sp_execute".into(),
                     Some(stmt.handle_parameter()),
                     rpc_params,
                     (),
+                    stmt.connection_id(),
                 )
                 .await
-                .map_err(Error::Tds)?;
+                .map_err(|error| {
+                    if operation.client_connection_id() != stmt.connection_id() {
+                        Error::InvalidPreparedStatement
+                    } else {
+                        Error::Tds(error)
+                    }
+                })?;
             Self::collect_execute_results(&mut operation, result).await
         }
         .await;
@@ -634,19 +648,26 @@ impl Client {
     /// server-side memory while keeping the connection alive.
     pub async fn unprepare(&mut self, stmt: crate::prepared::PreparedStatement) -> Result<()> {
         self.ensure_usable()?;
-        stmt.validate_session(&self.prepared_session)?;
+        stmt.validate_session(&self.prepared_session, self.inner.client_connection_id())?;
         let mut operation = Operation::new(&mut self.inner)?;
         let result = async {
             operation.close_query().await.map_err(Error::Tds)?;
             operation
-                .execute_stored_procedure(
+                .execute_stored_procedure_on_connection(
                     "sp_unprepare".into(),
                     Some(stmt.handle_parameter()),
                     None,
                     (),
+                    stmt.connection_id(),
                 )
                 .await
-                .map_err(Error::Tds)?;
+                .map_err(|error| {
+                    if operation.client_connection_id() != stmt.connection_id() {
+                        Error::InvalidPreparedStatement
+                    } else {
+                        Error::Tds(error)
+                    }
+                })?;
             operation.close_query().await.map_err(Error::Tds)
         }
         .await;

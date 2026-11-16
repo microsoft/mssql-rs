@@ -84,6 +84,10 @@ use async_trait::async_trait;
 use mssql_tds::connection::bulk_copy::BulkCopy as TdsBulkCopy;
 use mssql_tds::connection::tds_client::TdsClient;
 use mssql_tds::core::TdsResult;
+use mssql_tds::datatypes::bulk_copy_metadata::{BulkCopyColumnMetadata, SqlDbType};
+use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::datatypes::decoder::DecimalParts;
+use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::bulk_load::StreamingBulkLoadWriter;
 
 use crate::compat::ColumnData;
@@ -186,11 +190,86 @@ impl BulkLoadRow for TokenRow<'_> {
                 .clone()
                 .into_column_value()
                 .map_err(|error| mssql_tds::error::Error::UsageError(error.to_string()))?;
-            writer.write_column_value(*column_index, &value).await?;
+            write_adapter_value(writer, *column_index, value).await?;
             *column_index += 1;
         }
         Ok(())
     }
+}
+
+pub(crate) async fn write_adapter_value(
+    writer: &mut StreamingBulkLoadWriter<'_>,
+    column_index: usize,
+    mut value: ColumnValues,
+) -> TdsResult<()> {
+    let metadata = writer.column_metadata(column_index).ok_or_else(|| {
+        TdsError::UsageError(format!("Bulk column index {column_index} is out of bounds"))
+    })?;
+    normalize_adapter_value(&mut value, metadata)?;
+    writer.write_column_value(column_index, &value).await
+}
+
+fn normalize_adapter_value(
+    value: &mut ColumnValues,
+    metadata: &BulkCopyColumnMetadata,
+) -> TdsResult<()> {
+    match (value, metadata.sql_type) {
+        (ColumnValues::Time(time), SqlDbType::Time)
+        | (
+            ColumnValues::DateTime2(mssql_tds::datatypes::column_values::SqlDateTime2 {
+                time, ..
+            }),
+            SqlDbType::DateTime2,
+        )
+        | (
+            ColumnValues::DateTimeOffset(mssql_tds::datatypes::column_values::SqlDateTimeOffset {
+                datetime2: mssql_tds::datatypes::column_values::SqlDateTime2 { time, .. },
+                ..
+            }),
+            SqlDbType::DateTimeOffset,
+        ) => {
+            time.scale = metadata.scale;
+        }
+        (
+            ColumnValues::Decimal(parts) | ColumnValues::Numeric(parts),
+            SqlDbType::Decimal | SqlDbType::Numeric,
+        ) => {
+            let mut magnitude = parts.magnitude();
+            if parts.scale > metadata.scale {
+                let factor = 10_u128
+                    .checked_pow(u32::from(parts.scale - metadata.scale))
+                    .ok_or_else(|| {
+                        TdsError::UsageError("Bulk decimal scale is out of range".into())
+                    })?;
+                if magnitude % factor != 0 {
+                    return Err(TdsError::UsageError("Bulk decimal cannot be represented at destination scale without truncation".into()));
+                }
+                magnitude /= factor;
+            } else if parts.scale < metadata.scale {
+                let factor = 10_u128
+                    .checked_pow(u32::from(metadata.scale - parts.scale))
+                    .ok_or_else(|| {
+                        TdsError::UsageError("Bulk decimal scale is out of range".into())
+                    })?;
+                magnitude = magnitude.checked_mul(factor).ok_or_else(|| {
+                    TdsError::UsageError("Bulk decimal overflow at destination scale".into())
+                })?;
+            }
+            if magnitude.checked_ilog10().unwrap_or(0) + 1 > u32::from(metadata.precision) {
+                return Err(TdsError::UsageError(
+                    "Bulk decimal exceeds destination precision".into(),
+                ));
+            }
+            *parts = DecimalParts::new(
+                parts.is_positive,
+                metadata.precision,
+                metadata.scale,
+                magnitude,
+            );
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Convert a scalar or tuple into a compatibility bulk row.
@@ -483,6 +562,51 @@ impl<'a> BulkInsert<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_decimal_rescaling_is_exact() {
+        let metadata =
+            BulkCopyColumnMetadata::new("n", SqlDbType::Decimal, 0x6a).with_precision_scale(5, 2);
+        for (magnitude, source_scale, expected) in [(1234, 1, 12340), (123400, 3, 12340), (0, 3, 0)]
+        {
+            let mut value =
+                ColumnValues::Numeric(DecimalParts::new(false, 10, source_scale, magnitude));
+            normalize_adapter_value(&mut value, &metadata).expect("exact conversion");
+            let ColumnValues::Numeric(parts) = value else {
+                panic!("expected numeric")
+            };
+            assert_eq!(parts.magnitude(), expected);
+            assert_eq!(parts.scale, 2);
+            assert_eq!(parts.precision, 5);
+            assert!(!parts.is_positive);
+        }
+        for (magnitude, source_scale) in [(123401, 3), (100000, 2), (u128::MAX, 1)] {
+            let mut value =
+                ColumnValues::Decimal(DecimalParts::new(true, 38, source_scale, magnitude));
+            assert!(normalize_adapter_value(&mut value, &metadata).is_err());
+        }
+        let mut null = ColumnValues::Null;
+        normalize_adapter_value(&mut null, &metadata).expect("null");
+        assert_eq!(null, ColumnValues::Null);
+    }
+
+    #[test]
+    fn adapter_time_uses_destination_scale_at_boundaries() {
+        for scale in [0, 3, 4, 7] {
+            let metadata =
+                BulkCopyColumnMetadata::new("t", SqlDbType::Time, 0x29).with_scale(scale);
+            let mut value = ColumnValues::Time(mssql_tds::datatypes::column_values::SqlTime {
+                time_nanoseconds: 123_456_789,
+                scale: 7,
+            });
+            normalize_adapter_value(&mut value, &metadata).expect("time");
+            let ColumnValues::Time(time) = value else {
+                panic!("expected time")
+            };
+            assert_eq!(time.scale, scale);
+            assert_eq!(time.time_nanoseconds, 123_456_789);
+        }
+    }
 
     // No DB-required tests live here; the BulkCopy state is internal to
     // the upstream crate, so we can't construct a BulkInsert<'a> without

@@ -94,6 +94,8 @@ and validate the response. Temporary tables, changed session settings, open
 transactions, and prepared handles no longer carry over to the next borrower.
 Prepare and close statements within one checkout. Finish transactions before
 returning a connection: recycling runs at the next checkout, not at check-in.
+Transparent connection recovery also invalidates prepared handles; prepare
+them again on the recovered connection.
 
 For intentional legacy session reuse, build a pool with
 `TdsManager::new(config).with_recycling_method(RecyclingMethod::Ping)`.
@@ -111,6 +113,9 @@ Explicit bulk mappings must use consecutive source ordinals starting at zero in
 destination column order. Streaming rows cannot reorder or skip source values,
 and source-name mappings are unsupported; unsupported mappings return an error.
 Arrow batch iterators are consumed lazily, without buffering a wrapper per row.
+Arrow and compatibility bulk rows use the destination temporal and decimal
+scales. Decimal values that cannot be represented exactly at the destination
+scale or precision return an error.
 
 ## Cancellation and timeouts
 

@@ -449,6 +449,13 @@ impl ToSql for serde_json::Value {
             serde_json::Value::Number(number) => {
                 if let Some(value) = number.as_i64() {
                     SqlType::BigInt(Some(value))
+                } else if let Some(value) = number.as_u64() {
+                    SqlType::Numeric(Some(mssql_tds::datatypes::decoder::DecimalParts::new(
+                        true,
+                        20,
+                        0,
+                        u128::from(value),
+                    )))
                 } else if let Some(value) = number.as_f64() {
                     SqlType::Float(Some(value))
                 } else {
@@ -1661,6 +1668,18 @@ mod tests {
             ensure_equal(value.to_utf8_string(), object.to_string())?;
         } else {
             return Err("expected NVarchar JSON text for object".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn json_unsigned_integers_above_bigint_are_exact() -> TestResult {
+        for number in [i64::MAX as u64 + 1, i64::MAX as u64 + 2, u64::MAX] {
+            let SqlType::Numeric(Some(value)) = json!(number).to_sql()? else {
+                return Err("expected numeric parameter".into());
+            };
+            ensure_equal(value.magnitude(), u128::from(number))?;
+            ensure_equal(value.scale, 0)?;
         }
         Ok(())
     }

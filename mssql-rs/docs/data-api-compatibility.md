@@ -77,6 +77,9 @@ Native vector, variant, and table parameters use `ColumnData::Native` rather
 than a Tiberius-equivalent representation.
 An absent `Option<serde_json::Value>` binds as a nullable string, like JSON
 `null`; use `ColumnData::Json` explicitly to request SQL Server's native JSON type.
+Unsigned JSON integers above `i64::MAX` bind as exact `NUMERIC(20,0)` values.
+SQL decimal values that cannot be represented exactly by `rust_decimal::Decimal`
+are not rounded during extraction.
 
 `BigVarBin` identifies TDS `BigVarBinary` columns, including `varbinary(max)`.
 `Column::char_length()` returns `None` for `varchar(max)` and `nvarchar(max)`;

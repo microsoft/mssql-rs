@@ -777,8 +777,28 @@ impl<'a> FromSql<'a> for rust_decimal::Decimal {
     fn from_sql(val: &'a ColumnValues) -> Option<Self> {
         match val {
             ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => {
-                // DecimalParts has Display impl; parse through string for safety
-                d.to_string().parse::<rust_decimal::Decimal>().ok()
+                let mut magnitude = d.magnitude();
+                let mut scale = u32::from(d.scale);
+                loop {
+                    let value = i128::try_from(magnitude).ok().and_then(|value| {
+                        if d.is_positive {
+                            Some(value)
+                        } else {
+                            value.checked_neg()
+                        }
+                    });
+                    if let Some(value) = value
+                        && let Ok(decimal) =
+                            rust_decimal::Decimal::try_from_i128_with_scale(value, scale)
+                    {
+                        return Some(decimal);
+                    }
+                    if scale == 0 || magnitude % 10 != 0 {
+                        return None;
+                    }
+                    magnitude /= 10;
+                    scale -= 1;
+                }
             }
             ColumnValues::SmallMoney(m) => Some(rust_decimal::Decimal::new(m.int_val as i64, 4)),
             ColumnValues::Money(m) => {
@@ -1243,6 +1263,49 @@ mod tests {
                 Some(rust_decimal::Decimal::new(raw, 4))
             );
         }
+    }
+
+    #[test]
+    fn decimal_conversion_rejects_rounding_and_removes_trailing_zeroes() {
+        let value = ColumnValues::Numeric(DecimalParts::new(true, 29, 29, 1));
+        assert_eq!(rust_decimal::Decimal::from_sql(&value), None);
+
+        let value = ColumnValues::Numeric(DecimalParts::new(true, 30, 29, 10));
+        assert_eq!(
+            rust_decimal::Decimal::from_sql(&value),
+            Some(rust_decimal::Decimal::from_i128_with_scale(1, 28))
+        );
+
+        let value = ColumnValues::Decimal(DecimalParts::new(false, 30, 2, 12300));
+        assert_eq!(
+            rust_decimal::Decimal::from_sql(&value),
+            Some(rust_decimal::Decimal::new(-12300, 2))
+        );
+
+        let value = ColumnValues::Decimal(DecimalParts::new(
+            true,
+            30,
+            1,
+            792_281_625_142_643_375_935_439_503_350,
+        ));
+        assert_eq!(
+            rust_decimal::Decimal::from_sql(&value),
+            Some(rust_decimal::Decimal::MAX)
+        );
+
+        let value = ColumnValues::Numeric(DecimalParts::new(true, 38, 38, 0));
+        assert_eq!(
+            rust_decimal::Decimal::from_sql(&value),
+            Some(rust_decimal::Decimal::ZERO)
+        );
+
+        let value = ColumnValues::Numeric(DecimalParts::new(
+            false,
+            30,
+            0,
+            792_281_625_142_643_375_935_439_503_36,
+        ));
+        assert_eq!(rust_decimal::Decimal::from_sql(&value), None);
     }
 
     #[test]

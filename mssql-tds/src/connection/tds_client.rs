@@ -3907,12 +3907,52 @@ impl TdsClient {
         named_parameters: Option<Vec<RpcParameter>>,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementResult> {
+        self.execute_stored_procedure_inner(
+            stored_procedure_name,
+            positional_parameters,
+            named_parameters,
+            options.into(),
+            None,
+        )
+        .await
+    }
+
+    /// Execute a stored procedure only on the specified physical connection.
+    ///
+    /// If session recovery replaces that connection, returns a usage error
+    /// without sending the requested RPC.
+    pub async fn execute_stored_procedure_on_connection<'a>(
+        &mut self,
+        stored_procedure_name: String,
+        positional_parameters: Option<Vec<RpcParameter>>,
+        named_parameters: Option<Vec<RpcParameter>>,
+        options: impl Into<ExecuteOptions<'a>>,
+        connection_id: uuid::Uuid,
+    ) -> TdsResult<StatementResult> {
+        self.execute_stored_procedure_inner(
+            stored_procedure_name,
+            positional_parameters,
+            named_parameters,
+            options.into(),
+            Some(connection_id),
+        )
+        .await
+    }
+
+    async fn execute_stored_procedure_inner<'a>(
+        &mut self,
+        stored_procedure_name: String,
+        positional_parameters: Option<Vec<RpcParameter>>,
+        named_parameters: Option<Vec<RpcParameter>>,
+        options: ExecuteOptions<'a>,
+        connection_id: Option<uuid::Uuid>,
+    ) -> TdsResult<StatementResult> {
         let ExecuteOptions {
             timeout: timeout_sec,
             cancel: cancel_handle,
             column_encryption,
             on_error,
-        } = options.into();
+        } = options;
         Self::note_on_error_ignored(on_error);
         self.current_command_ce_setting = column_encryption;
 
@@ -3934,6 +3974,11 @@ impl TdsClient {
 
         self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        if connection_id.is_some_and(|id| id != self.client_connection_id()) {
+            return Err(crate::error::Error::UsageError(
+                "The physical connection changed during session recovery".into(),
+            ));
+        }
         let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
         let resolved = budget.into_timeout()?;
         let timeout_sec = resolved.seconds();
@@ -3998,6 +4043,11 @@ impl TdsClient {
             self.transport.reset_reader();
         }
 
+        if connection_id.is_some_and(|id| id != self.client_connection_id()) {
+            return Err(crate::error::Error::UsageError(
+                "The physical connection changed during session recovery".into(),
+            ));
+        }
         let database_collation = self.negotiated_settings.database_collation;
 
         let rpc = SqlRpc::new(

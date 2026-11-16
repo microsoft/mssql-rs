@@ -20,7 +20,70 @@ use arrow_array::{
     Time64NanosecondArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use mssql_rs::Client;
+use mssql_rs::{Client, IntoRow};
+
+#[tokio::test]
+async fn bulk_adapter_values_use_destination_scale() {
+    let cfg = common::live_config_or_exit();
+    let mut client = Client::connect(&cfg).await.expect("connect");
+    client
+        .execute(
+            "CREATE TABLE #BulkScales (t TIME(6), d DATETIME2(6), n DECIMAL(10,4))",
+            &[],
+        )
+        .await
+        .expect("create table");
+
+    let decimal = Decimal128Array::from(vec![12345])
+        .with_precision_and_scale(10, 2)
+        .expect("decimal metadata");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("t", DataType::Time64(TimeUnit::Nanosecond), false),
+        Field::new("d", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+        Field::new("n", DataType::Decimal128(10, 2), false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Time64NanosecondArray::from(vec![1_000_000_000])),
+            Arc::new(TimestampMicrosecondArray::from(vec![1_000_000])),
+            Arc::new(decimal),
+        ],
+    )
+    .expect("batch");
+    client
+        .bulk_insert("#BulkScales")
+        .send_arrow(batch)
+        .await
+        .expect("Arrow insert");
+    let time = chrono::NaiveTime::from_hms_opt(0, 0, 1).expect("time");
+    let datetime = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+        .expect("date")
+        .and_hms_opt(0, 0, 1)
+        .expect("datetime");
+    let mut request = client
+        .bulk_insert("#BulkScales")
+        .await
+        .expect("bulk request");
+    request
+        .send(
+            (time, datetime, rust_decimal::Decimal::new(12345, 2))
+                .into_row()
+                .expect("row"),
+        )
+        .await
+        .expect("compatibility insert");
+    request.finalize().await.expect("finish");
+
+    let rows = client
+        .simple_query(
+            "SELECT COUNT(*) AS n FROM #BulkScales WHERE t = '00:00:01' AND d = '1970-01-01T00:00:01' AND n = 123.4500",
+        )
+        .await
+        .expect("read values")
+        .into_first_result();
+    assert_eq!(rows.first().expect("count").get::<i32, _>("n"), Some(2));
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bulk_insert_send_arrow_mixed_types() {

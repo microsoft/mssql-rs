@@ -61,7 +61,8 @@
 //! dead, including when preparation is still reading its output handle. Discard
 //! the client and prepare new handles on the replacement connection.
 //!
-//! Statements belong to the client session that prepared them.
+//! Statements belong to the physical client session that prepared them.
+//! Transparent connection recovery invalidates their server-side handles.
 //! [`Client::reset_session`] and the default pool recycling policy invalidate
 //! them. On a usable client, querying, executing, or closing an invalidated statement returns
 //! [`Error::InvalidPreparedStatement`] without sending its stale handle.
@@ -104,19 +105,30 @@ pub struct PreparedStatement {
     handle: i32,
     sql: String,
     session: Arc<()>,
+    connection_id: uuid::Uuid,
 }
 
 impl PreparedStatement {
-    pub(crate) fn new(handle: i32, sql: String, session: Arc<()>) -> Self {
+    pub(crate) fn new(
+        handle: i32,
+        sql: String,
+        session: Arc<()>,
+        connection_id: uuid::Uuid,
+    ) -> Self {
         Self {
             handle,
             sql,
             session,
+            connection_id,
         }
     }
 
-    pub(crate) fn validate_session(&self, session: &Arc<()>) -> Result<()> {
-        if Arc::ptr_eq(&self.session, session) {
+    pub(crate) fn validate_session(
+        &self,
+        session: &Arc<()>,
+        connection_id: uuid::Uuid,
+    ) -> Result<()> {
+        if Arc::ptr_eq(&self.session, session) && self.connection_id == connection_id {
             Ok(())
         } else {
             Err(Error::InvalidPreparedStatement)
@@ -152,7 +164,12 @@ impl PreparedStatement {
         let values = client.get_return_values();
         match values.as_slice() {
             [value] => match value.value {
-                ColumnValues::Int(handle) => Ok(Self::new(handle, sql, session)),
+                ColumnValues::Int(handle) => Ok(Self::new(
+                    handle,
+                    sql,
+                    session,
+                    client.client_connection_id(),
+                )),
                 _ => Err(Error::Tds(mssql_tds::error::Error::ProtocolError(
                     "sp_prepare did not return an integer handle".into(),
                 ))),
@@ -169,6 +186,10 @@ impl PreparedStatement {
             StatusFlags::NONE,
             SqlType::Int(Some(self.handle)),
         )]
+    }
+
+    pub(crate) fn connection_id(&self) -> uuid::Uuid {
+        self.connection_id
     }
 
     /// The server-side `sp_prepare` handle.
@@ -464,7 +485,12 @@ mod tests {
 
     #[test]
     fn prepared_statement_handle_and_sql_accessors() {
-        let stmt = PreparedStatement::new(42, "SELECT @P1".to_string(), Arc::new(()));
+        let stmt = PreparedStatement::new(
+            42,
+            "SELECT @P1".to_string(),
+            Arc::new(()),
+            uuid::Uuid::nil(),
+        );
         assert_eq!(stmt.handle(), 42);
         assert_eq!(stmt.sql(), "SELECT @P1");
     }
@@ -477,7 +503,8 @@ mod tests {
 
     #[test]
     fn prepared_statement_debug_includes_handle() {
-        let stmt = PreparedStatement::new(7, "SELECT 1".to_string(), Arc::new(()));
+        let stmt =
+            PreparedStatement::new(7, "SELECT 1".to_string(), Arc::new(()), uuid::Uuid::nil());
         let s = format!("{stmt:?}");
         assert!(s.contains("7"), "debug should include handle: {s}");
     }
@@ -485,17 +512,23 @@ mod tests {
     #[test]
     fn prepared_statement_is_bound_to_one_session() {
         let mut session = Arc::new(());
-        let stmt = PreparedStatement::new(7, "SELECT 1".into(), Arc::clone(&session));
-        stmt.validate_session(&session)
+        let connection_id = uuid::Uuid::nil();
+        let stmt =
+            PreparedStatement::new(7, "SELECT 1".into(), Arc::clone(&session), connection_id);
+        stmt.validate_session(&session, connection_id)
             .expect("statement belongs to this session");
         assert!(matches!(
-            stmt.validate_session(&Arc::new(())),
+            stmt.validate_session(&Arc::new(()), connection_id),
+            Err(Error::InvalidPreparedStatement)
+        ));
+        assert!(matches!(
+            stmt.validate_session(&session, uuid::Uuid::from_u128(1)),
             Err(Error::InvalidPreparedStatement)
         ));
 
         session = Arc::new(());
         assert!(matches!(
-            stmt.validate_session(&session),
+            stmt.validate_session(&session, connection_id),
             Err(Error::InvalidPreparedStatement)
         ));
     }
