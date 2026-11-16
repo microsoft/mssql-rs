@@ -922,12 +922,17 @@ msodbcsql build is measured.
     before it returns. msodbcsql's `SQLCancel` sends ATTN while that call still
     holds `csStmt` (`sqlcmisc.cpp:759`), and the next call to read the batch
     reports `HY008` (`sqlccmd.cpp:11821-11826`). This driver settles the
-    pending response in the call that was interrupted, so `HY008` is reported
-    one call earlier and a cancellation never reaches a later call or a
-    subsequent close. A response already fully received is left intact in both
-    drivers. This half is read from source and covered by Rust unit tests; it
-    has not been measured against native, because the window is not
-    reproducible from an application.
+    pending response in the call that was interrupted, so a cancellation never
+    reaches a later call or a subsequent close: a call that would otherwise
+    succeed reports `HY008` one call earlier, and a call that already failed
+    keeps its own error. A response already fully received is left intact in
+    both drivers. The look-ahead of up to one second for a procedure's tail,
+    after a statement inside `EXEC` fails, opens this window reproducibly:
+    both drivers' `SQLExecDirect` returns only the statement's `42000`, then
+    msodbcsql's `SQLMoreResults` reports `HY008` where this driver's returns
+    `SQL_NO_DATA`, and both leave the connection free. Outside that
+    look-ahead the window is not reproducible from an application; that half
+    is read from source and covered by Rust unit tests.
 
     **Evidence level: measured.** The `CancelLiveTest` MoreResults cases record
     `SQL_DRIVER_VER` and assert each driver's exact return code. Measured on
@@ -935,11 +940,18 @@ msodbcsql build is measured.
     `libmsodbcsql-18.6.so.1.1` / `SQL_DRIVER_VER=18.06.0001`, against SQL Server
     2025 CU9 (`17.0.5005.3`). The same sequence was also measured through
     Windows Driver Manager against native `SQL_DRIVER_VER=18.06.0001` with
-    the same result. Other native builds have not been measured.
+    the same result. Other native builds have not been measured. The
+    look-ahead case was measured on Windows msodbcsql 18.07.0001, loaded
+    directly and through the Driver Manager, against SQL Server 2025
+    (`17.00.4025`); `CancelDuringTheProcedureTailLookAheadAbandonsTheBatch`
+    asserts each driver's sequence.
 
     Explicitly approved by the requester on 2026-10-07 for
     [AB#49223](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/49223):
     retain HY008, document the difference, and match native teardown ordering.
+    The look-ahead case was added for
+    [AB#45309](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/45309);
+    maintainer sign-off is pending review.
 28. **Connection-scoped trace events carry the full client connection GUID.**
     Classic ODBC's `CConnection::SendPreloginPacket`
     (`Sql/Ntdbms/sqlncli/tds/prelogin.cpp`, TRACEID branch) logs the GUID at
@@ -1438,3 +1450,80 @@ msodbcsql build is measured.
     fetch of the last rowset rather than the `SQL_NO_DATA` after it; msodbcsql
     has no equivalent to match. `BlockCursorsReportTheClassificationOnlyInThisDriver`
     asserts each driver's outcome.
+
+43. **`SQLMoreResults` reports a statement's unread trailing error and keeps
+    the batch.** After a fetch delivers a row from a plain batch, the
+    statement's row set can still end in a SQL Server error, with more
+    statements after it. msodbcsql's `SQLMoreResults` closes the open cursor
+    first (`Sql/Ntdbms/sqlncli/odbc/sqlcresl.cpp`, `ExportImp::SQLMoreResults`,
+    lines 196-199). It then returns `SQL_NO_DATA` once no result is pending
+    (lines 239-246), with no diagnostic. The later statements' results stay
+    unread, and the connection stays busy: another statement's execute fails
+    with "Connection is busy with results for another command" until this
+    statement is freed.
+
+    This driver returns `SQL_ERROR` with the error and positions on the
+    failed statement's error result. The next `SQLMoreResults` continues with
+    the batch. Both drivers already report a statement that fails between
+    results that way, and the rest of the batch stays reachable. A fetch that
+    reads the error first behaves as in msodbcsql: `SQL_ERROR`, then
+    `SQL_NO_DATA`, then `SQLMoreResults` reaches the next statement.
+
+    With nothing after the failed statement, including a row set that fails
+    inside `EXEC sp_executesql`, msodbcsql's `SQLMoreResults` still returns
+    `SQL_NO_DATA` with no diagnostic, and the connection stays busy until the
+    statement is freed. This driver returns `SQL_ERROR` with the error and
+    ends the batch, so the connection is free.
+
+    **Evidence level: measured.** Windows msodbcsql 18.07.0001, loaded
+    directly without a Driver Manager, against SQL Server 2025
+    (`17.00.4025`). The batch was `SET NOCOUNT ON; SELECT n, 1/(2-n) AS q FROM
+    (VALUES(1),(2),(3)) t(n); SELECT 42 AS v;`, read by a single-row bound
+    fetch and by a block fetch sized before or after execution, and
+    `EXEC sp_executesql N'SELECT n, 1/(2-n) AS q FROM (VALUES(1),(2),(3)) t(n)'`
+    with nothing after it, read by a single-row bound fetch.
+    `more_results_reports_a_deferred_continued_error_then_continues` and
+    `more_results_reports_a_deferred_error_that_ends_the_batch` pin this
+    driver's sequences. Chosen by the change author for
+    [AB#45309](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/45309);
+    maintainer sign-off is pending review.
+
+44. **A row set's trailing error that ends the batch frees the connection one
+    fetch earlier.** A fetch can deliver the last row before a SQL Server
+    error when nothing in the response follows that error but its
+    completion. Examples are a batch-aborting error (`XACT_ABORT`, a
+    conversion error), the batch's last statement, and a statement inside
+    `EXEC` or `sp_executesql` whose procedure then returns. msodbcsql caches
+    an ERROR token that follows a processed row for the next fetch
+    (`Sql/Ntdbms/sqlncli/odbc/sqlctokn.cpp`, `OnMessage`, lines 3157-3183,
+    `TDS_DELAYERROR`), so its read-ahead stops there and the connection stays
+    busy until that fetch: in between, another statement's execute fails with
+    "Connection is busy with results for another command".
+
+    This driver's read-ahead reads past the error to the end of the response,
+    so the connection is free as soon as the fetch that delivered the row
+    returns. The error is still reported by the next fetch, and the fetches
+    return what msodbcsql's do: the rows, then `SQL_ERROR`, then
+    `SQL_NO_DATA` from the open cursor. A batch with more statements after
+    the error keeps the connection busy in both drivers, and so does a T-SQL
+    procedure whose failing SELECT is followed by its own count DONEINPROC.
+    The connection is held only while part of its response is unread
+    (AB#47508); holding it longer would refuse other statements without
+    changing what any call on this one returns. The batch-aborting and
+    last-statement cases predate
+    [AB#45309](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/45309).
+
+    **Evidence level: measured.** Windows msodbcsql 18.07.0001, loaded
+    directly without a Driver Manager, against SQL Server 2025
+    (`17.00.4025`). The statement was `SELECT n, 1/(2-n) AS q FROM
+    (VALUES(1),(2),(3)) t(n)` as a plain batch's last statement, through
+    `EXEC sp_executesql` and `EXEC('...')`, under `SET XACT_ABORT ON`, and
+    with a conversion error in place of the division, each read by a
+    single-row bound fetch. The `sp_executesql` form was also read by a block
+    fetch sized after execution and by unbound fetches with and without
+    `SQLGetData`.
+    `bound_fetch_releases_a_procedure_its_failed_row_set_ends` and
+    `block_fetch_releases_a_procedure_its_failed_row_set_ends` pin this
+    driver's sequence; `FailedProcedureRowSetReleasesTheConnection` checks
+    the behavior both drivers share. Chosen by the change author for
+    AB#45309; maintainer sign-off is pending review.
