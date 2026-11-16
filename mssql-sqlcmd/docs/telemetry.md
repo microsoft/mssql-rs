@@ -71,8 +71,9 @@ flowchart LR
    was not sent yet (a run that never connected), and waits for it for at most
    half a second.
 
-The Rust `sqlcmd diagnose` path records its server row from its own session
-probe, with the same functions.
+The Rust `sqlcmd diagnose` path records its server row with the same functions,
+from its own session probe, or, when native sqlcmd supplies its own driver
+connection, from the row of the driver's query (see Server properties).
 
 The event is one `Microsoft.ApplicationInsights.Event` item (`name`, `time`,
 `iKey`, and `data` with `baseType: EventData` and `baseData` `{ver: 2, name,
@@ -127,6 +128,15 @@ records the row after that check's timing is taken, so telemetry cannot change
 the reported duration or clock offset. The query needs no permission beyond a
 connection. The query text is defined once, in `server_info.rs`, and both
 paths use it.
+
+When native sqlcmd supplies its own driver connection to `diagnose`, the
+diagnostic connection stops at the transport and the session probe does not
+run. The row of the driver's own query is then the only place the properties are
+read: the engine edition, and the version when native sqlcmd appended it. The
+operating system and architecture are not in that row, so the server OS and
+platform are omitted for such a run, as they are on Azure SQL Database. The
+telemetry columns are not appended to the callback's query, because native's own
+columns sit at fixed positions after the first three and would be read as them.
 
 Platform and OS are read from `@@VERSION` because `xp_msver` is unavailable on
 Azure SQL Database and `sys.dm_os_host_info` fails there; both stay omitted on
@@ -236,8 +246,9 @@ Which events that drops: the send starts at the first successful connection
 (`mssql_sqlcmd_telemetry_record_connection`) or, for a run that never records
 one, only at exit. A run that never connects therefore gets just the half-second
 window, however long it ran: every failed connection, and every `sqlcmd
-diagnose` that does not end with a successful session probe (a failed attempt, a
-failed or timed-out probe, a depth below session validation, or a DAC lookup).
+diagnose` that does not end with a successful session probe or a successful row
+from sqlcmd's own driver query (a failed attempt, a failed or timed-out probe or
+query, a depth below session validation, or a DAC lookup).
 From a distant network, where a cold send takes about a second, most of those
 events are dropped. The counts are skewed against failed runs and failing
 `diagnose` runs from distant regions, not only low, and they are a lower bound.

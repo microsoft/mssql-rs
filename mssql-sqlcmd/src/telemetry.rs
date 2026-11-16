@@ -123,9 +123,9 @@ static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// What a test transport was asked to send.
 #[cfg(test)]
-struct Captured {
-    url: String,
-    body: Vec<u8>,
+pub(crate) struct Captured {
+    pub(crate) url: String,
+    pub(crate) body: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -541,11 +541,11 @@ fn version_is_safe(version: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::Value as JsonValue;
 
-    const TEST_CONNECTION_STRING: &str = "InstrumentationKey=00000000-0000-0000-0000-000000000000;\
+    pub(crate) const TEST_CONNECTION_STRING: &str = "InstrumentationKey=00000000-0000-0000-0000-000000000000;\
          IngestionEndpoint=https://example.test";
 
     #[test]
@@ -1060,14 +1060,14 @@ mod tests {
 
     /// Serializes the tests that use the process-wide session and environment,
     /// and clears them afterwards.
-    struct TestEnv {
+    pub(crate) struct TestEnv {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     impl TestEnv {
-        fn new(connection_string: Option<&str>) -> Self {
+        pub(crate) fn new(connection_string: Option<&str>) -> Self {
             let lock = ENV_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1094,7 +1094,7 @@ mod tests {
         }
 
         /// Sends what would be posted to the returned channel instead.
-        fn capture_requests(&self) -> mpsc::Receiver<Captured> {
+        pub(crate) fn capture_requests(&self) -> mpsc::Receiver<Captured> {
             let (sender, receiver) = mpsc::channel();
             *ABI_TEST_CLIENT.lock().expect("ABI test client lock") = Some(sender);
             receiver
@@ -1183,7 +1183,9 @@ mod tests {
         }
     }
 
-    fn event_properties(request: &Captured) -> std::collections::BTreeMap<String, String> {
+    pub(crate) fn event_properties(
+        request: &Captured,
+    ) -> std::collections::BTreeMap<String, String> {
         let items: Vec<JsonValue> = serde_json::from_slice(&request.body).expect("request JSON");
         assert_eq!(items.len(), 1);
         assert_eq!(

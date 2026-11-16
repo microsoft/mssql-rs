@@ -3801,6 +3801,12 @@ impl Diagnosis {
                         .push(Check::skipped(CheckId::SessionValidation, Skip::Canceled));
                 } else {
                     self.driver_session(&outcome, probe_midpoint_unix_ms);
+                    // After the check, whose timing comes from the callback, so
+                    // that telemetry cannot change what it reports. With
+                    // telemetry off there is no session and this does nothing.
+                    if let Some(raw) = driver_server_info(&outcome) {
+                        crate::telemetry::record_server_info(&raw);
+                    }
                 }
             }
             self.enrich_driver_check(driver_check, endpoint.as_ref())
@@ -5424,6 +5430,31 @@ fn raw_server_info_from_row(row: &[ColumnValues]) -> Option<RawServerInfo> {
         product_version: text_column(row.get(SESSION_PROBE_COLUMNS)),
         os: text_column(row.get(SESSION_PROBE_COLUMNS + 1)),
         arch: text_column(row.get(SESSION_PROBE_COLUMNS + 2)),
+    })
+}
+
+/// The server properties from the row of sqlcmd's own driver query, for usage
+/// telemetry, or `None` when the query failed or gave no engine edition. Only
+/// the engine edition and, when native sqlcmd appended it, the version are
+/// there: the operating system and architecture are not in that row, so they
+/// are absent, as for Azure SQL Database. The columns of
+/// `server_info::EXTRA_COLUMNS` are deliberately not appended to the callback's
+/// query: native's own columns sit at the fixed indices of `driver::column`, so
+/// they would be read as the transport and the server name.
+fn driver_server_info(outcome: &driver::DriverOutcome) -> Option<RawServerInfo> {
+    if outcome.query_failed {
+        return None;
+    }
+    let engine_edition = outcome
+        .cell(driver::column::ENGINE_EDITION)?
+        .trim()
+        .parse::<i32>()
+        .ok()?;
+    Some(RawServerInfo {
+        engine_edition,
+        product_version: outcome.cell(driver::column::VERSION).map(str::to_owned),
+        os: None,
+        arch: None,
     })
 }
 
@@ -13714,6 +13745,102 @@ pub(crate) mod tests {
         );
         // A string where a number is expected is not an edition.
         assert_eq!(raw_server_info_from_row(&[text("2")]), None);
+    }
+
+    /// Native sqlcmd's own driver query gives the edition and, when native
+    /// appended it, the version; the OS and architecture are not in that row.
+    #[test]
+    fn the_drivers_row_gives_the_edition_and_version_and_no_os() {
+        let outcome = |row: Vec<Option<String>>, query_failed: bool| driver::DriverOutcome {
+            connected: true,
+            query_failed,
+            row,
+            ..driver::DriverOutcome::default()
+        };
+        assert_eq!(
+            driver_server_info(&outcome(driver_row("TCP"), false)),
+            Some(RawServerInfo {
+                engine_edition: 2,
+                product_version: Some("17.0.4085.2".to_string()),
+                os: None,
+                arch: None,
+            })
+        );
+        // Native appends the version only when it is known: without it the
+        // edition alone is kept.
+        let mut short = driver_row("TCP");
+        short.truncate(3);
+        assert_eq!(
+            driver_server_info(&outcome(short, false)),
+            Some(RawServerInfo {
+                engine_edition: 2,
+                ..RawServerInfo::default()
+            })
+        );
+        // A failed query, no row, or an edition that is not a number gives none.
+        assert_eq!(driver_server_info(&outcome(driver_row("TCP"), true)), None);
+        assert_eq!(driver_server_info(&outcome(Vec::new(), false)), None);
+        let mut garbled = driver_row("TCP");
+        garbled[0] = Some("two".to_string());
+        assert_eq!(driver_server_info(&outcome(garbled, false)), None);
+        let mut missing = driver_row("TCP");
+        missing[0] = None;
+        assert_eq!(driver_server_info(&outcome(missing, false)), None);
+    }
+
+    /// Through sqlcmd's own driver the diagnostic connection stops at the
+    /// transport, so session validation does not run and the driver's row is
+    /// the only place the server's properties are read. With telemetry on they
+    /// are recorded from it, and the event goes out with them.
+    #[test]
+    fn a_connected_run_through_the_driver_reports_the_server_properties() {
+        use crate::telemetry::tests::{TEST_CONNECTION_STRING, TestEnv, event_properties};
+        use crate::telemetry::{Command, FlushOutcome, FormatUse, Invocation};
+
+        for (query_failed, row) in [(false, driver_row("TCP")), (true, Vec::new())] {
+            let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
+            let requests = guard.capture_requests();
+            crate::telemetry::record_usage(Invocation {
+                version: Some("18.5"),
+                command: Command::Diagnose,
+                format: FormatUse::Json,
+            });
+            let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::SessionValidation));
+            let target = diagnosis.connection_input().unwrap();
+            let (hook, _) = fake_driver(driver::DriverOutcome {
+                connected: true,
+                query_failed,
+                row,
+                ..driver::DriverOutcome::default()
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(diagnosis.driver_attempt(hook, &target, None));
+
+            // With a row the event is sent when it is recorded, before shutdown.
+            assert_eq!(
+                crate::telemetry::shutdown(Duration::from_secs(1)),
+                FlushOutcome::Completed,
+                "{query_failed}"
+            );
+            let properties = event_properties(&requests.try_recv().expect("one request"));
+            assert_eq!(
+                properties.contains_key("sqlcmdcli_engine_edition"),
+                !query_failed
+            );
+            if query_failed {
+                assert!(!properties.contains_key("sqlcmdcli_server_version"));
+            } else {
+                assert_eq!(properties["sqlcmdcli_engine_edition"], "2");
+                assert_eq!(properties["sqlcmdcli_server_version"], "17.0.4085.2");
+            }
+            // The row has neither the OS nor the architecture.
+            assert!(!properties.contains_key("sqlcmdcli_server_os"));
+            assert!(!properties.contains_key("sqlcmdcli_server_platform"));
+            assert!(requests.try_recv().is_err(), "one event only");
+        }
     }
     /// How a failed session query is classified: SQL Server's own error is
     /// diagnosed and about the server; a timeout, the network or the client
