@@ -216,8 +216,10 @@ fn read_login7_string(data: &[u8], entry: usize) -> Option<String> {
     }
     let bytes = data.get(offset..offset + chars * 2)?;
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| u16::from_le_bytes(*chunk))
         .collect();
     String::from_utf16(&units).ok()
 }
@@ -270,8 +272,10 @@ pub(crate) fn parse_login7(packet_data: &[u8]) -> (Login7AuthInfo, bool) {
         let server_name_bytes =
             &data[server_name_offset..server_name_offset + server_name_length * 2];
         let u16_chars: Vec<u16> = server_name_bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_le_bytes(*chunk))
             .collect();
         if let Ok(server_name) = String::from_utf16(&u16_chars) {
             debug!("Login7 ServerName: '{}'", server_name);
@@ -394,8 +398,10 @@ pub(crate) fn parse_login7(packet_data: &[u8]) -> (Login7AuthInfo, bool) {
             let feat_data = &data[i + 5..i + 5 + feat_len];
             if feat_data.len().is_multiple_of(2) {
                 let u16_chars: Vec<u16> = feat_data
-                    .chunks_exact(2)
-                    .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|chunk| u16::from_le_bytes(*chunk))
                     .collect();
                 if let Ok(user_agent) = String::from_utf16(&u16_chars) {
                     debug!("Parsed UserAgent from Login7 (len: {})", user_agent.len());
@@ -1402,8 +1408,10 @@ pub fn parse_sql_batch(data: &[u8]) -> Result<String, ProtocolError> {
 
     // Convert UTF-16LE to String
     let u16_vec: Vec<u16> = sql_bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| u16::from_le_bytes(*chunk))
         .collect();
 
     let sql = String::from_utf16(&u16_vec)

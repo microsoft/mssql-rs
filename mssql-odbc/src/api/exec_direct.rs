@@ -673,7 +673,7 @@ mod tests {
                 .unwrap()
                 .vendor_attrs
                 .store_param_focus(ordinal as usize);
-            let mut value = [b'x'];
+            let mut value = *b"x";
             let mut length = SQL_DATA_AT_EXEC;
             assert_eq!(
                 unsafe {

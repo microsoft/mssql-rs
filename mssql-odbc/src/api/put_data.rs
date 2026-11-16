@@ -832,8 +832,10 @@ fn trim_buffered_encoded_spaces(
     let is_padding = match c_type {
         SQL_C_CHAR => buffer[keep..completed_end].iter().all(|byte| *byte == b' '),
         SQL_C_WCHAR => buffer[keep..completed_end]
-            .chunks_exact(size_of::<u16>())
-            .all(|unit| unit == [b' ', 0]),
+            .as_chunks::<{ size_of::<u16>() }>()
+            .0
+            .iter()
+            .all(|unit| *unit == [b' ', 0]),
         _ => false,
     };
     if !is_padding {

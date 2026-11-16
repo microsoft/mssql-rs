@@ -1424,7 +1424,7 @@ mod tests {
         };
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let mut values = [b'1', b'2', b'3'];
+        let mut values = *b"123";
         let mut indicators = [1, SQL_DATA_AT_EXEC, SQL_NULL_DATA];
         let tvp = crate::params::BoundParam {
             input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
@@ -1451,7 +1451,7 @@ mod tests {
             octet_length_ptr: indicators.as_mut_ptr(),
             ..tvp
         };
-        let mut other_values = [b'4', b'5', b'6'];
+        let mut other_values = *b"456";
         let mut other_lengths = [1; 3];
         let other_column = crate::params::BoundParam {
             parameter_value_ptr: other_values.as_mut_ptr().cast(),

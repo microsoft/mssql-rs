@@ -236,8 +236,8 @@ try {
 # --- Toolchain ---
 # Reuse the repo's canonical rustup installer (the same script the real CI stages
 # use, shipped to the VM at .pipeline\scripts\) rather than a second, drifting
-# copy. It passes no --default-toolchain, so the repo's rust-toolchain.toml
-# (channel = "1.95") drives the version the benches build under, and it sets the
+# copy. It passes no --default-toolchain, so the channel in the repo's
+# rust-toolchain.toml drives the version the benches build under, and it sets the
 # cargo bin dir on the in-process PATH.
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     Write-Host '>>> Installing Rust toolchain via .pipeline\scripts\InstallRustup.ps1...'

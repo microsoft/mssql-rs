@@ -144,6 +144,11 @@ public:
     /// Convert UTF-8 test text to an explicit Windows code page or supported iconv code page.
     static std::string Utf8ToCodePage(const std::string& utf8, unsigned codePage,
                                       bool* usedDefault = nullptr);
+
+    /// True when the host can produce |codePage| bytes for Utf8ToCodePage. Unix
+    /// iconv converters vary by libc and package: musl before 1.2.5 has no
+    /// cp932, and RHEL needs glibc-gconv-extra for CP932 and CP1251.
+    static bool HasCodePageConverter(unsigned codePage);
 };
 
 // ---------------------------------------------------------------------------

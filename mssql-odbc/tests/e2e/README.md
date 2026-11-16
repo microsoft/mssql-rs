@@ -169,6 +169,12 @@ override does not change the default system-locale path when the variable is
 absent. On the msodbcsql comparison leg,
 which has no override, a run executes only on Windows when its code page matches
 `GetACP()`; the other runs skip.
+`NativeNarrowFetchTranscodesAcrossCollations` and
+`NarrowChunksFillBufferAndReassemble` build their expected bytes with the host
+iconv and skip when it cannot convert the run's code page (musl before 1.2.5, as
+on Alpine 3.18, has no `cp932`; RHEL needs `glibc-gconv-extra` for CP932 and
+CP1251). The other cases still run, so the entry passes instead of reporting
+CTest skip code 77.
 
 ### Intentional divergence: `SKIP_IF_COMPARING_MSODBCSQL()`
 

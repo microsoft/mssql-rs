@@ -637,8 +637,10 @@ unsafe fn decode_access_token(value_ptr: SqlPointer) -> Option<String> {
     // guarantees the payload is `dataSize` bytes after the 4-byte length prefix.
     let data = unsafe { std::slice::from_raw_parts(base.add(4), data_size) };
     let units: Vec<u16> = data
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     String::from_utf16(&units).ok()
 }

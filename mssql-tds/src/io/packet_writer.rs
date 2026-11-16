@@ -929,11 +929,12 @@ impl<'s> Utf16Units<'s> {
             let bytes = self.rest.as_bytes();
             let ascii = Self::ascii_prefix_len(&bytes[..bytes.len().min(capacity - staged)]);
             for (unit, &byte) in dst[2 * staged..2 * (staged + ascii)]
-                .chunks_exact_mut(2)
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
                 .zip(&bytes[..ascii])
             {
-                unit[0] = byte;
-                unit[1] = 0;
+                *unit = [byte, 0];
             }
             staged += ascii;
             self.rest = &self.rest[ascii..];
@@ -1590,8 +1591,10 @@ pub(crate) mod tests {
         }
 
         let utf16_units = string_vec
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_le_bytes(*chunk))
             .collect::<Vec<u16>>();
 
         // get the utf18 value from string_vec
@@ -1801,8 +1804,10 @@ pub(crate) mod tests {
         let utf16_bytes = &buffer[8..18]; // "Hello" = 5 chars * 2 bytes = 10 bytes
 
         let utf16_units: Vec<u16> = utf16_bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_le_bytes(*chunk))
             .collect();
 
         let decoded = String::from_utf16(&utf16_units).unwrap();
@@ -1849,8 +1854,10 @@ pub(crate) mod tests {
         }
 
         let utf16_units: Vec<u16> = string_vec
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_le_bytes(*chunk))
             .collect();
 
         let decoded = String::from_utf16(&utf16_units).unwrap();

@@ -166,11 +166,19 @@ const ServerText& TextForCodePage(unsigned code_page) {
     return *found;
 }
 
+std::string MissingConverterMessage(unsigned code_page) {
+    return "host iconv cannot convert UTF-8 to code page " + std::to_string(code_page) +
+           " (musl before 1.2.5 has no cp932; RHEL needs glibc-gconv-extra)";
+}
+
 }  // namespace
 
 // Benefits-from-mock-tds: a scripted TDS response could assert the exact
 // collation metadata independently of SQL Server's COLLATE conversion.
 ODBC_TEST_F(ClientCodePageTest, NativeNarrowFetchTranscodesAcrossCollations) {
+    if (!ODBCTestUtils::HasCodePageConverter(client_code_page_)) {
+        GTEST_SKIP() << MissingConverterMessage(client_code_page_);
+    }
     for (const auto& text : kServerCollations) {
         ASSERT_NO_FATAL_FAILURE(CheckServerText(text));
     }
@@ -182,6 +190,9 @@ ODBC_TEST_F(ClientCodePageTest, NativeNarrowFetchTranscodesAcrossCollations) {
 // Benefits-from-mock-tds: synthetic UTF-8/DBCS PLP payloads could place encoded
 // characters at exact TDS chunk boundaries without relying on SQL Server casts.
 ODBC_TEST_F(ClientCodePageTest, NarrowChunksFillBufferAndReassemble) {
+    if (!ODBCTestUtils::HasCodePageConverter(client_code_page_)) {
+        GTEST_SKIP() << MissingConverterMessage(client_code_page_);
+    }
     const ServerText& text = TextForCodePage(client_code_page_);
     std::string sql = VarcharQuery(text);
     if (client_code_page_ == 1252) {

@@ -2,6 +2,7 @@
 # Additional targets to install for all builds (in both CI and local builds). The toolchain will
 # always come with support for the host platform.
 targets = ["i686-pc-windows-msvc", "aarch64-pc-windows-msvc", "aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"]
-# Public channel for OSS development. OneBranch pipelines override this
-# with ms-prod-1.95 via the rustToolchain.version templateContext setting.
-channel = "1.95"
+# Upstream channel used by local builds and every CI pipeline (all install upstream
+# rustup; none select an ms-prod toolchain). Keep it at the Rust version of the
+# current Microsoft Rust SDK release: SDK v2 = ms-prod-1.99 (Rust 1.99.1).
+channel = "1.99"
