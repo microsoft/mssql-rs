@@ -280,6 +280,7 @@ mod tests {
                 server_name: Some("server".to_string()),
                 proc_name: Some("procedure".to_string()),
                 line_number: Some(7),
+                ..Default::default()
             }],
             vec![SqlInfoMessage {
                 message: "existing info".to_string(),
@@ -289,6 +290,7 @@ mod tests {
                 server_name: Some("server".to_string()),
                 proc_name: None,
                 line_number: Some(5),
+                ..Default::default()
             }],
         );
         let error = map_tds_error(
@@ -302,6 +304,7 @@ mod tests {
                 server_name: Some("server".to_string()),
                 proc_name: Some("procedure".to_string()),
                 line_number: Some(6),
+                ..Default::default()
             }],
         );
 

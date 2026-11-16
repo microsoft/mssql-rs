@@ -464,3 +464,111 @@ TEST_F(CancelLiveTest, CancelInterruptsAGetDataBlockedMidPlpValue) {
     EXPECT_FALSE(proxy.Failed());
     DisconnectFromProxy();
 }
+
+// A statement inside EXEC fails while a later one runs, and the cancellation
+// lands during the one-second look-ahead for the procedure's tail. Both
+// drivers end the look-ahead and return the statement's error without HY008,
+// and the rest of the batch is abandoned. Through the Windows Driver Manager,
+// msodbcsql's next SQLMoreResults reports HY008; this driver settled the
+// response in the interrupted call (registry entry 27), so it finds no more
+// results. unixODBC answers SQLMoreResults after a failed SQLExecDirect
+// without calling either driver.
+// A cancellation before the error arrives rightly reports HY008, so the test
+// cancels once the server has sent it: RAISERROR WITH NOWAIT sends the error
+// before the WAITFOR starts, and a second connection watches for the session's
+// WAITFOR. Seeing another session's request needs VIEW SERVER STATE, which the
+// CI login (sa) has.
+// Benefits-from-mock-tds: assert ATTENTION and its DONE_ATTN acknowledgement
+// before SQLCancel returns; a_cancellation_ends_the_procedure_tail_wait pins
+// that the look-ahead itself leaves the cancellation to the caller.
+TEST_F(CancelLiveTest, CancelDuringTheProcedureTailLookAheadAbandonsTheBatch) {
+    using namespace std::chrono_literals;
+    ASSERT_NO_FATAL_FAILURE(ExecDirect("SELECT @@SPID"));
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER session = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &session, 0, nullptr), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+
+    struct Observer {
+        SQLHDBC dbc = SQL_NULL_HDBC;
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        bool connected = false;
+        ~Observer() {
+            if (stmt != SQL_NULL_HSTMT) {
+                EXPECT_SQL_OK(SQLFreeHandle(SQL_HANDLE_STMT, stmt), SQL_HANDLE_STMT, stmt);
+            }
+            if (connected) {
+                EXPECT_SQL_OK(SQLDisconnect(dbc), SQL_HANDLE_DBC, dbc);
+            }
+            if (dbc != SQL_NULL_HDBC) {
+                EXPECT_SQL_OK(SQLFreeHandle(SQL_HANDLE_DBC, dbc), SQL_HANDLE_DBC, dbc);
+            }
+        }
+    } observer;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, env_, &observer.dbc), SQL_HANDLE_ENV, env_);
+    auto connection = ODBCTestUtils::BuildConnectionString();
+    ASSERT_SQL_OK(SQLDriverConnect(observer.dbc, nullptr,
+                                  const_cast<SQLTCHAR*>(connection.c_str()), SQL_NTS, nullptr,
+                                  0, nullptr, SQL_DRIVER_NOPROMPT),
+                  SQL_HANDLE_DBC, observer.dbc);
+    observer.connected = true;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, observer.dbc, &observer.stmt),
+                  SQL_HANDLE_DBC, observer.dbc);
+    auto waiting = ODBCTestUtils::ToSqlTStr(
+        "SELECT COUNT(*) FROM sys.dm_exec_requests WHERE session_id = " +
+        std::to_string(session) + " AND wait_type = 'WAITFOR'");
+
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT,
+                                reinterpret_cast<SQLPOINTER>(15), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    auto sql = ODBCTestUtils::ToSqlTStr(
+        "SET NOCOUNT ON; EXEC(N'RAISERROR(''look_ahead'',16,1) WITH NOWAIT; "
+        "WAITFOR DELAY ''00:00:10''; SELECT 2;');");
+    auto execution = std::async(std::launch::async, [&] {
+        return SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    });
+    SQLINTEGER waitfors = 0;
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (waitfors == 0 && std::chrono::steady_clock::now() < deadline) {
+        ASSERT_SQL_OK(SQLExecDirect(observer.stmt, const_cast<SQLTCHAR*>(waiting.c_str()),
+                                   SQL_NTS),
+                      SQL_HANDLE_STMT, observer.stmt);
+        ASSERT_SQL_OK(SQLFetch(observer.stmt), SQL_HANDLE_STMT, observer.stmt);
+        ASSERT_SQL_OK(SQLGetData(observer.stmt, 1, SQL_C_SLONG, &waitfors, 0, nullptr),
+                      SQL_HANDLE_STMT, observer.stmt);
+        ASSERT_SQL_OK(SQLFreeStmt(observer.stmt, SQL_CLOSE), SQL_HANDLE_STMT, observer.stmt);
+        if (waitfors == 0) {
+            std::this_thread::sleep_for(5ms);
+        }
+    }
+    ASSERT_EQ(1, waitfors) << "the session never reached its WAITFOR";
+    // The error is already on its way; this leaves the client time to read it.
+    std::this_thread::sleep_for(200ms);
+    const auto running = execution.wait_for(0ms);
+    const auto started = std::chrono::steady_clock::now();
+    const auto cancelRc = SQLCancel(stmt_);
+    const auto settled = execution.wait_for(5s);
+    const auto executeRc = execution.get();
+    EXPECT_EQ(std::future_status::timeout, running) << "the look-ahead ended early";
+    EXPECT_EQ(SQL_SUCCESS, cancelRc);
+    ASSERT_EQ(std::future_status::ready, settled);
+    EXPECT_LT(std::chrono::steady_clock::now() - started, 5s);
+    ASSERT_EQ(SQL_ERROR, executeRc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+    EXPECT_FALSE(ODBCTestUtils::HasDiagState(SQL_HANDLE_STMT, stmt_, "HY008"));
+
+#ifdef _WIN32
+    const auto* target = std::getenv("ODBC_TEST_TARGET");
+    if (target && std::string(target) == "msodbcsql") {
+        EXPECT_EQ(SQL_ERROR, SQLMoreResults(stmt_));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY008");
+    } else {
+        EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    }
+#else
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+#endif
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    AssertReusable();
+}

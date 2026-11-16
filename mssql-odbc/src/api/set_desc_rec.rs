@@ -393,7 +393,7 @@ fn focused_tvp_ipd_desc_rec(
     let mut records = vec![DescRecord::default_for(DescKind::ImpParam); record_index + 1];
     records[record_index] = ipd_record;
     let mut state = DescState {
-        diag_records: Vec::new(),
+        diag_records: Default::default(),
         header: DescHeader::default(),
         records,
         data_classification: None,
@@ -491,7 +491,7 @@ fn focused_tvp_desc_rec_type(
     let mut records = vec![DescRecord::default_for(kind); record_index + 1];
     records[record_index] = apd_record;
     let mut state = DescState {
-        diag_records: Vec::new(),
+        diag_records: Default::default(),
         header: DescHeader::default(),
         records,
         data_classification: None,

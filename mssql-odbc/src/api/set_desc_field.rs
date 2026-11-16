@@ -577,7 +577,7 @@ fn set_focused_tvp_header_field(
     }
     if is_count {
         let mut scratch = DescState {
-            diag_records: Vec::new(),
+            diag_records: Default::default(),
             header: Default::default(),
             records: Vec::new(),
             data_classification: None,
@@ -621,7 +621,7 @@ fn set_focused_tvp_header_field(
         Err(()) => return Some(post_focused_tvp_internal_error(desc)),
     };
     let mut scratch = DescState {
-        diag_records: Vec::new(),
+        diag_records: Default::default(),
         header,
         records: Vec::new(),
         data_classification: None,
@@ -697,7 +697,7 @@ fn focused_tvp_type_after_set(
         apd_record
     };
     let mut state = DescState {
-        diag_records: Vec::new(),
+        diag_records: Default::default(),
         header: Default::default(),
         records: vec![record],
         data_classification: None,
