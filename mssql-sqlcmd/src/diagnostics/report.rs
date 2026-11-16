@@ -171,6 +171,9 @@ fn redactor(report: &Report) -> Redactor {
     if let Some(name) = &report.request.host_name_in_certificate {
         r.name(Category::Host, name);
     }
+    if let Some(name) = &report.request.workstation_name {
+        r.name(Category::Host, name);
+    }
     if let super::Authentication::SqlPassword { user, .. } = &report.request.authentication {
         r.name(Category::User, user);
     }
@@ -464,6 +467,20 @@ fn settings_text(sources: &SettingSources, locale: &str) -> Option<String> {
         &sources.host_name_in_certificate,
     );
     add("diagnose.settings.time_limit", &sources.login_timeout);
+    add(
+        "diagnose.settings.application_intent",
+        &sources.application_intent,
+    );
+    add(
+        "diagnose.settings.multi_subnet_failover",
+        &sources.multi_subnet_failover,
+    );
+    add("diagnose.settings.packet_size", &sources.packet_size);
+    add(
+        "diagnose.settings.dedicated_admin",
+        &sources.dedicated_admin,
+    );
+    add("diagnose.settings.workstation", &sources.workstation_name);
     Some(parts.join(&tr(locale, "diagnose.list.separator", &[])))
 }
 
@@ -637,7 +654,23 @@ fn check_text(check: &Check, protocol: Option<Protocol>, r: &mut Redactor, local
             // separator, so none depends on another one leading it.
             let mut parts = Vec::new();
             let phases = phases_text(&check.subphases, check.field("failedPhase"), locale);
-            if !phases.is_empty() {
+            // sqlcmd's own connection failed; the phases are the diagnostic
+            // client's, which connected too for evidence.
+            if let Some(outcome) = check.field("diagnosticClient") {
+                parts.push(if phases.is_empty() {
+                    tr(
+                        locale,
+                        "diagnose.detail.diagnostic_client",
+                        &[("outcome", &outcome)],
+                    )
+                } else {
+                    tr(
+                        locale,
+                        "diagnose.detail.diagnostic_client_phases",
+                        &[("outcome", &outcome), ("phases", &phases)],
+                    )
+                });
+            } else if !phases.is_empty() {
                 parts.push(phases);
             }
             if let Some(transport) = check.field("transport") {
@@ -684,6 +717,37 @@ fn check_text(check: &Check, protocol: Option<Protocol>, r: &mut Redactor, local
         }
         super::CheckId::SessionValidation => {
             let mut parts = Vec::new();
+            // A failed query: what the session had done, and how its
+            // connection was lost.
+            if check.coverage.failed() {
+                if check.field("loginCompleted") == Some("true") {
+                    parts.push(tr(locale, "diagnose.detail.login_completed", &[]));
+                }
+                if let Some(operation) = check.field("lastSuccessfulOperation") {
+                    parts.push(tr(
+                        locale,
+                        "diagnose.detail.last_successful_operation",
+                        &[("operation", &operation)],
+                    ));
+                }
+                if let Some(retries) = check.field("retries") {
+                    parts.push(tr(
+                        locale,
+                        "diagnose.detail.retries",
+                        &[("retries", &retries)],
+                    ));
+                }
+                if let Some(loss) = check.field("transportLoss") {
+                    parts.push(match check.field("osError") {
+                        Some(code) => tr(
+                            locale,
+                            "diagnose.detail.transport_loss_os",
+                            &[("loss", &loss), ("code", &code)],
+                        ),
+                        None => tr(locale, "diagnose.detail.transport_loss", &[("loss", &loss)]),
+                    });
+                }
+            }
             if let Some(target) = check.field("targetType") {
                 parts.push(tr(
                     locale,
@@ -796,6 +860,29 @@ pub fn text_in(report: &Report, locale: &str) -> String {
                     .sources
                     .dsn_name(|s| &s.host_name_in_certificate)
                     .as_deref(),
+            ));
+        }
+        if request.application_intent == super::ApplicationIntent::ReadOnly {
+            depth_line.push_str(&tr(locale, "diagnose.depth.read_only_intent", &[]));
+        }
+        if request.multi_subnet_failover {
+            depth_line.push_str(&tr(locale, "diagnose.depth.multi_subnet_failover", &[]));
+        }
+        if let Some(bytes) = request.packet_size {
+            depth_line.push_str(&tr(
+                locale,
+                "diagnose.depth.packet_size",
+                &[("bytes", &bytes)],
+            ));
+        }
+        if request.dedicated_admin_effective() {
+            depth_line.push_str(&tr(locale, "diagnose.depth.dedicated_admin", &[]));
+        }
+        if let Some(name) = &request.workstation_name {
+            depth_line.push_str(&tr(
+                locale,
+                "diagnose.depth.workstation",
+                &[("name", &r.name(Category::Host, name))],
             ));
         }
         let _ = writeln!(out, "{depth_line}");
@@ -924,17 +1011,22 @@ pub fn text_in(report: &Report, locale: &str) -> String {
         let _ = write!(
             out,
             "{}",
-            tr(
-                locale,
-                "diagnose.server.detail_suffix",
-                &[
-                    ("database", &r.name(Category::Database, &server.database)),
-                    (
-                        "encryption",
-                        &encrypted_text(report, server.encrypted, locale)
-                    ),
-                ],
-            )
+            match server.encrypted {
+                Some(encrypted) => tr(
+                    locale,
+                    "diagnose.server.detail_suffix",
+                    &[
+                        ("database", &r.name(Category::Database, &server.database)),
+                        ("encryption", &encrypted_text(report, encrypted, locale)),
+                    ],
+                ),
+                // Not known: sqlcmd's own driver does not say.
+                None => tr(
+                    locale,
+                    "diagnose.server.database_suffix",
+                    &[("database", &r.name(Category::Database, &server.database))],
+                ),
+            }
         );
         if let Some(target_type) = server.target_type() {
             let _ = write!(
@@ -957,8 +1049,13 @@ pub fn text_in(report: &Report, locale: &str) -> String {
             );
         }
         // With errors printed, the note follows them; it covers these
-        // findings too. Superseded errors are in the JSON report only.
-        if report.errors.iter().all(|e| e.superseded) && quotes_messages(report) {
+        // findings too. Superseded errors, and the driver's records sqlcmd
+        // does not print, are in the JSON report only.
+        let none_printed = report
+            .errors
+            .iter()
+            .all(|e| e.superseded || (e.source == "driver" && e.printed.is_none()));
+        if none_printed && quotes_messages(report) {
             let _ = writeln!(
                 out,
                 "  {}",
@@ -1018,7 +1115,12 @@ pub fn text_in(report: &Report, locale: &str) -> String {
     // Without a line to print, no heading either.
     let mut lines: Vec<String> = Vec::new();
     for error in report.errors.iter().filter(|e| !e.superseded) {
-        let line = if let Some(text) = &error.text {
+        let line = if let Some(printed) = &error.printed {
+            format!("  {}", r.text(printed))
+        } else if error.source == "driver" {
+            // A record sqlcmd itself does not print.
+            continue;
+        } else if let Some(text) = &error.text {
             let text = render(text, locale, &mut r);
             format!(
                 "  {}",
@@ -1079,6 +1181,60 @@ pub fn text_in(report: &Report, locale: &str) -> String {
             tr(locale, "diagnose.review_errors_before_sharing", &[])
         );
     }
+    let observations = report.out_of_scope_observations();
+    if !observations.is_empty() {
+        let _ = writeln!(out, "\n{}", tr(locale, "diagnose.observations.header", &[]));
+        for observation in &observations {
+            let _ = writeln!(
+                out,
+                "  [{}] {}",
+                observation.id,
+                render(&observation.summary, locale, &mut r)
+            );
+            for field in &observation.evidence {
+                let value = r.text(&field.value);
+                let detail = match field.key {
+                    "loginCompleted" => tr(locale, "diagnose.detail.login_completed", &[]),
+                    "lastSuccessfulOperation" => tr(
+                        locale,
+                        "diagnose.detail.last_successful_operation",
+                        &[("operation", &value)],
+                    ),
+                    "retries" => tr(locale, "diagnose.detail.retries", &[("retries", &value)]),
+                    "transportLoss" => tr(
+                        locale,
+                        "diagnose.detail.transport_loss",
+                        &[("loss", &value)],
+                    ),
+                    "osError" => tr(locale, "diagnose.error_id.os_error", &[("number", &value)]),
+                    _ => continue,
+                };
+                let _ = writeln!(out, "    {detail}");
+            }
+            let _ = writeln!(
+                out,
+                "    {}{}",
+                tr(
+                    locale,
+                    "diagnose.specialist.line",
+                    &[("domain", &observation.specialist_domain.primary)]
+                ),
+                tr(
+                    locale,
+                    "diagnose.specialist.candidates_suffix",
+                    &[(
+                        "candidates",
+                        &observation.specialist_domain.candidates.join(&tr(
+                            locale,
+                            "diagnose.list.separator",
+                            &[]
+                        ))
+                    )]
+                )
+            );
+            let _ = writeln!(out, "    {}", render(&observation.handoff, locale, &mut r));
+        }
+    }
     if !report.limitations.is_empty() {
         let _ = writeln!(out, "\n{}", tr(locale, "diagnose.limitations.header", &[]));
         for limitation in &report.limitations {
@@ -1109,6 +1265,7 @@ pub fn json_in(report: &Report, version: &str, locale: &str) -> Result<String, s
         super::Authentication::Integrated => None,
     };
     let category = report.exit_category();
+    let observations = report.out_of_scope_observations();
     let document = ReportView {
         contract_version: CONTRACT_VERSION,
         coverage_matrix_version: super::COVERAGE_MATRIX_VERSION,
@@ -1136,11 +1293,24 @@ pub fn json_in(report: &Report, version: &str, locale: &str) -> Result<String, s
                 .host_name_in_certificate
                 .as_deref()
                 .map(|name| r.name(Category::Host, name)),
+            application_intent: (request.application_intent != super::ApplicationIntent::ReadWrite)
+                .then(|| request.application_intent.name()),
+            multi_subnet_failover: request.multi_subnet_failover,
+            packet_size: request.packet_size,
+            dedicated_admin_connection: request.dedicated_admin_effective(),
+            workstation_name: request
+                .workstation_name
+                .as_deref()
+                .map(|name| r.name(Category::Host, name)),
         },
         client: ClientView {
             os: os_family(),
             os_version: os_version(locale),
-            connection_client: "mssql-tds",
+            connection_client: if request.driver.is_some() {
+                "odbc"
+            } else {
+                "mssql-tds"
+            },
         },
         start_time: utc_timestamp(report.start_unix_ms),
         duration_ms: report.duration_ms,
@@ -1180,6 +1350,26 @@ pub fn json_in(report: &Report, version: &str, locale: &str) -> Result<String, s
             })
             .collect(),
         tracing_guide: report.tracing_guide,
+        out_of_scope_observations: observations
+            .iter()
+            .map(|observation| ObservationView {
+                id: observation.id,
+                status: "outOfScope",
+                check: observation.check.name(),
+                text: render(&observation.summary, locale, &mut r),
+                evidence: observation
+                    .evidence
+                    .iter()
+                    .map(|field| (field.key, field.value.clone()))
+                    .collect(),
+                specialist_domain: DomainView {
+                    primary: observation.specialist_domain.primary,
+                    candidates: &observation.specialist_domain.candidates,
+                    note: Some(tr(locale, "diagnose.specialist.note", &[])),
+                },
+                handoff: render(&observation.handoff, locale, &mut r),
+            })
+            .collect(),
         specialist_domain: report.domain.as_ref().map(|domain| DomainView {
             primary: domain.primary,
             candidates: &domain.candidates,
@@ -1192,10 +1382,12 @@ pub fn json_in(report: &Report, version: &str, locale: &str) -> Result<String, s
                 source: error.source,
                 check: error.check.name(),
                 number: error.number,
+                native_error: error.native_error,
                 state: error.state,
                 class: error.class,
                 os_error: error.os_error,
                 code: error.code.as_deref(),
+                sql_state: error.sql_state.as_deref(),
                 message: render(&error.message, locale, &mut r),
                 text: error.text.as_ref().map(|text| render(text, locale, &mut r)),
                 superseded: error.superseded,
@@ -1259,6 +1451,8 @@ struct ReportView<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     server: Option<ServerView<'a>>,
     findings: Vec<FindingView>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    out_of_scope_observations: Vec<ObservationView<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tracing_guide: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1284,6 +1478,18 @@ struct TargetView {
     encrypt: &'static str,
     trust_server_certificate: bool,
     host_name_in_certificate: Option<String>,
+    /// The connection options below are left out at their defaults, so a
+    /// request without them reports as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    application_intent: Option<&'static str>,
+    #[serde(skip_serializing_if = "is_false")]
+    multi_subnet_failover: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    packet_size: Option<u16>,
+    #[serde(skip_serializing_if = "is_false")]
+    dedicated_admin_connection: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workstation_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1305,10 +1511,21 @@ struct SourcesView {
     host_name_in_certificate: Option<SettingSourceView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     login_timeout: Option<SettingSourceView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    application_intent: Option<SettingSourceView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    multi_subnet_failover: Option<SettingSourceView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    packet_size: Option<SettingSourceView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dedicated_admin_connection: Option<SettingSourceView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workstation_name: Option<SettingSourceView>,
 }
 
 impl SourcesView {
     fn new(sources: &SettingSources) -> Self {
+        let view = |origin: &Option<SettingOrigin>| origin.as_ref().map(SettingSourceView::new);
         Self {
             server: sources.server.as_ref().map(SettingSourceView::new),
             database: sources.database.as_ref().map(SettingSourceView::new),
@@ -1324,6 +1541,11 @@ impl SourcesView {
                 .as_ref()
                 .map(SettingSourceView::new),
             login_timeout: sources.login_timeout.as_ref().map(SettingSourceView::new),
+            application_intent: view(&sources.application_intent),
+            multi_subnet_failover: view(&sources.multi_subnet_failover),
+            packet_size: view(&sources.packet_size),
+            dedicated_admin_connection: view(&sources.dedicated_admin),
+            workstation_name: view(&sources.workstation_name),
         }
     }
 
@@ -1340,6 +1562,11 @@ impl SourcesView {
             && self.trust_server_certificate.is_none()
             && self.host_name_in_certificate.is_none()
             && self.login_timeout.is_none()
+            && self.application_intent.is_none()
+            && self.multi_subnet_failover.is_none()
+            && self.packet_size.is_none()
+            && self.dedicated_admin_connection.is_none()
+            && self.workstation_name.is_none()
     }
 }
 
@@ -1386,7 +1613,8 @@ struct ServerView<'a> {
     name: Option<String>,
     version: Option<&'a str>,
     database: String,
-    encrypted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encrypted: Option<bool>,
     target_type: Option<&'static str>,
 }
 
@@ -1395,6 +1623,18 @@ struct FindingView {
     certainty: &'static str,
     check: &'static str,
     text: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ObservationView<'a> {
+    id: &'static str,
+    status: &'static str,
+    check: &'static str,
+    text: String,
+    evidence: std::collections::BTreeMap<&'static str, String>,
+    specialist_domain: DomainView<'a>,
+    handoff: String,
 }
 
 #[derive(Serialize)]
@@ -1413,6 +1653,8 @@ struct ErrorView<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     number: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    native_error: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     class: Option<i32>,
@@ -1420,6 +1662,9 @@ struct ErrorView<'a> {
     os_error: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<&'a str>,
+    /// The ODBC SQLSTATE, for a record of sqlcmd's own driver connection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sql_state: Option<&'a str>,
     message: String,
     /// What a normal sqlcmd run prints for the same event.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1469,12 +1714,14 @@ enum SkipView {
 }
 
 /// A check's field: a list for `addresses`, a number for `port`,
-/// `engineEdition` and `clockOffsetMs` when the value is one, otherwise text.
+/// `engineEdition`, `clockOffsetMs`, `retries` and `osError` when the value is
+/// one, a boolean for `loginCompleted`, otherwise text.
 #[derive(Serialize)]
 #[serde(untagged)]
 enum FieldValue {
     List(Vec<String>),
     Number(i64),
+    Flag(bool),
     Text(String),
 }
 
@@ -1517,8 +1764,15 @@ impl CheckView {
                 .collect();
             let value = if field.key == "addresses" {
                 FieldValue::List(values)
+            } else if let (true, Ok(flag)) =
+                (field.key == "loginCompleted", values[0].parse::<bool>())
+            {
+                FieldValue::Flag(flag)
             } else if let (true, Ok(number)) = (
-                matches!(field.key, "port" | "engineEdition" | "clockOffsetMs"),
+                matches!(
+                    field.key,
+                    "port" | "engineEdition" | "clockOffsetMs" | "retries" | "osError"
+                ),
                 values[0].parse::<i64>(),
             ) {
                 FieldValue::Number(number)
@@ -1705,6 +1959,74 @@ mod tests {
             "over namedPipe; ticket cache notApplicable"
         );
     }
+    #[test]
+    fn transport_recurrence_is_separate_from_required_checks_and_outcomes() {
+        let mut report = passing_report();
+        report.checks.push(check(
+            CheckId::SessionValidation,
+            Coverage::Inconclusive,
+            2,
+            vec![
+                Field::plain("loginCompleted", "true"),
+                Field::plain("lastSuccessfulOperation", "login"),
+                Field::plain("transportLoss", "connectionReset"),
+                Field::plain("retries", "0"),
+                Field::plain("osError", "10054"),
+            ],
+        ));
+        let outcome = report.outcome;
+        let category = report.exit_category();
+        let observations = report.out_of_scope_observations();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].check, CheckId::SessionValidation);
+        let document: serde_json::Value =
+            serde_json::from_str(&json_in(&report, "v", "en-US").unwrap()).unwrap();
+        let observation = &document["outOfScopeObservations"][0];
+        assert_eq!(observation["status"], "outOfScope");
+        assert_eq!(observation["evidence"]["osError"], "10054");
+        assert_eq!(observation["specialistDomain"]["primary"], "undetermined");
+        assert!(
+            observation["handoff"]
+                .as_str()
+                .unwrap()
+                .contains("both sides")
+        );
+        assert!(
+            document["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["check"] == "sessionValidation"
+                    && entry["status"] == "inconclusive")
+        );
+        let text = text_in(&report, "en-US");
+        assert!(text.contains("Out-of-scope observations"));
+        assert!(text.contains("does not establish whether the loss recurs"));
+        assert_eq!(report.outcome, outcome);
+        assert_eq!(report.exit_category(), category);
+        report.checks.pop();
+        assert!(report.out_of_scope_observations().is_empty());
+        assert!(
+            !json_in(&report, "v", "en-US")
+                .unwrap()
+                .contains("outOfScopeObservations")
+        );
+    }
+
+    #[test]
+    fn connection_client_names_the_authoritative_driver_path() {
+        let mut report = passing_report();
+        let document: serde_json::Value =
+            serde_json::from_str(&json_in(&report, "v", "en-US").unwrap()).unwrap();
+        assert_eq!(document["client"]["connectionClient"], "mssql-tds");
+        report.request.driver = Some(crate::diagnostics::driver::DriverHook::new(|_, _| {
+            unreachable!("rendering does not connect")
+        }));
+        let document: serde_json::Value =
+            serde_json::from_str(&json_in(&report, "v", "en-US").unwrap()).unwrap();
+        assert_eq!(document["client"]["connectionClient"], "odbc");
+    }
+
     fn passing_report() -> Report {
         let mut request =
             crate::diagnostics::tests::request("tcp:db01,1433", Depth::SessionValidation);
@@ -1804,7 +2126,7 @@ mod tests {
                 name: Some("DB01".to_string()),
                 version: Some("17.0.4085".to_string()),
                 database: "master".to_string(),
-                encrypted: true,
+                encrypted: Some(true),
                 engine_edition: Some(3),
             }),
             domain: None,
@@ -1883,6 +2205,15 @@ mod tests {
     fn qps_failing_report() -> Report {
         let mut report = failing_report();
         report.limitations = Vec::new();
+        let mut session = Check::new(CheckId::SessionValidation, Coverage::Inconclusive);
+        session.fields = vec![
+            Field::plain("loginCompleted", "true"),
+            Field::plain("lastSuccessfulOperation", "login"),
+            Field::plain("retries", "0"),
+            Field::plain("transportLoss", "reset"),
+            Field::plain("osError", "10054"),
+        ];
+        report.checks.push(session);
         report
     }
 
@@ -1904,6 +2235,8 @@ mod tests {
             "Server:",
             "Findings:",
             "Specialist area:",
+            "specialistDomain:",
+            "lastSuccessfulOperation:",
             "Errors, in order:",
             "Review error messages",
             "Limitations:",
@@ -2351,7 +2684,7 @@ Limitations:
     #[test]
     fn an_unencrypted_session_says_what_was_negotiated() {
         let mut report = passing_report();
-        report.server.as_mut().unwrap().encrypted = false;
+        report.server.as_mut().unwrap().encrypted = Some(false);
         for (negotiated, expected) in [
             (Some("off"), ", not encrypted, "),
             (Some("loginOnly"), ", only the login encrypted, "),
@@ -2369,6 +2702,52 @@ Limitations:
             let text = text(&report);
             let server = text.lines().find(|l| l.starts_with("Server:")).unwrap();
             assert!(server.contains(expected), "{negotiated:?}: {server}");
+        }
+    }
+
+    /// Encryption that is not known (sqlcmd's own driver does not say) is not
+    /// reported, in text or JSON.
+    #[test]
+    fn an_unknown_encryption_is_not_reported() {
+        let mut report = passing_report();
+        report.server.as_mut().unwrap().encrypted = None;
+        let text = text(&report);
+        let server = text.lines().find(|l| l.starts_with("Server:")).unwrap();
+        assert!(
+            server.ends_with("(DB01), database database-1, sqlServer"),
+            "{server}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&json(&report, "v").unwrap()).unwrap();
+        assert!(value["server"].get("encrypted").is_none(), "{value:#}");
+    }
+
+    /// sqlcmd's own driver connection failed and mssql-tds connected for
+    /// evidence: its outcome leads the phases, which are its own.
+    #[test]
+    fn the_diagnostic_clients_outcome_leads_its_phases() {
+        for (phases, expected) in [
+            (true, "mssql-tds connected: pre-login 1 ms"),
+            (false, "mssql-tds failed"),
+        ] {
+            let mut report = passing_report();
+            let attempt = report
+                .checks
+                .iter_mut()
+                .find(|c| c.id == CheckId::ConnectionAttempt)
+                .unwrap();
+            if !phases {
+                attempt.subphases.clear();
+            }
+            attempt.fields.push(Field::plain(
+                "diagnosticClient",
+                if phases { "connected" } else { "failed" },
+            ));
+            let text = text(&report);
+            let line = text
+                .lines()
+                .find(|l| l.contains("Connection attempt"))
+                .unwrap();
+            assert!(line.contains(expected), "{line}");
         }
     }
 
@@ -2544,6 +2923,41 @@ Limitations:
         );
         let value: serde_json::Value = serde_json::from_str(&json(&report, "v").unwrap()).unwrap();
         assert_eq!(value["errors"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[test]
+    fn a_driver_record_prints_as_sqlcmd_prints_it() {
+        let mut report = failing_report();
+        let mut printed = ErrorRecord::new(
+            "driver",
+            CheckId::ConnectionAttempt,
+            "Login failed for user 'sa'.",
+        );
+        printed.number = Some(18456);
+        printed.sql_state = Some("28000".to_string());
+        printed.printed = Some(
+            "Sqlcmd: Error: Microsoft ODBC Driver 18 for SQL Server : Login failed for user 'sa'.."
+                .to_string(),
+        );
+        let mut silent = ErrorRecord::new(
+            "driver",
+            CheckId::ConnectionAttempt,
+            "Changed database context",
+        );
+        silent.number = Some(5701);
+        report.errors = vec![printed, silent];
+        let text = text(&report);
+        assert!(
+            text.contains(
+                "\n  Sqlcmd: Error: Microsoft ODBC Driver 18 for SQL Server : Login failed for \
+                 user 'user-1'..\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("Changed database context"), "{text}");
+        let value: serde_json::Value = serde_json::from_str(&json(&report, "v").unwrap()).unwrap();
+        assert_eq!(value["errors"][0]["sqlState"], "28000");
+        assert_eq!(value["errors"][1]["number"], 5701);
     }
 
     #[test]
@@ -2728,6 +3142,16 @@ Limitations:
         for limitation in value["limitations"].as_array_mut().unwrap() {
             blank(limitation);
         }
+        for observation in value
+            .get_mut("outOfScopeObservations")
+            .and_then(serde_json::Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            blank(&mut observation["text"]);
+            blank(&mut observation["handoff"]);
+            blank(&mut observation["specialistDomain"]["note"]);
+        }
         value
     }
 
@@ -2790,6 +3214,19 @@ Limitations:
             }
             if let Some(note) = pseudo["specialistDomain"].get("note") {
                 assert!(localized(note), "{pseudo_json}");
+            }
+            for observation in pseudo["outOfScopeObservations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                for prose in [
+                    &observation["text"],
+                    &observation["handoff"],
+                    &observation["specialistDomain"]["note"],
+                ] {
+                    assert!(localized(prose), "{pseudo_json}");
+                }
             }
             assert_eq!(without_prose(pseudo), without_prose(english));
         }
@@ -2897,7 +3334,7 @@ Limitations:
         }
         let json = json(&report, "v").unwrap();
         assert!(
-            json.contains("\"coverageMatrixVersion\": \"1.3\""),
+            json.contains("\"coverageMatrixVersion\": \"1.4\""),
             "{json}"
         );
         assert!(
@@ -2952,13 +3389,13 @@ Limitations:
         let text = text(&report);
         assert!(
             text.contains(
-                "Driver tracing can show more than these checks; see https://aka.ms/sqlcmd-diagnose-tracing\n"
+                "Driver tracing can show more than these checks; see https://go.microsoft.com/fwlink/?LinkId=2386408\n"
             ),
             "{text}"
         );
         let json = json(&report, "v").unwrap();
         assert!(
-            json.contains("\"tracingGuide\": \"https://aka.ms/sqlcmd-diagnose-tracing\""),
+            json.contains("\"tracingGuide\": \"https://go.microsoft.com/fwlink/?LinkId=2386408\""),
             "{json}"
         );
     }
