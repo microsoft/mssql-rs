@@ -106,7 +106,9 @@ fn map_tds_error(op: &str, user_msg: &str, e: impl std::fmt::Display) -> PyErr {
 }
 
 fn map_connect_error(error: TdsError, uses_async_auth: bool) -> PyErr {
-    if uses_async_auth && matches!(error, TdsError::OperationCancelledError(_)) {
+    if matches!(error, TdsError::TokenAcquisitionCancelled)
+        || (uses_async_auth && matches!(error, TdsError::OperationCancelledError(_)))
+    {
         tracing::debug!("PyAsyncConnection::connect: token acquisition cancelled");
         return Python::attach(|py| {
             py.import("asyncio")?
@@ -740,5 +742,45 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn provider_connect_cancellation_logs_at_debug() {
+        use std::sync::{Arc, Mutex};
+
+        use tracing_subscriber::prelude::*;
+
+        struct EventLevels(Arc<Mutex<Vec<tracing::Level>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventLevels {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _context: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0.lock().unwrap().push(*event.metadata().level());
+            }
+        }
+
+        let levels = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(EventLevels(levels.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            Python::attach(|py| {
+                let cancelled_error = py
+                    .import("asyncio")
+                    .unwrap()
+                    .getattr("CancelledError")
+                    .unwrap();
+                for uses_async_auth in [false, true] {
+                    let error =
+                        map_connect_error(Error::TokenAcquisitionCancelled, uses_async_auth);
+                    assert!(error.is_instance(py, &cancelled_error));
+                }
+            });
+        });
+        assert_eq!(
+            *levels.lock().unwrap(),
+            vec![tracing::Level::DEBUG, tracing::Level::DEBUG]
+        );
     }
 }
