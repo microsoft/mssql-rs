@@ -90,10 +90,11 @@ void MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_record_usage(
 int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_enabled(void);
 
 /* The SELECT that reads the server properties: four columns, in the order of
-   MssqlSqlcmdServerInfo. A static NUL-terminated UTF-8 string; do not free it.
-   Send it in a batch sqlcmd already sends, ahead of a SET statement in that
-   batch: the SET resets @@ROWCOUNT to 0, so no round trip is added and the
-   session's @@ROWCOUNT is what it would be without telemetry. */
+   MssqlSqlcmdServerInfo. A static NUL-terminated UTF-8 string with no statement
+   terminator; do not free it. Send it in a batch sqlcmd already sends, ahead of
+   a SET statement in that batch and separated from it by a newline or ';': the
+   SET resets @@ROWCOUNT to 0, so no round trip is added and the session's
+   @@ROWCOUNT is what it would be without telemetry. */
 const char* MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_server_info_query(void);
 
 /* The row of that SELECT. A NULL column is data == NULL with len == 0. Each text

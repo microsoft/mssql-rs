@@ -171,10 +171,11 @@ pub extern "C" fn mssql_sqlcmd_telemetry_enabled() -> i32 {
 
 /// The SQL that reads the server properties: one `SELECT` of four columns, in
 /// the order of [`MssqlSqlcmdServerInfo`]'s fields. A static, NUL-terminated
-/// UTF-8 string the caller must not free. Native sqlcmd sends it in a batch it
-/// already sends, ahead of a `SET` statement in that batch: the `SET` resets
-/// `@@ROWCOUNT` to 0, so no round trip is added and the session's `@@ROWCOUNT`
-/// is what it would be without telemetry. It is
+/// UTF-8 string with no statement terminator, which the caller must not free.
+/// Native sqlcmd sends it in a batch it already sends, ahead of a `SET`
+/// statement in that batch and separated from it by a newline or `;`: the `SET`
+/// resets `@@ROWCOUNT` to 0, so no round trip is added and the session's
+/// `@@ROWCOUNT` is what it would be without telemetry. It is
 /// [`crate::server_info::QUERY`], the one definition the diagnose path's
 /// columns come from too.
 #[unsafe(no_mangle)]
