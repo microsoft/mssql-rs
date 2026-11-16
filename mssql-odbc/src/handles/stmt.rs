@@ -25,7 +25,7 @@ use crate::api::set_desc_field::datetime_interval_code_for;
 use crate::conversion::client_encoding::ClientEncoding;
 use crate::conversion::fetch_convert::TextOutput;
 use crate::conversion::param_convert::{DaeLengthLimit, DaeTranscode};
-use crate::error::{DiagRecord, HasDiagnostics};
+use crate::error::{DiagRecord, DiagRecords, HasDiagnostics};
 use crate::handles::desc::UdtNames;
 use crate::params::{BoundParam, ParamSnapshot};
 use mssql_tds::datatypes::column_values::ColumnValues;
@@ -471,7 +471,7 @@ pub(crate) struct StmtHandle {
 /// Mutable state within a statement handle, protected by `inner`.
 #[derive(Debug)]
 pub(crate) struct StmtState {
-    pub(crate) diag_records: Vec<DiagRecord>,
+    pub(crate) diag_records: DiagRecords,
     /// Empty storage reused for a fresh ARD snapshot, not cached bindings.
     pub(crate) fetch_bindings: Vec<ColumnBinding>,
     pub(crate) text_output: TextOutput,
@@ -530,7 +530,12 @@ pub(crate) struct StmtState {
     /// still posts this to the statement's diagnostics but does not fail its
     /// own return, since that return code specifically means "the stream
     /// failed to drain," which a stale diagnostic on an already-closed batch
-    /// does not make true. Cleared by [`StmtState::clear_exhaustion_state`],
+    /// does not make true. A block fetch defers an error that follows the rows
+    /// it returned the same way. With `batch_exhausted` unset, the error failed
+    /// only its own statement under `BatchErrorMode::Continue` and the batch is
+    /// still reserved: the fetch that reports it keeps the cursor, and
+    /// `SQLMoreResults` reports it as an error result before continuing.
+    /// Cleared by [`StmtState::clear_exhaustion_state`],
     /// since both it and `result_set_exhausted` describe facts about the
     /// same now-superseded result set.
     pub(crate) pending_fetch_error: Option<TdsError>,
@@ -2070,7 +2075,7 @@ impl HasDiagnostics for StmtState {
     fn diag_records(&self) -> &[DiagRecord] {
         &self.diag_records
     }
-    fn diag_records_mut(&mut self) -> &mut Vec<DiagRecord> {
+    fn diag_records_mut(&mut self) -> &mut DiagRecords {
         &mut self.diag_records
     }
 }
@@ -2441,7 +2446,7 @@ impl StmtHandle {
             operation_state: AtomicU8::new(0),
             operation_finished: Condvar::new(),
             inner: Mutex::new(StmtState {
-                diag_records: Vec::new(),
+                diag_records: Default::default(),
                 fetch_bindings: Vec::new(),
                 text_output: TextOutput::UTF8,
                 column_metadata: Vec::new(),
@@ -3091,7 +3096,7 @@ mod tests {
     /// Runs `f` against a fresh, empty ARD-shaped `DescState`.
     fn with_ard_state(f: impl FnOnce(&mut DescState)) {
         let mut state = DescState {
-            diag_records: Vec::new(),
+            diag_records: Default::default(),
             header: DescHeader::default(),
             records: Vec::new(),
             data_classification: None,

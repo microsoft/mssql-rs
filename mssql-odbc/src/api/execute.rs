@@ -4145,6 +4145,82 @@ mod tests {
         }
     }
 
+    /// Set 1's unmapped error is posted first and must stay first once the
+    /// records sort: msodbcsql orders a parameter array's diagnostics by set,
+    /// then priority, then arrival (18.07.0001). Set 2's mapped warning has the
+    /// priority of its mapped error and arrived before it, so it stays ahead
+    /// although the error is posted first.
+    #[test]
+    fn parameter_array_diagnostics_keep_their_set_order() {
+        use crate::error::sort_diagnostics;
+        use mssql_tds::error::{SqlErrorInfo, SqlInfoMessage};
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        let mut statuses = [SQL_PARAM_UNUSED; 2];
+        let mut processed = 0;
+        let mut batch = BatchClientResults {
+            outputs: ParamArrayOutputs {
+                paramset_size: 2,
+                param_status_ptr: statuses.as_mut_ptr(),
+                params_processed_ptr: &mut processed,
+            },
+            client_side_failures: 0,
+            truncated_rows: Vec::new(),
+            rows_affected: None,
+            processed: 0,
+        };
+        let failed_row = |row_index: usize, number, ordinal| {
+            let mut row = reported_row(row_index);
+            row.errors.push(SqlErrorInfo {
+                diagnostic_ordinal: ordinal,
+                parameter_set: Some(row_index),
+                message: "failed".into(),
+                state: 1,
+                class: 16,
+                number,
+                server_name: None,
+                proc_name: None,
+                line_number: Some(1),
+            });
+            row
+        };
+        let message = |number, class, ordinal| SqlInfoMessage {
+            diagnostic_ordinal: ordinal,
+            parameter_set: Some(1),
+            message: "message".into(),
+            state: 1,
+            class,
+            number,
+            server_name: None,
+            proc_name: None,
+            line_number: Some(1),
+        };
+
+        report_parameter_array(
+            &mut state,
+            PreparedBatchResult {
+                rows: vec![failed_row(0, 50000, 0), failed_row(1, 2627, 2)],
+                complete: true,
+            },
+            &mut batch,
+            None,
+            false,
+            None,
+        );
+        post_tds_info_messages(&mut state, &[message(8153, 10, 1), message(3621, 0, 3)]);
+        sort_diagnostics(&mut state);
+
+        let natives: Vec<_> = state
+            .diag_records
+            .iter()
+            .map(|record| record.native_error)
+            .collect();
+        assert_eq!(natives, [50000, 8153, 2627, 3621]);
+        assert_eq!(statuses, [SQL_PARAM_ERROR; 2]);
+    }
+
     #[test]
     fn finish_parameter_array_publishes_nothing_from_a_stale_lease() {
         use crate::handles::DbcHandle;

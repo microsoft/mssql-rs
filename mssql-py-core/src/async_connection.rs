@@ -697,6 +697,7 @@ mod tests {
                             server_name: Some("server".into()),
                             proc_name: None,
                             line_number: None,
+                            ..Default::default()
                         }],
                         Vec::new(),
                     ),
