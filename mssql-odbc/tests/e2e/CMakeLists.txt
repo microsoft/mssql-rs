@@ -353,6 +353,35 @@ add_odbc_test(tvp_test tests/tvp_test.cpp)
 add_odbc_test(escape_sequence_test tests/escape_sequence_test.cpp)
 add_odbc_test(api_contract_test tests/api_contract_test.cpp)
 add_odbc_test(get_data_test      tests/get_data_test.cpp)
+add_executable(client_code_page_test
+    tests/client_code_page_test.cpp
+    lib/odbc_skip_aware_main.cpp
+)
+target_link_libraries(client_code_page_test PRIVATE odbc_test_lib)
+foreach(code_page IN ITEMS 1252 65001 932 1251)
+    set(test_name client_code_page_${code_page})
+    if(ODBC_E2E_CONCURRENT)
+        add_test(NAME ${test_name}
+                 COMMAND client_code_page_test "--gtest_filter=-${ODBC_MT_MODE_FILTER}")
+        if(UNIX)
+            add_test(NAME ${test_name}_mt
+                     COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/run_mt_test.sh"
+                             $<TARGET_FILE:client_code_page_test>
+                             "--gtest_filter=${ODBC_MT_MODE_FILTER}")
+        else()
+            add_test(NAME ${test_name}_mt
+                     COMMAND client_code_page_test "--gtest_filter=${ODBC_MT_MODE_FILTER}")
+        endif()
+        set_tests_properties(${test_name}_mt PROPERTIES SKIP_RETURN_CODE 77 LABELS mt)
+        set_tests_properties(${test_name}_mt PROPERTIES
+                             ENVIRONMENT "MSSQL_ODBC_TEST_CLIENT_CODE_PAGE=${code_page}")
+    else()
+        add_test(NAME ${test_name} COMMAND client_code_page_test)
+    endif()
+    set_tests_properties(${test_name} PROPERTIES
+                         SKIP_RETURN_CODE 77
+                         ENVIRONMENT "MSSQL_ODBC_TEST_CLIENT_CODE_PAGE=${code_page}")
+endforeach()
 add_odbc_test(binary_fetch_test tests/binary_fetch_test.cpp)
 add_odbc_test(bin_to_char_test tests/bin_to_char_test.cpp)
 add_odbc_test(get_type_info_test tests/get_type_info_test.cpp)

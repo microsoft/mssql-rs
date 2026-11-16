@@ -57,8 +57,10 @@ fn split_us_varchar<'a>(
         .split_at_checked(chars * 2)
         .ok_or_else(|| malformed_routing(&format!("truncated {field}")))?;
     let units: Vec<u16> = value
-        .chunks_exact(2)
-        .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|unit| u16::from_le_bytes(*unit))
         .collect();
     let value = String::from_utf16(&units)
         .map_err(|_| malformed_routing(&format!("{field} is not valid UTF-16")))?;

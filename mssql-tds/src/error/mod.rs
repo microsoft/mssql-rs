@@ -16,8 +16,13 @@ use tokio::time::error::Elapsed;
 /// SQL Server can return multiple errors for a single batch execution.
 /// This struct represents one error from the stream. The full collection
 /// is available via [`SqlServerDiagnostics`] inside `Error::SqlServerError`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SqlErrorInfo {
+    /// Arrival order among SQL Server ERROR and INFO tokens for this command.
+    pub diagnostic_ordinal: u64,
+    /// Zero-based parameter set of the prepared batch whose RPC raised it, or
+    /// `None` outside a batch.
+    pub parameter_set: Option<usize>,
     /// Error message text returned by the server.
     pub message: String,
     /// Error state, used by the server to indicate specific error conditions.
@@ -53,6 +58,8 @@ impl std::fmt::Display for SqlErrorInfo {
 impl From<&crate::token::tokens::ErrorToken> for SqlErrorInfo {
     fn from(token: &crate::token::tokens::ErrorToken) -> Self {
         Self {
+            diagnostic_ordinal: 0,
+            parameter_set: None,
             message: token.message.clone(),
             state: token.state,
             class: token.severity as i32,
@@ -69,8 +76,13 @@ impl From<&crate::token::tokens::ErrorToken> for SqlErrorInfo {
 /// SQL Server can return multiple INFO tokens for one request. These tokens
 /// carry warning or informational messages such as PRINT output, database or
 /// language changes, and low-severity RAISERROR output.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SqlInfoMessage {
+    /// Arrival order among SQL Server ERROR and INFO tokens for this command.
+    pub diagnostic_ordinal: u64,
+    /// Zero-based parameter set of the prepared batch whose RPC raised it, or
+    /// `None` outside a batch.
+    pub parameter_set: Option<usize>,
     /// Message text returned by the server.
     pub message: String,
     /// Message state, used by the server to indicate specific conditions.
@@ -90,6 +102,8 @@ pub struct SqlInfoMessage {
 impl From<&crate::token::tokens::InfoToken> for SqlInfoMessage {
     fn from(token: &crate::token::tokens::InfoToken) -> Self {
         Self {
+            diagnostic_ordinal: 0,
+            parameter_set: None,
             message: token.message.clone(),
             state: token.state,
             class: token.severity as i32,
@@ -218,6 +232,11 @@ pub enum Error {
     /// Operation was cancelled via a `CancelHandle`.
     #[error("Operation Cancelled Error: {0}")]
     OperationCancelledError(String),
+
+    /// An Entra token provider cancelled acquisition independently of the
+    /// command's `CancelHandle`. Recovery must not retry this acquisition.
+    #[error("Entra token acquisition cancelled")]
+    TokenAcquisitionCancelled,
 
     /// One or more errors returned by SQL Server, plus any informational
     /// messages that accompanied them.
@@ -603,6 +622,7 @@ mod tests {
             server_name: Some("SQLSERVER01".to_string()),
             proc_name: Some("sp_login".to_string()),
             line_number: Some(42),
+            ..Default::default()
         });
         let err_str = error.to_string();
         assert!(err_str.contains("18456"));
@@ -622,6 +642,7 @@ mod tests {
             server_name: None,
             proc_name: None,
             line_number: None,
+            ..Default::default()
         });
         let err_str = error.to_string();
         assert!(err_str.contains("50000"));
@@ -640,6 +661,7 @@ mod tests {
                 server_name: Some("SRV".to_string()),
                 proc_name: None,
                 line_number: Some(1),
+                ..Default::default()
             },
             SqlErrorInfo {
                 message: "Second error".to_string(),
@@ -649,6 +671,7 @@ mod tests {
                 server_name: Some("SRV".to_string()),
                 proc_name: None,
                 line_number: Some(2),
+                ..Default::default()
             },
         ]);
         let err_str = error.to_string();
@@ -737,6 +760,7 @@ mod tests {
             server_name: None,
             proc_name: None,
             line_number: None,
+            ..Default::default()
         });
         assert!(!err.is_transient_connect_error());
     }
@@ -755,6 +779,7 @@ mod tests {
                 server_name: None,
                 proc_name: None,
                 line_number: None,
+                ..Default::default()
             });
             assert!(
                 err.is_transient_connect_error(),
@@ -775,6 +800,7 @@ mod tests {
                 server_name: None,
                 proc_name: None,
                 line_number: None,
+                ..Default::default()
             },
             SqlErrorInfo {
                 message: "Service busy".to_string(),
@@ -784,6 +810,7 @@ mod tests {
                 server_name: None,
                 proc_name: None,
                 line_number: None,
+                ..Default::default()
             },
         ]);
         assert!(err.is_transient_connect_error());
@@ -834,6 +861,7 @@ mod tests {
             server_name: None,
             proc_name: None,
             line_number: None,
+            ..Default::default()
         }
     }
 
@@ -846,6 +874,7 @@ mod tests {
             server_name: None,
             proc_name: None,
             line_number: None,
+            ..Default::default()
         }
     }
 

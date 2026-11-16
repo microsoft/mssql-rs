@@ -159,6 +159,9 @@ public:
     OdbcSession(const OdbcSession&) = delete;
     OdbcSession& operator=(const OdbcSession&) = delete;
 
+    /// Connection handle for runners that allocate and free their own statements.
+    SQLHDBC connection() const;
+
     /// Expose the statement only to the runner that controls its complete lifecycle.
     SQLHSTMT statement() const;
 
@@ -261,6 +264,42 @@ public:
 
     ParameterArrayWriteRunner(const ParameterArrayWriteRunner&) = delete;
     ParameterArrayWriteRunner& operator=(const ParameterArrayWriteRunner&) = delete;
+
+    const char* name() const;
+    void preflight();
+    RetrievalMetrics execute();
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+/// Scenario filter value for the `mssql-python`-shaped executemany workloads.
+inline constexpr char kExecuteManyScenario[] = "pywrite";
+
+/// Column sets of the `pywrite` scenario.
+enum class ExecuteManyShape {
+    /// SMALLINT id, ASCII name, naive datetime.
+    c3,
+    /// Three integer widths, three ASCII strings, two datetimes, two Decimals.
+    c10,
+};
+
+/// Replays one `mssql-python` `Cursor.executemany` call on a 1,000-row batch.
+///
+/// The existing `write` workload binds INT/NVARCHAR/BIGINT, which is not what
+/// `mssql-python` sends: its Python-side type detection narrows integers to the
+/// smallest fitting type and binds ASCII `str` and money-range `Decimal` as
+/// `SQL_C_CHAR`/`SQL_VARCHAR`. This scenario ignores `ODBC_BENCH_WRITE_MODE`, so
+/// every leg, including the pinned baseline, runs the same parameter-array call
+/// sequence.
+class ExecuteManyWriteRunner {
+public:
+    ExecuteManyWriteRunner(OdbcSession& session, ExecuteManyShape shape);
+    ~ExecuteManyWriteRunner();
+
+    ExecuteManyWriteRunner(const ExecuteManyWriteRunner&) = delete;
+    ExecuteManyWriteRunner& operator=(const ExecuteManyWriteRunner&) = delete;
 
     const char* name() const;
     void preflight();

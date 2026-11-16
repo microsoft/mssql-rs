@@ -122,6 +122,10 @@ impl OpenedConnection {
     pub(crate) fn into_parts(self) -> (TdsClient, AuthMetadata) {
         (self.client, self.auth)
     }
+
+    pub(crate) fn client_mut(&mut self) -> &mut TdsClient {
+        &mut self.client
+    }
 }
 
 /// Opens physical connections with per-call options, not shared request state.

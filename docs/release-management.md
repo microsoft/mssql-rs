@@ -27,12 +27,13 @@ PyPI: mssql-python-rs
 PyPI: mssql-python
 ```
 
-`mssql-python` does not embed or repackage `mssql_py_core`. Its build and test
-pipelines still download the wheel from the legacy NuGet package. Migrating that
-installer to `pip install` an exact version from the Azure Artifacts feed is a
-separate follow-up in the `mssql-python` repository. Public users install
-`mssql-python-rs` from PyPI through the exact runtime dependency declared by
-`mssql-python`.
+`mssql-python` does not embed or repackage `mssql_py_core`. Since
+[microsoft/mssql-python#868](https://github.com/microsoft/mssql-python/pull/868),
+its official and release builds install the version pinned in
+`eng/versions/mssql-python-rs.version` from public PyPI, and its PR validation
+installs the latest scheduled nightly from the Azure Artifacts feed. Public users
+install `mssql-python-rs` from PyPI through the exact runtime dependency declared
+by `mssql-python`.
 
 Feed simple index (anonymous read):
 `https://pkgs.dev.azure.com/sqlclientdrivers/public/_packaging/mssql-rs_Public/pypi/simple/`
@@ -206,31 +207,17 @@ against `main`. The pull request always advances
 `eng/versions/mssql-python-rs.version` when the repository is behind the
 published release.
 
-This pipeline no longer publishes the `mssql-python-rs-wheels` NuGet package.
-Until the `mssql-python` installer migration lands, its NuGet pin remains the
-consumer-facing pin and cannot advance to feed-only releases. The release worker
-still checks for a legacy NuGet package so it can handle older or separately
-published packages; a missing package leaves the NuGet pin unchanged:
+That PyPI pin is the only pin the worker manages. `mssql-python` removed the
+legacy `eng/versions/mssql-python-rs-nuget.version` pin in
+[microsoft/mssql-python#868](https://github.com/microsoft/mssql-python/pull/868),
+and this repository no longer publishes the `mssql-python-rs-wheels` NuGet
+package.
 
-- when it exists, `eng/versions/mssql-python-rs-nuget.version` is advanced too;
-- when it does not exist (including a 404 after NuGet retention), the NuGet pin
-  is left unchanged and the worker still advances the public PyPI pin;
-- prerelease `-dev` and `-nightly` packages never satisfy the check.
-
-The separate installer migration must also switch the release worker to check
-the Azure Artifacts PyPI feed and advance the pin consumed by `mssql-python`.
-Until that follow-up lands, the worker can update the public PyPI pin, but
-`mssql-python` continues using the legacy NuGet pin. Older release events never
-downgrade either pin on `main` or on the pending automation branch. An unrelated
-`main` change does not rebase a pending PR when its two managed pins already have
-the requested values. A branch containing maintainer commits is left untouched,
-and all automation-owned replacements use an exact `--force-with-lease`.
-
-If a newer PyPI release arrives while the pending automation PR already carries
-a higher legacy NuGet pin from an earlier run, the worker advances the PyPI pin
-and retains that higher pending NuGet pin. The regenerated issue and PR summaries
-show both transitions relative to `main`; a PyPI-only event never rolls back an
-already verified NuGet package.
+Older release events never downgrade the pin on `main` or on the pending
+automation branch. An unrelated `main` change does not rebase a pending PR when
+its pin already has the requested value. A branch containing maintainer commits
+is left untouched, and all automation-owned replacements use an exact
+`--force-with-lease`.
 
 This YAML also requires a permanent pipeline definition after the change reaches
 `main`:
@@ -300,23 +287,19 @@ is no longer produced.
 4. Publish stage:
    - Validates wheel names, metadata, and ODBC payloads against the stamped version
    - twine-uploads the wheels to the public/mssql-rs_Public feed's PyPI index
-5. The feed contains the new nightly version. `mssql-python` CI continues using
-   its legacy NuGet pin until the installer migration follow-up lands.
+5. The feed contains the new nightly version, which `mssql-python` PR validation
+   selects automatically.
 ```
 
-### mssql-python consumer migration
+### Installing a nightly from the feed
 
-After the separate installer migration in the `mssql-python` repository,
-`mssql-python` can install an exact nightly from the feed:
+To install an exact nightly from the feed:
 
 ```
 python -m pip install \
   --index-url https://pkgs.dev.azure.com/sqlclientdrivers/public/_packaging/mssql-rs_Public/pypi/simple/ \
   mssql-python-rs==0.3.0.dev20260217
 ```
-
-The migration must also update the release-bump worker to check the feed and
-advance the pin consumed by `mssql-python`.
 
 ### Key properties
 

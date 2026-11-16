@@ -11,7 +11,7 @@ use tracing::{debug, error};
 
 use super::{HandleType, HasObjectType};
 use crate::api::odbc_types::{SQL_OV_ODBC3, SQL_OV_ODBC3_80};
-use crate::error::{DiagRecord, HasDiagnostics};
+use crate::error::{DiagRecord, DiagRecords, HasDiagnostics};
 
 /// ODBC environment attributes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,7 +227,7 @@ pub(crate) struct EnvHandle {
 /// Mutable state within an environment handle, protected by `inner`.
 #[derive(Debug)]
 pub(crate) struct EnvState {
-    pub(crate) diag_records: Vec<DiagRecord>,
+    pub(crate) diag_records: DiagRecords,
     pub(crate) odbc_version: OdbcVersion,
     #[allow(dead_code)]
     pub(crate) output_nts: bool,
@@ -239,7 +239,7 @@ impl HasDiagnostics for EnvState {
     fn diag_records(&self) -> &[DiagRecord] {
         &self.diag_records
     }
-    fn diag_records_mut(&mut self) -> &mut Vec<DiagRecord> {
+    fn diag_records_mut(&mut self) -> &mut DiagRecords {
         &mut self.diag_records
     }
 }
@@ -262,7 +262,7 @@ impl EnvHandle {
         Ok(Self {
             object_type: HandleType::Env,
             inner: Mutex::new(EnvState {
-                diag_records: Vec::new(),
+                diag_records: Default::default(),
                 odbc_version: OdbcVersion::Unset,
                 output_nts: true, // SQL_ATTR_OUTPUT_NTS defaults to SQL_TRUE
                 connections: Vec::new(),

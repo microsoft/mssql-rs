@@ -103,8 +103,10 @@ pub fn read_access_token(path: &Path) -> Result<AccessToken, TokenFileError> {
         return Err(TokenFileError::NotUtf16);
     }
     let units = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| u16::from_le_bytes(pair));
     let mut token = String::with_capacity(bytes.len() / 2);
     for c in char::decode_utf16(units) {
         token.push(c.map_err(|_| TokenFileError::NotUtf16)?);

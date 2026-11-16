@@ -61,6 +61,8 @@ pub(crate) enum PoolError {
     CleanupTimeout,
     #[error("pool shutdown timed out")]
     ShutdownTimeout,
+    #[error("pool bookkeeping failed: {reason}")]
+    Internal { reason: &'static str },
 }
 
 // Causes remain available to callers, but provider/server messages are not safe
@@ -150,6 +152,9 @@ mod tests {
             PoolError::TokenExpired,
             PoolError::CleanupTimeout,
             PoolError::ShutdownTimeout,
+            PoolError::Internal {
+                reason: "invariant failure",
+            },
         ];
         let messages: std::collections::HashSet<_> =
             errors.iter().map(ToString::to_string).collect();

@@ -4,12 +4,42 @@
 #include "../connection_busy_fixture.h"
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 class SharedConnectionBusyLiveTest : public ConnectionBusyLiveTest {};
+
+namespace {
+
+// An execute waits out the other workers' round trips, so a budget that
+// accumulates over the run trips on a slow SQL Server rather than a stuck
+// lease. Bound each execute's consecutive wait instead.
+constexpr std::chrono::seconds kMaxBusyWait{30};
+
+// One execute's consecutive busy results; any success starts a new wait.
+class BusyWait {
+public:
+    // Records a busy result; false once the wait has outlasted kMaxBusyWait.
+    bool OnBusy() {
+        const auto now = std::chrono::steady_clock::now();
+        if (!waiting_) {
+            waiting_ = true;
+            since_ = now;
+        }
+        return now - since_ <= kMaxBusyWait;
+    }
+
+    void OnProgress() { waiting_ = false; }
+
+private:
+    bool waiting_ = false;
+    std::chrono::steady_clock::time_point since_;
+};
+
+}  // namespace
 
 // AB#49225: statements on threads sharing one connection may only ever be told
 // the connection is busy, never an internal error, and a busy execute is
@@ -20,7 +50,6 @@ class SharedConnectionBusyLiveTest : public ConnectionBusyLiveTest {};
 TEST_F(SharedConnectionBusyLiveTest, ConcurrentStatementsOnSharedConnectionOnlyReportBusy) {
     constexpr int kThreads = 8;
     constexpr int kIterations = 20;
-    constexpr int kMaxBusyRetries = 100000;
     std::atomic<int> busy_total{0};
     std::mutex mutex;
     std::vector<std::string> failures;
@@ -35,7 +64,7 @@ TEST_F(SharedConnectionBusyLiveTest, ConcurrentStatementsOnSharedConnectionOnlyR
             fail("SQLAllocHandle: " + ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc_));
             return;
         }
-        int busy = 0;
+        BusyWait wait;
         for (int i = 0; i < kIterations;) {
             // Unique per execution, so a row delivered to the wrong statement fails.
             const int run = worker_index * kIterations + i;
@@ -48,13 +77,15 @@ TEST_F(SharedConnectionBusyLiveTest, ConcurrentStatementsOnSharedConnectionOnlyR
                     break;
                 }
                 ++busy_total;
-                if (++busy > kMaxBusyRetries) {
-                    fail("connection stayed busy");
+                if (!wait.OnBusy()) {
+                    fail("connection stayed busy for " + std::to_string(kMaxBusyWait.count()) +
+                         " s");
                     break;
                 }
                 std::this_thread::yield();
                 continue;
             }
+            wait.OnProgress();
             SQLRETURN rc;
             bool wrong_data = false;
             while (SQL_SUCCEEDED(rc = SQLFetch(hstmt))) {
@@ -113,7 +144,6 @@ TEST_F(SharedConnectionBusyLiveTest, ConcurrentStatementsOnSharedConnectionOnlyR
 TEST_F(SharedConnectionBusyLiveTest, ExecutesRacingTheUserNameLookupOnlyReportBusy) {
     constexpr int kThreads = 4;
     constexpr int kIterations = 50;
-    constexpr int kMaxBusyRetries = 100000;
     std::atomic<int> busy_total{0};
     std::atomic<bool> workers_done{false};
     std::mutex mutex;
@@ -140,10 +170,11 @@ TEST_F(SharedConnectionBusyLiveTest, ExecutesRacingTheUserNameLookupOnlyReportBu
             fail("SQLAllocHandle: " + ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc_));
             return;
         }
-        int busy = 0;
+        BusyWait wait;
         for (int i = 0; i < kIterations;) {
             SQLRETURN rc = Run(hstmt, "USE tempdb");
             if (SQL_SUCCEEDED(rc) || rc == SQL_NO_DATA) {
+                wait.OnProgress();
                 ++i;
                 continue;
             }
@@ -152,8 +183,8 @@ TEST_F(SharedConnectionBusyLiveTest, ExecutesRacingTheUserNameLookupOnlyReportBu
                 break;
             }
             ++busy_total;
-            if (++busy > kMaxBusyRetries) {
-                fail("connection stayed busy");
+            if (!wait.OnBusy()) {
+                fail("connection stayed busy for " + std::to_string(kMaxBusyWait.count()) + " s");
                 break;
             }
             std::this_thread::yield();

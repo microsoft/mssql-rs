@@ -234,16 +234,20 @@ fn decode_utf16_le_lossy(bytes: &[u8]) -> String {
     // `Ok` keeps this free of `unsafe` and panics, and copying the bytes then
     // validating them in one pass is markedly faster than collecting `char`s.
     if bytes
-        .chunks_exact(2)
-        .all(|pair| pair[1] == 0 && pair[0].is_ascii())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .all(|&[low, high]| high == 0 && low.is_ascii())
         && let Ok(ascii) = String::from_utf8(bytes.iter().step_by(2).copied().collect())
     {
         return ascii;
     }
     char::decode_utf16(
         bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]])),
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| u16::from_le_bytes(pair)),
     )
     .map(|decoded| decoded.unwrap_or(char::REPLACEMENT_CHARACTER))
     .collect()

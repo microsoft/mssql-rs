@@ -12,6 +12,9 @@ use super::error::ConvError;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ClientEncoding(u32);
 
+#[cfg(any(test, feature = "e2e-test-client-code-page"))]
+const E2E_TEST_CLIENT_CODE_PAGE: &str = "MSSQL_ODBC_TEST_CLIENT_CODE_PAGE";
+
 #[derive(Debug)]
 pub(crate) struct ClientEncoded<'a> {
     pub(crate) bytes: Cow<'a, [u8]>,
@@ -177,6 +180,23 @@ mod tests {
     }
 
     #[test]
+    fn e2e_test_override_reports_invalid_values_instead_of_panicking() {
+        use std::ffi::OsStr;
+
+        assert_eq!(ClientEncoding::e2e_test_override(None), Ok(None));
+        assert_eq!(
+            ClientEncoding::e2e_test_override(Some(OsStr::new("65001"))),
+            Ok(Some(ClientEncoding::UTF8))
+        );
+        for value in ["", "utf8", "-1", "4294967296", "99999"] {
+            assert!(
+                ClientEncoding::e2e_test_override(Some(OsStr::new(value))).is_err(),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
     fn system_default_can_convert_ascii() {
         let encoding = ClientEncoding::system_default();
         assert_eq!(
@@ -210,6 +230,35 @@ impl ClientEncoding {
         // Native SystemLocale::Singleton captures the locale on its first use.
         static DEFAULT: std::sync::OnceLock<ClientEncoding> = std::sync::OnceLock::new();
         *DEFAULT.get_or_init(platform::system_default)
+    }
+
+    /// The encoding a new connection captures. Errors only for an invalid
+    /// e2e-test override, which `SQLAllocHandle(DBC)` reports as a diagnostic.
+    pub(crate) fn for_new_connection() -> Result<Self, String> {
+        #[cfg(feature = "e2e-test-client-code-page")]
+        if let Some(encoding) =
+            Self::e2e_test_override(std::env::var_os(E2E_TEST_CLIENT_CODE_PAGE).as_deref())?
+        {
+            return Ok(encoding);
+        }
+        Ok(Self::system_default())
+    }
+
+    #[cfg(any(test, feature = "e2e-test-client-code-page"))]
+    fn e2e_test_override(value: Option<&std::ffi::OsStr>) -> Result<Option<Self>, String> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        value
+            .to_str()
+            .and_then(|code_page| code_page.parse::<u32>().ok())
+            .and_then(Self::for_code_page)
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "{E2E_TEST_CLIENT_CODE_PAGE} must name a supported code page, not {value:?}"
+                )
+            })
     }
 
     pub(crate) fn is_utf8(self) -> bool {
@@ -295,7 +344,7 @@ impl ClientEncoding {
         platform::prefix_len(self, bytes, capacity)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "e2e-test-client-code-page"))]
     pub(crate) fn for_code_page(code_page: u32) -> Option<Self> {
         platform::for_code_page(code_page)
     }
@@ -693,7 +742,7 @@ mod platform {
         Ok(consumed)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "e2e-test-client-code-page"))]
     pub(super) fn for_code_page(code_page: u32) -> Option<ClientEncoding> {
         let encoding = ClientEncoding(code_page);
         charset(encoding, false).ok()?;
@@ -1071,9 +1120,12 @@ mod platform {
         let mut end = 0;
         while end < capacity {
             let byte = *bytes.get(end).ok_or(ConvError::Internal)?;
-            let is_lead = info.LeadByte.chunks_exact(2).any(|range| {
-                matches!(range, [start, stop] if *start != 0 && (*start..=*stop).contains(&byte))
-            });
+            let is_lead = info
+                .LeadByte
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .any(|&[start, stop]| start != 0 && (start..=stop).contains(&byte));
             let width = if is_lead { 2 } else { 1 };
             if width > capacity - end {
                 break;
@@ -1083,7 +1135,7 @@ mod platform {
         Ok(end)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "e2e-test-client-code-page"))]
     pub(super) fn for_code_page(code_page: u32) -> Option<ClientEncoding> {
         if code_page == 65001 {
             return Some(ClientEncoding::UTF8);
