@@ -808,6 +808,17 @@ impl Default for ClientContext {
 }
 
 impl ClientContext {
+    /// Resolves and freezes endpoint policy without opening a connection.
+    ///
+    /// Internal bindings use this before fingerprinting an effective context.
+    /// Not a semver-stable application API.
+    #[doc(hidden)]
+    pub fn prepare_for_connect(&mut self) -> TdsResult<()> {
+        let datasource = self.data_source.clone();
+        self.prepare_datasource(&datasource)?;
+        self.validate()
+    }
+
     /// The policy captured when this context was prepared for a connection.
     pub fn multi_subnet_failover_policy(
         &self,

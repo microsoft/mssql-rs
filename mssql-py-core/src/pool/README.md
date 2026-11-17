@@ -21,6 +21,7 @@ For the compiled manager and slot lifecycle, see the
 | `AcquireControl` in [control.rs](control.rs) | One caller-owned absolute deadline and cancellation token shared across acquisition stages. It drops interrupted work, but does not supervise detached work or cancel TDS/Python operations for their owners. |
 | `AcquireStage` in [error.rs](error.rs) | Identifies where acquisition timed out; changing stages does not start a new budget. |
 | `PoolKey` in [connection.rs](connection.rs) | Opaque fingerprint that partitions reuse. The caller adapter must supply a fingerprint, never a raw connection string or token; this type only rejects empty input, not noncanonical keys. |
+| `PreparedSqlConnection` in [connection_key.rs](../connection_key.rs) | Private Rust SQL-auth key authority above the scheduler. Validates Python-adapted options, freezes native endpoint policy, and derives a process-private HMAC key and authentication binding paired with the same immutable `ConnectSpec`. Not exported to Python or called by direct/pooled connect. |
 | `AuthBinding` in [connection.rs](connection.rs) | Separate opaque identity/credential-version fingerprint expected for a physical open. Equality is not proof of a real login principal. |
 | `TokenExpiry` and `AuthMetadata` in [connection.rs](connection.rs) | Distinguish non-token authentication, known UTC expiry and unknown raw-token expiry. Metadata carries the binding to compare with the expected one; it does not implement credential refresh or reuse policy. |
 | `ConnectSpec` in [connection.rs](connection.rs) | Immutable, already-validated effective connection options and expected authentication binding supplied for each open. Recovery policy validation belongs to the caller. |
@@ -51,8 +52,67 @@ Caller adapter
 A reserved acquisition guard must own its capacity slot before
 physical opening/reset begins. Per-call options stay explicit rather than
 being installed as shared "current request" state on the factory or scheduler.
-The [Python integration design](../../../docs/async-connection-pooling-mssql-python-integration.md)
-owns key construction, logical connection/cursor ownership and result delivery.
+Rust's [key authority](../connection_key.rs) owns SQL-auth key construction; the
+[Python integration design](../../../docs/async-connection-pooling-mssql-python-integration.md)
+defines parser/adaptation compatibility, logical connection/cursor ownership and
+result delivery.
+
+## SQL-auth key preparation
+
+The private entry point accepts only the 21 canonical context fields currently
+produced by Python's connection-string adaptation and login-timeout argument.
+It rejects unknown fields, token/provider/attribute hooks, trusted authentication,
+invalid types and unsigned/range violations. It reuses native authentication,
+enum and context validation rather than adding a connection-string parser.
+
+| Classification | Effective settings |
+|---|---|
+| Partition | Endpoint/instance, database, exact SQL principal/password, application name/intent, TLS/trust/certificate/SPN, packet size, IP preference, keep-alive, login timeout and recovery count/interval |
+| Equivalent | Canonical adapted inputs independent of dictionary order, accepted enum casing/defaults, implicit/explicit SQL password and Trusted_Connection=No, inherited MSF matching an explicit effective value |
+| Rust ODBC behavior | PacketSize=0/omission uses TDS default 8000; nonzero sizes clamp to 512-32768. Unknown IP preference resolves to IPv4First. Keep-alive inputs have already been converted to milliseconds by the existing Python adapter |
+| Fixed native defaults | Workstation, language, library/version and User-Agent are taken from the prepared native context, not guessed by Python |
+| Rejected | Unsupported fields and authentication modes; no arbitrary key, token provider or attrs_before seam |
+
+Structured serialization is versioned and preserves empty strings, Unicode and
+field boundaries. The whole descriptor and the separate principal/credential
+binding are HMAC-SHA256 fingerprints with domain separation and one private
+random process key. Cryptography reuses TDS's approved native providers
+(Windows CNG, Apple native crypto and OpenSSL), not a new crypto implementation.
+Routine diagnostics redact both prepared objects and opaque fingerprints.
+
+No lease settings are accepted by this physical-spec seam. Future integration
+must prove their reset/reapplication contract before reusing a session across
+such settings. Recovery values remain in the fingerprint; pooled recovery gates,
+physical acquisition, check-in, public API and authentication beyond SQL password
+remain separate work. There is no change to the direct connection paths.
+
+The direct PyCore adapter still defaults packet size to 4096 and falls back for
+out-of-range values, unlike this private Rust-ODBC-aligned preparation. Reconcile
+or explicitly gate/document that application-visible difference before enabling
+pooling. A physical factory must consume the prepared context, never reconstruct
+it through direct adaptation after keying.
+
+Run the real consumer-parser contract with the active Python environment:
+
+```text
+python -m pip install --upgrade -r mssql-py-core/tests/requirements-pool-key.txt
+python .pipeline/scripts/run-sql-pool-keys.py
+```
+
+For a source consumer, build its native bindings first and make that checkout
+importable in this Python environment. The runner preserves its import paths in
+the embedded interpreter, runs the normally ignored parser test explicitly, and
+produces nextest CI-profile JUnit results. The bridge exists only in Rust tests;
+it compares private keys without exporting keys or a production preparation API.
+It covers every accepted keyword spelling, canonical adaptation, aliases,
+ordering, duplicates, escaping, Unicode and rejection cases.
+
+The PR pipeline has dedicated Windows/Linux/macOS key-contract legs. Their
+configuration is not proof of passing results. Existing live-SQL regression jobs
+remain separate; no key-only test claims pooled acquisition, SPID reuse or reset.
+These legs intentionally test the latest supported consumer release: newly
+accepted options or changed private parser contracts fail CI until reconciled,
+including on otherwise unrelated Rust PRs. There is no older-version fallback.
 
 ## Ownership and cancellation rules
 

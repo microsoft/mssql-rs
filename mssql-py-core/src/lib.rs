@@ -21,6 +21,7 @@ mod async_session;
 mod async_tracing;
 mod bulkcopy;
 mod connection;
+mod connection_key;
 mod cursor;
 mod odbc_auth;
 #[cfg_attr(

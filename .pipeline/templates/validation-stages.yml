@@ -862,6 +862,53 @@ stages:
   condition: and(not(canceled()), eq(dependencies.InitializeValidation.result, 'Succeeded'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), or(ne(variables['Build.Reason'], 'PullRequest'), ne(dependencies.InitializeValidation.outputs['Initialize.SetDuplicateState.skipDuplicate'], 'true')))
   displayName: Build mssql-python
   jobs:
+  - job: Test_SQL_Pool_Keys
+    displayName: SQL-auth pool-key contracts
+    timeoutInMinutes: 90
+    strategy:
+      matrix:
+        Windows:
+          poolKeyImage: windows-latest
+        Linux:
+          poolKeyImage: ubuntu-latest
+        MacOS:
+          poolKeyImage: macOS-latest
+    pool:
+      name: Azure Pipelines
+      vmImage: $(poolKeyImage)
+    steps:
+      - task: UsePythonVersion@0
+        inputs:
+          versionSpec: '3.13'
+          addToPath: true
+        displayName: Use Python 3.13
+      - script: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+        condition: and(succeeded(), eq(variables['Agent.OS'], 'Linux'))
+        displayName: Install Linux native crypto dependencies
+      - pwsh: |
+          $cargoHome = $env:CARGO_HOME
+          if ([string]::IsNullOrWhiteSpace($cargoHome)) {
+            $cargoHome = Join-Path $HOME '.cargo'
+          }
+          $cargoBin = Join-Path $cargoHome 'bin'
+          Write-Host "##vso[task.prependpath]$cargoBin"
+        displayName: Add Rust tools to PATH
+      - script: cargo install cargo-nextest --version 0.9.99 --locked
+        displayName: Install nextest
+      - script: python -m pip install --upgrade -r mssql-py-core/tests/requirements-pool-key.txt
+        displayName: Install latest supported Python consumer
+      - script: python .pipeline/scripts/run-sql-pool-keys.py
+        displayName: Verify native and real-parser key contracts
+      - task: PublishTestResults@2
+        condition: succeededOrFailed()
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: '**/nextest/ci/junit.xml'
+          testRunTitle: SQL pool-key contracts $(Agent.OS)
+          failTaskOnFailedTests: true
+          failTaskOnMissingResultsFile: true
+        displayName: Publish key-contract test results
+
   - job: Build_mssql_python_MacOS
     displayName: Build mssql-python macOS (cross-repo)
     timeoutInMinutes: 120
