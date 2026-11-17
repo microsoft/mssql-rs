@@ -62,6 +62,9 @@ before connecting; certificate validation remains enabled.
 cancellation, and other per-command settings. Use `advance()` for subsequent
 results in a batch. See the [API reference](https://docs.rs/mssql-tds).
 
+`SqlString::try_to_utf8_string()` returns a conversion error for malformed UTF-8.
+Existing `to_utf8_string()` and `decode()` behavior is unchanged.
+
 ## Feature flags
 
 | Feature | Default | Purpose |

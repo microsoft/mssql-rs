@@ -222,6 +222,70 @@ def test_fetchone_takes_no_arguments_and_distinguishes_null_from_exhaustion(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("use_prepare", [True, False], ids=["prepared", "direct"])
+@pytest.mark.parametrize("operation", ["fetchone", "fetchmany", "fetchall"])
+def test_malformed_utf8_returns_data_error_and_keeps_session_reusable(
+    client_context, use_prepare, operation
+):
+    async def run():
+        admin = await connect({**client_context, "database": "master"})
+        database = f"pycore_utf8_{uuid.uuid4().hex}"
+        admin_cursor = admin.cursor()
+        created = False
+        conn = None
+        try:
+            await admin_cursor.execute(
+                f"CREATE DATABASE [{database}] COLLATE Latin1_General_100_BIN2_UTF8",
+                use_prepare=False,
+            )
+            created = True
+            conn = await connect({**client_context, "database": database})
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            [(session_id,)] = await cursor.fetchall()
+            fetch = {
+                "fetchone": cursor.fetchone,
+                "fetchmany": lambda: cursor.fetchmany(1),
+                "fetchall": cursor.fetchall,
+            }[operation]
+            for payload in (b"\x80", b"\xc0\xaf", b"\xe2\x82", b"\xf0\x28\x8c\xbc"):
+                await cursor.execute(
+                    "SELECT CONVERT(varbinary(max), CONVERT(varchar(max), ?))",
+                    payload,
+                    use_prepare=use_prepare,
+                )
+                assert await cursor.fetchall() == [(payload,)]
+
+                await cursor.execute(
+                    "SELECT CONVERT(varchar(max), ?)", payload, use_prepare=use_prepare
+                )
+                with pytest.raises(mssql_py_core.DataError, match="Invalid UTF-8"):
+                    await fetch()
+
+                value = "valid:\u6f22\U0001f600\x00e\u0301"
+                await cursor.execute(
+                    "SELECT @@SPID, CAST(? AS nvarchar(64))",
+                    value,
+                    use_prepare=use_prepare,
+                )
+                assert await cursor.fetchall() == [(session_id, value)]
+        finally:
+            try:
+                if conn is not None:
+                    await conn.close()
+            finally:
+                try:
+                    if created:
+                        await admin_cursor.execute(
+                            f"DROP DATABASE [{database}]", use_prepare=False
+                        )
+                finally:
+                    await admin.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_fetchone_returns_rows_and_releases_final_exhaustion(client_context):
     async def run():
         conn = await connect(client_context)

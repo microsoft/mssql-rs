@@ -38,6 +38,8 @@ do not require OpenSSL.
 
 For SDK authors integrating the native runtime:
 
+- Synchronous and asynchronous cursor fetches report malformed UTF-8 string
+  results as `mssql_py_core.DataError` rather than panicking during decoding.
 - [Connection settings](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md#connection-policy-and-migration)
   for native connection options and defaults.
 - [Bulk-copy behavior](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/docs/bulk-copy.md)

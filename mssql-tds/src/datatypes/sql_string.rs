@@ -362,6 +362,21 @@ impl SqlString {
         Self::decode(&self.bytes, self.encoding_type)
     }
 
+    /// Decodes without panicking on malformed UTF-8 or an unresolved encoding.
+    ///
+    /// UTF-16 and legacy code pages retain their replacement-character behavior.
+    pub fn try_to_utf8_string(&self) -> TdsResult<String> {
+        match self.encoding_type {
+            EncodingType::Utf8 => std::str::from_utf8(&self.bytes)
+                .map(str::to_owned)
+                .map_err(|error| Error::TypeConversionError(format!("Invalid UTF-8: {error}"))),
+            EncodingType::DelayedSet => Err(Error::TypeConversionError(
+                "Cannot decode a string before its encoding is resolved".to_string(),
+            )),
+            _ => Ok(self.to_utf8_string()),
+        }
+    }
+
     /// Decodes wire bytes in `encoding_type` into a Rust `String`.
     /// The explicit encoding is authoritative; BOM-shaped prefixes are payload.
     ///
@@ -507,6 +522,48 @@ mod tests {
         let bytes = "Test".as_bytes().to_vec();
         let sql_str = SqlString::new(bytes, EncodingType::Utf8);
         assert_eq!(sql_str.to_utf8_string(), "Test");
+    }
+
+    #[test]
+    fn fallible_decode_rejects_malformed_utf8() {
+        for bytes in [
+            &b"\x80"[..],
+            &b"\xc0\xaf"[..],
+            &b"\xe2\x82"[..],
+            &b"\xf0\x28\x8c\xbc"[..],
+            &b"valid\xed\xa0\x80"[..],
+        ] {
+            let value = SqlString::new(bytes.to_vec(), EncodingType::Utf8);
+            assert!(matches!(
+                value.try_to_utf8_string(),
+                Err(Error::TypeConversionError(_))
+            ));
+        }
+        let unresolved = SqlString::new(b"value".to_vec(), EncodingType::DelayedSet);
+        assert!(matches!(
+            unresolved.try_to_utf8_string(),
+            Err(Error::TypeConversionError(_))
+        ));
+    }
+
+    #[test]
+    fn fallible_decode_preserves_existing_text_conversions() {
+        let cases = [
+            (b"".to_vec(), EncodingType::Utf8),
+            (
+                "A\0\u{feff}\u{1f600}".as_bytes().to_vec(),
+                EncodingType::Utf8,
+            ),
+            (b"A\0\0\xd8".to_vec(), EncodingType::Utf16),
+            (
+                b"Caf\xe9 \x80".to_vec(),
+                EncodingType::LcidBased(collation(0x0409)),
+            ),
+        ];
+        for (bytes, encoding) in cases {
+            let value = SqlString::new(bytes, encoding);
+            assert_eq!(value.try_to_utf8_string().unwrap(), value.to_utf8_string());
+        }
     }
 
     #[test]
