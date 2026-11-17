@@ -1557,17 +1557,37 @@ msodbcsql build is measured.
     encode-direction counterpart, and entry 24 covers collations with no
     mapped encoding.
 
-    **Evidence level: measured.** Windows msodbcsql 18.07.0001 against SQL
-    Server 2025 (`17.00.4025`), reading values stored through `varbinary`
-    literals into `Japanese_90_BIN` and `Latin1_General_100_CI_AS_SC_UTF8`
-    columns, bounded and `varchar(max)`. SQL Server will not store a trailing
-    CP932 lead byte, and rejects some invalid UTF-8, such as a lone `0x80`, in
-    a bounded column (error 9833), so those cases need a mock server. `MalformedServerBytesDecodeWithoutError`
+    **Source.** For a `char`/`varchar` column read as `SQL_C_WCHAR`,
+    msodbcsql's `InternalGetColData` (`odbc/sqlcdata.h`, `StringType` arm)
+    switches the connection's server code page to the column's `ColumnCP` and
+    calls `Xlat` (`odbc/sqlcfunc.cpp`). `TranslateParam`'s char-to-Unicode
+    branch then calls `SystemLocale::ToUtf16(cpSrc, ...)` and fails only on a
+    zero return. On Windows, `ToUtf16` (`Common/include/Localization.hpp`)
+    reaches `FastAsciiMultiByteToWideChar` (`LocalizationImpl.hpp`), which
+    passes `MultiByteToWideChar` `MB_PRECOMPOSED`, or `0` for UTF-8, but never
+    `MB_ERR_INVALID_CHARS`. Windows NLS therefore substitutes instead of
+    failing, which produces the best-fit characters and the two U+FFFD above.
+    The non-Windows `ToUtf16` (`LocalizationImpl.hpp`) decodes UTF-8 with
+    `SystemLocale::Utf8To16`, which validates a three-byte sequence only after
+    consuming it. By that reading, Linux and macOS turn `ED A0 80` into one
+    U+FFFD, and convert other code pages through iconv. As in entry 22, the
+    reference driver's replacement depends on its platform.
+
+    **Evidence level: measured on Windows; source-only elsewhere.** Windows
+    msodbcsql 18.07.0001 against SQL Server 2025 (`17.00.4025`), reading
+    values stored through `varbinary` literals into `Japanese_90_BIN` and
+    `Latin1_General_100_CI_AS_SC_UTF8` columns, bounded and `varchar(max)`.
+    SQL Server will not store a trailing CP932 lead byte, and rejects some
+    invalid UTF-8, such as a lone `0x80`, in a bounded column (error 9833), so
+    those cases need a mock server. `MalformedServerBytesDecodeWithoutError`
     (`mssql-odbc/tests/e2e/tests/client_code_page_test.cpp`) asserts each
     driver's characters; `utf8_decode_replaces_invalid_sequences`
     (`mssql-tds/src/datatypes/sql_string.rs`) and
     `bound_client_text_replaces_invalid_utf8`
-    (`mssql-odbc/src/api/fetch_scroll.rs`) pin this driver's decoding. Chosen
-    by the change author for
+    (`mssql-odbc/src/api/fetch_scroll.rs`) pin this driver's decoding. The
+    Linux CI reference leg skips that suite because msodbcsql there takes its
+    code page from the process locale, so the non-Windows reading above is
+    unmeasured; running the same values against Linux msodbcsql under a UTF-8
+    and a CP932 locale would close it. Chosen by the change author for
     [AB#49106](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/49106);
     maintainer sign-off is pending review.
