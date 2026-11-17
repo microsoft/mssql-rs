@@ -101,7 +101,8 @@ python .pipeline/scripts/run-sql-pool-keys.py
 
 For a source consumer, build its native bindings first and make that checkout
 importable in this Python environment. The runner preserves its import paths in
-the embedded interpreter, runs the normally ignored parser test explicitly, and
+the embedded interpreter, fetches locked Cargo dependencies before the frozen
+test run, runs the normally ignored parser test explicitly, and
 produces nextest CI-profile JUnit results. The bridge exists only in Rust tests;
 it compares private keys without exporting keys or a production preparation API.
 It covers every accepted keyword spelling, canonical adaptation, aliases,

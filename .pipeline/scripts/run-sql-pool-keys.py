@@ -42,6 +42,12 @@ def main():
             check=True,
         )
     subprocess.run(
+        ["cargo", "fetch", "--locked", "--manifest-path", str(manifest)],
+        cwd=ROOT,
+        env=env,
+        check=True,
+    )
+    subprocess.run(
         [
             "cargo",
             "nextest",

@@ -29,16 +29,28 @@ def configured_runner(monkeypatch, tmp_path):
     return tmp_path, consumer
 
 
+@pytest.mark.parametrize("existing_lock", [False, True])
 def test_runner_uses_active_consumer_and_runs_ignored_parser_contract(
-    configured_runner, monkeypatch
+    configured_runner, monkeypatch, existing_lock
 ):
     root, consumer = configured_runner
+    manifest = root / "mssql-py-core" / "Cargo.toml"
+    lock = manifest.with_name("Cargo.lock")
+    if existing_lock:
+        lock.parent.mkdir()
+        lock.write_text("existing lock", encoding="utf-8")
     calls = []
     monkeypatch.setattr(runner.subprocess, "run", lambda args, **kw: calls.append((args, kw)))
     runner.main()
-    assert len(calls) == 2
-    assert calls[0][0][:2] == ["cargo", "generate-lockfile"]
-    args, kwargs = calls[1]
+    assert len(calls) == (2 if existing_lock else 3)
+    if not existing_lock:
+        assert calls[0][0] == ["cargo", "generate-lockfile", "--manifest-path", str(manifest)]
+    assert calls[-2][0] == ["cargo", "fetch", "--locked", "--manifest-path", str(manifest)]
+    for _, kwargs in calls:
+        assert kwargs["check"] is True
+        assert kwargs["cwd"] == root
+        assert kwargs["env"]["PYO3_PYTHON"] == sys.executable
+    args, kwargs = calls[-1]
     assert args[:3] == ["cargo", "nextest", "run"]
     assert args[args.index("--config-file") + 1] == str(root / ".config" / "nextest.toml")
     assert args[args.index("--run-ignored") + 1] == "all"
@@ -52,24 +64,45 @@ def test_runner_uses_active_consumer_and_runs_ignored_parser_contract(
     paths = kwargs["env"]["PYTHONPATH"].split(os.pathsep)
     assert paths[0] == str(consumer.resolve().parents[1])
     assert all(entry in paths for entry in sys.path if entry)
+    if existing_lock:
+        assert lock.read_text(encoding="utf-8") == "existing lock"
 
 
-def test_runner_preserves_existing_lock_and_propagates_failure(configured_runner, monkeypatch):
+@pytest.mark.parametrize(
+    ("existing_lock", "failing_command"),
+    [
+        (False, "generate-lockfile"),
+        (False, "fetch"),
+        (False, "nextest"),
+        (True, "fetch"),
+        (True, "nextest"),
+    ],
+)
+def test_runner_preserves_existing_lock_and_propagates_failure(
+    configured_runner, monkeypatch, existing_lock, failing_command
+):
     root, _ = configured_runner
     manifest_dir = root / "mssql-py-core"
-    manifest_dir.mkdir()
-    (manifest_dir / "Cargo.lock").write_text("existing lock", encoding="utf-8")
+    lock = manifest_dir / "Cargo.lock"
+    if existing_lock:
+        manifest_dir.mkdir()
+        lock.write_text("existing lock", encoding="utf-8")
     calls = []
 
     def fail(args, **kwargs):
         calls.append(args)
-        raise subprocess.CalledProcessError(100, args)
+        if args[1] == failing_command:
+            raise subprocess.CalledProcessError(100, args)
 
     monkeypatch.setattr(runner.subprocess, "run", fail)
-    with pytest.raises(subprocess.CalledProcessError):
+    with pytest.raises(subprocess.CalledProcessError) as error:
         runner.main()
-    assert len(calls) == 1
-    assert calls[0][:3] == ["cargo", "nextest", "run"]
+    expected = ["fetch", "nextest"] if existing_lock else ["generate-lockfile", "fetch", "nextest"]
+    assert [args[1] for args in calls] == expected[: expected.index(failing_command) + 1]
+    assert error.value.returncode == 100
+    assert error.value.cmd == calls[-1]
+    if existing_lock:
+        assert lock.read_text(encoding="utf-8") == "existing lock"
 
 
 def test_key_contract_ci_covers_three_platforms_without_changing_sql_jobs():
