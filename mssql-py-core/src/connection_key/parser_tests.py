@@ -40,6 +40,8 @@ def verify_pool_keys(same_key):
         ("Authentication", "SqlPassword", "authentication", False),
         ("Trusted_Connection", "No", "trusted_connection", False),
         ("Database", "CaseSensitiveDatabase", "database", True),
+        ("APP", "KeyApplication", "application_name", True),
+        ("Application Name", "KeyApplication", "application_name", True),
         ("Encrypt", "Optional", "encryption", True),
         ("TrustServerCertificate", "Yes", "trust_server_certificate", True),
         ("Trust_Server_Certificate", "Yes", "trust_server_certificate", True),
@@ -58,7 +60,7 @@ def verify_pool_keys(same_key):
     ]
     check.assertEqual(
         {keyword.lower() for keyword, *_ in cases},
-        set(_ALLOWED_CONNECTION_STRING_PARAMS) - {"app", "driver"},
+        set(_ALLOWED_CONNECTION_STRING_PARAMS) - {"driver"},
         "Every accepted keyword spelling needs an explicit key-contract case",
     )
     for keyword, value, field, partitions in cases:
@@ -75,6 +77,8 @@ def verify_pool_keys(same_key):
             expected = int(value)
         if field in {"keep_alive", "keep_alive_interval"}:
             expected *= 1000
+        if field == "application_name":
+            expected = "MSSQL-Python|" + value
         check.assertEqual(actual[field], expected, keyword)
         check.assertEqual(not same_key(baseline, actual), partitions, keyword)
         check.assertTrue(same_key(actual, _context(keyword.upper(), value, field)), keyword)
@@ -100,6 +104,12 @@ def verify_pool_keys(same_key):
         check.assertTrue(same_key(baseline, _context(alias, "tcp:localhost,1433", "server")))
     check.assertTrue(
         same_key(
+            _context("APP", "ExactApplication"),
+            _context("Application Name", "ExactApplication"),
+        )
+    )
+    check.assertTrue(
+        same_key(
             _context("PacketSize", "16000"),
             _context("Packet Size", "16000"),
         )
@@ -108,11 +118,12 @@ def verify_pool_keys(same_key):
         ("UID", "user_name"),
         ("PWD", "password"),
         ("Database", "database"),
+        ("APP", "application_name"),
     ):
         for value in ("Case", "case", " a;b=c|d:0} ", "\u00e9", "e\u0301", "\U0001f600"):
             actual = _context(keyword, value, field)
             expected = dict(baseline)
-            expected[field] = value
+            expected[field] = "MSSQL-Python|" + value if field == "application_name" else value
             check.assertTrue(same_key(actual, expected), keyword)
         check.assertFalse(
             same_key(_context(keyword, "Case", field), _context(keyword, "case", field)),
@@ -138,8 +149,6 @@ def verify_pool_keys(same_key):
         entries + [("Database", "")],
         [(key, value) for key, value in entries if key != "PWD"] + [("PWD", "")],
         entries + [("Driver", "customer-driver")],
-        entries + [("APP", "KeyApplication")],
-        entries + [("Application Name", "KeyApplication")],
         entries + [("UnknownPoolOption", "value")],
     ):
         with check.assertRaises((ConnectionStringParseError, ValueError)):

@@ -112,11 +112,12 @@ The bridge exists only in Rust tests; it compares private keys without exporting
 keys or a production preparation API.
 It covers every accepted keyword spelling, canonical adaptation, aliases,
 ordering, duplicates, escaping, Unicode and rejection cases.
-The published 1.17.0 consumer rejects reserved `APP` and unsupported
-`Application Name`; these are rejection cases, not accepted aliases.
-Application-name partitioning and exact-value semantics remain covered by
-the native dictionary tests. Validate the release contract against an installed
-wheel, not only a source checkout with potentially unreleased parser changes.
+The test consumer requires 1.18.0 or later, whose parser accepts `APP` and
+`Application Name`; both aliases, application-name partitioning and exact-value
+semantics are covered. Version 1.17.0 rejected these spellings and is not the
+contract targeted by this latest-consumer test. Validate against an installed
+release wheel: a source checkout can contain unreleased changes, and a package
+mirror can lag behind the public release.
 
 The PR pipeline has dedicated Windows/Linux/macOS key-contract legs. Their
 configuration is not proof of passing results. Existing live-SQL regression jobs

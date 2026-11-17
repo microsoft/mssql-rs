@@ -25,7 +25,7 @@ def configured_runner(monkeypatch, tmp_path):
     consumer = tmp_path / "consumer" / "mssql_python" / "__init__.py"
     monkeypatch.setitem(sys.modules, "mssql_python", SimpleNamespace(__file__=str(consumer)))
     monkeypatch.setattr(runner, "ROOT", tmp_path)
-    monkeypatch.setattr(runner.importlib.metadata, "version", lambda _: "1.17.0")
+    monkeypatch.setattr(runner.importlib.metadata, "version", lambda _: "1.18.0")
     return tmp_path, consumer
 
 
@@ -188,6 +188,8 @@ def test_key_contract_ci_covers_three_platforms_without_changing_sql_jobs():
     assert "##vso[task.prependpath]" in rust_path
     assert "python .pipeline/scripts/run-sql-pool-keys.py" in commands
     assert any("requirements-pool-key.txt" in command for command in commands)
+    requirements = ROOT / "mssql-py-core" / "tests" / "requirements-pool-key.txt"
+    assert "mssql-python>=1.18.0" in requirements.read_text(encoding="utf-8").splitlines()
     publication = next(step for step in job["steps"] if step.get("task") == "PublishTestResults@2")
     assert publication["inputs"]["failTaskOnFailedTests"] is True
     assert publication["inputs"]["failTaskOnMissingResultsFile"] is True
