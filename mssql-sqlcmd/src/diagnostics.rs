@@ -9,7 +9,7 @@
 //!
 //! | Depth | Checks |
 //! |---|---|
-//! | Connection input | parse the server given to `-S` ([`target`]); no external call |
+//! | Connection input | parse the server given to `-S` ([`target`]) and read a `-G -P` access token file ([`entra`]), which can be on a network share; no name resolution, SQL Server Browser query or connection |
 //! | Endpoint resolution | the client resolves the host name, and asks SQL Server Browser for a named instance's port; it stops there |
 //! | Network reachability | the client also opens its transport (a TCP connection to the first address that accepts, and to every address after it, or a pipe); it stops there |
 //! | Connection attempt | the client also logs in, with its pre-login, TLS and login phases |
@@ -27,9 +27,10 @@
 //! for review before sharing: database and user names become labels unless
 //! local detail is requested ([`redact`]).
 //!
-//! sqlcmd makes no network call of its own. `mssql-tds` makes one connection
-//! attempt, as a normal run does (its name resolution, SQL Server Browser
-//! lookup, protocol order, TCP connects or pipe, TLS and login), through its
+//! sqlcmd makes no network call of its own, other than reading an access token
+//! file that is on a network share. `mssql-tds` makes one connection attempt,
+//! as a normal run does (its name resolution, SQL Server Browser lookup,
+//! protocol order, TCP connects or pipe, TLS and login), through its
 //! diagnostic entry point, which stops where the depth asks and also connects
 //! to the addresses after the one it uses. Its connect-stage spans
 //! ([`stages`]) are the evidence: the checks are read from them and from how
@@ -42,6 +43,7 @@
 
 pub mod driver;
 pub mod driver_text;
+pub mod entra;
 pub mod redact;
 pub mod report;
 pub mod stages;
@@ -67,6 +69,7 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 
 use crate::i18n;
+use crate::server_info::RawServerInfo;
 use redact::Category;
 use stages::{ConnectStagesOnly, Stage, StageRecorder, Step};
 use target::{Protocol, Target};
@@ -78,6 +81,11 @@ pub enum Authentication {
     SqlPassword { user: String, password: String },
     /// Windows authentication, or Kerberos off Windows (`-E`).
     Integrated,
+    /// Microsoft Entra password authentication (`-G` with `-U`).
+    EntraPassword { user: String, password: String },
+    /// A Microsoft Entra access token that sqlcmd reads from `file`, the `-P`
+    /// value (`-G -P` without `-U`).
+    EntraAccessToken { file: String },
 }
 
 fn own_connection_succeeded_skip() -> Skip {
@@ -97,6 +105,13 @@ impl std::fmt::Debug for Authentication {
                 .field("user", user)
                 .finish_non_exhaustive(),
             Authentication::Integrated => f.write_str("Integrated"),
+            Authentication::EntraPassword { user, .. } => f
+                .debug_struct("EntraPassword")
+                .field("user", user)
+                .finish_non_exhaustive(),
+            Authentication::EntraAccessToken { .. } => {
+                f.debug_struct("EntraAccessToken").finish_non_exhaustive()
+            }
         }
     }
 }
@@ -106,6 +121,34 @@ impl Authentication {
         match self {
             Authentication::SqlPassword { .. } => "SqlPassword",
             Authentication::Integrated => "Integrated",
+            Authentication::EntraPassword { .. } => "ActiveDirectoryPassword",
+            Authentication::EntraAccessToken { .. } => "ActiveDirectoryAccessToken",
+        }
+    }
+
+    /// The login name the method logs in with, when it has one.
+    pub fn user(&self) -> Option<&str> {
+        match self {
+            Authentication::SqlPassword { user, .. }
+            | Authentication::EntraPassword { user, .. } => Some(user),
+            _ => None,
+        }
+    }
+
+    /// Whether this is Microsoft Entra authentication (`-G`).
+    pub fn is_entra(&self) -> bool {
+        matches!(
+            self,
+            Authentication::EntraPassword { .. } | Authentication::EntraAccessToken { .. }
+        )
+    }
+
+    /// Forgets the password, which is only for logging in.
+    fn forget_password(&mut self) {
+        if let Authentication::SqlPassword { password, .. }
+        | Authentication::EntraPassword { password, .. } = self
+        {
+            *password = String::new();
         }
     }
 }
@@ -412,7 +455,7 @@ impl Request {
 /// The version of the diagnostic coverage matrix this implementation follows
 /// (`docs/diagnose-coverage.md`): which phases are checked, with which signals,
 /// and which coverage states each can report.
-pub const COVERAGE_MATRIX_VERSION: &str = "1.4";
+pub const COVERAGE_MATRIX_VERSION: &str = "1.5";
 
 /// The link to driver-tracing guidance for `sqlcmd diagnose`, given when the
 /// client's own evidence cannot explain a failure. It is a Microsoft FWLink so
@@ -792,6 +835,9 @@ pub enum Skip {
     NotApplicable(LocalizedText),
     /// The diagnosis was canceled before the check finished.
     Canceled,
+    /// sqlcmd diagnose cannot complete the check yet: it lacks what the check
+    /// needs, which the text names. The execution is partial.
+    NotSupported(LocalizedText),
 }
 
 /// The field of a check that names what the user must give before the checks
@@ -1627,6 +1673,12 @@ struct Diagnosis {
     /// sqlcmd's own words, from the catalog, for the error the connection
     /// attempt ended on when sqlcmd made it: its outer bound ran out.
     own_failure: Option<LocalizedText>,
+    /// The access token connection input read from the `-P` file
+    /// ([`Authentication::EntraAccessToken`]).
+    access_token: Option<entra::AccessToken>,
+    /// Whether the server asked for a Microsoft Entra token that a credential
+    /// provider would acquire, which diagnose does not.
+    token_request: entra::TokenRequest,
     limitations: Vec<LocalizedText>,
     status: ExecutionStatus,
     /// The server the diagnostic client connects to: as sqlcmd gives it to
@@ -1794,6 +1846,8 @@ impl Diagnosis {
             spn: None,
             transport: None,
             own_failure: None,
+            access_token: None,
+            token_request: entra::TokenRequest::default(),
             limitations: Vec::new(),
             status: ExecutionStatus::Completed,
             client_server: String::new(),
@@ -1965,7 +2019,7 @@ impl Diagnosis {
     /// nothing and connects to nothing itself. The depth sets where the
     /// attempt stops.
     async fn execute(&mut self) {
-        let Some(target) = self.connection_input() else {
+        let Some(target) = self.connection_input().await else {
             return;
         };
         if !self.wants(Depth::EndpointResolution) {
@@ -1993,7 +2047,12 @@ impl Diagnosis {
         if self.request.multi_subnet_failover && self.wants(Depth::NetworkReachability) {
             self.multi_subnet_failover_limitation(driver.is_some());
         }
-        let context = self.client_context();
+        let mut context = self.client_context();
+        // Only an attempt that logs in sends the token; one that stops before
+        // the login leaves it for the evidence login after sqlcmd's own driver.
+        if stop_after.is_none() {
+            self.hand_over_access_token(&mut context);
+        }
         let server = self.client_server.clone();
         let started = Instant::now();
         let attempt = bounded(
@@ -3800,6 +3859,12 @@ impl Diagnosis {
                         .push(Check::skipped(CheckId::SessionValidation, Skip::Canceled));
                 } else {
                     self.driver_session(&outcome, probe_midpoint_unix_ms);
+                    // After the check, whose timing comes from the callback, so
+                    // that telemetry cannot change what it reports. With
+                    // telemetry off there is no session and this does nothing.
+                    if let Some(raw) = driver_server_info(&outcome) {
+                        crate::telemetry::record_server_info(&raw);
+                    }
                 }
             }
             self.enrich_driver_check(driver_check, endpoint.as_ref())
@@ -3864,6 +3929,13 @@ impl Diagnosis {
         check.coverage = coverage;
         check.domain = Some(domain);
         self.authentication = Some(auth);
+        // SQL Server ending a Microsoft Entra login is its rejection, as the
+        // diagnostic client reports it when it makes the attempt.
+        if refused_login && server_refused && self.request.authentication.is_entra() {
+            check
+                .fields
+                .push(Field::plain("entraStage", "serverRejection"));
+        }
         // The driver's own words, as they are: the finding quoting them is
         // flagged for review.
         let error = LocalizedArg::localized_text("error", &first);
@@ -4020,12 +4092,10 @@ impl Diagnosis {
         let mut check = Check::new(CheckId::SessionValidation, Coverage::Passed);
         check.duration_ms = Some(outcome.query_ms);
         check.deadline_ms = Some(self.request.timeout_ms());
-        let edition = outcome
-            .cell(driver::column::ENGINE_EDITION)
-            .and_then(|e| e.trim().parse::<i32>().ok());
+        let edition = outcome.engine_edition();
         // Retries are the driver's own, which sqlcmd does not see.
-        session_fields(&mut check, !outcome.query_failed && edition.is_some(), None);
-        if outcome.query_failed || edition.is_none() {
+        session_fields(&mut check, edition.is_some(), None);
+        if edition.is_none() {
             let records = driver_records(outcome, CheckId::SessionValidation);
             let first = first_driver_message(outcome, CheckId::SessionValidation);
             // SQL Server's own error has its severity; the driver's own have
@@ -4117,7 +4187,8 @@ impl Diagnosis {
     /// already.
     async fn evidence_attempt(&mut self, target: &Target) -> Option<TdsClient> {
         self.recorder.clear();
-        let context = self.client_context();
+        let mut context = self.client_context();
+        self.hand_over_access_token(&mut context);
         let server = self.client_server.clone();
         let started = Instant::now();
         let attempt = bounded(
@@ -4164,7 +4235,7 @@ impl Diagnosis {
         }
     }
 
-    fn connection_input(&mut self) -> Option<Target> {
+    async fn connection_input(&mut self) -> Option<Target> {
         let started = Instant::now();
         if let Some(dsn) = self.request.dsn.clone() {
             match dsn.status {
@@ -4232,6 +4303,26 @@ impl Diagnosis {
                         database.clone(),
                         Category::Database,
                     ));
+                }
+                if let Authentication::EntraAccessToken { file } = &self.request.authentication {
+                    // Read on a thread of its own within the time limit: the
+                    // path may name a pipe no one writes to, or a share that
+                    // does not answer, and a cancel is seen meanwhile.
+                    let path = std::path::PathBuf::from(file);
+                    let read = within(self.request.timeout(), move || {
+                        entra::read_access_token(&path)
+                    })
+                    .await
+                    .unwrap_or(Err(entra::TokenFileError::TimedOut));
+                    check.duration_ms = Some(millis(started));
+                    check.deadline_ms = Some(self.request.timeout_ms());
+                    match read {
+                        Ok(token) => self.access_token = Some(token),
+                        Err(error) => {
+                            self.access_token_file_unusable(check, &error);
+                            return None;
+                        }
+                    }
                 }
                 if let Some(text) = self.multi_subnet_failover_refused(&target) {
                     // The client refuses the combination before any network
@@ -4437,6 +4528,93 @@ impl Diagnosis {
         );
     }
 
+    /// Connection input for an access token file (`-G -P`, without `-U`) that
+    /// sqlcmd could not send, or that was not read within the time limit:
+    /// there is no token to log in with, and the checks after connection
+    /// input are skipped. The file is not named: its path is the user's.
+    fn access_token_file_unusable(&mut self, mut check: Check, error: &entra::TokenFileError) {
+        let code = error.code();
+        // A file not read in time is not known to be wrong.
+        check.coverage = match error {
+            entra::TokenFileError::TimedOut => Coverage::Inconclusive,
+            _ => Coverage::Diagnosed,
+        };
+        check.fields.push(Field::plain("error", code));
+        check.domain = Some(Domain::specific("client.inputConfiguration"));
+        self.checks.push(check);
+        let mut record = ErrorRecord::new("sqlcmd", CheckId::ConnectionInput, "");
+        record.code = Some(code.to_string());
+        let (text, quotes) = match error {
+            entra::TokenFileError::NotFound(io) => {
+                record.os_error = io.raw_os_error();
+                (
+                    LocalizedText::new(
+                        "diagnose.finding.access_token_file_not_found",
+                        "The access token file given with -P was not found.",
+                        vec![],
+                    ),
+                    false,
+                )
+            }
+            entra::TokenFileError::Unreadable(io) => {
+                record.os_error = io.raw_os_error();
+                (
+                    LocalizedText::new(
+                        "diagnose.finding.access_token_file_unreadable",
+                        format!("The access token file given with -P could not be read: {io}"),
+                        vec![("error", io.to_string())],
+                    ),
+                    true,
+                )
+            }
+            entra::TokenFileError::TooLarge(size) => {
+                let max = entra::ACCESS_TOKEN_FILE_MAX;
+                (
+                    LocalizedText::new(
+                        "diagnose.finding.access_token_file_too_large",
+                        format!(
+                            "The access token file given with -P is {size} bytes, more than the {max} bytes sqlcmd reads."
+                        ),
+                        vec![("size", size.to_string()), ("max", max.to_string())],
+                    ),
+                    false,
+                )
+            }
+            entra::TokenFileError::NotUtf16 => (
+                LocalizedText::new(
+                    "diagnose.finding.access_token_file_not_utf16",
+                    "The access token file given with -P is not UTF-16LE text, the form in which sqlcmd passes the token to the driver.",
+                    vec![],
+                ),
+                false,
+            ),
+            entra::TokenFileError::TimedOut => {
+                let seconds = self.request.timeout().as_secs();
+                (
+                    LocalizedText::new(
+                        "diagnose.finding.access_token_file_time_limit",
+                        format!(
+                            "The access token file given with -P was not read within the {seconds} s time limit."
+                        ),
+                        vec![("seconds", seconds.to_string())],
+                    ),
+                    false,
+                )
+            }
+        };
+        record.message = text.clone();
+        self.errors.push(record);
+        if quotes {
+            self.quoting_finding(Certainty::Confirmed, CheckId::ConnectionInput, text);
+        } else {
+            self.finding(Certainty::Confirmed, CheckId::ConnectionInput, text);
+        }
+        self.skip_rest(
+            CheckId::ConnectionInput,
+            &Skip::BlockedBy(CheckId::ConnectionInput),
+        );
+    }
+
     /// A login given with `-U` (or `SQLCMDUSER`) is not used when the data
     /// source sets `Trusted_Connection=yes`: the driver then logs in with
     /// integrated authentication, as native sqlcmd resolved it.
@@ -4597,6 +4775,21 @@ impl Diagnosis {
             Authentication::Integrated => {
                 context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
             }
+            // The token itself goes only to an attempt that logs in
+            // (`hand_over_access_token`).
+            Authentication::EntraAccessToken { .. } => {
+                context.tds_authentication_method = TdsAuthenticationMethod::AccessToken;
+            }
+            // A credential provider would acquire the token: the client goes
+            // as far as the server's request for it. Neither the login nor its
+            // password is sent anywhere.
+            Authentication::EntraPassword { .. } => {
+                let method = TdsAuthenticationMethod::ActiveDirectoryPassword;
+                context
+                    .auth_method_map
+                    .insert(method.clone(), Box::new(self.token_request.clone()));
+                context.tds_authentication_method = method;
+            }
         }
         if let Some(database) = &request.database {
             context.database = database.clone();
@@ -4628,6 +4821,13 @@ impl Diagnosis {
             context.workstation_id = workstation.clone();
         }
         context
+    }
+
+    /// Moves the access token connection input read into `context`, for the
+    /// one attempt that logs in with it: moved, not copied, so the client holds
+    /// the only copy.
+    fn hand_over_access_token(&mut self, context: &mut ClientContext) {
+        context.access_token = self.access_token.take().map(entra::AccessToken::into_inner);
     }
 
     /// `-M` connects to every address at once; the diagnostic client
@@ -4746,6 +4946,11 @@ impl Diagnosis {
         };
 
         match (ended, client) {
+            // The server asked for a Microsoft Entra token, which diagnose
+            // does not acquire: the login was not evaluated.
+            (Ended::Failed(_), _) if self.token_request.made() => {
+                self.entra_login_not_evaluated(check);
+            }
             (Ended::Failed(error), _) => {
                 let failed_phase = failed_stage(&check.subphases, ended.timed_out());
                 let text = self.failure_text(error);
@@ -4762,6 +4967,16 @@ impl Diagnosis {
                 }
                 if let Some(category) = classified.tls_category {
                     check.fields.push(Field::plain("tlsFailure", category));
+                }
+                // The server ended a Microsoft Entra login: the stage the
+                // client can see is the server's rejection.
+                if self.request.authentication.is_entra()
+                    && classified.auth == AuthOutcome::Failed
+                    && matches!(error, Error::SqlServerError { .. })
+                {
+                    check
+                        .fields
+                        .push(Field::plain("entraStage", "serverRejection"));
                 }
                 let no_ticket_cache = check.field("kerberosTicketCache") == Some("notFound");
                 self.checks.push(check);
@@ -4837,6 +5052,49 @@ impl Diagnosis {
         }
     }
 
+    /// The connection attempt with a Microsoft Entra method that needs a
+    /// credential provider: the client went as far as the server's request
+    /// for a token, which diagnose does not acquire yet. The check keeps the
+    /// pre-login and TLS phases that passed and is skipped as not supported:
+    /// the login is not evaluated, and the execution is partial. When sqlcmd's
+    /// own driver made the connection attempt, it logged in itself and this
+    /// attempt is evidence only: the check gives its phases, and nothing else
+    /// about the run changes.
+    fn entra_login_not_evaluated(&mut self, mut check: Check) {
+        check
+            .subphases
+            .retain(|phase| phase.stage != Stage::Login && phase.ok == Some(true));
+        check.coverage = Coverage::Skipped;
+        check.skip = Some(Skip::NotSupported(LocalizedText::new(
+            "diagnose.skip.entra_token_not_acquired",
+            "sqlcmd diagnose does not acquire Microsoft Entra tokens yet",
+            vec![],
+        )));
+        self.checks.push(check);
+        if self.request.driver.is_some() {
+            return;
+        }
+        self.authentication = Some(AuthOutcome::NotEvaluated);
+        self.status = ExecutionStatus::Partial;
+        self.finding(
+            Certainty::Informational,
+            CheckId::ConnectionAttempt,
+            LocalizedText::new(
+                "diagnose.finding.entra_token_requested",
+                "The server asked for a Microsoft Entra token; the login was not evaluated.",
+                vec![],
+            ),
+        );
+        let method = self.request.authentication.name();
+        self.limitation_text(LocalizedText::new(
+            "diagnose.limitation.entra_token_not_acquired",
+            format!(
+                "sqlcmd diagnose does not acquire Microsoft Entra tokens yet: with {method} it checks the connection up to the server's request for a token, and the login is not evaluated."
+            ),
+            vec![("method", method.to_string())],
+        ));
+    }
+
     /// The client's side of Kerberos/SSPI: the SPN the attempt requested and,
     /// off Windows, whether a ticket cache exists. Windows keeps tickets in
     /// the logon session, which needs no cache. The cache may be on a slow
@@ -4906,13 +5164,22 @@ impl Diagnosis {
     async fn session_validation(&mut self, client: &mut TdsClient) {
         let mut check = Check::new(CheckId::SessionValidation, Coverage::Passed);
         check.deadline_ms = Some(self.request.timeout_ms());
+        // Decided before the clock starts: it validates the telemetry
+        // destination, which is not part of what this check measures.
+        let collect = crate::telemetry::enabled();
         let sent_unix_ms = unix_ms_now();
         let started = Instant::now();
-        let result = tokio::time::timeout(self.request.timeout(), session_probe(client)).await;
+        let result =
+            tokio::time::timeout(self.request.timeout(), session_probe(client, collect)).await;
         check.duration_ms = Some(millis(started));
         let received_unix_ms = unix_ms_now();
         let error = match result {
-            Ok(Ok(probe)) => {
+            Ok(Ok((probe, server_info))) => {
+                // After the timing is taken, so telemetry cannot skew the
+                // reported duration or the clock offset.
+                if let Some(raw) = server_info {
+                    crate::telemetry::record_server_info(&raw);
+                }
                 self.session_probed(check, &probe, sent_unix_ms, received_unix_ms);
                 return;
             }
@@ -5128,9 +5395,7 @@ impl Diagnosis {
     fn finish(mut self, start_unix_ms: u64, duration_ms: u64) -> Report {
         // The report describes the request; the password was only for logging
         // in, so it is not kept.
-        if let Authentication::SqlPassword { password, .. } = &mut self.request.authentication {
-            *password = String::new();
-        }
+        self.request.authentication.forget_password();
         // Checks in their order, whatever order the protocol order ran them in.
         self.checks.sort_by_key(|c| {
             CheckId::ORDER
@@ -5349,15 +5614,32 @@ struct SessionProbe {
 /// The minimal session operation: the engine edition and the server's UTC
 /// clock, in one query. The clock is read as days plus milliseconds, which
 /// every supported version can compute (`DATEDIFF_BIG` needs 2016).
-async fn session_probe(client: &mut TdsClient) -> Result<SessionProbe, Error> {
-    let mut result = client.execute(driver::DRIVER_QUERY.to_string(), ()).await?;
+///
+/// With `collect`, the server properties for usage telemetry ride in the same
+/// query, so they cost no round trip; they are returned for the caller to
+/// record, so that nothing about telemetry happens inside the timed query.
+/// Without it the query is [`driver::DRIVER_QUERY`], unchanged.
+async fn session_probe(
+    client: &mut TdsClient,
+    collect: bool,
+) -> Result<(SessionProbe, Option<RawServerInfo>), Error> {
+    let query = if collect {
+        driver::session_query_with(crate::server_info::EXTRA_COLUMNS)
+    } else {
+        driver::DRIVER_QUERY.to_string()
+    };
+    let mut result = client.execute(query, ()).await?;
     let mut probe = None;
+    let mut server_info = None;
     loop {
         match result {
             StatementResult::Rows => {
                 while let Some(row) = client.next_row().await? {
                     if probe.is_none() {
                         probe = probe_from_row(&row);
+                        if collect {
+                            server_info = raw_server_info_from_row(&row);
+                        }
                     }
                 }
             }
@@ -5366,8 +5648,54 @@ async fn session_probe(client: &mut TdsClient) -> Result<SessionProbe, Error> {
         }
         result = client.advance().await?;
     }
-    probe.ok_or_else(|| {
+    let probe = probe.ok_or_else(|| {
         Error::ProtocolError("the session validation query returned no row".to_string())
+    })?;
+    Ok((probe, server_info))
+}
+
+/// The text of a string column, or `None` for `NULL` or another type.
+fn text_column(value: Option<&ColumnValues>) -> Option<String> {
+    match value {
+        Some(ColumnValues::String(text)) => Some(text.to_utf8_string()),
+        _ => None,
+    }
+}
+
+/// The columns before the telemetry ones: the engine edition and the two clock
+/// columns. The columns `server_info::EXTRA_COLUMNS` adds follow them, in the
+/// order of `RawServerInfo`: version, OS, architecture.
+const SESSION_PROBE_COLUMNS: usize = 3;
+
+/// The server properties that follow the probe's own columns, or `None` for a
+/// row without an engine edition. A `NULL` column, as for the OS and
+/// architecture on Azure SQL Database, is an absent value.
+fn raw_server_info_from_row(row: &[ColumnValues]) -> Option<RawServerInfo> {
+    let Some(ColumnValues::Int(edition)) = row.first() else {
+        return None;
+    };
+    Some(RawServerInfo {
+        engine_edition: *edition,
+        product_version: text_column(row.get(SESSION_PROBE_COLUMNS)),
+        os: text_column(row.get(SESSION_PROBE_COLUMNS + 1)),
+        arch: text_column(row.get(SESSION_PROBE_COLUMNS + 2)),
+    })
+}
+
+/// The server properties from the row of sqlcmd's own driver query, for usage
+/// telemetry, or `None` when the query failed or gave no engine edition. Only
+/// the engine edition is reported. The row has no operating system or
+/// architecture, so those are absent, as for Azure SQL Database. The version in
+/// it is native sqlcmd's own form (`SQL_DBMS_VER`, `17.00.4085`), not the
+/// `ProductVersion` the other paths report, so it is left out rather than send
+/// two values for one version. The columns of `server_info::EXTRA_COLUMNS` are
+/// deliberately not appended to the callback's query: native's own columns sit
+/// at the fixed indices of `driver::column`, so they would be read as the
+/// transport and the server name.
+fn driver_server_info(outcome: &driver::DriverOutcome) -> Option<RawServerInfo> {
+    Some(RawServerInfo {
+        engine_edition: outcome.engine_edition()?,
+        ..RawServerInfo::default()
     })
 }
 
@@ -5601,6 +5929,9 @@ fn authentication_domain(authentication: &Authentication) -> &'static str {
         Authentication::SqlPassword { .. } => "security.authentication.sql",
         Authentication::Integrated if cfg!(windows) => "security.authentication.windows",
         Authentication::Integrated => "security.authentication.kerberos",
+        Authentication::EntraPassword { .. } | Authentication::EntraAccessToken { .. } => {
+            "security.authentication.entra"
+        }
     }
 }
 
@@ -8035,7 +8366,7 @@ pub(crate) mod tests {
             let mut input = request("tcp:127.0.0.1,1433", Depth::SessionValidation);
             input.authentication = Authentication::Integrated;
             let mut diagnosis = Diagnosis::new(input);
-            let target = diagnosis.connection_input().unwrap();
+            let target = self::input(&mut diagnosis).unwrap();
             diagnosis.ticket_cache = Some(delayed_cache);
             let mut outcome = driver_failure("28000", 18456, "Login failed");
             if connected {
@@ -8098,7 +8429,7 @@ pub(crate) mod tests {
         for transport in ["Session", "unrecognized"] {
             let mut diagnosis =
                 Diagnosis::new(request("tcp:127.0.0.1,1", Depth::SessionValidation));
-            let target = diagnosis.connection_input().unwrap();
+            let target = input(&mut diagnosis).unwrap();
             diagnosis
                 .checks
                 .push(Check::new(CheckId::TcpConnect, Coverage::Diagnosed));
@@ -8129,7 +8460,7 @@ pub(crate) mod tests {
     fn signed_driver_native_errors_round_trip_without_a_server_number() {
         let outcome = driver_failure("08001", -2146893019, "TLS error");
         let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::ConnectionAttempt));
-        diagnosis.connection_input().unwrap();
+        input(&mut diagnosis).unwrap();
         diagnosis
             .errors
             .extend(driver_records(&outcome, CheckId::ConnectionAttempt));
@@ -8143,7 +8474,7 @@ pub(crate) mod tests {
     #[test]
     fn post_probe_callback_delay_is_not_clock_skew() {
         let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::SessionValidation));
-        let target = diagnosis.connection_input().unwrap();
+        let target = input(&mut diagnosis).unwrap();
         let hook = driver::DriverHook::new(|_, _| {
             let server_ms = unix_ms_now();
             std::thread::sleep(Duration::from_millis(400));
@@ -8174,7 +8505,7 @@ pub(crate) mod tests {
     #[test]
     fn driver_preparation_does_not_leave_prerequisites_blocked_by_its_result() {
         let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::ConnectionAttempt));
-        diagnosis.connection_input().unwrap();
+        input(&mut diagnosis).unwrap();
         for id in [
             CheckId::NameResolution,
             CheckId::InstanceResolution,
@@ -9661,13 +9992,22 @@ pub(crate) mod tests {
         observe_ended(diagnosis, stages, &ended, 10)
     }
 
+    /// [`Diagnosis::connection_input`], run to completion.
+    fn input(diagnosis: &mut Diagnosis) -> Option<Target> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(diagnosis.connection_input())
+    }
+
     fn observe_ended(
         mut diagnosis: Diagnosis,
         stages: Stages,
         ended: &Ended,
         attempt_ms: u64,
     ) -> Report {
-        let target = diagnosis.connection_input().unwrap();
+        let target = input(&mut diagnosis).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -11500,7 +11840,7 @@ pub(crate) mod tests {
     fn canceled_with(request: Request, stages: Stages) -> Report {
         let mut diagnosis = Diagnosis::new(request);
         diagnosis.windows = true;
-        diagnosis.connection_input().unwrap();
+        input(&mut diagnosis).unwrap();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -13517,7 +13857,7 @@ pub(crate) mod tests {
     fn a_failed_session_query_is_flagged_for_review() {
         let failed = |error: Option<Error>| {
             let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::SessionValidation));
-            diagnosis.connection_input().unwrap();
+            input(&mut diagnosis).unwrap();
             diagnosis.session_failed(
                 Check::new(CheckId::SessionValidation, Coverage::Passed),
                 error,
@@ -13582,6 +13922,183 @@ pub(crate) mod tests {
         assert_eq!(probe_from_row(&[ColumnValues::Null]), None);
         assert_eq!(probe_from_row(&[]), None);
     }
+
+    fn text(value: &str) -> ColumnValues {
+        ColumnValues::String(
+            mssql_tds::datatypes::sql_string::SqlString::from_utf8_string(value.to_string()),
+        )
+    }
+
+    /// The telemetry columns are read from where `EXTRA_COLUMNS` puts them: after
+    /// the probe's three, as version, OS and architecture.
+    #[test]
+    fn the_server_properties_are_read_from_the_columns_after_the_probes() {
+        let row = [
+            ColumnValues::Int(2),
+            ColumnValues::Int(20_000),
+            ColumnValues::Int(3_723_456),
+            text("17.0.5015.4"),
+            text("windows"),
+            text("x64"),
+        ];
+        assert_eq!(
+            raw_server_info_from_row(&row),
+            Some(RawServerInfo {
+                engine_edition: 2,
+                product_version: Some("17.0.5015.4".to_string()),
+                os: Some("windows".to_string()),
+                arch: Some("x64".to_string()),
+            })
+        );
+        // The same row selects the probe's own columns unchanged.
+        assert_eq!(
+            probe_from_row(&row).map(|probe| probe.engine_edition),
+            Some(2)
+        );
+    }
+
+    /// Azure SQL Database has no OS or architecture in `@@VERSION`, so they are
+    /// `NULL` and come out absent while the rest is kept.
+    #[test]
+    fn null_os_and_architecture_are_absent_values() {
+        let row = [
+            ColumnValues::Int(5),
+            ColumnValues::Int(20_000),
+            ColumnValues::Int(1),
+            text("12.0.2000.8"),
+            ColumnValues::Null,
+            ColumnValues::Null,
+        ];
+        assert_eq!(
+            raw_server_info_from_row(&row),
+            Some(RawServerInfo {
+                engine_edition: 5,
+                product_version: Some("12.0.2000.8".to_string()),
+                os: None,
+                arch: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_row_without_an_edition_or_telemetry_columns_gives_no_properties_it_cannot_read() {
+        assert_eq!(raw_server_info_from_row(&[]), None);
+        assert_eq!(raw_server_info_from_row(&[ColumnValues::Null]), None);
+        // A probe row without the extra columns (telemetry off) has none to read.
+        assert_eq!(
+            raw_server_info_from_row(&[
+                ColumnValues::Int(2),
+                ColumnValues::Int(20_000),
+                ColumnValues::Int(1),
+            ]),
+            Some(RawServerInfo {
+                engine_edition: 2,
+                ..RawServerInfo::default()
+            })
+        );
+        // A string where a number is expected is not an edition.
+        assert_eq!(raw_server_info_from_row(&[text("2")]), None);
+    }
+
+    /// Native sqlcmd's own driver query gives the edition; the version native
+    /// appends is its own form (`SQL_DBMS_VER`), not `ProductVersion`, so only
+    /// the edition is reported, whatever version is there.
+    #[test]
+    fn the_drivers_row_gives_only_the_edition() {
+        let outcome = |row: Vec<Option<String>>, query_failed: bool| driver::DriverOutcome {
+            connected: true,
+            query_failed,
+            row,
+            ..driver::DriverOutcome::default()
+        };
+        let edition_only = Some(RawServerInfo {
+            engine_edition: 2,
+            ..RawServerInfo::default()
+        });
+        // With a version in either form, with none, and with the version NULL.
+        assert_eq!(
+            driver_server_info(&outcome(driver_row("TCP"), false)),
+            edition_only
+        );
+        let mut dbms_ver = driver_row("TCP");
+        dbms_ver[driver::column::VERSION] = Some("17.00.4085".to_string());
+        assert_eq!(driver_server_info(&outcome(dbms_ver, false)), edition_only);
+        let mut short = driver_row("TCP");
+        short.truncate(driver::column::VERSION);
+        assert_eq!(driver_server_info(&outcome(short, false)), edition_only);
+        let mut null_version = driver_row("TCP");
+        null_version[driver::column::VERSION] = None;
+        assert_eq!(
+            driver_server_info(&outcome(null_version, false)),
+            edition_only
+        );
+        // A failed query, no row, or an edition that is not a number gives none.
+        assert_eq!(driver_server_info(&outcome(driver_row("TCP"), true)), None);
+        assert_eq!(driver_server_info(&outcome(Vec::new(), false)), None);
+        let mut garbled = driver_row("TCP");
+        garbled[driver::column::ENGINE_EDITION] = Some("two".to_string());
+        assert_eq!(driver_server_info(&outcome(garbled, false)), None);
+        let mut missing = driver_row("TCP");
+        missing[driver::column::ENGINE_EDITION] = None;
+        assert_eq!(driver_server_info(&outcome(missing, false)), None);
+    }
+
+    /// Through sqlcmd's own driver the diagnostic connection stops at the
+    /// transport, so session validation does not run and the driver's row is
+    /// the only place the server's properties are read. With telemetry on the
+    /// edition is recorded from it, and the event goes out with it. The version
+    /// native appends is its own form (`SQL_DBMS_VER`) and is not sent.
+    #[test]
+    fn a_connected_run_through_the_driver_reports_the_edition_only() {
+        use crate::telemetry::tests::{TEST_CONNECTION_STRING, TestEnv, event_properties};
+        use crate::telemetry::{Command, FlushOutcome, FormatUse, Invocation};
+
+        let mut dbms_ver_row = driver_row("TCP");
+        dbms_ver_row[driver::column::VERSION] = Some("17.00.4085".to_string());
+        for (query_failed, row) in [(false, dbms_ver_row), (true, Vec::new())] {
+            let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
+            let requests = guard.capture_requests();
+            crate::telemetry::record_usage(Invocation {
+                version: Some("18.5"),
+                command: Command::Diagnose,
+                format: FormatUse::Json,
+            });
+            let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::SessionValidation));
+            let target = input(&mut diagnosis).unwrap();
+            let (hook, _) = fake_driver(driver::DriverOutcome {
+                connected: true,
+                query_failed,
+                row,
+                ..driver::DriverOutcome::default()
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(diagnosis.driver_attempt(hook, &target, None));
+
+            assert_eq!(
+                crate::telemetry::shutdown(Duration::from_secs(1)),
+                FlushOutcome::Completed,
+                "{query_failed}"
+            );
+            let properties = event_properties(&requests.try_recv().expect("one request"));
+            assert_eq!(
+                properties.contains_key("sqlcmdcli_engine_edition"),
+                !query_failed
+            );
+            if !query_failed {
+                assert_eq!(properties["sqlcmdcli_engine_edition"], "2");
+            }
+            // Neither the version in native's form, nor the OS or architecture
+            // the row does not have.
+            assert!(!properties.contains_key("sqlcmdcli_server_version"));
+            assert!(!properties.contains_key("sqlcmdcli_server_os"));
+            assert!(!properties.contains_key("sqlcmdcli_server_platform"));
+            assert!(requests.try_recv().is_err(), "one event only");
+        }
+    }
+
     /// How a failed session query is classified: SQL Server's own error is
     /// diagnosed and about the server; a timeout, the network or the client
     /// leaves it inconclusive with the area undetermined, as for the
@@ -13590,7 +14107,7 @@ pub(crate) mod tests {
     fn a_failed_session_query_is_classified_by_its_error() {
         let failed = |error: Option<Error>| {
             let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::SessionValidation));
-            diagnosis.connection_input().unwrap();
+            input(&mut diagnosis).unwrap();
             diagnosis.session_failed(
                 Check::new(CheckId::SessionValidation, Coverage::Passed),
                 error,
@@ -13696,7 +14213,7 @@ pub(crate) mod tests {
             status: DsnStatus::Found,
         });
         let mut diagnosis = Diagnosis::new(from_dsn);
-        let target = diagnosis.connection_input().unwrap();
+        let target = input(&mut diagnosis).unwrap();
         assert_ne!(target.protocol, Protocol::Admin);
         assert_eq!(diagnosis.client_server, "127.0.0.1");
         let report = diagnosis.finish(0, 0);
@@ -13715,7 +14232,7 @@ pub(crate) mod tests {
             msf.multi_subnet_failover = true;
             let mut diagnosis = Diagnosis::new(msf);
             diagnosis.windows = windows;
-            let target = diagnosis.connection_input().unwrap();
+            let target = input(&mut diagnosis).unwrap();
             assert_eq!(target.protocol, Protocol::Tcp);
             assert_eq!(diagnosis.client_server, "tcp:db01");
             assert_eq!(diagnosis.checks[0].field("protocol"), Some("tcp"));
@@ -13723,12 +14240,12 @@ pub(crate) mod tests {
         let mut msf = request("tcp:db01,1433", Depth::ConnectionInput);
         msf.multi_subnet_failover = true;
         let mut diagnosis = Diagnosis::new(msf);
-        diagnosis.connection_input().unwrap();
+        input(&mut diagnosis).unwrap();
         assert_eq!(diagnosis.client_server, "tcp:db01,1433");
         // Without -M the protocol order is the client's.
         let mut diagnosis = Diagnosis::new(request(" db01 ", Depth::ConnectionInput));
         diagnosis.windows = true;
-        diagnosis.connection_input().unwrap();
+        input(&mut diagnosis).unwrap();
         assert_eq!(diagnosis.client_server, "db01");
         assert_eq!(diagnosis.checks[0].field("protocol"), Some("auto"));
     }
@@ -14012,7 +14529,7 @@ pub(crate) mod tests {
     /// Session validation that failed with `error`, as reported.
     fn session_failed_with(error: Error) -> Report {
         let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::SessionValidation));
-        diagnosis.connection_input().unwrap();
+        input(&mut diagnosis).unwrap();
         diagnosis.session_failed(
             Check::new(CheckId::SessionValidation, Coverage::Passed),
             Some(error),
@@ -14197,7 +14714,7 @@ pub(crate) mod tests {
         );
 
         let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::SessionValidation));
-        diagnosis.connection_input().unwrap();
+        input(&mut diagnosis).unwrap();
         diagnosis.session_probed(
             Check::new(CheckId::SessionValidation, Coverage::Passed),
             &SessionProbe {
@@ -14237,7 +14754,7 @@ pub(crate) mod tests {
         );
         outcome.connect_record_count = 1;
         let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::SessionValidation));
-        diagnosis.connection_input().unwrap();
+        input(&mut diagnosis).unwrap();
         diagnosis.driver_session(&outcome, unix_ms_now());
         let report = diagnosis.finish(0, 0);
         assert_eq!(report.errors.len(), 1);
@@ -14248,7 +14765,7 @@ pub(crate) mod tests {
         outcome.records[1].severity = None;
         outcome.records[1].sql_state = "08S01".to_string();
         let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::SessionValidation));
-        diagnosis.connection_input().unwrap();
+        input(&mut diagnosis).unwrap();
         diagnosis.driver_session(&outcome, unix_ms_now());
         assert_eq!(
             checked(&diagnosis.finish(0, 0), CheckId::SessionValidation).coverage,
@@ -14263,7 +14780,7 @@ pub(crate) mod tests {
     fn a_driver_session_query_failure_is_classified_by_its_records() {
         let session = |outcome: driver::DriverOutcome| {
             let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::SessionValidation));
-            diagnosis.connection_input().unwrap();
+            input(&mut diagnosis).unwrap();
             diagnosis.driver_session(&outcome, unix_ms_now());
             diagnosis.finish(0, 0)
         };
@@ -14417,7 +14934,7 @@ pub(crate) mod tests {
             .build()
             .unwrap();
         runtime.block_on(async move {
-            diagnosis.connection_input().unwrap();
+            diagnosis.connection_input().await.unwrap();
             let server = diagnosis.client_server.clone();
             let provider = TdsConnectionProvider::new();
             let mut session = provider
@@ -14486,5 +15003,601 @@ pub(crate) mod tests {
                 "{report:#?}"
             );
         });
+    }
+
+    fn entra_password() -> Authentication {
+        Authentication::EntraPassword {
+            user: "alice@contoso.com".to_string(),
+            password: "Sentinel-Pa55word".to_string(),
+        }
+    }
+
+    fn entra_access_token(file: &entra::testing::TempFile) -> Authentication {
+        Authentication::EntraAccessToken {
+            file: file.0.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// Microsoft Entra authentication (`-G`): each method sqlcmd selects, as
+    /// it names it in `--format json`, from `-G`, without its password or
+    /// token file.
+    #[test]
+    fn entra_methods_are_named_as_sqlcmd_names_them() {
+        let token = entra::testing::file_with(&entra::testing::utf16le("token"));
+        let token_name = token.0.file_name().unwrap().to_string_lossy().into_owned();
+        let cases = [
+            (
+                entra_password(),
+                "ActiveDirectoryPassword",
+                Some("alice@contoso.com"),
+            ),
+            (
+                entra_access_token(&token),
+                "ActiveDirectoryAccessToken",
+                None,
+            ),
+        ];
+        for (authentication, name, user) in cases {
+            assert!(authentication.is_entra());
+            assert_eq!(authentication.name(), name);
+            assert_eq!(authentication.user(), user);
+            assert!(!format!("{authentication:?}").contains("Sentinel"));
+            assert!(!format!("{authentication:?}").contains(&token_name));
+            let mut entra = request("tcp:db01.database.windows.net,1433", Depth::ConnectionInput);
+            entra.authentication = authentication;
+            entra.sources.authentication = Some(SettingOrigin::command_line("-G"));
+            let report = run(entra);
+            assert_eq!(report.checks[0].coverage, Coverage::Passed, "{name}");
+            assert_eq!(report.exit_code(), 0, "{name}");
+            let text = report::text(&report);
+            let login = match user {
+                Some(_) => format!("{name} login user-1;"),
+                None => format!("{name} login;"),
+            };
+            assert!(text.contains(&login), "{text}");
+            assert!(text.contains("authentication from -G"), "{text}");
+            let json = report::json(&report, "18.7.0001.1").unwrap();
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(value["target"]["authentication"], name, "{json}");
+            for rendered in [&text, &json] {
+                assert!(!rendered.contains("Sentinel"), "{rendered}");
+                assert!(!rendered.contains(&token_name), "{rendered}");
+            }
+        }
+        assert!(!sql_login().is_entra());
+        assert!(!Authentication::Integrated.is_entra());
+    }
+
+    /// An access token file sqlcmd could not send is a connection input
+    /// issue: nothing after connection input runs, and the file is not
+    /// named.
+    #[test]
+    fn an_access_token_file_sqlcmd_cannot_send_is_a_connection_input_issue() {
+        let odd = entra::testing::file_with(b"abc");
+        let max = usize::try_from(entra::ACCESS_TOKEN_FILE_MAX).unwrap();
+        let large = entra::testing::file_with(&vec![0x41; max + 2]);
+        let missing = std::env::temp_dir().join("mssql-sqlcmd-no-such-token-file");
+        // A directory is a file sqlcmd cannot read.
+        let directory = entra::testing::directory();
+        let cases = [
+            (
+                missing,
+                "accessTokenFileNotFound",
+                "The access token file given with -P was not found.",
+            ),
+            (
+                odd.0.clone(),
+                "accessTokenFileNotUtf16",
+                "The access token file given with -P is not UTF-16LE text, the form in which \
+                 sqlcmd passes the token to the driver.",
+            ),
+            (
+                large.0.clone(),
+                "accessTokenFileTooLarge",
+                "The access token file given with -P is 1048578 bytes, more than the 1048576 \
+                 bytes sqlcmd reads.",
+            ),
+            (
+                directory.0.clone(),
+                "accessTokenFileUnreadable",
+                "The access token file given with -P could not be read: ",
+            ),
+        ];
+        for (file, code, finding) in cases {
+            let mut entra = request("tcp:db01,1433", Depth::SessionValidation);
+            entra.authentication = Authentication::EntraAccessToken {
+                file: file.to_string_lossy().into_owned(),
+            };
+            let report = run(entra);
+            assert_eq!(report.checks[0].id, CheckId::ConnectionInput);
+            assert_eq!(report.checks[0].coverage, Coverage::Diagnosed, "{code}");
+            assert_eq!(report.checks[0].field("error"), Some(code));
+            assert_eq!(
+                report.checks[0].domain,
+                Some(Domain::specific("client.inputConfiguration"))
+            );
+            assert!(report.checks.len() > 1);
+            assert!(
+                report.checks[1..]
+                    .iter()
+                    .all(|c| c.skip == Some(Skip::BlockedBy(CheckId::ConnectionInput))),
+                "{code}: {:#?}",
+                report.checks
+            );
+            assert_eq!(report.errors.len(), 1, "{:#?}", report.errors);
+            assert_eq!(report.errors[0].code.as_deref(), Some(code));
+            let rendered = report.findings[0].text.render("en-US");
+            assert!(rendered.starts_with(finding), "{rendered}");
+            assert_eq!(report.exit_code(), 1, "{code}");
+            let name = file.file_name().unwrap().to_string_lossy().into_owned();
+            let json = report::json(&report, "v").unwrap();
+            assert!(!json.contains(&name), "{json}");
+            assert!(!report::text(&report).contains(&name));
+        }
+    }
+
+    /// [`run_until`] on a thread of its own, canceled once `cancel_after` has
+    /// passed: the report and the time it took. A run that blocks fails the
+    /// test after ten seconds instead of hanging it.
+    #[cfg(unix)]
+    fn run_on_a_thread(request: Request, cancel_after: Option<Duration>) -> (Report, Duration) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let report = run_until(request, &|| {
+                cancel_after.is_some_and(|after| started.elapsed() > after)
+            });
+            let _ = sender.send((report, started.elapsed()));
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the run did not end within 10 s")
+    }
+
+    /// An access token file that does not give its token (here a pipe no one
+    /// writes to; or a share that does not answer) gets the check's time
+    /// limit, which its time counts: connection input is inconclusive, and
+    /// nothing after it runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_token_file_that_does_not_answer_gets_the_time_limit() {
+        let fifo = entra::testing::Fifo::new();
+        let mut entra = request("tcp:db01,1433", Depth::SessionValidation);
+        entra.authentication = Authentication::EntraAccessToken {
+            file: fifo.0.to_string_lossy().into_owned(),
+        };
+        entra.login_timeout_seconds = 1;
+        let (report, took) = run_on_a_thread(entra, None);
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        let input = checked(&report, CheckId::ConnectionInput);
+        assert_eq!(input.coverage, Coverage::Inconclusive, "{report:#?}");
+        assert_eq!(input.field("error"), Some("accessTokenFileTimedOut"));
+        assert_eq!(input.deadline_ms, Some(1000));
+        assert!(input.duration_ms.is_some_and(|ms| ms >= 1000), "{input:#?}");
+        assert!(
+            report.checks[1..]
+                .iter()
+                .all(|c| c.skip == Some(Skip::BlockedBy(CheckId::ConnectionInput))),
+            "{:#?}",
+            report.checks
+        );
+        assert_eq!(
+            report.findings[0].text.render("en-US"),
+            "The access token file given with -P was not read within the 1 s time limit."
+        );
+        assert_eq!(
+            report.errors[0].code.as_deref(),
+            Some("accessTokenFileTimedOut")
+        );
+        assert_eq!(report.outcome, DiagnosticOutcome::Inconclusive);
+        assert_eq!(report.exit_code(), 2);
+        let name = fifo.0.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(!report::json(&report, "v").unwrap().contains(&name));
+    }
+
+    /// A cancel is seen while the access token file is read.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancel_is_seen_while_the_token_file_is_read() {
+        let fifo = entra::testing::Fifo::new();
+        let mut entra = request("tcp:db01,1433", Depth::SessionValidation);
+        entra.authentication = Authentication::EntraAccessToken {
+            file: fifo.0.to_string_lossy().into_owned(),
+        };
+        entra.login_timeout_seconds = 60;
+        let (report, took) = run_on_a_thread(entra, Some(Duration::from_millis(200)));
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        assert_eq!(report.execution_status, ExecutionStatus::Canceled);
+        assert_eq!(
+            checked(&report, CheckId::ConnectionInput).skip,
+            Some(Skip::Canceled),
+            "{report:#?}"
+        );
+        assert_eq!(report.exit_code(), 4);
+    }
+
+    fn entra_attempt_stages() -> Stages {
+        Stages::new()
+            .add(
+                Stage::Dns,
+                Some(true),
+                0,
+                1,
+                &[
+                    (cs::HOST, "db01.database.windows.net"),
+                    (cs::ADDRESSES, "10.0.0.1"),
+                ],
+            )
+            .add(
+                Stage::Tcp,
+                Some(true),
+                1,
+                2,
+                &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1433")],
+            )
+            .add(Stage::Prelogin, Some(true), 2, 3, &[])
+            .add(Stage::Tls, Some(true), 3, 5, &[])
+            .add(Stage::Login, Some(false), 5, 6, &[])
+    }
+
+    /// The server ending a Microsoft Entra login is its rejection: the stage
+    /// the client can see. A database the server would not open after the
+    /// login is not.
+    #[test]
+    fn a_server_that_ends_an_entra_login_rejects_it() {
+        let mut entra = request(
+            "tcp:db01.database.windows.net,1433",
+            Depth::ConnectionAttempt,
+        );
+        entra.authentication = entra_password();
+        let report = observed(
+            entra.clone(),
+            entra_attempt_stages(),
+            Ended::Failed(server_error(
+                18456,
+                "Login failed for user '<token-identified principal>'.",
+            )),
+        );
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.coverage, Coverage::Diagnosed);
+        assert_eq!(
+            attempt.domain,
+            Some(Domain::specific("security.authentication.entra"))
+        );
+        assert_eq!(attempt.field("entraStage"), Some("serverRejection"));
+        assert_eq!(report.authentication, Some(AuthOutcome::Failed));
+        assert_eq!(report.exit_code(), 1);
+
+        let report = observed(
+            entra,
+            entra_attempt_stages(),
+            Ended::Failed(server_error(
+                4060,
+                "Cannot open database \"sales\" requested by the login.",
+            )),
+        );
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.field("entraStage"), None);
+        assert_eq!(report.authentication, Some(AuthOutcome::Succeeded));
+    }
+
+    /// With sqlcmd's own driver connection, SQL Server ending a Microsoft Entra
+    /// login is its rejection too, for either method; the same refusal of a SQL
+    /// login is not an Entra stage.
+    #[test]
+    fn with_sqlcmds_driver_a_server_that_ends_an_entra_login_rejects_it() {
+        const TOKEN: &str = "eyJ0eXAiOiJKV1QifQ.eyJhdWQiOiJzcWwifQ.Sentinel-signature";
+        let file = entra::testing::file_with(&entra::testing::utf16le(TOKEN));
+        let (_listener, server) = silent_listener();
+        let refused = || {
+            driver_failure(
+                "28000",
+                18456,
+                "Login failed for user '<token-identified principal>'.",
+            )
+        };
+        for authentication in [entra_password(), entra_access_token(&file)] {
+            let (hook, _) = fake_driver(refused());
+            let mut request = request(&server, Depth::ConnectionAttempt);
+            request.authentication = authentication;
+            request.driver = Some(hook);
+            let report = run(request);
+            let attempt = checked(&report, CheckId::ConnectionAttempt);
+            assert_eq!(attempt.coverage, Coverage::Diagnosed, "{report:#?}");
+            assert_eq!(
+                attempt.domain,
+                Some(Domain::specific("security.authentication.entra"))
+            );
+            assert_eq!(attempt.field("entraStage"), Some("serverRejection"));
+            assert_eq!(report.authentication, Some(AuthOutcome::Failed));
+        }
+        let (hook, _) = fake_driver(refused());
+        let mut sql = request(&server, Depth::ConnectionAttempt);
+        sql.driver = Some(hook);
+        let report = run(sql);
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.field("entraStage"), None);
+    }
+
+    /// When the server asked for a token diagnose does not acquire, the
+    /// connection attempt keeps the phases it went through and says why it
+    /// stopped there.
+    #[test]
+    fn a_token_request_keeps_the_phases_the_attempt_went_through() {
+        let mut entra = request(
+            "tcp:db01.database.windows.net,1433",
+            Depth::SessionValidation,
+        );
+        entra.authentication = entra_password();
+        let report = observed_with(
+            entra,
+            entra_attempt_stages(),
+            Ended::Failed(Error::UsageError("no token".to_string())),
+            |diagnosis| diagnosis.token_request = entra::TokenRequest::already_made(),
+        );
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.coverage, Coverage::Skipped);
+        let phases: Vec<Stage> = attempt.subphases.iter().map(|p| p.stage).collect();
+        assert_eq!(phases, [Stage::Prelogin, Stage::Tls]);
+        assert_eq!(
+            checked(&report, CheckId::SessionValidation).skip,
+            Some(Skip::BlockedBy(CheckId::ConnectionAttempt))
+        );
+        let text = report::text(&report);
+        assert!(
+            text.contains(
+                "pre-login 1 ms, TLS 2 ms; sqlcmd diagnose does not acquire Microsoft Entra tokens yet"
+            ),
+            "{text}"
+        );
+        assert!(report.errors.is_empty(), "{:#?}", report.errors);
+    }
+
+    /// A mock TDS server on its own thread, which answers a Microsoft Entra
+    /// login with the token it carries, or else asks for one. It has no TLS:
+    /// requests to it encrypt only if the server requires it (`-No`).
+    struct EntraServer {
+        port: u16,
+        store: std::sync::Arc<tokio::sync::Mutex<mssql_mock_tds::ConnectionStore>>,
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl EntraServer {
+        fn start() -> Self {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let thread = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let server = mssql_mock_tds::MockTdsServer::new("127.0.0.1:0")
+                        .await
+                        .unwrap();
+                    ready_tx
+                        .send((server.local_addr().port(), server.connection_store()))
+                        .unwrap();
+                    let _ = server.run_with_shutdown(shutdown_rx).await;
+                });
+            });
+            let (port, store) = ready_rx.recv().unwrap();
+            Self {
+                port,
+                store,
+                shutdown: Some(shutdown_tx),
+                thread: Some(thread),
+            }
+        }
+
+        fn request(&self, depth: Depth, authentication: Authentication) -> Request {
+            let mut entra = request(&format!("tcp:127.0.0.1,{}", self.port), depth);
+            entra.encrypt = Encrypt::Optional;
+            entra.authentication = authentication;
+            entra
+        }
+
+        /// The logins the server recorded, once there are `count` of them.
+        fn logins(&self, count: usize) -> Vec<mssql_mock_tds::ConnectionInfo> {
+            for _ in 0..100 {
+                let logins: Vec<_> = self.store.blocking_lock().all().values().cloned().collect();
+                if logins.len() >= count {
+                    return logins;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("the server did not record {count} logins");
+        }
+    }
+
+    impl Drop for EntraServer {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// An access token is sent as sqlcmd sends it, the token file's bytes,
+    /// and is never shown.
+    #[test]
+    fn an_access_token_is_sent_as_sqlcmd_sends_it_and_never_shown() {
+        const TOKEN: &str = "eyJ0eXAiOiJKV1QifQ.eyJhdWQiOiJzcWwifQ.Sentinel-signature";
+        let file = entra::testing::file_with(&entra::testing::utf16le(TOKEN));
+        let server = EntraServer::start();
+        let report = run(server.request(Depth::ConnectionAttempt, entra_access_token(&file)));
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.coverage, Coverage::Passed, "{:#?}", report.checks);
+        assert_eq!(report.authentication, Some(AuthOutcome::Succeeded));
+        assert_eq!(report.exit_code(), 0);
+        let logins = server.logins(1);
+        assert_eq!(
+            logins[0].received_token.as_deref(),
+            Some(std::fs::read(&file.0).unwrap().as_slice())
+        );
+        let text = report::text(&report);
+        let json = report::json(&report, "v").unwrap();
+        for rendered in [&text, &json] {
+            assert!(!rendered.contains("Sentinel"), "{rendered}");
+            assert!(!rendered.contains("eyJ0eXAi"), "{rendered}");
+        }
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["authentication"],
+            serde_json::json!({ "method": "ActiveDirectoryAccessToken", "outcome": "succeeded" })
+        );
+    }
+
+    /// A Microsoft Entra method that needs a credential provider for its
+    /// token goes as far as the server's request for one: the login is not
+    /// evaluated, the execution is partial, and no token, password or user
+    /// name is shown.
+    #[test]
+    fn an_entra_login_that_needs_a_token_stops_at_the_servers_request() {
+        let server = EntraServer::start();
+        let methods = [entra_password()];
+        for authentication in methods.clone() {
+            let method = authentication.name();
+            let report = run(server.request(Depth::SessionValidation, authentication));
+            let attempt = checked(&report, CheckId::ConnectionAttempt);
+            assert_eq!(
+                attempt.coverage,
+                Coverage::Skipped,
+                "{method}: {:#?}",
+                report.checks
+            );
+            assert!(
+                matches!(attempt.skip, Some(Skip::NotSupported(_))),
+                "{method}"
+            );
+            assert!(
+                attempt
+                    .subphases
+                    .iter()
+                    .any(|p| p.stage == Stage::Prelogin && p.ok == Some(true)),
+                "{method}: {attempt:#?}"
+            );
+            assert!(attempt.subphases.iter().all(|p| p.stage != Stage::Login));
+            assert_eq!(
+                checked(&report, CheckId::SessionValidation).skip,
+                Some(Skip::BlockedBy(CheckId::ConnectionAttempt))
+            );
+            assert_eq!(report.authentication, Some(AuthOutcome::NotEvaluated));
+            assert_eq!(report.execution_status, ExecutionStatus::Partial);
+            assert_eq!(report.outcome, DiagnosticOutcome::NotEvaluated);
+            assert_eq!(report.exit_code(), 3);
+            assert!(report.errors.is_empty(), "{:#?}", report.errors);
+            let findings: Vec<String> = report
+                .findings
+                .iter()
+                .map(|f| f.text.render("en-US"))
+                .collect();
+            assert_eq!(
+                findings,
+                ["The server asked for a Microsoft Entra token; the login was not evaluated."]
+            );
+            let limitation = format!(
+                "sqlcmd diagnose does not acquire Microsoft Entra tokens yet: with {method} it \
+                 checks the connection up to the server's request for a token, and the login is \
+                 not evaluated."
+            );
+            assert!(
+                report
+                    .limitations
+                    .iter()
+                    .any(|l| l.render("en-US") == limitation),
+                "{:#?}",
+                report.limitations
+            );
+            let text = report::text(&report);
+            assert!(
+                text.contains("sqlcmd diagnose does not acquire Microsoft Entra tokens yet"),
+                "{text}"
+            );
+            let json = report::json(&report, "v").unwrap();
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let check = value["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["check"] == "connectionAttempt")
+                .unwrap();
+            assert_eq!(check["status"], "skipped", "{json}");
+            assert_eq!(check["reason"], "notSupported", "{json}");
+            assert_eq!(check["phases"][0]["phase"], "prelogin", "{json}");
+            assert_eq!(value["authentication"]["outcome"], "notEvaluated", "{json}");
+            assert_eq!(value["executionStatus"], "partial", "{json}");
+            for rendered in [&text, &json] {
+                assert!(!rendered.contains("Sentinel"), "{rendered}");
+                assert!(!rendered.contains("alice@contoso.com"), "{rendered}");
+            }
+        }
+        // Each login asked for a token from the server, and carried none.
+        for login in server.logins(methods.len()) {
+            assert!(login.fedauth_workflow.is_some(), "{login:#?}");
+            assert_eq!(login.received_token, None, "{login:#?}");
+        }
+    }
+
+    /// A driver failure that leaves the cause open, after the transport
+    /// opened, so `mssql-tds` logs in too, for evidence.
+    fn open_driver_failure() -> driver::DriverOutcome {
+        driver_failure("08001", 0, "Client unable to establish connection")
+    }
+
+    /// With sqlcmd's own driver connection, the attempt that stops at the
+    /// transport does not take the access token: the evidence login after the
+    /// driver's failure sends it.
+    #[test]
+    fn the_evidence_login_after_sqlcmds_driver_sends_the_access_token() {
+        const TOKEN: &str = "eyJ0eXAiOiJKV1QifQ.eyJhdWQiOiJzcWwifQ.Sentinel-signature";
+        let file = entra::testing::file_with(&entra::testing::utf16le(TOKEN));
+        let server = EntraServer::start();
+        let (hook, calls) = fake_driver(open_driver_failure());
+        let mut request = server.request(Depth::ConnectionAttempt, entra_access_token(&file));
+        request.driver = Some(hook);
+        let report = run(request);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(
+            attempt.field("diagnosticClient"),
+            Some("connected"),
+            "{report:#?}"
+        );
+        assert_eq!(
+            server.logins(1)[0].received_token.as_deref(),
+            Some(std::fs::read(&file.0).unwrap().as_slice())
+        );
+    }
+
+    /// With sqlcmd's own driver connection, the driver logs in with Microsoft
+    /// Entra itself. The evidence login, which stops at the server's request
+    /// for a token, gives its phases and does not make the run partial or say
+    /// the login was not evaluated.
+    #[test]
+    fn with_sqlcmds_driver_an_entra_password_login_is_the_drivers() {
+        let server = EntraServer::start();
+        let (hook, _) = fake_driver(open_driver_failure());
+        let mut request = server.request(Depth::ConnectionAttempt, entra_password());
+        request.driver = Some(hook);
+        let report = run(request);
+        assert_ne!(
+            report.execution_status,
+            ExecutionStatus::Partial,
+            "{report:#?}"
+        );
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.field("diagnosticClient"), Some("failed"));
+        assert!(
+            attempt.subphases.iter().any(|p| p.stage == Stage::Prelogin),
+            "{attempt:#?}"
+        );
+        let text = report::text(&report);
+        assert!(!text.contains("Microsoft Entra token"), "{text}");
+        assert_eq!(server.logins(1)[0].received_token, None);
     }
 }
