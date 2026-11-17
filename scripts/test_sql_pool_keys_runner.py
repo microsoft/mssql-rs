@@ -129,3 +129,18 @@ def test_key_contract_ci_covers_three_platforms_without_changing_sql_jobs():
     assert publication["inputs"]["failTaskOnFailedTests"] is True
     assert publication["inputs"]["failTaskOnMissingResultsFile"] is True
     assert any(item.get("job") == "Build_mssql_python_MacOS" for item in stage["jobs"])
+
+
+def test_runner_suite_is_selected_by_ci():
+    stages = yaml.safe_load(
+        (ROOT / ".pipeline" / "templates" / "validation-stages.yml").read_text(encoding="utf-8")
+    )["stages"]
+    stage = next(item for item in stages if item.get("stage") == "Build")
+    job = next(item for item in stage["jobs"] if item.get("job") == "Build_Windows")
+    step = next(
+        item for item in job["steps"] if "python -m pytest scripts/" in item.get("pwsh", "")
+    )
+    command = next(line for line in step["pwsh"].splitlines() if "python -m pytest" in line)
+    assert "scripts/test_sql_pool_keys_runner.py" in command.split()
+    assert "-k" not in command.split()
+    assert "continueOnError" not in step
