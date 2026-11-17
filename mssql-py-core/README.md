@@ -47,6 +47,22 @@ For contributors, the
 [async pool context guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/src/pool/README.md)
 maps internal types and ownership; it does not describe an enabled pooling API.
 
+## Vector bulk-copy bridge
+
+`BulkCopyVector(values, base_type="float32")` is the typed bridge used by host
+drivers to preserve vector dimensions and SQL base type through row bulk copy.
+Both base types hold float32 application values; the TDS core encodes FLOAT16.
+The destination dimensions and base type must match. Existing list cells infer
+their base type from the destination vector column.
+
+Arrow bulk copy accepts `fixed_size_list<float32>` for both SQL vector base
+types. The list size must match destination dimensions. Optional field metadata
+`mssql.vector.base_type` (`float32` or `float16`) must match the destination.
+Parent NULLs are supported; NULL elements, non-finite elements and FLOAT16
+magnitudes above 65504 are rejected during serialization. Sliced lists and
+chunked inputs retain normal Arrow offsets. No Python row materialization or
+JSON/binary fallback is used for Arrow vectors.
+
 ## License
 
 Licensed under the [MIT License](https://github.com/microsoft/mssql-rs/blob/main/LICENSE).

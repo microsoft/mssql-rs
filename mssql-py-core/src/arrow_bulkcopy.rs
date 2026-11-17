@@ -13,11 +13,12 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
-    FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, StringViewArray,
-    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
+    StringViewArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
+    Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 use arrow::datatypes::{DataType, Schema, TimeUnit};
 use async_trait::async_trait;
@@ -31,6 +32,7 @@ use mssql_tds::datatypes::column_values::{
 use mssql_tds::datatypes::decoder::DecimalParts;
 use mssql_tds::datatypes::sql_json::SqlJson;
 use mssql_tds::datatypes::sql_string::SqlString;
+use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use mssql_tds::error::Error;
 use mssql_tds::message::bulk_load::StreamingBulkLoadWriter;
 use uuid::Uuid;
@@ -70,6 +72,9 @@ pub enum ColumnPlanKind {
     /// Arrow `uint64` -> SQL `bigint`. Values > `i64::MAX` are rejected (A2).
     UInt64,
     Float32,
+    Vector {
+        base_type: VectorBaseType,
+    },
     Float64,
     Bool,
     /// UTF-8 → NVARCHAR (SQL Server stores UTF-16LE internally).
@@ -171,6 +176,21 @@ pub fn build_column_plans(
                     e
                 ))
             })?;
+            if dest_meta.sql_type == SqlDbType::Vector {
+                let base_type = VectorBaseType::try_from(dest_meta.scale)?;
+                let expected = match base_type {
+                    VectorBaseType::Float32 => "float32",
+                    VectorBaseType::Float16 => "float16",
+                };
+                if let Some(source_type) = field.metadata().get("mssql.vector.base_type")
+                    && source_type != expected
+                {
+                    return Err(Error::UsageError(format!(
+                        "Arrow vector base_type does not match destination column '{}'",
+                        dest_meta.column_name
+                    )));
+                }
+            }
             Ok(ColumnPlan {
                 source_index: m.source_index,
                 destination_index: m.destination_index,
@@ -202,6 +222,18 @@ fn resolve_kind(arrow_ty: &DataType, dest: &BulkCopyColumnMetadata) -> TdsResult
 
         (DataType::Float32, S::Real | S::Float) => ColumnPlanKind::Float32,
         (DataType::Float64, S::Float) => ColumnPlanKind::Float64,
+        (DataType::FixedSizeList(child, dimensions), S::Vector)
+            if child.data_type() == &DataType::Float32 =>
+        {
+            if *dimensions <= 0 || *dimensions as usize != dest.vector_dimensions()? {
+                return Err(Error::UsageError(
+                    "Arrow vector dimensions do not match destination".into(),
+                ));
+            }
+            ColumnPlanKind::Vector {
+                base_type: VectorBaseType::try_from(dest.scale)?,
+            }
+        }
 
         (DataType::Utf8, S::NVarChar | S::NChar | S::NText) => ColumnPlanKind::Utf8Nvarchar,
         (DataType::Utf8, S::VarChar | S::Char | S::Text) => ColumnPlanKind::Utf8VarChar,
@@ -420,6 +452,19 @@ impl ColumnPlan {
                 let v = downcast::<Float64Array>(arr)?.value(row_idx);
                 check_finite(v, dest)?;
                 Ok(ColumnValues::Float(v))
+            }
+            ColumnPlanKind::Vector { base_type } => {
+                let values = downcast::<FixedSizeListArray>(arr)?.value(row_idx);
+                let values = downcast::<Float32Array>(values.as_ref())?;
+                if values.null_count() != 0 {
+                    return Err(Error::UsageError(
+                        "Vector elements cannot be NULL; use a NULL parent vector instead".into(),
+                    ));
+                }
+                Ok(ColumnValues::Vector(crate::vector::make_vector(
+                    values.values().to_vec(),
+                    base_type,
+                )?))
             }
             ColumnPlanKind::Utf8Nvarchar | ColumnPlanKind::Utf8VarChar => {
                 let s = downcast::<StringArray>(arr)?.value(row_idx).to_owned();
@@ -886,6 +931,83 @@ mod tests {
         }];
         let plans = build_column_plans(&schema, std::slice::from_ref(dest), &mappings).unwrap();
         plans.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn vector_float32_and_float16_values_and_nulls() {
+        use arrow::datatypes::Float32Type;
+        use mssql_tds::datatypes::sqldatatypes::VECTOR_HEADER_SIZE;
+
+        for base_type in [VectorBaseType::Float32, VectorBaseType::Float16] {
+            let mut dest = meta("v", SqlDbType::Vector, true);
+            dest.scale = base_type as u8;
+            dest.length = (VECTOR_HEADER_SIZE + 3 * base_type.element_size_bytes()) as i32;
+            let arr = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                [Some(vec![Some(0.1), Some(-0.0), Some(1.0)]), None],
+                3,
+            );
+            let plan = one_col_plan(arr.data_type().clone(), &dest);
+            let sliced = arr.slice(1, 1);
+            assert_eq!(
+                plan.extract_value(&sliced, 0, &dest).unwrap(),
+                ColumnValues::Null
+            );
+            match plan.extract_value(&arr, 0, &dest).unwrap() {
+                ColumnValues::Vector(v) => {
+                    assert_eq!(v.base_type(), base_type);
+                    assert_eq!(v.as_f32().unwrap(), &[0.1, -0.0, 1.0]);
+                }
+                other => panic!("expected Vector, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn vector_rejects_null_elements_and_out_of_range_values() {
+        use arrow::datatypes::Float32Type;
+        use mssql_tds::datatypes::sqldatatypes::VECTOR_HEADER_SIZE;
+
+        for values in [
+            vec![Some(1.0), None],
+            vec![Some(f32::NAN), Some(0.0)],
+            vec![Some(f32::INFINITY), Some(0.0)],
+            vec![Some(65505.0), Some(0.0)],
+        ] {
+            let mut dest = meta("v", SqlDbType::Vector, true);
+            dest.scale = 1;
+            dest.length = (VECTOR_HEADER_SIZE + 4) as i32;
+            let arr =
+                FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>([Some(values)], 2);
+            let plan = one_col_plan(arr.data_type().clone(), &dest);
+            assert!(plan.extract_value(&arr, 0, &dest).is_err());
+        }
+    }
+
+    #[test]
+    fn vector_rejects_wrong_shape_type_and_base_type_metadata() {
+        use mssql_tds::datatypes::sqldatatypes::VECTOR_HEADER_SIZE;
+        let mut dest = meta("v", SqlDbType::Vector, true);
+        dest.length = (VECTOR_HEADER_SIZE + 12) as i32;
+        for ty in [
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 3),
+            DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+        ] {
+            assert!(resolve_kind(&ty, &dest).is_err());
+        }
+        let field = Field::new(
+            "v",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3),
+            true,
+        )
+        .with_metadata([("mssql.vector.base_type".into(), "float16".into())].into());
+        let mappings = [ResolvedColumnMapping {
+            source_index: 0,
+            destination_index: 0,
+            destination_name: "v".into(),
+            destination_type: SqlDbType::Vector,
+        }];
+        assert!(build_column_plans(&Schema::new(vec![field]), &[dest], &mappings).is_err());
     }
 
     #[test]

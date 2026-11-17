@@ -240,6 +240,7 @@ enum SourcePythonType {
     Uuid,
     Dict,
     List,
+    Vector,
     Other,
 }
 
@@ -263,6 +264,8 @@ impl SourcePythonType {
             SourcePythonType::Dict
         } else if py_obj.is_instance_of::<pyo3::types::PyList>() {
             SourcePythonType::List
+        } else if py_obj.is_instance_of::<crate::vector::BulkCopyVector>() {
+            SourcePythonType::Vector
         } else if py_obj.is_instance_of::<PyDateTime>() {
             // Check for datetime before date, since datetime is a subclass of date
             SourcePythonType::DateTime
@@ -684,6 +687,22 @@ impl PythonRowAdapter {
             (SourcePythonType::List, SqlDbType::Vector) => {
                 let result = Self::coerce_list_to_vector(py_obj, target_meta)?;
                 Ok(Some(result))
+            }
+            (SourcePythonType::Vector, SqlDbType::Vector) => {
+                let source = py_obj
+                    .extract::<PyRef<'_, crate::vector::BulkCopyVector>>()
+                    .map_err(|e| Error::UsageError(e.to_string()))?;
+                let base_type = VectorBaseType::try_from(target_meta.scale)?;
+                if source.value.base_type() != base_type
+                    || usize::from(source.value.dimension_count())
+                        != target_meta.vector_dimensions()?
+                {
+                    return Err(Error::UsageError(format!(
+                        "Vector dimensions or base_type do not match column '{}'",
+                        target_meta.column_name
+                    )));
+                }
+                Ok(Some(ColumnValues::Vector(source.value.clone())))
             }
 
             // String → Vector: Parse JSON float array string to VECTOR
@@ -1733,7 +1752,7 @@ impl PythonRowAdapter {
 
     /// Coerce a Python list to a SQL Server VECTOR value.
     ///
-    /// - Validates the target VECTOR base type is supported (Float32)
+    /// - Uses the destination VECTOR base type for storage conversion
     /// - Ensures the Python list length matches expected dimensions from metadata
     /// - Converts elements to f32, rejecting NaN/Infinity
     fn coerce_list_to_vector(
@@ -1767,38 +1786,36 @@ impl PythonRowAdapter {
             )));
         }
 
-        match base_type {
-            VectorBaseType::Float32 => {
-                // Convert elements to f32 with validation (reject NaN/Inf)
-                let mut values: Vec<f32> = Vec::with_capacity(seq_len);
-                for (idx, item) in py_list.iter().enumerate() {
-                    let as_f32 = item
-                        .extract::<f32>()
-                        .or_else(|_| item.extract::<i32>().map(|i| i as f32))
-                        .map_err(|e| {
-                            Error::UsageError(format!(
-                                "VECTOR element conversion error at index {} in column '{}': {}",
-                                idx, target_meta.column_name, e
-                            ))
-                        })?;
+        {
+            let mut values: Vec<f32> = Vec::with_capacity(seq_len);
+            for (idx, item) in py_list.iter().enumerate() {
+                if item.is_instance_of::<pyo3::types::PyBool>() {
+                    return Err(Error::UsageError(format!(
+                        "VECTOR element at index {idx} must be a real number, not bool"
+                    )));
+                }
+                let as_f32 = item
+                    .extract::<f32>()
+                    .or_else(|_| item.extract::<i32>().map(|i| i as f32))
+                    .map_err(|e| {
+                        Error::UsageError(format!(
+                            "VECTOR element conversion error at index {} in column '{}': {}",
+                            idx, target_meta.column_name, e
+                        ))
+                    })?;
 
-                    if !as_f32.is_finite() {
-                        return Err(Error::UsageError(format!(
-                            "VECTOR element at index {} in column '{}' is NaN or Infinity when converting to Float32",
-                            idx, target_meta.column_name
-                        )));
-                    }
-
-                    values.push(as_f32);
+                if !as_f32.is_finite() {
+                    return Err(Error::UsageError(format!(
+                        "VECTOR element at index {} in column '{}' is NaN or Infinity when converting to Float32",
+                        idx, target_meta.column_name
+                    )));
                 }
 
-                let vector = SqlVector::try_from_f32(values)?;
-                Ok(ColumnValues::Vector(vector))
+                values.push(as_f32);
             }
-            VectorBaseType::Float16 => Err(Error::UsageError(format!(
-                "Float16 VECTOR column '{}' is not supported in Python bulk copy yet",
-                target_meta.column_name
-            ))),
+
+            let vector = crate::vector::make_vector(values, base_type)?;
+            Ok(ColumnValues::Vector(vector))
         }
     }
 
