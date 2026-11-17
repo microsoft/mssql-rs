@@ -1752,6 +1752,9 @@ def test_concurrent_unicode_inserts_and_retrieval(
             await conn.close()
 
     async def run_tasks():
+        asyncio.get_running_loop().set_default_executor(
+            ThreadPoolExecutor(max_workers=worker_count)
+        )
         return await asyncio.gather(*(worker(index) for index in range(worker_count)))
 
     with warnings.catch_warnings():
