@@ -40,7 +40,9 @@ use uuid::Uuid;
 use super::sqlstate::*;
 use crate::api::describe_col::odbc_sql_type;
 use crate::api::exec_common::post_claim_error;
-use crate::api::exec_common::{RowDelivery, release_busy_if_row_exhausted};
+use crate::api::exec_common::{
+    RowDelivery, is_continued_statement_error, release_busy_if_row_exhausted,
+};
 use crate::api::get_data::{
     TextError, column_value_to_bytes, column_value_to_text, convert_typed_c,
     converted_narrow_indicator, decode_narrow_into_pending, hex_buffer_elements,
@@ -1459,6 +1461,27 @@ fn fill_rowset(
         fetch_error.is_none()
     });
 
+    // msodbcsql stops a rowset at a SQL Server ERROR token: the rows before it
+    // are returned and the error is left for the next fetch (measured on
+    // 18.7.1.1, block and single-row). Under `BatchErrorMode::Continue` the
+    // error ends only this statement's row set, so the batch stays reserved,
+    // unless the procedure tail after a DONEINPROC ends it (see
+    // `release_busy_if_row_exhausted`). Read before the messages are taken, so
+    // any the completion reads are posted with this call.
+    let continued_error = fetch_error
+        .as_ref()
+        .is_some_and(|error| is_continued_statement_error(&client, error));
+    let completion =
+        continued_error.then(|| dbc.runtime.block_on(client.complete_failed_statement()));
+    let batch_continues = matches!(completion, Some(Ok(true)));
+    let completion_error = completion.and_then(Result::err);
+    // Cancellation stays on the interrupted call rather than being deferred.
+    let completion_cancelled =
+        matches!(completion_error, Some(TdsError::OperationCancelledError(_)));
+    let statement_error =
+        matches!(fetch_error, Some(TdsError::SqlServerError { .. })) && !completion_cancelled;
+    let defer_error = rows_filled > 0 && statement_error;
+
     // Zero-row messages stay on the client so the release helper drains them
     // together with anything its own peek consumes, posting the whole set in
     // wire order under one lock. With rows delivered they are taken here and
@@ -1496,7 +1519,12 @@ fn fill_rowset(
     // them, and nothing would catch it.
     let (release_has_server_info, row_diags_posted, cancelled, array_failed) =
         if fetch_error.is_some() {
-            if !dbc.return_lease(client, LeaseReturn::Release) {
+            let lease_return = if batch_continues {
+                LeaseReturn::KeepReservation
+            } else {
+                LeaseReturn::Release
+            };
+            if !dbc.return_lease(client, lease_return) {
                 return SQL_ERROR;
             }
             (false, false, false, false)
@@ -1546,21 +1574,42 @@ fn fill_rowset(
     }
     if let Some(e) = fetch_error {
         error!(%e, "SQLFetchScroll: row fetch failed");
-        // A cancelled read drops the classification with the cursor. A server
-        // error keeps it readable, as msodbcsql does.
-        let cancelled_read = matches!(e, TdsError::OperationCancelledError(_));
-        // The cursor cannot be resumed after a protocol failure, so tear the
-        // row stream down rather than leaving it addressable.
-        super::close_cursor::reset_cursor_state(&mut stmt_state);
-        // Fans a server error out into one diagnostic per record, keeping each
-        // SQLSTATE and native error rather than flattening them into HY000.
-        post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
-        post_tds_info_messages(&mut stmt_state, &info_messages);
-        drop(stmt_state);
-        if cancelled_read {
-            super::ird::clear_ird_classification(stmt);
+        if defer_error {
+            // The row set is over and its error belongs to the next fetch. A
+            // failure reading the rest of the statement ended the batch instead
+            // and is the one kept, as in `release_busy_if_row_exhausted`.
+            stmt_state.result_set_exhausted = true;
+            stmt_state.batch_exhausted = !batch_continues;
+            stmt_state.pending_fetch_error = Some(completion_error.unwrap_or(e));
+        } else if statement_error && completion_error.is_none() {
+            // A SQL Server error ends only the row set, so the cursor stays open:
+            // the next fetch reports SQL_NO_DATA, and SQLMoreResults reaches the
+            // rest of a continued batch (msodbcsql 18.07.0001).
+            stmt_state.result_set_exhausted = true;
+            stmt_state.batch_exhausted = !batch_continues;
+            stmt_state.reset_row_stream();
+            post_tds_error_with_info(&mut stmt_state, &e, SQLSTATE_HY000, &info_messages);
+            return SQL_ERROR;
+        } else {
+            // A cancelled read drops the classification with the cursor. A server
+            // error keeps it readable, as msodbcsql does.
+            let cancelled_read =
+                matches!(e, TdsError::OperationCancelledError(_)) || completion_cancelled;
+            // The cursor cannot be resumed after a protocol failure, so tear the
+            // row stream down rather than leaving it addressable.
+            super::close_cursor::reset_cursor_state(&mut stmt_state);
+            // Fans a server error out into one diagnostic per record, keeping each
+            // SQLSTATE and native error rather than flattening them into HY000.
+            post_tds_error_with_info(&mut stmt_state, &e, SQLSTATE_HY000, &info_messages);
+            if let Some(completion_error) = &completion_error {
+                post_tds_error(&mut stmt_state, completion_error, SQLSTATE_HY000);
+            }
+            drop(stmt_state);
+            if cancelled_read {
+                super::ird::clear_ird_classification(stmt);
+            }
+            return SQL_ERROR;
         }
-        return SQL_ERROR;
     }
 
     let row_has_server_info = if row_diags_posted {
@@ -1746,9 +1795,15 @@ fn finish_exhausted_fetch(
         // a clean end of set (see `release_busy_if_row_exhausted`): the call
         // that found it had already committed to delivering its own row
         // successfully, so the diagnostic was deferred here, to the call that
-        // would have hit it directly without the peek's read-ahead.
+        // would have hit it directly without the peek's read-ahead. A SQL Server
+        // error ends only its row set, so the cursor stays open whether or not
+        // the batch goes on: msodbcsql answers the next fetch with SQL_NO_DATA,
+        // and SQLMoreResults continues (18.07.0001). Nothing can resume after
+        // any other failure.
         let rc = if let Some(e) = stmt_state.pending_fetch_error.take() {
-            stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
+            if !matches!(e, TdsError::SqlServerError { .. }) {
+                stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
+            }
             post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
             SQL_ERROR
         } else {
@@ -6208,6 +6263,7 @@ mod tests {
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             let mut s = stmt.inner.lock().unwrap();
             s.result_set_exhausted = true;
+            s.batch_exhausted = true;
             s.pending_fetch_error = Some(TdsError::ProtocolError(
                 "simulated trailing SQL Server error".to_string(),
             ));
@@ -6566,6 +6622,512 @@ mod tests {
         assert_eq!(s.diag_records.len(), 1);
         assert_eq!(s.diag_records[0].sql_state, *b"01003");
         assert_eq!(s.diag_records[0].native_error, 8153);
+    }
+
+    /// Positions on a plain batch executed as `SQLExecDirect` runs it: the first
+    /// statement returns the row (1, 1) and then fails with 8134; with `more`,
+    /// `SELECT 42` follows.
+    fn position_on_failing_rowset(h: &TestHandles, more: bool) {
+        use mssql_tds::test_client_support::{col_metadata, done_more};
+
+        let ending = if more {
+            vec![done_more(), col_metadata(int_columns(1)), done_no_more()]
+        } else {
+            vec![done_no_more()]
+        };
+        position_on_failing_statement(h, ending);
+    }
+
+    /// The same statement run by `EXEC sp_executesql`, ended as SQL Server ends
+    /// it there: DONEINPROC, RETURNSTATUS, then DONEPROC. With `more`,
+    /// `SELECT 42` follows the procedure.
+    fn position_on_failing_procedure_rowset(h: &TestHandles, more: bool) {
+        use mssql_tds::test_client_support::{
+            col_metadata, done_in_proc_more_error, done_proc_more, done_proc_no_more, return_status,
+        };
+
+        let mut ending = vec![done_in_proc_more_error(), return_status(8134)];
+        if more {
+            ending.extend([
+                done_proc_more(),
+                col_metadata(int_columns(1)),
+                done_no_more(),
+            ]);
+        } else {
+            ending.push(done_proc_no_more());
+        }
+        position_on_failing_statement(h, ending);
+    }
+
+    /// Positions on a statement returning the row (1, 1) and failing with 8134,
+    /// followed by `ending`, executed as `SQLExecDirect` runs a plain batch. A
+    /// later row set returns 42.
+    fn position_on_failing_statement(
+        h: &TestHandles,
+        ending: Vec<mssql_tds::test_client_support::ScriptedToken>,
+    ) {
+        position_on_failing_statement_pausing(h, ending, None);
+    }
+
+    /// [`position_on_failing_statement`], with the response pausing before
+    /// `ending[pause]` when given.
+    fn position_on_failing_statement_pausing(
+        h: &TestHandles,
+        ending: Vec<mssql_tds::test_client_support::ScriptedToken>,
+        pause: Option<usize>,
+    ) {
+        use mssql_tds::connection::tds_client::{BatchErrorMode, ExecuteOptions};
+        use mssql_tds::test_client_support::{
+            col_metadata, sql_error, tds_client_from_tokens_with_int_rowsets,
+            tds_client_pausing_before,
+        };
+
+        let mut tokens = vec![
+            col_metadata(int_columns(2)),
+            sql_error(8134, 16, "Divide by zero error encountered."),
+        ];
+        let lead = tokens.len();
+        tokens.extend(ending);
+        let rowsets = vec![vec![vec![1, 1]], vec![vec![42]]];
+        let mut client = match pause {
+            Some(index) => tds_client_pausing_before(tokens, rowsets, lead + index),
+            None => tds_client_from_tokens_with_int_rowsets(tokens, rowsets),
+        };
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.runtime
+            .block_on(client.execute(
+                "SELECT n, 1/(2-n) FROM t; SELECT 42;".to_string(),
+                ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+            ))
+            .unwrap();
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.column_metadata = int_columns(2);
+        }
+        let mut ds = dbc.inner.lock().unwrap();
+        ds.wire.put_client_for_test(client);
+        ds.wire.set_owner_for_test(Some(h.stmt));
+    }
+
+    fn bind_int_column(
+        h: &TestHandles,
+        column: SqlUSmallInt,
+        values: &mut [i32],
+        ind: &mut [SqlLen],
+    ) {
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    column,
+                    SQL_C_SLONG,
+                    values.as_mut_ptr().cast(),
+                    0,
+                    ind.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
+    }
+
+    fn fetch_next(h: &TestHandles) -> SqlReturn {
+        unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) }
+    }
+
+    fn wire_owner(h: &TestHandles) -> Option<SqlHandle> {
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().wire.statement_owner()
+    }
+
+    fn posted_native(h: &TestHandles, native: i32) -> bool {
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = stmt.inner.lock().unwrap();
+        s.diag_records.iter().any(|d| d.native_error == native)
+    }
+
+    /// msodbcsql leaves the ERROR after a delivered row for the next fetch,
+    /// answers the fetch after it with SQL_NO_DATA, and SQLMoreResults reaches
+    /// the next statement (measured on 18.7.1.1). The read-ahead past the row
+    /// finds the error first, so it must keep both the error and the batch.
+    #[test]
+    fn bound_fetch_reports_a_continued_statement_error_on_the_next_fetch() {
+        use crate::api::more_results::sql_more_results;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_on_failing_rowset(&h, true);
+        let (mut first, mut second) = ([0_i32], [0_i32]);
+        let (mut first_ind, mut second_ind) = ([0 as SqlLen], [0 as SqlLen]);
+        bind_int_column(&h, 1, &mut first, &mut first_ind);
+        bind_int_column(&h, 2, &mut second, &mut second_ind);
+
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!((first[0], second[0]), (1, 1));
+        assert!(!posted_native(&h, 8134));
+        assert_eq!(wire_owner(&h), Some(h.stmt));
+        assert_eq!(fetch_next(&h), SQL_ERROR);
+        assert!(posted_native(&h, 8134));
+        assert_eq!(fetch_next(&h), SQL_NO_DATA);
+        assert_eq!(wire_owner(&h), Some(h.stmt));
+
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!(first[0], 42);
+        assert_eq!(fetch_next(&h), SQL_NO_DATA);
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+        assert_eq!(wire_owner(&h), None);
+    }
+
+    /// msodbcsql returns the rows a block fetch read before an ERROR token with
+    /// SQL_SUCCESS and reports the error on the next fetch, which fetches no
+    /// rows; SQLMoreResults then reaches the next statement (measured on
+    /// 18.7.1.1). Releasing the connection here would strand the rest of the
+    /// batch on the wire for the next command to trip over.
+    #[test]
+    fn block_fetch_returns_rows_before_a_continued_statement_error() {
+        use crate::api::more_results::sql_more_results;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_on_failing_rowset(&h, true);
+        set_row_array_size(&h, 10);
+        let mut fetched: SqlULen = 99;
+        let mut statuses = [0 as SqlUSmallInt; 10];
+        set_rows_fetched_ptr(&h, &mut fetched);
+        set_row_status_ptr(&h, statuses.as_mut_ptr());
+        let (mut first, mut second) = ([0_i32; 10], [0_i32; 10]);
+        let (mut first_ind, mut second_ind) = ([0 as SqlLen; 10], [0 as SqlLen; 10]);
+        bind_int_column(&h, 1, &mut first, &mut first_ind);
+        bind_int_column(&h, 2, &mut second, &mut second_ind);
+
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!((fetched, first[0], second[0]), (1, 1, 1));
+        assert_eq!(statuses[..2], [SQL_ROW_SUCCESS, SQL_ROW_NOROW]);
+        assert!(!posted_native(&h, 8134));
+        assert_eq!(wire_owner(&h), Some(h.stmt));
+        assert_eq!(fetch_next(&h), SQL_ERROR);
+        assert_eq!(fetched, 0);
+        assert!(posted_native(&h, 8134));
+        assert_eq!(fetch_next(&h), SQL_NO_DATA);
+
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!((fetched, first[0]), (1, 42));
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+        assert_eq!(wire_owner(&h), None);
+    }
+
+    /// The same deferral when the failed statement ends the batch (msodbcsql
+    /// 18.7.1.1): the rows come back with SQL_SUCCESS, the connection is free,
+    /// and the next fetch reports the error.
+    #[test]
+    fn block_fetch_defers_an_error_that_ends_the_batch() {
+        let h = TestHandles::with_env_dbc_stmt();
+        position_on_failing_rowset(&h, false);
+        set_row_array_size(&h, 10);
+        let mut fetched: SqlULen = 99;
+        set_rows_fetched_ptr(&h, &mut fetched);
+        let (mut first, mut second) = ([0_i32; 10], [0_i32; 10]);
+        let (mut first_ind, mut second_ind) = ([0 as SqlLen; 10], [0 as SqlLen; 10]);
+        bind_int_column(&h, 1, &mut first, &mut first_ind);
+        bind_int_column(&h, 2, &mut second, &mut second_ind);
+
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!((fetched, first[0]), (1, 1));
+        assert_eq!(wire_owner(&h), None);
+        assert_eq!(fetch_next(&h), SQL_ERROR);
+        assert_eq!(fetched, 0);
+        assert!(posted_native(&h, 8134));
+        assert_eq!(fetch_next(&h), SQL_NO_DATA, "the cursor stays open");
+    }
+
+    /// A fetch that reads the failed statement's error itself, with no rows to
+    /// return, reports it and keeps the batch: the row before it was not fully
+    /// read, so no read-ahead ran (msodbcsql 18.7.1.1 answers the next fetch
+    /// with SQL_NO_DATA and SQLMoreResults continues).
+    #[test]
+    fn fetch_that_reads_a_continued_statement_error_keeps_the_batch() {
+        use crate::api::more_results::sql_more_results;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_on_failing_rowset(&h, true);
+        let (mut first, mut first_ind) = ([0_i32], [0 as SqlLen]);
+        bind_int_column(&h, 1, &mut first, &mut first_ind);
+
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!(fetch_next(&h), SQL_ERROR);
+        assert!(posted_native(&h, 8134));
+        assert_eq!(wire_owner(&h), Some(h.stmt));
+        assert_eq!(fetch_next(&h), SQL_NO_DATA);
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!(first[0], 42);
+    }
+
+    /// SQLMoreResults that meets a deferred continued error reports it as the
+    /// failed statement's result and continues on the next call. msodbcsql
+    /// returns SQL_NO_DATA here and leaves the rest of the batch unread, so the
+    /// connection stays busy (docs/parity-deviations.md).
+    #[test]
+    fn more_results_reports_a_deferred_continued_error_then_continues() {
+        use crate::api::more_results::sql_more_results;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_on_failing_rowset(&h, true);
+        let (mut first, mut second) = ([0_i32], [0_i32]);
+        let (mut first_ind, mut second_ind) = ([0 as SqlLen], [0 as SqlLen]);
+        bind_int_column(&h, 1, &mut first, &mut first_ind);
+        bind_int_column(&h, 2, &mut second, &mut second_ind);
+
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_ERROR);
+        assert!(posted_native(&h, 8134));
+        assert_eq!(wire_owner(&h), Some(h.stmt));
+        assert_eq!(fetch_next(&h), SQL_ERROR);
+        assert_eq!(last_state(&h), SQLSTATE_24000);
+
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!(first[0], 42);
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+        assert_eq!(wire_owner(&h), None);
+    }
+
+    /// With nothing after the failed statement, SQLMoreResults still reports
+    /// its unread error, and the batch is over. msodbcsql returns SQL_NO_DATA
+    /// and keeps the connection busy (docs/parity-deviations.md).
+    #[test]
+    fn more_results_reports_a_deferred_error_that_ends_the_batch() {
+        use crate::api::more_results::sql_more_results;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_on_failing_procedure_rowset(&h, false);
+        let _buffers = bind_two_int_columns(&h);
+
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_ERROR);
+        assert!(posted_native(&h, 8134));
+        assert_eq!(wire_owner(&h), None);
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+    }
+
+    /// A SQL Server error that the fetch reads itself ends only the row set,
+    /// even when it ends the batch: the cursor stays open, so the next fetch
+    /// reports SQL_NO_DATA (msodbcsql 18.07.0001).
+    #[test]
+    fn fetch_that_reads_an_error_ending_the_batch_keeps_the_cursor() {
+        let h = TestHandles::with_env_dbc_stmt();
+        position_on_failing_rowset(&h, false);
+        let (mut first, mut first_ind) = ([0_i32], [0 as SqlLen]);
+        bind_int_column(&h, 1, &mut first, &mut first_ind);
+
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!(fetch_next(&h), SQL_ERROR);
+        assert!(posted_native(&h, 8134));
+        assert_eq!(wire_owner(&h), None);
+        assert_eq!(fetch_next(&h), SQL_NO_DATA);
+    }
+
+    /// Buffers for two bound integer columns, boxed so the bound addresses stay
+    /// put.
+    struct TwoIntColumns {
+        first: [i32; 1],
+        second: [i32; 1],
+        first_ind: [SqlLen; 1],
+        second_ind: [SqlLen; 1],
+    }
+
+    fn bind_two_int_columns(h: &TestHandles) -> Box<TwoIntColumns> {
+        let mut columns = Box::new(TwoIntColumns {
+            first: [0],
+            second: [0],
+            first_ind: [0],
+            second_ind: [0],
+        });
+        let TwoIntColumns {
+            first,
+            second,
+            first_ind,
+            second_ind,
+        } = &mut *columns;
+        bind_int_column(h, 1, first, first_ind);
+        bind_int_column(h, 2, second, second_ind);
+        columns
+    }
+
+    /// Inside a procedure the failed row set ends on DONEINPROC, and the
+    /// RETURNSTATUS and DONEPROC after it end the batch. The read-ahead past the
+    /// row reads them, so the connection is free before the error is reported;
+    /// msodbcsql 18.07.0001 frees it one fetch later, as it does for an error
+    /// that aborts the batch. The fetches report the same in both: the error,
+    /// then SQL_NO_DATA from the open cursor.
+    #[test]
+    fn bound_fetch_releases_a_procedure_its_failed_row_set_ends() {
+        use crate::api::more_results::sql_more_results;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_on_failing_procedure_rowset(&h, false);
+        let buffers = bind_two_int_columns(&h);
+
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!((buffers.first[0], buffers.second[0]), (1, 1));
+        assert!(!posted_native(&h, 8134));
+        assert_eq!(wire_owner(&h), None);
+        assert_eq!(fetch_next(&h), SQL_ERROR);
+        assert!(posted_native(&h, 8134));
+        assert_eq!(fetch_next(&h), SQL_NO_DATA);
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+    }
+
+    /// The same for a block fetch, whose rows come back with SQL_SUCCESS.
+    #[test]
+    fn block_fetch_releases_a_procedure_its_failed_row_set_ends() {
+        let h = TestHandles::with_env_dbc_stmt();
+        position_on_failing_procedure_rowset(&h, false);
+        set_row_array_size(&h, 10);
+        let mut fetched: SqlULen = 99;
+        set_rows_fetched_ptr(&h, &mut fetched);
+        let (mut first, mut second) = ([0_i32; 10], [0_i32; 10]);
+        let (mut first_ind, mut second_ind) = ([0 as SqlLen; 10], [0 as SqlLen; 10]);
+        bind_int_column(&h, 1, &mut first, &mut first_ind);
+        bind_int_column(&h, 2, &mut second, &mut second_ind);
+
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!((fetched, first[0]), (1, 1));
+        assert_eq!(wire_owner(&h), None);
+        assert_eq!(fetch_next(&h), SQL_ERROR);
+        assert_eq!(fetched, 0);
+        assert!(posted_native(&h, 8134));
+        assert_eq!(fetch_next(&h), SQL_NO_DATA);
+    }
+
+    /// And for a fetch that reads the error itself because no read-ahead ran.
+    #[test]
+    fn fetch_that_reads_a_failed_procedure_row_set_releases_the_batch() {
+        use crate::api::more_results::sql_more_results;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_on_failing_procedure_rowset(&h, false);
+        let (mut first, mut first_ind) = ([0_i32], [0 as SqlLen]);
+        bind_int_column(&h, 1, &mut first, &mut first_ind);
+
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!(wire_owner(&h), Some(h.stmt));
+        assert_eq!(fetch_next(&h), SQL_ERROR);
+        assert!(posted_native(&h, 8134));
+        assert_eq!(wire_owner(&h), None);
+        assert_eq!(fetch_next(&h), SQL_NO_DATA);
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+    }
+
+    /// A batch that goes on after the procedure stays reserved once the
+    /// procedure's tail is read, and SQLMoreResults reaches the next statement.
+    #[test]
+    fn a_failed_procedure_row_set_keeps_a_batch_that_goes_on() {
+        use crate::api::more_results::sql_more_results;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_on_failing_procedure_rowset(&h, true);
+        let buffers = bind_two_int_columns(&h);
+
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!(wire_owner(&h), Some(h.stmt));
+        assert_eq!(fetch_next(&h), SQL_ERROR);
+        assert!(posted_native(&h, 8134));
+        assert_eq!(fetch_next(&h), SQL_NO_DATA);
+        assert_eq!(wire_owner(&h), Some(h.stmt));
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!(buffers.first[0], 42);
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+        assert_eq!(wire_owner(&h), None);
+    }
+
+    /// A later statement of the procedure can still be running when the failed
+    /// row set's DONEINPROC arrives. The read-ahead waits only briefly for the
+    /// procedure's tail, so the row comes back, the batch stays reserved, and
+    /// SQLMoreResults reaches the later result.
+    #[test]
+    fn a_delayed_procedure_tail_keeps_the_batch_for_more_results() {
+        use crate::api::more_results::sql_more_results;
+        use mssql_tds::test_client_support::{
+            col_metadata, done_in_proc_more, done_in_proc_more_error, done_proc_no_more,
+            return_status,
+        };
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_on_failing_statement_pausing(
+            &h,
+            vec![
+                done_in_proc_more_error(),
+                col_metadata(int_columns(1)),
+                done_in_proc_more(),
+                return_status(0),
+                done_proc_no_more(),
+            ],
+            Some(1),
+        );
+        let buffers = bind_two_int_columns(&h);
+
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!(wire_owner(&h), Some(h.stmt));
+        assert_eq!(fetch_next(&h), SQL_ERROR);
+        assert!(posted_native(&h, 8134));
+        assert_eq!(fetch_next(&h), SQL_NO_DATA);
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!(buffers.first[0], 42);
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+        assert_eq!(wire_owner(&h), None);
+    }
+
+    /// A failure reading the procedure's tail ends the batch and decides
+    /// whether the connection survives, so it is what the next fetch reports
+    /// in place of the statement's error.
+    #[test]
+    fn a_failure_completing_a_failed_row_set_is_deferred_in_its_place() {
+        use mssql_tds::test_client_support::done_in_proc_more_error;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_on_failing_statement(&h, vec![done_in_proc_more_error()]);
+        let _buffers = bind_two_int_columns(&h);
+
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!(wire_owner(&h), None);
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let s = stmt.inner.lock().unwrap();
+            assert!(matches!(
+                s.pending_fetch_error,
+                Some(TdsError::ConnectionClosed(_))
+            ));
+            assert!(s.batch_exhausted);
+        }
+        assert_eq!(fetch_next(&h), SQL_ERROR);
+        assert!(!posted_native(&h, 8134));
+        assert_eq!(fetch_next(&h), SQL_ERROR);
+        assert_eq!(last_state(&h), SQLSTATE_24000, "nothing resumes after it");
+    }
+
+    /// With no rows to return, the fetch reports both errors, in wire order.
+    #[test]
+    fn a_failure_completing_a_failed_row_set_follows_its_error() {
+        use mssql_tds::test_client_support::done_in_proc_more_error;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_on_failing_statement(&h, vec![done_in_proc_more_error()]);
+        let (mut first, mut first_ind) = ([0_i32], [0 as SqlLen]);
+        bind_int_column(&h, 1, &mut first, &mut first_ind);
+
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!(fetch_next(&h), SQL_ERROR);
+        assert_eq!(wire_owner(&h), None);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = stmt.inner.lock().unwrap();
+        assert_eq!(s.diag_records.len(), 2);
+        assert_eq!(s.diag_records[0].native_error, 8134);
+        assert!(!s.has_state(STMT_STATE_CURSOR_OPEN));
     }
 
     /// Row-wise binding is not implemented, and reporting HYC00 is better than

@@ -80,6 +80,307 @@ ODBC_TEST_F_MODES(MoreResultsLiveTest, MultipleSelectBatchAdvances, odbc_concurr
     EXPECT_EQ(SQL_NO_DATA, rc);
 }
 
+// Plain batches expose a failed statement as its own SQLMoreResults boundary;
+// later statements remain reachable after the error (msodbcsql B1 parity).
+ODBC_TEST_F_MODES(MoreResultsLiveTest, BatchInfoErrorInfoHaveSeparateBoundaries,
+                  odbc_concurrency::kAllModes) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "SET NOCOUNT OFF; RAISERROR('i1',0,1); RAISERROR('e16',16,1); RAISERROR('i2',0,1);");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01000");
+
+    rc = SQLMoreResults(stmt_);
+    ASSERT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+
+    rc = SQLMoreResults(stmt_);
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01000");
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+}
+
+// A batch whose failing first statement is followed by another server error
+// keeps that later error for the next SQLMoreResults call (msodbcsql B3 parity).
+// unixODBC answers SQLMoreResults after a failed SQLExecDirect with
+// SQL_NO_DATA without calling either driver (measured in CI); the Windows
+// Driver Manager passes it through.
+ODBC_TEST_F_MODES(MoreResultsLiveTest, BatchContinuesAfterInitialStatementError,
+                  odbc_concurrency::kAllModes) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "SET NOCOUNT ON; EXEC('RAISERROR(''e16'',16,1); DECLARE @x int = 1/0;')");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+
+#ifdef _WIN32
+    rc = SQLMoreResults(stmt_);
+    ASSERT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+#else
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+#endif
+}
+
+// A statement that fails after returning a row keeps the batch: the next fetch
+// reports the error, the one after returns SQL_NO_DATA, and SQLMoreResults
+// reaches the next statement (msodbcsql 18.7.1.1).
+ODBC_TEST_F_MODES(MoreResultsLiveTest, BoundFetchReportsAStatementErrorAfterItsRow,
+                  odbc_concurrency::kAllModes) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "SET NOCOUNT ON; SELECT n, 1/(2-n) AS q FROM (VALUES(1),(2),(3)) t(n); SELECT 42 AS v;");
+    SQLINTEGER n = 0;
+    SQLINTEGER q = 0;
+    SQLLEN n_ind = 0;
+    SQLLEN q_ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &n, 0, &n_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_SLONG, &q, 0, &q_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(1, n);
+    ASSERT_EQ(SQL_ERROR, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(42, n);
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+}
+
+// A block fetch returns the rows before a statement's error with SQL_SUCCESS
+// and leaves the error for the next fetch, which fetches no rows; the batch
+// continues (msodbcsql 18.7.1.1). The rowset is sized after execution so
+// msodbcsql streams the result, as this driver does.
+ODBC_TEST_F_MODES(MoreResultsLiveTest, BlockFetchReturnsRowsBeforeAStatementError,
+                  odbc_concurrency::kAllModes) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "SET NOCOUNT ON; SELECT n, 1/(2-n) AS q FROM (VALUES(1),(2),(3)) t(n); SELECT 42 AS v;");
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    constexpr SQLULEN rowset = 10;
+    SQLINTEGER n[rowset] = {};
+    SQLINTEGER q[rowset] = {};
+    SQLLEN n_ind[rowset] = {};
+    SQLLEN q_ind[rowset] = {};
+    SQLUSMALLINT status[rowset] = {};
+    SQLULEN fetched = 0;
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(rowset), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_STATUS_PTR, status, 0), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, n, 0, n_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_SLONG, q, 0, q_ind), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(1u, fetched);
+    EXPECT_EQ(1, n[0]);
+    EXPECT_EQ(SQL_ROW_SUCCESS, status[0]);
+    EXPECT_EQ(SQL_ROW_NOROW, status[1]);
+    ASSERT_EQ(SQL_ERROR, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
+    EXPECT_EQ(0u, fetched);
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(1u, fetched);
+    EXPECT_EQ(42, n[0]);
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+}
+
+// Once a failed last statement's completion is read, the connection is free,
+// including for a statement that failed inside EXEC or sp_executesql. A
+// statement whose SQLExecDirect failed runs again; after SQLMoreResults reports
+// the failure, another statement runs. A later statement still keeps the batch
+// (msodbcsql 18.7.1.1).
+ODBC_TEST_F_MODES(MoreResultsLiveTest, FailedLastStatementReleasesTheConnection,
+                  odbc_concurrency::kAllModes) {
+    const SqlTString reuse = ODBCTestUtils::ToSqlTStr("SELECT 1");
+    for (const char* text : {"RAISERROR('reuse_probe',16,1);",
+                             "SET NOCOUNT ON; EXEC('RAISERROR(''reuse_probe'',16,1)');",
+                             "EXEC sp_executesql N'RAISERROR(''reuse_probe'',16,1)';"}) {
+        SCOPED_TRACE(text);
+        SqlTString sql = ODBCTestUtils::ToSqlTStr(text);
+        ASSERT_EQ(SQL_ERROR, SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+        ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(reuse.c_str()), SQL_NTS),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+
+    // A Driver Manager may keep the statement's cursor state after
+    // SQLMoreResults fails, so the release is shown through another statement.
+    SQLHSTMT other = AllocStmt();
+    ASSERT_NE(nullptr, other);
+    for (const char* text : {"SELECT 1; RAISERROR('reuse_probe',16,1);",
+                             "SELECT 1; EXEC('RAISERROR(''reuse_probe'',16,1)');"}) {
+        SCOPED_TRACE(text);
+        SqlTString sql = ODBCTestUtils::ToSqlTStr(text);
+        ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(SQL_ERROR, SQLMoreResults(stmt_));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+        ASSERT_SQL_OK(SQLExecDirect(other, const_cast<SQLTCHAR*>(reuse.c_str()), SQL_NTS),
+                      SQL_HANDLE_STMT, other);
+        ASSERT_SQL_OK(SQLCloseCursor(other), SQL_HANDLE_STMT, other);
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    }
+
+    SqlTString pending = ODBCTestUtils::ToSqlTStr("RAISERROR('reuse_probe',16,1); SELECT 2;");
+    ASSERT_EQ(SQL_ERROR, SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(pending.c_str()), SQL_NTS));
+    EXPECT_EQ(SQL_ERROR, SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(reuse.c_str()), SQL_NTS));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "24000");
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+}
+
+// Inside sp_executesql a failed row set ends on DONEINPROC, and the
+// procedure's RETURNSTATUS and DONEPROC still end the batch. Once the error is
+// reported the connection is free and the cursor stays open, so the next fetch
+// returns SQL_NO_DATA. A row set failing before its first row fails
+// SQLExecDirect and leaves no cursor (msodbcsql 18.07.0001).
+ODBC_TEST_F_MODES(MoreResultsLiveTest, FailedProcedureRowSetReleasesTheConnection,
+                  odbc_concurrency::kAllModes) {
+    const SqlTString reuse = ODBCTestUtils::ToSqlTStr("SELECT 1");
+    SQLHSTMT other = AllocStmt();
+    ASSERT_NE(nullptr, other);
+    SqlTString after_row = ODBCTestUtils::ToSqlTStr(
+        "EXEC sp_executesql N'SELECT n, 1/(2-n) AS q FROM (VALUES(1),(2),(3)) t(n)';");
+    SQLINTEGER n = 0;
+    SQLINTEGER q = 0;
+    SQLLEN n_ind = 0;
+    SQLLEN q_ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &n, 0, &n_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_SLONG, &q, 0, &q_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(after_row.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(1, n);
+    ASSERT_EQ(SQL_ERROR, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
+    ASSERT_SQL_OK(SQLExecDirect(other, const_cast<SQLTCHAR*>(reuse.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(SQLCloseCursor(other), SQL_HANDLE_STMT, other);
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+
+    SqlTString first_row = ODBCTestUtils::ToSqlTStr(
+        "EXEC sp_executesql N'SELECT n, 1/(1-n) AS q FROM (VALUES(1),(2)) t(n)';");
+    ASSERT_EQ(SQL_ERROR, SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(first_row.c_str()), SQL_NTS));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(reuse.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// A statement inside EXEC fails while a later one is still running. The error
+// is reported after a short look-ahead rather than once the procedure's tail
+// arrives, so the query timeout does not abandon the batch, and SQLMoreResults
+// reaches the later result (msodbcsql 18.07.0001). The batch starts with a
+// result, so the failure comes from SQLMoreResults: unixODBC answers
+// SQLMoreResults after a failed SQLExecDirect without calling the driver.
+// Benefits-from-mock-tds: assert that the look-ahead sends no ATTENTION and
+// leaves the later statement's tokens unread; tds_client.rs's
+// completing_a_failed_statement_leaves_a_delayed_procedure_tail pins that.
+ODBC_TEST_F_MODES(MoreResultsLiveTest, DelayedProcedureTailKeepsTheBatch,
+                  odbc_concurrency::kAllModes) {
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "SET NOCOUNT ON; SELECT 841 AS u; EXEC(N'RAISERROR(''delayed_tail'',16,1) WITH NOWAIT; "
+        "WAITFOR DELAY ''00:00:02.500''; SELECT 842 AS v;');");
+    SQLINTEGER v = 0;
+    SQLLEN v_ind = 0;
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &v, 0, &v_ind), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(841, v);
+
+    ASSERT_EQ(SQL_ERROR, SQLMoreResults(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+    EXPECT_FALSE(ODBCTestUtils::HasDiagState(SQL_HANDLE_STMT, stmt_, "HYT00"));
+
+    ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &v, 0, &v_ind), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(842, v);
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+}
+
+// A failed statement's result reports no affected-row count rather than the
+// previous statement's, whether later statements follow or it ends the batch
+// (msodbcsql 18.07.0001).
+ODBC_TEST_F_MODES(MoreResultsLiveTest, FailedStatementResultReportsNoRowCount,
+                  odbc_concurrency::kAllModes) {
+    for (const char* rest : {"RAISERROR('row_count_probe',16,1); SELECT 42 AS v;",
+                             "INSERT @t VALUES (1);"}) {
+        SCOPED_TRACE(rest);
+        SqlTString sql = ODBCTestUtils::ToSqlTStr(
+            std::string("SET NOCOUNT OFF; DECLARE @t TABLE(v int PRIMARY KEY); "
+                        "INSERT @t VALUES (1),(2); ") +
+            rest);
+        ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                      SQL_HANDLE_STMT, stmt_);
+        SQLLEN count = 0;
+        ASSERT_SQL_OK(SQLRowCount(stmt_, &count), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(2, count);
+
+        ASSERT_EQ(SQL_ERROR, SQLMoreResults(stmt_));
+        count = 0;
+        ASSERT_SQL_OK(SQLRowCount(stmt_, &count), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(-1, count);
+        SQLRETURN rc;
+        while ((rc = SQLMoreResults(stmt_)) == SQL_SUCCESS) {
+        }
+        EXPECT_EQ(SQL_NO_DATA, rc);
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
+// For diagnostics returned by one execution call, a mapped server warning
+// precedes the subsequent unmapped server error.
+ODBC_TEST_F_MODES(MoreResultsLiveTest, ServerDiagnosticsUseMsodbcsqlPriorityOrder,
+                  odbc_concurrency::kAllModes) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "SET NOCOUNT ON; EXEC('DECLARE @x int; SELECT @x = SUM(v) FROM "
+        "(VALUES(CAST(NULL AS int)),(1)) t(v); RAISERROR(''e16'',16,1);')");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_EQ(SQL_ERROR, rc);
+
+    const auto read_state = [&](SQLSMALLINT record, SQLINTEGER expected_native,
+                                const char* expected_state) {
+        SQLWCHAR state[6] = {};
+        SQLINTEGER native = -1;
+        SQLWCHAR message[512] = {};
+        SQLSMALLINT message_len = 0;
+        SQLRETURN diag_rc = SQLGetDiagRecW(
+            SQL_HANDLE_STMT, stmt_, record, state, &native, message,
+            static_cast<SQLSMALLINT>(sizeof(message) / sizeof(message[0])), &message_len);
+        ASSERT_TRUE(diag_rc == SQL_SUCCESS || diag_rc == SQL_SUCCESS_WITH_INFO);
+        std::string actual_state;
+        for (int i = 0; i < 5; ++i) {
+            actual_state.push_back(static_cast<char>(state[i]));
+        }
+        EXPECT_EQ(expected_state, actual_state);
+        EXPECT_EQ(expected_native, native);
+    };
+    read_state(1, 8153, "01003");
+    read_state(2, 50000, "42000");
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+}
+
 // An informational message emitted between two result sets (here a PRINT)
 // surfaces as a diagnostic on the SQLMoreResults call that advances past it,
 // and that call returns SQL_SUCCESS_WITH_INFO so the application is told to read
