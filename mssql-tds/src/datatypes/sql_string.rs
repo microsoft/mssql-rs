@@ -380,7 +380,7 @@ impl SqlString {
             EncodingType::Utf8 => match String::from_utf8_lossy(bytes) {
                 Cow::Borrowed(text) => text.to_owned(),
                 Cow::Owned(text) => {
-                    warn!("Invalid UTF-8 in a UTF-8 collation value; replaced with U+FFFD.");
+                    warn!("Invalid UTF-8 in a value declared as UTF-8; replaced with U+FFFD.");
                     text
                 }
             },
