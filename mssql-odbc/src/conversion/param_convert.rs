@@ -5276,9 +5276,8 @@ mod tests {
         }
     }
 
-    /// Non-ASCII must survive the narrow path. `SqlString`'s UTF-8 decode
-    /// carries a TODO claiming UTF-16 decode "works better"; this pins that the
-    /// UTF-8 tag round-trips so the claim cannot silently become true.
+    /// Non-ASCII must survive the narrow path through `SqlString`'s UTF-8 tag,
+    /// which AB#47576 relies on when it drops the UTF-16 transcode.
     #[test]
     fn char_round_trips_non_ascii_utf8() {
         let mut buf: Vec<u8> = "caf\u{e9} \u{2615}\0".as_bytes().to_vec();
