@@ -3922,6 +3922,13 @@ impl Diagnosis {
         check.coverage = coverage;
         check.domain = Some(domain);
         self.authentication = Some(auth);
+        // SQL Server ending a Microsoft Entra login is its rejection, as the
+        // diagnostic client reports it when it makes the attempt.
+        if refused_login && server_refused && self.request.authentication.is_entra() {
+            check
+                .fields
+                .push(Field::plain("entraStage", "serverRejection"));
+        }
         // The driver's own words, as they are: the finding quoting them is
         // flagged for review.
         let error = LocalizedArg::localized_text("error", &first);
@@ -15018,6 +15025,44 @@ pub(crate) mod tests {
         let attempt = checked(&report, CheckId::ConnectionAttempt);
         assert_eq!(attempt.field("entraStage"), None);
         assert_eq!(report.authentication, Some(AuthOutcome::Succeeded));
+    }
+
+    /// With sqlcmd's own driver connection, SQL Server ending a Microsoft Entra
+    /// login is its rejection too, for either method; the same refusal of a SQL
+    /// login is not an Entra stage.
+    #[test]
+    fn with_sqlcmds_driver_a_server_that_ends_an_entra_login_rejects_it() {
+        const TOKEN: &str = "eyJ0eXAiOiJKV1QifQ.eyJhdWQiOiJzcWwifQ.Sentinel-signature";
+        let file = entra::testing::file_with(&entra::testing::utf16le(TOKEN));
+        let (_listener, server) = silent_listener();
+        let refused = || {
+            driver_failure(
+                "28000",
+                18456,
+                "Login failed for user '<token-identified principal>'.",
+            )
+        };
+        for authentication in [entra_password(), entra_access_token(&file)] {
+            let (hook, _) = fake_driver(refused());
+            let mut request = request(&server, Depth::ConnectionAttempt);
+            request.authentication = authentication;
+            request.driver = Some(hook);
+            let report = run(request);
+            let attempt = checked(&report, CheckId::ConnectionAttempt);
+            assert_eq!(attempt.coverage, Coverage::Diagnosed, "{report:#?}");
+            assert_eq!(
+                attempt.domain,
+                Some(Domain::specific("security.authentication.entra"))
+            );
+            assert_eq!(attempt.field("entraStage"), Some("serverRejection"));
+            assert_eq!(report.authentication, Some(AuthOutcome::Failed));
+        }
+        let (hook, _) = fake_driver(refused());
+        let mut sql = request(&server, Depth::ConnectionAttempt);
+        sql.driver = Some(hook);
+        let report = run(sql);
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.field("entraStage"), None);
     }
 
     /// When the server asked for a token diagnose does not acquire, the
