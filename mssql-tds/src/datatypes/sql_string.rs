@@ -8,7 +8,7 @@ use crate::{
     token::tokens::{CODE_PAGE_FROM_SORT_ID, SqlCollation},
 };
 use core::fmt;
-use std::{fmt::Debug, fmt::Display};
+use std::{borrow::Cow, fmt::Debug, fmt::Display};
 use tracing::warn;
 
 mod encoding;
@@ -61,27 +61,28 @@ pub fn fit_narrow_byte_limit(bytes: &[u8], maximum: usize) -> TdsResult<&[u8]> {
 /// Resolves `collation` to its narrow encoding, or `None` when neither the
 /// UTF-8 flag, the SQL sort ID, nor the LCID names one this crate maps.
 ///
+/// Derived from [`collation_code_page`] so the encoding and the
+/// `SQL_COLLATION_SEQ` code page cannot drift apart. The server's locale map
+/// behind it is authoritative for collation LCIDs, including sort variants
+/// such as Japanese_Unicode (`0x1_0411`) that [`lcid_to_encoding`] lacks; that
+/// table still covers locales the map omits.
+///
 /// Split from [`resolve_collation`] so a caller with its own fallback -- the
 /// parameter serializer's `VARCHAR | CHAR | TEXT` arm keeps a Latin-1 one --
 /// can share the resolution order without inheriting the Windows-1252 default.
 pub(crate) fn try_resolve_collation(collation: SqlCollation) -> Option<ResolvedEncoding> {
-    if collation.utf8() {
-        return Some(encoding_rs::UTF_8.into());
-    }
-    if let Some(code_page) = CODE_PAGE_FROM_SORT_ID[usize::from(collation.sort_id)] {
-        if let Some(encoding) = encoding_for_code_page(code_page) {
-            return Some(encoding);
-        }
-        warn!(
-            "Unsupported code page {} for SQL sort ID {}, falling back to LCID",
-            code_page, collation.sort_id
-        );
-    }
-    encoding_for_lcid(collation.info & 0x000F_FFFF)
+    collation_code_page(collation)
+        .and_then(encoding_for_code_page)
+        .or_else(|| {
+            lcid_to_encoding(collation.info & 0x000F_FFFF)
+                .ok()
+                .map(Into::into)
+        })
 }
 
 fn encoding_for_code_page(code_page: u16) -> Option<ResolvedEncoding> {
     let encoding = match code_page {
+        65001 => encoding_rs::UTF_8,
         437 => return Some(ResolvedEncoding::Oem437),
         850 => return Some(ResolvedEncoding::Oem850),
         874 => encoding_rs::WINDOWS_874,
@@ -101,15 +102,6 @@ fn encoding_for_code_page(code_page: u16) -> Option<ResolvedEncoding> {
         _ => return None,
     };
     Some(encoding.into())
-}
-
-/// The server's locale map is authoritative for collation LCIDs, including
-/// sort variants such as Japanese_Unicode (`0x1_0411`) that
-/// [`lcid_to_encoding`] lacks; that table still covers locales the map omits.
-fn encoding_for_lcid(lcid: u32) -> Option<ResolvedEncoding> {
-    lcid_to_code_page(lcid)
-        .and_then(encoding_for_code_page)
-        .or_else(|| lcid_to_encoding(lcid).ok().map(Into::into))
 }
 
 fn resolve_collation(collation: SqlCollation) -> ResolvedEncoding {
@@ -363,6 +355,7 @@ impl SqlString {
     }
 
     /// Decodes the stored bytes into a Rust `String` according to the encoding type.
+    /// See [`Self::decode`] for how malformed input is handled.
     pub fn to_utf8_string(&self) -> String {
         Self::decode(&self.bytes, self.encoding_type)
     }
@@ -373,11 +366,24 @@ impl SqlString {
     /// Lets a writer handed borrowed bytes by
     /// [`RowWriter::write_string`](crate::datatypes::row_writer::RowWriter::write_string)
     /// decode them without first copying into an owned [`SqlString`].
+    ///
+    /// Malformed sequences decode to U+FFFD rather than failing; a warning is
+    /// logged for UTF-8 and LCID-based input when that happens.
+    ///
+    /// # Panics
+    ///
+    /// Panics for [`EncodingType::DelayedSet`], which names no encoding.
     pub fn decode(bytes: &[u8], encoding_type: EncodingType) -> String {
         match encoding_type {
             // UTF-8 collation columns can hold invalid sequences (SQL Server accepts
             // some on insert), so replace them like the LCID and UTF-16 branches.
-            EncodingType::Utf8 => String::from_utf8_lossy(bytes).into_owned(),
+            EncodingType::Utf8 => match String::from_utf8_lossy(bytes) {
+                Cow::Borrowed(text) => text.to_owned(),
+                Cow::Owned(text) => {
+                    warn!("Invalid UTF-8 in a UTF-8 collation value; replaced with U+FFFD.");
+                    text
+                }
+            },
             EncodingType::Utf16 => {
                 // Use encoding_rs for efficient UTF-16LE decoding without intermediate Vec<u16> allocation
                 let (decoded, _) = encoding_rs::UTF_16LE.decode_without_bom_handling(bytes);
@@ -594,6 +600,18 @@ mod tests {
             }
         }
         assert!(checked > 60);
+    }
+
+    #[test]
+    fn every_sort_id_code_page_resolves() {
+        for (sort_id, code_page) in CODE_PAGE_FROM_SORT_ID.iter().enumerate() {
+            if let Some(code_page) = *code_page {
+                assert!(
+                    encoding_for_code_page(code_page).is_some(),
+                    "sort ID {sort_id} code page {code_page}"
+                );
+            }
+        }
     }
 
     #[test]
