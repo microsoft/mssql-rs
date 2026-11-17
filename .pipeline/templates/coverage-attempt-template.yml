@@ -1,0 +1,18 @@
+parameters:
+- name: osType
+  type: string
+  default: Linux
+
+steps:
+- ${{ if eq(parameters.osType, 'Windows') }}:
+  - pwsh: |
+      Write-Host "##vso[task.setvariable variable=value;isOutput=true]$(System.StageAttempt)_$(System.JobAttempt)"
+    name: coverageAttempt
+    displayName: Record coverage artifact attempt
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+- ${{ if ne(parameters.osType, 'Windows') }}:
+  - bash: |
+      echo "##vso[task.setvariable variable=value;isOutput=true]$(System.StageAttempt)_$(System.JobAttempt)"
+    name: coverageAttempt
+    displayName: Record coverage artifact attempt
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
