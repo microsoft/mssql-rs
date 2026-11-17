@@ -311,11 +311,6 @@ impl EncodingType {
     /// Retained for compatibility with callers using `encoding_rs` directly.
     /// New conversion code should use [`Self::resolved_encoding`] to include
     /// the OEM codecs.
-    ///
-    /// Decoding through this substitutes U+FFFD on malformed input, whereas
-    /// [`SqlString::to_utf8_string`] panics on invalid UTF-8 under
-    /// [`EncodingType::Utf8`]. Use this when replacement is the wanted
-    /// behaviour, not as a drop-in for `to_utf8_string`.
     pub fn encoding(&self) -> Option<&'static encoding_rs::Encoding> {
         self.resolved_encoding()
             .and_then(ResolvedEncoding::as_encoding_rs)

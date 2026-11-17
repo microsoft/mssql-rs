@@ -6210,13 +6210,15 @@ mod tests {
                     std::ptr::null_mut(),
                 )
             },
-            SQL_ERROR,
+            SQL_SUCCESS,
         );
+        // Invalid UTF-8 decodes to U+FFFD, which iconv then substitutes.
+        #[cfg(target_env = "musl")]
+        assert_eq!(&output[..2], b"*\0");
+        #[cfg(not(target_env = "musl"))]
+        assert_eq!(&output[..2], b"?\0");
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        assert_last_diag(
-            &stmt.inner.lock().unwrap().diag_records,
-            ERR_INVALID_CHARACTER_VALUE,
-        );
+        assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
     }
 
     #[test]
