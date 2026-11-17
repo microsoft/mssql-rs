@@ -39,8 +39,7 @@ use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::fetch_convert::{
     TextOutput, convert_datetime_c, convert_float_c, convert_guid_c, convert_integer_c, date_parts,
     datetime2_parts, datetimeoffset_parts, extract_datetime_parts, format_datetime_parts,
-    is_float_c_target, is_integer_c_target, is_typed_c_target, money_scaled, sql_string_to_text,
-    time_parts,
+    is_float_c_target, is_integer_c_target, is_typed_c_target, money_scaled, time_parts,
 };
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::decoder::DECIMAL_STR_LEN;
@@ -4261,8 +4260,7 @@ pub(crate) fn column_value_to_text(v: &ColumnValues) -> Result<String, TextError
         ColumnValues::SmallMoney(m) => Ok(strip_sub_one_leading_zero(money_scaled_to_string(
             i64::from(m.int_val),
         ))),
-        // `SqlString::to_utf8_string` unwraps on its UTF-8 branch; decode fallibly.
-        ColumnValues::String(s) => sql_string_to_text(s).ok_or(TextError::Malformed),
+        ColumnValues::String(s) => Ok(s.to_utf8_string()),
         ColumnValues::Xml(x) => xml_to_text(&x.bytes),
         // `SqlJson::as_string` unwraps; decode fallibly.
         ColumnValues::Json(j) => {
@@ -6847,7 +6845,7 @@ mod tests {
     }
 
     #[test]
-    fn cp1252_fast_path_keeps_other_encodings_and_invalid_utf8_behavior() {
+    fn cp1252_fast_path_keeps_other_encodings_and_replaces_invalid_utf8() {
         use mssql_tds::token::tokens::SqlCollation;
         let lcid = |info| {
             EncodingType::LcidBased(SqlCollation {
@@ -6865,7 +6863,7 @@ mod tests {
                 vec![0xF0, 0x9F, 0x98, 0x80],
                 vec![0xD83D, 0xDE00],
             ),
-            (EncodingType::Utf8, vec![0xFF], vec![]),
+            (EncodingType::Utf8, vec![0x41, 0xFF], vec![0x41, 0xFFFD]),
         ] {
             for columns in [2, 8] {
                 let h = TestHandles::with_env_dbc_stmt();
@@ -6884,38 +6882,10 @@ mod tests {
                         &mut indicator,
                     )
                 };
-                if expected.is_empty() {
-                    assert_eq!(rc, SQL_ERROR);
-                    assert_eq!(indicator, -99);
-                    assert_eq!(output, [0xAAAA; 4]);
-                    let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-                    {
-                        let state = stmt.inner.lock().unwrap();
-                        assert_eq!(state.diag_records.len(), 1);
-                        assert_last_diag(&state.diag_records, ERR_INVALID_CHARACTER_VALUE);
-                    }
-                    let mut binary = [0xAA; 2];
-                    assert_eq!(
-                        unsafe {
-                            sql_get_data(
-                                h.stmt,
-                                1,
-                                SQL_C_BINARY,
-                                binary.as_mut_ptr().cast(),
-                                2,
-                                &mut indicator,
-                            )
-                        },
-                        SQL_SUCCESS
-                    );
-                    assert_eq!(binary, [0xFF, 0xAA]);
-                    assert_eq!(indicator, 1);
-                } else {
-                    assert_eq!(rc, SQL_SUCCESS);
-                    assert_eq!(indicator, (expected.len() * 2) as SqlLen);
-                    assert_eq!(&output[..expected.len()], &expected);
-                    assert_eq!(output[expected.len()], 0);
-                }
+                assert_eq!(rc, SQL_SUCCESS);
+                assert_eq!(indicator, (expected.len() * 2) as SqlLen);
+                assert_eq!(&output[..expected.len()], &expected);
+                assert_eq!(output[expected.len()], 0);
             }
         }
     }

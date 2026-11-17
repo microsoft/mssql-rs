@@ -756,13 +756,18 @@ msodbcsql build is measured.
     result, or exercise `CodePageFromTDSCollation` directly with a synthesised
     `TDSCOLLATION`.
 
-    The same evidence gap cuts the other way and is worth stating, because it
-    is the more reachable half: this crate's `lcid_to_encoding` table is
-    narrower than `GetLocaleInfoA`, so there are LCIDs msodbcsql resolves
-    correctly and this driver does not. For those, the fallbacks above send
-    *wrong bytes* where msodbcsql sends right ones — a silent divergence rather
-    than the error-versus-value one this entry's title describes. Which LCIDs
-    those are is likewise unmeasured.
+    The table gap that once cut the other way is closed. Resolution now
+    consults `lcid_to_code_page`, the server's own locale map, before the
+    narrower `lcid_to_encoding` table, so every LCID a server collation carries
+    resolves to its ANSI code page. Before AB#49106, 69 server collations
+    (sort variants such as Japanese_Unicode and Chinese_PRC_Stroke, and locales
+    such as Azeri_Cyrillic and Bosnian_Latin) fell through to these fallbacks
+    and silently sent and decoded Windows-1252 bytes.
+    `CollationSweepMatchesServerDecoding`
+    (`mssql-odbc/tests/e2e/tests/client_code_page_test.cpp`) compares every
+    server collation's decoding with the server's, and
+    `every_locale_map_lcid_resolves_to_its_code_page`
+    (`mssql-tds/src/datatypes/sql_string.rs`) pins the resolution order.
 
     Taken because erroring on a collation the driver merely does not map is a
     poor trade for an application that would otherwise round-trip its data
@@ -783,8 +788,7 @@ msodbcsql build is measured.
 
     No application regresses at this entry's introduction: both rules predate
     it and AB#48437 preserved them unchanged, so no sign-off is recorded.
-    Unifying the two defaults needs one, as does closing the table gap above.
-    Decision history in AB#48437.
+    Unifying the two defaults needs one. Decision history in AB#48437.
 
     **Scope is the shared serializer, not only parameters.**
     `TdsValueSerializer::serialize_value` is also what bulk copy
@@ -1527,3 +1531,43 @@ msodbcsql build is measured.
     driver's sequence; `FailedProcedureRowSetReleasesTheConnection` checks
     the behavior both drivers share. Chosen by the change author for
     AB#45309; maintainer sign-off is pending review.
+
+45. **Invalid narrow bytes from the server decode to U+FFFD per WHATWG.**
+    When a `char`/`varchar` value holds bytes that are invalid in its
+    collation's code page, both drivers replace them and return `SQL_SUCCESS`
+    with no diagnostic; neither raises `22018`. The replacement differs:
+    - Under CP932, msodbcsql uses Windows best-fit decoding: an unassigned
+      byte such as `0xFF` becomes U+F8F3, and a lead byte followed by an
+      invalid trail (`0x8241`) becomes U+30FB, consuming the ASCII trail.
+      This driver decodes with `encoding_rs`, which follows the WHATWG
+      Encoding Standard: `0xFF` becomes U+FFFD, and `0x8241` becomes U+FFFD
+      followed by `A`, keeping the ASCII byte.
+    - Under a UTF-8 collation, the encoded surrogate `ED A0 80` becomes two
+      U+FFFD in msodbcsql and three in this driver, one per maximal invalid
+      subsequence as WHATWG specifies. Other invalid UTF-8 replaces the same
+      way in both drivers.
+
+    The same decoders serve every route, so `SQL_C_WCHAR` and a narrow target
+    in another code page see the same characters, bound or through
+    `SQLGetData`. Keeping the ASCII trail byte preserves data a best-fit
+    decoder discards, and U+FFFD is what an application checking for lossy
+    conversion looks for; reproducing the Windows best-fit tables would also
+    make the output depend on the client OS. Before AB#49106 an invalid UTF-8
+    value panicked inside the driver; it now decodes lossily. Entry 22 is the
+    encode-direction counterpart, and entry 24 covers collations with no
+    mapped encoding.
+
+    **Evidence level: measured.** Windows msodbcsql 18.07.0001 against SQL
+    Server 2025 (`17.00.4025`), reading values stored through `varbinary`
+    literals into `Japanese_90_BIN` and `Latin1_General_100_CI_AS_SC_UTF8`
+    columns, bounded and `varchar(max)`. SQL Server will not store a trailing
+    CP932 lead byte, and rejects some invalid UTF-8, such as a lone `0x80`, in
+    a bounded column (error 9833), so those cases need a mock server. `MalformedServerBytesDecodeWithoutError`
+    (`mssql-odbc/tests/e2e/tests/client_code_page_test.cpp`) asserts each
+    driver's characters; `utf8_decode_replaces_invalid_sequences`
+    (`mssql-tds/src/datatypes/sql_string.rs`) and
+    `bound_client_text_replaces_invalid_utf8`
+    (`mssql-odbc/src/api/fetch_scroll.rs`) pin this driver's decoding. Chosen
+    by the change author for
+    [AB#49106](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/49106);
+    maintainer sign-off is pending review.
