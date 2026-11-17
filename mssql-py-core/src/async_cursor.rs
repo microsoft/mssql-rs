@@ -393,6 +393,10 @@ mod tests {
     use pyo3::prelude::*;
     use pyo3::types::{PyCFunction, PyDict};
     use tokio::sync::oneshot;
+    use tracing::Subscriber;
+    use tracing::span::{Attributes, Id};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
 
     use super::{FinalizerCompletionGuard, PyAsyncCursor, clear_result_state, map_claim_error};
     use crate::async_description::DescriptionState;
@@ -400,7 +404,26 @@ mod tests {
     use crate::async_fetch::{BufferedResults, BufferedRowSet, FetchState, FetchStatus};
     use crate::async_handle::LogicalConnection;
     use crate::async_session::{AsyncConnectionState, ClaimError, ConnectionLifecycle};
+    use crate::async_tracing::CURSOR_OPERATION_SPAN_NAME;
     use crate::row_writer::PyRowWriter;
+
+    struct ClaimInstalled(std::sync::Mutex<Option<oneshot::Sender<()>>>);
+
+    impl<S: Subscriber> Layer<S> for ClaimInstalled {
+        fn on_new_span(
+            &self,
+            attributes: &Attributes<'_>,
+            _id: &Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            // Cursor-operation spans are created after admission, before physical access.
+            if attributes.metadata().name() == CURSOR_OPERATION_SPAN_NAME
+                && let Some(sender) = self.0.lock().unwrap().take()
+            {
+                sender.send(()).unwrap();
+            }
+        }
+    }
 
     fn cursor() -> (PyAsyncCursor, Arc<std::sync::Mutex<Vec<u8>>>) {
         let (client, transport) = tds_client_from_tokens_capturing(Vec::new());
@@ -417,7 +440,12 @@ mod tests {
     }
 
     fn assert_queued_operation_rejected(operation: &str, closed: bool) {
-        let (cursor, transport) = cursor();
+        let (mut cursor, transport) = cursor();
+        let (claimed_tx, claimed_rx) = oneshot::channel();
+        cursor.tracing_dispatch = Some(tracing::Dispatch::new(
+            tracing_subscriber::Registry::default()
+                .with(ClaimInstalled(std::sync::Mutex::new(Some(claimed_tx)))),
+        ));
         let connection = cursor.tds_client.clone();
         let state = cursor.session_state.clone();
         let runtime = pyo3_async_runtimes::tokio::get_runtime();
@@ -444,6 +472,17 @@ mod tests {
             globals
                 .set_item("cursor", Py::new(py, cursor).unwrap())
                 .unwrap();
+            let claimed = std::sync::Mutex::new(Some(claimed_rx));
+            let wait_for_claim = PyCFunction::new_closure(py, None, None, move |args, _| {
+                let claimed = claimed.lock().unwrap().take().unwrap();
+                pyo3_async_runtimes::tokio::future_into_py(args.py(), async move {
+                    claimed.await.unwrap();
+                    Ok(())
+                })
+                .map(Bound::unbind)
+            })
+            .unwrap();
+            globals.set_item("wait_for_claim", wait_for_claim).unwrap();
             let release = std::sync::Mutex::new(Some(release_tx));
             let revoke = PyCFunction::new_closure(py, None, None, move |_, _| {
                 if closed {
@@ -464,11 +503,16 @@ mod tests {
                 _ => format!("cursor.{operation}()"),
             };
             let expected = if closed { "closed" } else { "closing" };
+            let await_claim = if matches!(operation, "execute" | "executemany") {
+                "    await asyncio.wait_for(wait_for_claim(), 5)\n"
+            } else {
+                ""
+            };
             let code = CString::new(format!(
                 r#"import asyncio
 async def run():
     pending = {call}
-    revoke()
+{await_claim}    revoke()
     try:
         await asyncio.wait_for(pending, 5)
     except RuntimeError as error:
@@ -495,11 +539,16 @@ asyncio.run(run())
     }
 
     #[test]
-    fn queued_execute_and_executemany_reject_revoked_parent() {
-        for operation in ["execute", "executemany"] {
-            for closed in [false, true] {
-                assert_queued_operation_rejected(operation, closed);
-            }
+    fn queued_execute_rejects_revoked_parent() {
+        for closed in [false, true] {
+            assert_queued_operation_rejected("execute", closed);
+        }
+    }
+
+    #[test]
+    fn queued_executemany_rejects_revoked_parent() {
+        for closed in [false, true] {
+            assert_queued_operation_rejected("executemany", closed);
         }
     }
 
