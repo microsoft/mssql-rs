@@ -103,8 +103,13 @@ For a source consumer, build its native bindings first and make that checkout
 importable in this Python environment. The runner preserves its import paths in
 the embedded interpreter, fetches locked Cargo dependencies before the frozen
 test run, runs the normally ignored parser test explicitly, and
-produces nextest CI-profile JUnit results. The bridge exists only in Rust tests;
-it compares private keys without exporting keys or a production preparation API.
+produces nextest CI-profile JUnit results.
+On Linux it prepends the active interpreter's `LIBDIR` to `LD_LIBRARY_PATH`
+so standalone test executables can load Python. On macOS it defaults an unset
+or empty `MACOSX_DEPLOYMENT_TARGET` to 10.15, matching the native TLS minimum;
+explicit deployment targets are preserved and remain subject to build validation.
+The bridge exists only in Rust tests; it compares private keys without exporting
+keys or a production preparation API.
 It covers every accepted keyword spelling, canonical adaptation, aliases,
 ordering, duplicates, escaping, Unicode and rejection cases.
 The published 1.17.0 consumer rejects reserved `APP` and unsupported

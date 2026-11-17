@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import sysconfig
 
 ROOT = Path(__file__).resolve().parents[2]
 TEST_FILTER = (
@@ -27,6 +28,15 @@ def main():
     )
     env = os.environ.copy()
     env["PYO3_PYTHON"] = sys.executable
+    if sys.platform == "linux":
+        libdir = sysconfig.get_config_var("LIBDIR")
+        if not libdir:
+            raise RuntimeError("The active Python interpreter does not define LIBDIR")
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(
+            [libdir] + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else [])
+        )
+    elif sys.platform == "darwin":
+        env["MACOSX_DEPLOYMENT_TARGET"] = env.get("MACOSX_DEPLOYMENT_TARGET") or "10.15"
     # Standalone PyO3 test binaries otherwise initialize the base interpreter,
     # not necessarily the venv/site-packages used by the invoking Python.
     env["PYTHONPATH"] = os.pathsep.join(

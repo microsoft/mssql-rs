@@ -105,6 +105,69 @@ def test_runner_preserves_existing_lock_and_propagates_failure(
         assert lock.read_text(encoding="utf-8") == "existing lock"
 
 
+@pytest.mark.parametrize("existing_path", [None, "", "existing-python-libs"])
+def test_linux_runner_exposes_active_python_shared_library(
+    configured_runner, monkeypatch, existing_path
+):
+    monkeypatch.setattr(runner.sys, "platform", "linux")
+    monkeypatch.setattr(
+        runner.sysconfig, "get_config_var", lambda name: {"LIBDIR": "python-lib"}[name]
+    )
+    if existing_path is None:
+        monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+    else:
+        monkeypatch.setenv("LD_LIBRARY_PATH", existing_path)
+    calls = []
+    monkeypatch.setattr(runner.subprocess, "run", lambda args, **kw: calls.append(kw))
+    runner.main()
+    expected = os.pathsep.join(["python-lib", existing_path]) if existing_path else "python-lib"
+    assert all(call["env"]["LD_LIBRARY_PATH"] == expected for call in calls)
+    assert os.environ.get("LD_LIBRARY_PATH") == existing_path
+
+
+@pytest.mark.parametrize("libdir", [None, ""])
+def test_linux_runner_rejects_missing_python_library_directory(
+    configured_runner, monkeypatch, libdir
+):
+    monkeypatch.setattr(runner.sys, "platform", "linux")
+    monkeypatch.setattr(runner.sysconfig, "get_config_var", lambda _: libdir)
+    calls = []
+    monkeypatch.setattr(runner.subprocess, "run", lambda args, **kw: calls.append(args))
+    with pytest.raises(RuntimeError, match="LIBDIR"):
+        runner.main()
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("configured_target", "expected"),
+    [(None, "10.15"), ("", "10.15"), ("10.15", "10.15"), ("26.0", "26.0"), ("10.12", "10.12")],
+)
+def test_macos_runner_sets_supported_default_and_preserves_explicit_target(
+    configured_runner, monkeypatch, configured_target, expected
+):
+    monkeypatch.setattr(runner.sys, "platform", "darwin")
+    if configured_target is None:
+        monkeypatch.delenv("MACOSX_DEPLOYMENT_TARGET", raising=False)
+    else:
+        monkeypatch.setenv("MACOSX_DEPLOYMENT_TARGET", configured_target)
+    calls = []
+    monkeypatch.setattr(runner.subprocess, "run", lambda args, **kw: calls.append(kw))
+    runner.main()
+    assert all(call["env"]["MACOSX_DEPLOYMENT_TARGET"] == expected for call in calls)
+    assert os.environ.get("MACOSX_DEPLOYMENT_TARGET") == configured_target
+
+
+def test_windows_runner_preserves_existing_platform_environment(configured_runner, monkeypatch):
+    monkeypatch.setattr(runner.sys, "platform", "win32")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "existing-python-libs")
+    monkeypatch.setenv("MACOSX_DEPLOYMENT_TARGET", "26.0")
+    calls = []
+    monkeypatch.setattr(runner.subprocess, "run", lambda args, **kw: calls.append(kw))
+    runner.main()
+    assert all(call["env"]["LD_LIBRARY_PATH"] == "existing-python-libs" for call in calls)
+    assert all(call["env"]["MACOSX_DEPLOYMENT_TARGET"] == "26.0" for call in calls)
+
+
 def test_key_contract_ci_covers_three_platforms_without_changing_sql_jobs():
     stages = yaml.safe_load(
         (ROOT / ".pipeline" / "templates" / "validation-stages.yml").read_text(encoding="utf-8")
