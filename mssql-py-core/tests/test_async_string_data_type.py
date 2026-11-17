@@ -613,6 +613,14 @@ def test_cp1252_rebinding_and_nvarchar_conversion(client_context, use_prepare):
         try:
             cursor = conn.cursor()
             await cursor.execute(
+                "SELECT CONVERT(int, COLLATIONPROPERTY(CONVERT(nvarchar(128), "
+                "DATABASEPROPERTYEX(DB_NAME(), 'Collation')), 'CodePage'))",
+                use_prepare=False,
+            )
+            [(code_page,)] = await cursor.fetchall()
+            if code_page != 1252:
+                pytest.skip("Explicit CP1252 binding requires a CP1252 database")
+            await cursor.execute(
                 "CREATE TABLE #async_strings (id int PRIMARY KEY, "
                 "value varchar(max) COLLATE Latin1_General_100_BIN2 NULL)",
                 use_prepare=False,
