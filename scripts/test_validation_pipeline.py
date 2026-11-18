@@ -1982,7 +1982,16 @@ def test_macos_pr_runs_native_odbc_e2e_against_existing_sql():
     assert rust["parameters"].get("enableTests", True) is True
     assert rust["parameters"]["prebuildTests"] is True
     assert rust["parameters"]["backgroundCoverageReport"] is True
-    join_sql, verify = rust["parameters"]["beforeTestSteps"]
+    before_tests = rust["parameters"]["beforeTestSteps"]
+    join_sql = next(
+        step for step in before_tests
+        if step.get("displayName") == "Wait for Colima and SQL Server"
+    )
+    verify = next(
+        step for step in before_tests
+        if step.get("displayName") == "Verify macOS SQL Server before tests"
+    )
+    assert before_tests.index(join_sql) < before_tests.index(verify)
     assert join_sql["script"] == (
         'bash .pipeline/scripts/background-step.sh wait "$(Agent.TempDirectory)/macos-sql" 2400'
     )
