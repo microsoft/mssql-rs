@@ -824,6 +824,11 @@ impl RpcParameter {
     fn inline_value(&self) -> Option<RpcInlineValue<'_>> {
         match &self.value {
             RpcValue::Materialized(value) if self.encrypted.is_none() => {
+                // The limit only constrains narrow strings; fitting stays async.
+                if self.narrow_string_byte_limit.is_some() && matches!(value, SqlType::Varchar(..))
+                {
+                    return None;
+                }
                 value.rpc_inline(self.type_metadata)
             }
             _ => None,
