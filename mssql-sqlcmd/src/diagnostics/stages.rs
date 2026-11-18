@@ -233,6 +233,23 @@ impl StageRecorder {
         Self::default()
     }
 
+    /// Forgets the stages recorded so far: a second connection's stages are
+    /// not mixed with the first's.
+    pub fn clear(&self) {
+        let mut running = self
+            .running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut steps = self
+            .steps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        running.clear();
+        steps.clear();
+        self.running.clear_poison();
+        self.steps.clear_poison();
+    }
+
     /// The stages recorded so far, in the order they ended, which is the order
     /// they ran in (login, which contains the TLS handshake when encryption
     /// starts at login, follows it). A stage whose span is still open ends
@@ -372,6 +389,106 @@ where
 mod tests {
     use super::*;
     use tracing_subscriber::layer::SubscriberExt;
+
+    #[test]
+    fn clear_recovers_poisoned_buffers_and_records_the_next_connection() {
+        fn poison<T>(mutex: &Mutex<T>) {
+            assert!(
+                std::panic::catch_unwind(|| {
+                    let _guard = mutex.lock().unwrap();
+                    panic!("poison recorder buffer");
+                })
+                .is_err()
+            );
+        }
+
+        for (poison_running, poison_steps) in [(true, false), (false, true), (true, true)] {
+            let recorder = StageRecorder::new();
+            let subscriber = tracing_subscriber::registry()
+                .with(recorder.clone().with_filter(ConnectStagesOnly));
+            tracing::subscriber::with_default(subscriber, || {
+                let dns = tracing::info_span!(
+                    target: connect_stage::TARGET,
+                    connect_stage::DNS,
+                    ok = tracing::field::Empty
+                );
+                dns.record(connect_stage::OK, true);
+                drop(dns);
+                let tcp = tracing::info_span!(
+                    target: connect_stage::TARGET,
+                    connect_stage::TCP,
+                    ok = tracing::field::Empty
+                );
+                assert_eq!(recorder.steps().len(), 2);
+
+                if poison_running {
+                    poison(&recorder.running);
+                }
+                if poison_steps {
+                    poison(&recorder.steps);
+                }
+                recorder.clear();
+                assert!(recorder.running.lock().unwrap().is_empty());
+                assert!(recorder.steps.lock().unwrap().is_empty());
+                assert!(recorder.steps().is_empty());
+                drop(tcp);
+
+                let login = tracing::info_span!(
+                    target: connect_stage::TARGET,
+                    connect_stage::LOGIN,
+                    ok = tracing::field::Empty
+                );
+                login.record(connect_stage::OK, true);
+                drop(login);
+                let steps = recorder.steps();
+                assert_eq!(steps.len(), 1);
+                assert_eq!(steps[0].stage, Stage::Login);
+                assert_eq!(steps[0].ok, Some(true));
+            });
+        }
+    }
+
+    #[test]
+    fn clear_forgets_open_and_closed_stages_and_ignores_late_closes() {
+        let recorder = StageRecorder::new();
+        let subscriber =
+            tracing_subscriber::registry().with(recorder.clone().with_filter(ConnectStagesOnly));
+        tracing::subscriber::with_default(subscriber, || {
+            let dns = tracing::info_span!(
+                target: connect_stage::TARGET,
+                connect_stage::DNS,
+                ok = tracing::field::Empty
+            );
+            dns.record(connect_stage::OK, true);
+            drop(dns);
+            let tcp = tracing::info_span!(
+                target: connect_stage::TARGET,
+                connect_stage::TCP,
+                ok = tracing::field::Empty
+            );
+            assert_eq!(recorder.steps().len(), 2);
+
+            recorder.clear();
+            assert!(recorder.steps().is_empty());
+
+            let tls = tracing::info_span!(
+                target: connect_stage::TARGET,
+                connect_stage::TLS,
+                ok = tracing::field::Empty
+            );
+            tls.record(connect_stage::OK, true);
+            drop(tls);
+            tcp.record(connect_stage::OK, true);
+            drop(tcp);
+
+            let steps = recorder.steps();
+            assert_eq!(steps.len(), 1);
+            assert_eq!(steps[0].stage, Stage::Tls);
+            assert_eq!(steps[0].ok, Some(true));
+            recorder.clear();
+            assert!(recorder.steps().is_empty());
+        });
+    }
 
     /// A concurrency check, not a test of the single lock: stages that close
     /// on other threads while `steps` reads are each read once, and every

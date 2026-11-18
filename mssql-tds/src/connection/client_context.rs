@@ -135,6 +135,10 @@ pub enum ExecutionColumnEncryptionSetting {
 #[async_trait]
 pub trait EntraIdTokenFactory: Send + Sync {
     /// Creates an access token for the given SPN, STS URL, and auth method.
+    ///
+    /// Return [`Error::TokenAcquisitionCancelled`](crate::error::Error::TokenAcquisitionCancelled)
+    /// when the provider itself cancels acquisition, independently of command
+    /// cancellation. Session recovery propagates cancellation without retrying.
     async fn create_token(
         &self,
         spn: String,

@@ -193,6 +193,9 @@ steps:
   displayName: Build mssql-python pybind bindings
 
 # Released mssql_py_core, so the only variable under test is the ODBC driver.
+# Anonymous reads of the mssql-rs_Public feed intermittently fail with HTTP 403.
+# The script starts clean on each run (it clears its download directory and
+# force-reinstalls), so a failed attempt is retried.
 - script: |
     set -euo pipefail
     docker exec mssql-python-odbc-tests bash -c '
@@ -202,6 +205,7 @@ steps:
       ./eng/scripts/install-mssql-py-core.sh
     '
   displayName: Install mssql_py_core from NuGet
+  retryCountOnTaskFailure: 5
 
 # Upstream purges the ODBC build toolchain and the system libodbcinst before
 # testing, so the bundled copy next to the driver is what loads. Mirror it: the

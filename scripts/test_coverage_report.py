@@ -8,6 +8,7 @@ from fnmatch import fnmatchcase
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import re
 import stat
 import subprocess
 import threading
@@ -68,14 +69,46 @@ def fake_diff_cover(monkeypatch, source, value=85, summary="Coverage report"):
 
 
 @pytest.mark.parametrize("directory_entry", [False, True])
-def test_extracts_only_expected_xml(tmp_path, directory_entry):
-    archive = archive_with(tmp_path)
+@pytest.mark.parametrize("artifact_name", ["CoberturaCoverage", "CoberturaCoverage_2_3"])
+def test_extracts_only_expected_xml(tmp_path, directory_entry, artifact_name):
+    archive = archive_with(tmp_path, name=f"{artifact_name}/cobertura.xml")
     if directory_entry:
         with zipfile.ZipFile(archive, "a") as output:
-            output.mkdir("CoberturaCoverage/")
+            output.mkdir(f"{artifact_name}/")
     destination = tmp_path / "coverage.xml"
-    coverage_report.extract_coverage(archive, destination)
+    coverage_report.extract_coverage(archive, destination, artifact_name)
     assert destination.read_text() == XML
+
+
+@pytest.mark.parametrize("artifact_name", [
+    "../CoberturaCoverage", "CoberturaCoverage_0_1", "CoberturaCoverage_1_0",
+    "CoberturaCoverage_01_1", "CoberturaCoverage_1_1&other=1",
+    "CoberturaCoverage_1_1\nINJECTED=1",
+])
+def test_rejects_invalid_artifact_names(tmp_path, artifact_name):
+    with pytest.raises(ValueError, match="Invalid coverage artifact name"):
+        coverage_report.extract_coverage(tmp_path / "absent.zip", tmp_path / "coverage.xml", artifact_name)
+
+
+@pytest.mark.parametrize("root", ["CoberturaCoverage", "CoberturaCoverage_1_1", "CoberturaCoverage_9_9"])
+def test_rejects_archive_from_different_attempt(tmp_path, root):
+    archive = archive_with(tmp_path, name=f"{root}/cobertura.xml")
+    destination = tmp_path / "coverage.xml"
+    with pytest.raises(ValueError, match="Unexpected coverage archive member"):
+        coverage_report.extract_coverage(archive, destination, "CoberturaCoverage_1_2")
+    assert not destination.exists()
+
+
+def test_reports_selected_attempt(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    fake_diff_cover(monkeypatch, source)
+    artifact = "CoberturaCoverage_1_2"
+    report = coverage_report.generate_report(
+        archive_with(tmp_path, name=f"{artifact}/cobertura.xml"),
+        source, "123", tmp_path, artifact,
+    )
+    assert report["coverage_percentage"] == "85.0%"
 
 
 @pytest.mark.parametrize("name", [
@@ -268,7 +301,10 @@ def test_build_and_download_are_bound_to_expected_provenance():
     download = steps["Download Cobertura coverage artifact"]["run"]
     assert ".resource.downloadUrl" not in download
     assert "unzip" not in download
-    assert "&artifactName=CoberturaCoverage&%24format=zip" in download
+    assert steps["Download Cobertura coverage artifact"]["env"]["ARTIFACT_NAME"] == "${{ steps.build.outputs.artifact_name }}"
+    assert "&artifactName=${ARTIFACT_NAME}&%24format=zip" in download
+    assert steps["Run diff-cover"]["env"]["ARTIFACT_NAME"] == "${{ steps.build.outputs.artifact_name }}"
+    assert '--artifact-name "$ARTIFACT_NAME"' in steps["Run diff-cover"]["run"]
     assert '"$RUNNER_TEMP/coverage-artifact.zip"' in download
 
 
@@ -276,6 +312,291 @@ def test_security_regressions_run_in_validation():
     pipeline = (ROOT / ".pipeline" / "templates" / "validation-stages.yml").read_text(encoding="utf-8")
     command = next(line for line in pipeline.splitlines() if "python -m pytest" in line)
     assert "scripts/test_coverage_report.py" in command.split()
+
+
+TEMPLATES = ROOT / ".pipeline" / "templates"
+MERGE_SPEC = importlib.util.spec_from_file_location(
+    "merge_cobertura", ROOT / ".pipeline" / "scripts" / "merge-cobertura.py"
+)
+assert MERGE_SPEC and MERGE_SPEC.loader
+merging = importlib.util.module_from_spec(MERGE_SPEC)
+MERGE_SPEC.loader.exec_module(merging)
+# Each coverage artifact prefix and the Build job that publishes it.
+COVERAGE_OWNERS = {
+    "CoberturaCoverageRust_Windows": "Build_Windows",
+    "CoberturaCoverageOdbcE2E_Windows": "Build_Windows",
+    "CoberturaCoverageRust_Linux": "Build_Linux",
+    "CoberturaCoverageOdbcE2E_Linux": "Build_Linux",
+    "CoberturaCoveragePython": "Build_Linux",
+    "CoberturaCoveragePyCoreRust": "Build_Linux",
+    "CoberturaCoverageRust_MacOS": "Test_MacOS",
+}
+ATTEMPT = "$(coverageAttempt.value)"
+
+
+def load_template(name):
+    return yaml.safe_load((TEMPLATES / name).read_text(encoding="utf-8"))
+
+
+def template_steps(value):
+    for step in value:
+        if not isinstance(step, dict):
+            continue
+        yield step
+        for key, nested in step.items():
+            if key.startswith("${{") and isinstance(nested, list):
+                yield from template_steps(nested)
+
+
+def attempt_branch(os_type):
+    steps = load_template("coverage-attempt-template.yml")["steps"]
+    return next(iter(steps[0 if os_type == "Windows" else 1].values()))[0]
+
+
+def recorded_attempt(os_type, stage_attempt, job_attempt):
+    """The `coverageAttempt.value` output the attempt template's command sets."""
+    branch = attempt_branch(os_type)
+    command = branch.get("pwsh", branch.get("bash"))
+    command = command.replace("$(System.StageAttempt)", str(stage_attempt))
+    command = command.replace("$(System.JobAttempt)", str(job_attempt))
+    return re.search(r"##vso\[task\.setvariable variable=value;isOutput=true\]([^\s\"']+)", command)[1]
+
+
+def coverage_wiring():
+    """Coverage producers, merge downloads and the merged artifact, read from the templates."""
+    stages = load_template("validation-stages.yml")["stages"]
+    build = next(stage for stage in stages if stage.get("stage") == "Build")
+    merge = next(stage for stage in stages if stage.get("stage") == "Coverage")["jobs"][0]
+    producers = {}
+    for owner in dict.fromkeys(COVERAGE_OWNERS.values()):
+        job = next(job for job in build["jobs"] if job.get("job") == owner)
+        invocation = next(
+            step for step in job["steps"]
+            if step.get("template") in ("build-template.yml", "build-template-container.yml")
+        )
+        producer = load_template(invocation["template"])
+        os_type = invocation["parameters"].get("osType", "Linux")
+        setup = next(
+            (step for step in producer["steps"] if step.get("template") == "coverage-attempt-template.yml"),
+            None,
+        )
+        published = {}
+        for step in (*template_steps(producer["steps"]), *template_steps(job["steps"])):
+            name = step.get("inputs", {}).get("artifactName", "")
+            name = name.replace("${{ parameters.osType }}", os_type)
+            if COVERAGE_OWNERS.get(name.removesuffix(f"_{ATTEMPT}")) == owner:
+                published[name] = Path(step["inputs"]["targetPath"]).name
+        producers[owner] = SimpleNamespace(os_type=os_type, setup=setup, published=published)
+    downloads = []
+    for step in merge["steps"]:
+        if step.get("task") != "DownloadPipelineArtifact@2":
+            continue
+        name = step["inputs"]["artifactName"]
+        reference = re.search(r"\$\((\w+)\)", name)
+        variable = owner = None
+        if reference:
+            variable = reference[1]
+            owner = re.fullmatch(
+                r"\$\[ stageDependencies\.Build\.(\w+)\.outputs\['coverageAttempt.value'\] \]",
+                merge["variables"][variable],
+            )[1]
+        directory = step["inputs"]["targetPath"].removeprefix("$(Pipeline.Workspace)/")
+        downloads.append(SimpleNamespace(name=name, variable=variable, owner=owner, directory=directory))
+    merged = next(step for step in merge["steps"] if step.get("task") == "PublishPipelineArtifact@1")
+    script = next(step["bash"] for step in merge["steps"] if step.get("displayName") == "Merge Cobertura reports")
+    attempt = next(
+        (step for step in merge["steps"] if step.get("template") == "coverage-attempt-template.yml"), {}
+    )
+    default_os = load_template("coverage-attempt-template.yml")["parameters"][0]["default"]
+    return SimpleNamespace(
+        producers=producers, merge=merge, downloads=downloads,
+        merged=merged["inputs"]["artifactName"], merge_script=script,
+        merge_os=attempt.get("parameters", {}).get("osType", default_os),
+    )
+
+
+@pytest.mark.parametrize("macos_attempt", ["1_2", "2_2"])
+def test_coverage_downloads_follow_each_producers_recorded_attempt(macos_attempt):
+    wiring = coverage_wiring()
+    assert wiring.merge["workspace"]["clean"] == "all"
+    outputs = {"Build_Windows": "1_1", "Build_Linux": "1_1", "Test_MacOS": macos_attempt}
+
+    published = set()
+    for owner, suffix in outputs.items():
+        producer = wiring.producers[owner]
+        assert producer.setup is not None
+        setup_os = producer.setup["parameters"]["osType"].replace("${{ parameters.osType }}", producer.os_type)
+        branch = attempt_branch(setup_os)
+        assert branch["name"] == "coverageAttempt"
+        command = branch.get("pwsh", branch.get("bash"))
+        assert "variable=value;isOutput=true]$(System.StageAttempt)_$(System.JobAttempt)" in command
+        for name in producer.published:
+            assert name.endswith(f"_{ATTEMPT}")
+            published.add(name.replace(ATTEMPT, suffix))
+
+    downloaded = set()
+    for download in wiring.downloads:
+        prefix = download.name.split("$(")[0].removesuffix("_")
+        assert download.owner == COVERAGE_OWNERS[prefix]
+        downloaded.add(download.name.replace(f"$({download.variable})", outputs[download.owner]))
+    assert published == downloaded == {
+        f"{prefix}_{outputs[owner]}" for prefix, owner in COVERAGE_OWNERS.items()
+    }
+    assert any(step.get("template") == "coverage-attempt-template.yml" for step in wiring.merge["steps"])
+    assert wiring.merged == f"CoberturaCoverage_{ATTEMPT}"
+
+
+class ArtifactExists(Exception):
+    pass
+
+
+class FakeArtifactStore:
+    """One Azure build's pipeline artifacts: kept across retries and never overwritten."""
+
+    def __init__(self, build_id):
+        self.build_id = build_id
+        self.artifacts = {}
+
+    def publish(self, name, files):
+        if name in self.artifacts:
+            raise ArtifactExists(f"Artifact {name} already exists for build {self.build_id}.")
+        self.artifacts[name] = dict(files)
+
+    def download(self, name, target):
+        if name not in self.artifacts:
+            return False
+        target.mkdir(parents=True, exist_ok=True)
+        for filename, content in self.artifacts[name].items():
+            (target / filename).write_text(content, encoding="utf-8")
+        return True
+
+    def archive(self, name, path):
+        with zipfile.ZipFile(path, "w") as output:
+            for filename, content in self.artifacts[name].items():
+                output.writestr(f"{name}/{filename}", content)
+        return path
+
+
+def attempt_report(prefix, attempt):
+    """A Cobertura report whose only source file names its producer and attempt."""
+    return (
+        f'<coverage line-rate="1"><packages><package name="src"><classes>'
+        f'<class name="{prefix}" filename="src/{prefix}_{attempt}.rs">'
+        f'<lines><line number="1" hits="1"/></lines></class>'
+        f"</classes></package></packages></coverage>"
+    )
+
+
+def report_sources(xml):
+    return {Path(item.get("filename")).name for item in ET.fromstring(xml).iter("class")}
+
+
+class SimulatedRetryBuild:
+    """Replays producer, merge and reporting steps of one Azure build across retries.
+
+    Artifact names and attempt outputs come from the real templates, and the merge
+    and reporting run the production scripts. Azure itself is simulated: the store
+    rejects reused names, and `stageDependencies` resolves to each producer's latest
+    attempt.
+    """
+
+    BUILD_ID = 191709
+
+    def __init__(self, tmp_path, monkeypatch):
+        self.tmp_path = tmp_path
+        self.monkeypatch = monkeypatch
+        self.wiring = coverage_wiring()
+        self.store = FakeArtifactStore(self.BUILD_ID)
+        self.outputs = {}
+        self.merges = 0
+
+    def produce(self, owner, stage_attempt, job_attempt):
+        producer = self.wiring.producers[owner]
+        attempt = recorded_attempt(producer.os_type, stage_attempt, job_attempt)
+        for name, filename in producer.published.items():
+            prefix = name.removesuffix(f"_{ATTEMPT}")
+            self.store.publish(name.replace(ATTEMPT, attempt), {filename: attempt_report(prefix, attempt)})
+        self.outputs[owner] = attempt
+
+    def merge(self, stage_attempt, job_attempt):
+        self.merges += 1
+        workspace = self.tmp_path / f"merge-{self.merges}"
+        for download in self.wiring.downloads:
+            name = download.name
+            if download.variable:
+                name = name.replace(f"$({download.variable})", self.outputs[download.owner])
+            self.store.download(name, workspace / download.directory)
+        script = self.wiring.merge_script
+        inputs = []
+        for variable, path in re.findall(r'(?:(\w+)=)?"\$\(Pipeline\.Workspace\)/([^"]+)"', script):
+            prefix = re.search(rf'"\${variable}::([^"]+)"', script) if variable else None
+            if (workspace / path).is_file():
+                inputs.append(str(workspace / path) + (f"::{prefix[1]}" if prefix else ""))
+        merged = workspace / "cobertura.xml"
+        assert merging.main(["--output", str(merged), *inputs]) == 0
+        attempt = recorded_attempt(self.wiring.merge_os, stage_attempt, job_attempt)
+        name = self.wiring.merged.replace(ATTEMPT, attempt)
+        self.store.publish(name, {"cobertura.xml": merged.read_text(encoding="utf-8")})
+        return name
+
+    def report(self, stage_attempt, job_attempt):
+        """Select and extract the coverage the PR comment would report."""
+        def get_json(url, *, deadline):
+            path = urlparse(url).path
+            if path.endswith(f"/builds/{self.BUILD_ID}/artifacts"):
+                return {"value": [{"name": name} for name in self.store.artifacts]}
+            assert path.endswith(f"/builds/{self.BUILD_ID}/timeline"), url
+            return {"records": coverage_timeline(stage_attempt, job_attempt)}
+        self.monkeypatch.setattr(polling, "get_json", get_json)
+        name = polling.coverage_artifact(self.BUILD_ID, deadline=60)
+        assert name is not None
+        archive = self.store.archive(name, self.tmp_path / f"{name}.zip")
+        destination = self.tmp_path / f"{name}.xml"
+        coverage_report.extract_coverage(archive, destination, name)
+        return name, report_sources(destination.read_text(encoding="utf-8"))
+
+
+def expected_sources(attempts):
+    return {
+        f"{prefix}_{attempts[owner]}.rs" for prefix, owner in COVERAGE_OWNERS.items()
+    }
+
+
+@pytest.mark.parametrize("retried", [
+    "Build_Windows", "Build_Linux", pytest.param("Test_MacOS", id="partial_macos_retry"),
+])
+def test_job_retry_in_the_same_build_publishes_and_reports_its_coverage(tmp_path, monkeypatch, retried):
+    build = SimulatedRetryBuild(tmp_path, monkeypatch)
+    for owner in build.wiring.producers:
+        build.produce(owner, 1, 1)
+    # The retried job published its coverage and then failed; the retry keeps
+    # those artifacts in the build and every other job's successful coverage.
+    build.produce(retried, 1, 2)
+    attempts = {owner: "1_2" if owner == retried else "1_1" for owner in build.wiring.producers}
+    stale = expected_sources({owner: "1_1" for owner in build.wiring.producers})
+
+    assert build.merge(1, 1) == "CoberturaCoverage_1_1"
+    name, sources = build.report(1, 1)
+    assert sources == expected_sources(attempts)
+    assert not sources & (stale - expected_sources(attempts))
+    assert name == "CoberturaCoverage_1_1"
+
+
+def test_stage_retry_in_the_same_build_reports_the_current_merged_coverage(tmp_path, monkeypatch):
+    build = SimulatedRetryBuild(tmp_path, monkeypatch)
+    for owner in build.wiring.producers:
+        build.produce(owner, 1, 1)
+    # The first Coverage run published its merged report before the stage failed.
+    stale = build.merge(1, 1)
+    # Rerunning the Build stage reruns its jobs as stage attempt 2, then Coverage.
+    for owner in build.wiring.producers:
+        build.produce(owner, 2, 1)
+    current = build.merge(2, 1)
+
+    name, sources = build.report(2, 1)
+    assert sources == expected_sources({owner: "2_1" for owner in build.wiring.producers})
+    assert not sources & expected_sources({owner: "1_1" for owner in build.wiring.producers})
+    assert (stale, current, name) == ("CoberturaCoverage_1_1",) + ("CoberturaCoverage_2_1",) * 2
 
 
 def run_workflow_script(script, **values):
@@ -394,6 +715,9 @@ def test_posting_does_not_write_if_head_lookup_fails():
     ".github/coverage-requirements.txt",
     "scripts/test_coverage_report.py",
     ".pipeline/templates/validation-stages.yml",
+    ".pipeline/templates/coverage-attempt-template.yml",
+    ".pipeline/templates/build-template.yml",
+    ".pipeline/templates/build-template-container.yml",
     ".pipeline/scripts/evaluate-duplicate-pr.py",
 ])
 def test_coverage_only_changes_trigger_lightweight_regressions(path):
@@ -465,6 +789,80 @@ def queued_api(monkeypatch, responses):
     return pending, calls
 
 
+def coverage_timeline(stage_attempt=1, job_attempt=2, state="completed", result="succeeded"):
+    return [
+        {"type": "Stage", "identifier": "Coverage", "attempt": stage_attempt,
+         "state": state, "result": result},
+        {"type": "Job", "identifier": "Coverage.Merge_Coverage.__default",
+         "attempt": job_attempt, "state": state, "result": result},
+    ]
+
+
+@pytest.mark.parametrize("stage,job", [(1, 2), (2, 1)])
+@pytest.mark.parametrize("result", ["succeeded", "succeededWithIssues"])
+def test_selects_current_coverage_attempt_not_largest_suffix(monkeypatch, poll_clock, stage, job, result):
+    expected = f"CoberturaCoverage_{stage}_{job}"
+    pending, _ = queued_api(monkeypatch, [
+        (101, [{"name": name} for name in [
+            "CoberturaCoverage", "CoberturaCoverage_1_1", "CoberturaCoverage_9_9", expected,
+        ]]),
+        ("timeline:101", coverage_timeline(stage, job, result=result)),
+    ])
+    assert polling.coverage_artifact(101, deadline=60) == expected
+    assert not pending
+
+
+@pytest.mark.parametrize("state,result", [
+    ("pending", None), ("inProgress", None), ("completed", "failed"),
+    ("completed", "canceled"), ("completed", "skipped"), ("completed", "succeeded"),
+])
+def test_does_not_fall_back_to_coverage_from_previous_attempt(monkeypatch, poll_clock, state, result):
+    pending, _ = queued_api(monkeypatch, [
+        (101, [{"name": "CoberturaCoverage_1_1"}, {"name": "CoberturaCoverage"}]),
+        ("timeline:101", coverage_timeline(state=state, result=result)),
+    ])
+    assert polling.coverage_artifact(101, deadline=60) is None
+    assert not pending
+
+
+@pytest.mark.parametrize("index", [0, 1])
+@pytest.mark.parametrize("state,result", [("inProgress", None), ("completed", "failed")])
+def test_published_coverage_waits_for_current_stage_and_job(monkeypatch, poll_clock, index, state, result):
+    records = coverage_timeline()
+    records[index].update(state=state, result=result)
+    pending, _ = queued_api(monkeypatch, [
+        (101, [{"name": "CoberturaCoverage_1_2"}]),
+        ("timeline:101", records),
+    ])
+    assert polling.coverage_artifact(101, deadline=60) is None
+    assert not pending
+
+
+@pytest.mark.parametrize("attempt", [0, -1, True, "2", "2\nINJECTED=1"])
+def test_rejects_invalid_timeline_attempt(monkeypatch, poll_clock, attempt):
+    pending, _ = queued_api(monkeypatch, [
+        (101, [{"name": "CoberturaCoverage_1_2"}]),
+        ("timeline:101", coverage_timeline(job_attempt=attempt)),
+    ])
+    with pytest.raises(ValueError, match="Invalid coverage stage or job attempt"):
+        polling.coverage_artifact(101, deadline=60)
+    assert not pending
+
+
+def test_poll_waits_for_retry_to_replace_old_coverage(monkeypatch, poll_clock):
+    build = ado_build()
+    pending, _ = queued_api(monkeypatch, [
+        ("builds", [build]), (101, [{"name": "CoberturaCoverage_1_1"}]),
+        ("timeline:101", coverage_timeline(state="inProgress", result=None)),
+        ("builds", [build]),
+        (101, [{"name": "CoberturaCoverage_1_1"}, {"name": "CoberturaCoverage_1_2"}]),
+        ("timeline:101", coverage_timeline()), ("builds", [build]),
+    ])
+    assert polling.wait_for_artifact("710") == (101, "a" * 40, "CoberturaCoverage_1_2")
+    assert poll_clock.sleeps == [300]
+    assert not pending
+
+
 def test_poll_follows_replacement_build_after_new_commit(monkeypatch, poll_clock):
     github_heads(monkeypatch, "a", "b", "b", "b", "b")
     old = ado_build()
@@ -478,7 +876,7 @@ def test_poll_follows_replacement_build_after_new_commit(monkeypatch, poll_clock
         ("builds", [complete, canceled]), (102, [{"name": "CoberturaCoverage"}]),
         ("builds", [complete, canceled]),
     ])
-    assert polling.wait_for_artifact("710") == (102, "b" * 40)
+    assert polling.wait_for_artifact("710") == (102, "b" * 40, "CoberturaCoverage")
     assert not pending
     assert poll_clock.sleeps == [300, 10, 300]
     assert len([url for url in calls if "/101/artifacts" in url]) == 1
@@ -494,7 +892,7 @@ def test_poll_discards_artifact_if_build_changes_during_request(monkeypatch, pol
         ("builds", [new, old]), (102, [{"name": "CoberturaCoverage"}]),
         ("builds", [new, old]),
     ])
-    assert polling.wait_for_artifact("710") == (102, "b" * 40)
+    assert polling.wait_for_artifact("710") == (102, "b" * 40, "CoberturaCoverage")
     assert not pending
 
 
@@ -509,7 +907,7 @@ def test_poll_discards_artifact_if_build_is_canceled_during_request(monkeypatch,
         ("builds", [new]), (102, [{"name": "CoberturaCoverage"}]),
         ("builds", [new]),
     ])
-    assert polling.wait_for_artifact("710") == (102, "b" * 40)
+    assert polling.wait_for_artifact("710") == (102, "b" * 40, "CoberturaCoverage")
     assert not pending
 
 
@@ -521,7 +919,7 @@ def test_poll_does_not_fall_back_to_older_build(monkeypatch, poll_clock):
         ("builds", [new, old]), (102, [{"name": "CoberturaCoverage"}]),
         ("builds", [new, old]),
     ])
-    assert polling.wait_for_artifact("710") == (102, "a" * 40)
+    assert polling.wait_for_artifact("710") == (102, "a" * 40, "CoberturaCoverage")
     assert not pending
     assert not any("/101/artifacts" in url for url in calls)
 
@@ -535,7 +933,7 @@ def test_poll_waits_through_missing_and_canceling_builds(monkeypatch, poll_clock
         ("builds", [build]), (102, [{"name": "CoberturaCoverage"}]),
         ("builds", [build]),
     ])
-    assert polling.wait_for_artifact("710") == (102, "b" * 40)
+    assert polling.wait_for_artifact("710") == (102, "b" * 40, "CoberturaCoverage")
     assert not pending
     assert poll_clock.sleeps == [10, 10]
 
@@ -598,7 +996,7 @@ def test_poll_filters_unrelated_pr_builds(monkeypatch, poll_clock):
         ("builds", [ado_build(999, pr="711"), build]), (101, [{"name": "CoberturaCoverage"}]),
         ("builds", [build]),
     ])
-    assert polling.wait_for_artifact("710") == (101, "a" * 40)
+    assert polling.wait_for_artifact("710") == (101, "a" * 40, "CoberturaCoverage")
     assert not pending
 
 
@@ -622,10 +1020,10 @@ def test_poll_rejects_invalid_pr_number(monkeypatch, poll_clock, pr_number):
 
 def test_poll_cli_outputs_matching_build_and_sha(monkeypatch, tmp_path):
     output = tmp_path / "output"
-    monkeypatch.setattr(polling, "wait_for_artifact", lambda pr: (102, "b" * 40))
+    monkeypatch.setattr(polling, "wait_for_artifact", lambda pr: (102, "b" * 40, "CoberturaCoverage_1_2"))
     monkeypatch.setattr("sys.argv", ["wait-for-coverage.py", "--pr-number", "710", "--output", str(output)])
     polling.main()
-    assert output.read_text() == f"build_id=102\nhead_sha={'b' * 40}\n"
+    assert output.read_text() == f"build_id=102\nhead_sha={'b' * 40}\nartifact_name=CoberturaCoverage_1_2\n"
 
 
 @pytest.mark.parametrize("key", ["pr.sourceSha", "pr.sourceCommitId", "pr.headSha"])
@@ -637,7 +1035,7 @@ def test_poll_accepts_supported_sha_aliases(monkeypatch, poll_clock, key):
         ("builds", [build]), (101, [{"name": "CoberturaCoverage"}]),
         ("builds", [build]),
     ])
-    assert polling.wait_for_artifact("710") == (101, "a" * 40)
+    assert polling.wait_for_artifact("710") == (101, "a" * 40, "CoberturaCoverage")
     assert build["triggerInfo"]["pr.sourceSha"] == "a" * 40
     assert not pending
 
@@ -653,7 +1051,7 @@ def test_poll_waits_for_current_head_before_replacement_is_queued(monkeypatch, p
         ("builds", [new, old]), (102, [{"name": "CoberturaCoverage"}]),
         ("builds", [new, old]),
     ])
-    assert polling.wait_for_artifact("710") == (102, "b" * 40)
+    assert polling.wait_for_artifact("710") == (102, "b" * 40, "CoberturaCoverage")
     assert poll_clock.sleeps == [10, 10]
     assert not any("/101/artifacts" in url for url in calls)
     assert not pending
@@ -670,7 +1068,7 @@ def test_poll_refreshes_github_head_before_accepting_ready_artifact(monkeypatch,
         ("builds", [new, old]), (102, [{"name": "CoberturaCoverage"}]),
         ("builds", [new, old]),
     ])
-    assert polling.wait_for_artifact("710") == (102, "b" * 40)
+    assert polling.wait_for_artifact("710") == (102, "b" * 40, "CoberturaCoverage")
     assert len([url for url in calls if "/101/artifacts" in url]) == 1
     assert not pending
 
@@ -705,6 +1103,8 @@ def test_duplicate_timeline_matches_pipeline_stage_identifiers():
     )
     stages = {stage["stage"] for stage in pipeline["stages"] if "stage" in stage}
     assert {record["identifier"] for record in duplicate_timeline()} <= stages
+    coverage = next(stage for stage in pipeline["stages"] if stage.get("stage") == "Coverage")
+    assert coverage_timeline()[1]["identifier"] == f"Coverage.{coverage['jobs'][0]['job']}.__default"
 
 
 def test_poll_reuses_original_coverage_after_duplicate_finishes(monkeypatch, poll_clock):
@@ -716,10 +1116,11 @@ def test_poll_reuses_original_coverage_after_duplicate_finishes(monkeypatch, pol
         ("builds", [duplicate, completed]), (102, []),
         ("timeline:102", duplicate_timeline()),
         ("successful", [duplicate, completed]), ("builds", [duplicate]),
-        (101, [{"name": "CoberturaCoverage"}]),
+        (101, [{"name": "CoberturaCoverage_1_2"}]),
+        ("timeline:101", coverage_timeline()),
         ("builds", [duplicate, completed]),
     ])
-    assert polling.wait_for_artifact("710") == (101, "a" * 40)
+    assert polling.wait_for_artifact("710") == (101, "a" * 40, "CoberturaCoverage_1_2")
     assert poll_clock.sleeps == [300]
     assert not pending
 
@@ -738,7 +1139,7 @@ def test_duplicate_lookup_skips_chains_and_other_heads(monkeypatch, poll_clock):
         ("builds", [duplicate]), (101, [{"name": "CoberturaCoverage"}]),
         ("builds", [duplicate]),
     ])
-    assert polling.wait_for_artifact("710") == (101, "a" * 40)
+    assert polling.wait_for_artifact("710") == (101, "a" * 40, "CoberturaCoverage")
     assert not any("/99/artifacts" in url or "/98/artifacts" in url for url in calls)
     assert not pending
 
@@ -776,7 +1177,7 @@ def test_poll_follows_new_head_after_duplicate_coverage_lookup(monkeypatch, poll
         ("builds", [replacement, duplicate]), (103, [{"name": "CoberturaCoverage"}]),
         ("builds", [replacement, duplicate]),
     ])
-    assert polling.wait_for_artifact("710") == (103, "b" * 40)
+    assert polling.wait_for_artifact("710") == (103, "b" * 40, "CoberturaCoverage")
     assert not pending
 
 
@@ -818,14 +1219,14 @@ def test_history_scan_follows_replacement_before_next_artifact(monkeypatch, poll
         ("builds", [replacement]),
     ])
     pending, calls = queued_api(monkeypatch, responses)
-    has_coverage = polling.has_coverage
+    coverage_artifact = polling.coverage_artifact
     def slow_first_artifact(build_id, *, deadline):
-        result = has_coverage(build_id, deadline=deadline)
+        result = coverage_artifact(build_id, deadline=deadline)
         if build_id == 102:
             poll_clock.now += 40
         return result
-    monkeypatch.setattr(polling, "has_coverage", slow_first_artifact)
-    assert polling.wait_for_artifact("710", timeout=60) == (104, replacement_sha)
+    monkeypatch.setattr(polling, "coverage_artifact", slow_first_artifact)
+    assert polling.wait_for_artifact("710", timeout=60) == (104, replacement_sha, "CoberturaCoverage")
     assert not any("/101/artifacts" in url for url in calls)
     assert poll_clock.now == 40
     assert not poll_clock.sleeps
@@ -842,7 +1243,7 @@ def test_poll_recovers_from_transient_artifact_errors(monkeypatch, poll_clock, s
         ("builds", [new]), (102, [{"name": "CoberturaCoverage"}]),
         ("builds", [new]),
     ])
-    assert polling.wait_for_artifact("710") == (102, "a" * 40)
+    assert polling.wait_for_artifact("710") == (102, "a" * 40, "CoberturaCoverage")
     assert poll_clock.sleeps == [10]
     assert not pending
 
@@ -869,7 +1270,7 @@ def test_poll_resets_backoff_after_successful_api_calls(monkeypatch, poll_clock)
         ("builds", [build]), (101, [{"name": "CoberturaCoverage"}]),
         ("builds", [build]),
     ])
-    assert polling.wait_for_artifact("710") == (101, "a" * 40)
+    assert polling.wait_for_artifact("710") == (101, "a" * 40, "CoberturaCoverage")
     assert poll_clock.sleeps == [10, 300, 10]
     assert not pending
 
@@ -881,7 +1282,7 @@ def test_poll_recovers_from_request_timeout(monkeypatch, poll_clock):
         ("builds", [build]), (101, [{"name": "CoberturaCoverage"}]),
         ("builds", [build]),
     ])
-    assert polling.wait_for_artifact("710") == (101, "a" * 40)
+    assert polling.wait_for_artifact("710") == (101, "a" * 40, "CoberturaCoverage")
     assert poll_clock.sleeps == [10]
     assert not pending
 
@@ -927,7 +1328,7 @@ def test_poll_retries_transfer_timeout(monkeypatch, poll_clock, timeout_kind):
             raise response
         return response if isinstance(response, subprocess.CompletedProcess) else curl_response(response)
     monkeypatch.setattr(polling.subprocess, "run", run)
-    assert polling.wait_for_artifact("710") == (101, "a" * 40)
+    assert polling.wait_for_artifact("710") == (101, "a" * 40, "CoberturaCoverage")
     assert poll_clock.sleeps == [10]
     assert not responses
 

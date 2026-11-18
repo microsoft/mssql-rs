@@ -53,6 +53,28 @@ See `.pipeline/docs/arm-sql-host-design.md` for the full design.
 
 ## Scripts
 
+### Coverage artifacts and job retries
+
+Pipeline artifacts are immutable within a build. Coverage producers append
+`System.StageAttempt` and `System.JobAttempt` to their artifact names and expose
+that suffix through the `coverageAttempt.value` job output. The merge job downloads
+each producer's recorded attempt, so retrying macOS does not discard successful
+Windows or Linux coverage or reuse the failed macOS attempt.
+
+The merged artifact is also attempt-scoped (`CoberturaCoverage_<stage>_<job>`).
+GitHub reporting checks the coverage stage and merge job's current successful
+attempt before downloading that exact artifact; it does not select the largest
+suffix or fall back to an older report during a retry. Legacy builds with only
+`CoberturaCoverage` remain supported. Existing builds keep their original pipeline
+definition, so this fix applies to newly queued builds, not retries of old builds.
+Test failures and optional-coverage policies are unchanged.
+
+For fork PRs, land the backward-compatible GitHub reporter changes on `main`
+before the producer changes: manual `/coverage` reports use default-branch
+tooling, not the fork's scripts. Same-repository PR workflows use their own
+workflow revision. The merge job cleans its workspace before downloading so a
+missing optional artifact cannot leave a previous attempt's XML in the merge.
+
 ### Windows Python certificate bootstrap
 
 The shared Windows wheel build, signed-wheel repack, and install-test templates
