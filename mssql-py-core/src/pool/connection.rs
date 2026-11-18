@@ -9,7 +9,9 @@ use mssql_tds::connection::{
     client_context::{ClientContext, ColumnEncryptionSetting, TdsAuthenticationMethod},
     tds_client::TdsClient,
 };
-use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
+use mssql_tds::connection_provider::tds_connection_provider::{
+    ConnectionDropBehavior, TdsConnectionProvider,
+};
 use mssql_tds::core::CancelHandle;
 
 use super::error::{OpenError, PoolError, PoolResult};
@@ -96,8 +98,7 @@ pub(crate) struct ConnectSpec {
 
 impl ConnectSpec {
     /// Takes ownership of effective options without repeating caller validation.
-    pub(crate) fn new(mut context: ClientContext, expected_auth: AuthBinding) -> Self {
-        context.abort_on_drop = true;
+    pub(crate) fn new(context: ClientContext, expected_auth: AuthBinding) -> Self {
         Self {
             context,
             expected_auth,
@@ -183,10 +184,11 @@ impl ConnectionFactory for SqlConnectionFactory {
         cancel: &CancelHandle,
     ) -> Result<OpenedConnection, OpenError> {
         let client = TdsConnectionProvider {}
-            .create_client(
+            .create_client_with_drop_behavior(
                 spec.context().clone(),
                 &spec.context().data_source,
                 Some(cancel),
+                ConnectionDropBehavior::Abort,
             )
             .await
             .map_err(|error| OpenError::Tds(Box::new(error)))?;
@@ -217,16 +219,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-
-    #[test]
-    fn pooled_specs_require_synchronous_transport_discard() {
-        let context = ClientContext::with_data_source("tcp:localhost,1433");
-        assert!(!context.abort_on_drop);
-        let binding = AuthBinding::new(vec![1].into_boxed_slice()).unwrap();
-        let spec = ConnectSpec::new(context, binding);
-        assert!(spec.context().abort_on_drop);
-        assert!(spec.context().clone().abort_on_drop);
-    }
 
     #[test]
     fn keys_and_bindings_are_opaque_and_distinct() {

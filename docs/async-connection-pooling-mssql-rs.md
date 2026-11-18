@@ -903,9 +903,12 @@ trait ConnectionFactory: Send + Sync {
 ```
 
 The pool reserves capacity first and invokes `open` only for a physical open. The production
-adapter calls `TdsConnectionProvider::create_client(context, &datasource, Some(cancel))`. The
-pool owns isolation/reset/return policy, not the factory. Deterministic tests inject a Rust
-factory returning scripted clients.
+adapter calls `TdsConnectionProvider::create_client_with_drop_behavior` with
+`ConnectionDropBehavior::Abort`, passing the context, datasource and cancellation
+handle explicitly. Disposal is an owner-selected runtime policy, not part of
+`ClientContext` or the connection string. The pool owns isolation/reset/return
+policy, not the factory. Deterministic tests inject a Rust factory returning
+scripted clients.
 
 The factory supports SQL/trusted auth, a raw pre-acquired token, or the public async
 `EntraIdTokenFactory` installed in `ClientContext` for FEDAUTHINFO. That callback currently
@@ -1312,8 +1315,9 @@ Fresh login and initialization failures propagate without retry.
 All stages retain the original absolute acquisition deadline, cancellation
 signal and pool generation. Operation guards cancel TDS handles on interruption;
 caller-owned parallel TCP attempts drop synchronously before slot release.
-Pooled `ConnectSpec` enables `ClientContext::abort_on_drop` before physical
-opening. Network.framework connections then force-cancel on Drop, including
+The pooled `SqlConnectionFactory` selects `ConnectionDropBehavior::Abort` through
+the provider's lifecycle API before physical opening, without changing connection
+configuration. Network.framework connections then force-cancel on Drop, including
 interrupted opens and initialization, rather than draining TLS asynchronously
 after capacity has been released. Direct connections retain graceful teardown.
 No application SQL is replayed.
