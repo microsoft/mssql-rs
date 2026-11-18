@@ -11,7 +11,7 @@
 //!
 //! Sibling of `cursor.rs` (the synchronous surface). A [`PyAsyncCursor`] is
 //! bound to a single [`crate::async_connection::PyAsyncConnection`] and
-//! shares that connection's `TdsClient` via an `Arc<tokio::sync::Mutex<_>>`.
+//! retains its revocable logical parent rather than owning the physical client.
 //! All I/O methods will submit their futures to the shared process-wide
 //! Tokio runtime and return Python awaitables through
 //! `pyo3_async_runtimes::tokio::future_into_py`.
@@ -25,7 +25,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
-use mssql_tds::connection::tds_client::TdsClient;
 use mssql_tds::error::Error;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -37,6 +36,7 @@ use crate::async_description::DescriptionState;
 use crate::async_errors::ProgrammingError;
 use crate::async_execute::{ExecuteResources, PreparedState, release_prepared_statements};
 use crate::async_fetch::{BufferedResults, FetchState};
+use crate::async_handle::LogicalConnection;
 use crate::async_session::{
     AsyncConnectionState, ClaimError, CursorCloseClaim, CursorId, SessionOperationGuard,
 };
@@ -70,7 +70,7 @@ fn clear_result_state(
 
 /// Python-independent resources required to drain and release a cursor.
 struct CursorCleanup {
-    client: Arc<Mutex<TdsClient>>,
+    client: Arc<LogicalConnection>,
     prepared_state: Arc<Mutex<PreparedState>>,
     session_state: Arc<AsyncConnectionState>,
     cursor_id: CursorId,
@@ -90,11 +90,26 @@ impl CursorCleanup {
         );
     }
 
+    /// Borrow through the close claim; a revoked parent needs only local cursor cleanup.
     async fn run(self, claim: CursorCloseClaim) -> Result<(), Error> {
         let mut cleanup_guard =
             SessionOperationGuard::new(self.session_state.clone(), claim.operation_id);
         let (result, has_open_batch) = {
-            let mut client = self.client.lock().await;
+            let mut client = match self.client.lock_operation(claim.operation_id).await {
+                Ok(client) => client,
+                Err(ClaimError::Closing | ClaimError::Closed) => {
+                    cleanup_guard.settle(false);
+                    self.clear_result_state();
+                    self.closed.store(true, Ordering::Release);
+                    return Ok(());
+                }
+                Err(error) => {
+                    cleanup_guard.settle(false);
+                    return Err(Error::UsageError(format!(
+                        "Cursor cleanup rejected: {error:?}"
+                    )));
+                }
+            };
             let result = async {
                 if claim.drain_previous {
                     client.close_query().await?;
@@ -123,6 +138,7 @@ struct FinalizerCleanup {
     completion_guard: FinalizerCompletionGuard,
 }
 
+/// Abandon session ownership if a scheduled finalizer never finishes its cleanup.
 struct FinalizerCompletionGuard {
     session_state: Arc<AsyncConnectionState>,
     cursor_id: CursorId,
@@ -173,11 +189,8 @@ impl Drop for FinalizerCompletionGuard {
 /// This API is a preview and may change between minor releases.
 #[pyclass]
 pub struct PyAsyncCursor {
-    /// Cloned from the parent `PyAsyncConnection`. The `Arc` keeps the
-    /// client alive across cursor and connection lifetimes; the async mutex
-    /// serializes wire access across `.await` points.
-    #[allow(dead_code)] // Consumed by upcoming async execute/fetch/close APIs.
-    tds_client: Arc<Mutex<TdsClient>>,
+    /// Keeps the logical parent alive, but cannot bypass explicit connection close.
+    tds_client: Arc<LogicalConnection>,
     tracing_dispatch: Option<tracing::Dispatch>,
     prepared_state: Arc<Mutex<PreparedState>>,
     /// Shared with the parent connection for future execute-time transaction handling.
@@ -206,11 +219,11 @@ pub struct PyAsyncCursor {
 }
 
 impl PyAsyncCursor {
-    /// Construct a new cursor bound to the given TDS client.
+    /// Construct a cursor retaining its logical connection.
     ///
     /// Called only from `PyAsyncConnection::cursor`.
     pub(crate) fn new(
-        tds_client: Arc<Mutex<TdsClient>>,
+        tds_client: Arc<LogicalConnection>,
         tracing_dispatch: Option<tracing::Dispatch>,
         autocommit: Arc<AtomicBool>,
         session_state: Arc<AsyncConnectionState>,
@@ -238,6 +251,7 @@ impl PyAsyncCursor {
         }
     }
 
+    /// Retain the logical parent for cleanup without giving the finalizer physical ownership.
     fn cleanup(&self) -> CursorCleanup {
         CursorCleanup {
             client: self.tds_client.clone(),
@@ -252,6 +266,7 @@ impl PyAsyncCursor {
         }
     }
 
+    /// Capture fetch state and parent lifetime before releasing the Python borrow.
     pub(crate) fn fetch_resources(&self) -> PyResult<crate::async_fetch::FetchResources> {
         if self.closed.load(Ordering::Acquire) {
             return Err(PyRuntimeError::new_err("Cursor is closed"));
@@ -268,6 +283,7 @@ impl PyAsyncCursor {
         ))
     }
 
+    /// Snapshot execution inputs while retaining revocable, not raw-client, access.
     pub(crate) fn execute_resources(&self) -> PyResult<ExecuteResources> {
         if self.closed.load(Ordering::Acquire) {
             return Err(PyRuntimeError::new_err("Cursor is closed"));
@@ -368,16 +384,241 @@ impl Drop for PyAsyncCursor {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::ffi::CString;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    use pyo3::Python;
+    use mssql_tds::error::Error;
+    use mssql_tds::test_client_support::tds_client_from_tokens_capturing;
+    use pyo3::prelude::*;
+    use pyo3::types::{PyCFunction, PyDict};
+    use tokio::sync::oneshot;
+    use tracing::Subscriber;
+    use tracing::span::{Attributes, Id};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
 
-    use super::{FinalizerCompletionGuard, clear_result_state, map_claim_error};
+    use super::{FinalizerCompletionGuard, PyAsyncCursor, clear_result_state, map_claim_error};
     use crate::async_description::DescriptionState;
     use crate::async_errors::ProgrammingError;
     use crate::async_fetch::{BufferedResults, BufferedRowSet, FetchState, FetchStatus};
+    use crate::async_handle::LogicalConnection;
     use crate::async_session::{AsyncConnectionState, ClaimError, ConnectionLifecycle};
+    use crate::async_tracing::CURSOR_OPERATION_SPAN_NAME;
     use crate::row_writer::PyRowWriter;
+
+    struct ClaimInstalled(std::sync::Mutex<Option<oneshot::Sender<()>>>);
+
+    impl<S: Subscriber> Layer<S> for ClaimInstalled {
+        fn on_new_span(
+            &self,
+            attributes: &Attributes<'_>,
+            _id: &Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            // Cursor-operation spans are created after admission, before physical access.
+            if attributes.metadata().name() == CURSOR_OPERATION_SPAN_NAME
+                && let Some(sender) = self.0.lock().unwrap().take()
+            {
+                sender.send(()).unwrap();
+            }
+        }
+    }
+
+    fn cursor() -> (PyAsyncCursor, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let (client, transport) = tds_client_from_tokens_capturing(Vec::new());
+        let connection = Arc::new(LogicalConnection::new(client));
+        let cursor = PyAsyncCursor::new(
+            connection.clone(),
+            None,
+            Arc::new(AtomicBool::new(true)),
+            connection.state.clone(),
+            1,
+            0,
+        );
+        (cursor, transport)
+    }
+
+    fn assert_queued_operation_rejected(operation: &str, closed: bool) {
+        let (mut cursor, transport) = cursor();
+        let (claimed_tx, claimed_rx) = oneshot::channel();
+        cursor.tracing_dispatch = Some(tracing::Dispatch::new(
+            tracing_subscriber::Registry::default()
+                .with(ClaimInstalled(std::sync::Mutex::new(Some(claimed_tx)))),
+        ));
+        let connection = cursor.tds_client.clone();
+        let state = cursor.session_state.clone();
+        let runtime = pyo3_async_runtimes::tokio::get_runtime();
+        let held_connection = connection.clone();
+        let (locked_tx, locked_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let holding = runtime.spawn(async move {
+            let operation_id = held_connection.state.claim_connection_operation().unwrap();
+            let held = held_connection.lock_operation(operation_id).await.unwrap();
+            held_connection.state.release_operation(operation_id);
+            locked_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            drop(held);
+        });
+        runtime.block_on(locked_rx).unwrap();
+        if !matches!(operation, "execute" | "executemany") {
+            let claim = state.claim_execute(1).unwrap();
+            state.finish_execute(claim.operation_id, true);
+            cursor.fetch_state.set(FetchStatus::Ready);
+        }
+
+        Python::attach(|py| {
+            let globals = PyDict::new(py);
+            globals
+                .set_item("cursor", Py::new(py, cursor).unwrap())
+                .unwrap();
+            let claimed = std::sync::Mutex::new(Some(claimed_rx));
+            let wait_for_claim = PyCFunction::new_closure(py, None, None, move |args, _| {
+                let claimed = claimed.lock().unwrap().take().unwrap();
+                pyo3_async_runtimes::tokio::future_into_py(args.py(), async move {
+                    claimed.await.unwrap();
+                    Ok(())
+                })
+                .map(Bound::unbind)
+            })
+            .unwrap();
+            globals.set_item("wait_for_claim", wait_for_claim).unwrap();
+            let release = std::sync::Mutex::new(Some(release_tx));
+            let revoke = PyCFunction::new_closure(py, None, None, move |_, _| {
+                if closed {
+                    connection.state.mark_closed();
+                } else {
+                    connection.state.begin_close();
+                }
+                release.lock().unwrap().take().unwrap().send(()).unwrap();
+                Ok::<(), PyErr>(())
+            })
+            .unwrap();
+            globals.set_item("revoke", revoke).unwrap();
+            let call = match operation {
+                "execute" => "cursor.execute('SELECT 1', use_prepare=False)".to_string(),
+                "executemany" => {
+                    "cursor.executemany('SELECT ?', [(1,)], use_prepare=False)".to_string()
+                }
+                _ => format!("cursor.{operation}()"),
+            };
+            let expected = if closed { "closed" } else { "closing" };
+            let await_claim = if matches!(operation, "execute" | "executemany") {
+                "    await asyncio.wait_for(wait_for_claim(), 5)\n"
+            } else {
+                ""
+            };
+            let code = CString::new(format!(
+                r#"import asyncio
+async def run():
+    pending = {call}
+{await_claim}    revoke()
+    try:
+        await asyncio.wait_for(pending, 5)
+    except RuntimeError as error:
+        assert str(error) == 'Connection is {expected}', str(error)
+    else:
+        raise AssertionError('queued {operation} reached the client')
+    assert await cursor.close() is None
+asyncio.run(run())
+"#
+            ))
+            .unwrap();
+            py.run(&code, Some(&globals), None).unwrap();
+        });
+        runtime.block_on(holding).unwrap();
+        assert_eq!(
+            state.lifecycle(),
+            if closed {
+                ConnectionLifecycle::Closed
+            } else {
+                ConnectionLifecycle::Closing
+            }
+        );
+        assert!(transport.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn queued_execute_rejects_revoked_parent() {
+        for closed in [false, true] {
+            assert_queued_operation_rejected("execute", closed);
+        }
+    }
+
+    #[test]
+    fn queued_executemany_rejects_revoked_parent() {
+        for closed in [false, true] {
+            assert_queued_operation_rejected("executemany", closed);
+        }
+    }
+
+    #[test]
+    fn queued_fetch_variants_and_nextset_reject_revoked_parent() {
+        for operation in ["fetchone", "fetchmany", "fetchall", "nextset"] {
+            for closed in [false, true] {
+                assert_queued_operation_rejected(operation, closed);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_cleanup_after_parent_revocation_clears_only_local_results() {
+        for closed in [false, true] {
+            let (cursor, transport) = cursor();
+            cursor.fetch_state.set(FetchStatus::Ready);
+            cursor
+                .buffered_results
+                .replace(VecDeque::from([BufferedRowSet {
+                    metadata: Vec::new(),
+                    rows: VecDeque::from([PyRowWriter::new(0)]),
+                }]));
+            let state = cursor.session_state.clone();
+            let claim = state.claim_cursor_close(1).unwrap();
+            if closed {
+                drop(cursor.tds_client.take_for_close().await.unwrap());
+                state.mark_closed();
+            } else {
+                state.begin_close();
+            }
+
+            cursor.cleanup().run(claim).await.unwrap();
+
+            assert!(cursor.closed.load(Ordering::Acquire));
+            assert!(cursor.fetch_state.status() == FetchStatus::NoResultSet);
+            assert!(!cursor.buffered_results.has_current());
+            assert!(transport.lock().unwrap().is_empty());
+            assert_eq!(Arc::strong_count(&transport), if closed { 1 } else { 2 });
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_cleanup_rejects_broken_or_replaced_claim_without_io() {
+        for broken in [false, true] {
+            let (cursor, transport) = cursor();
+            let state = cursor.session_state.clone();
+            let claim = state.claim_cursor_close(1).unwrap();
+            let replacement = if broken {
+                state.mark_broken();
+                None
+            } else {
+                state.release_operation(claim.operation_id);
+                Some(state.claim_connection_operation().unwrap())
+            };
+
+            let error = cursor.cleanup().run(claim).await.unwrap_err();
+
+            assert!(matches!(error, Error::UsageError(message) if message ==
+                format!("Cursor cleanup rejected: {}", if broken { "Broken" } else { "Busy" })));
+            assert!(!cursor.closed.load(Ordering::Acquire));
+            assert!(transport.lock().unwrap().is_empty());
+            if let Some(replacement) = replacement {
+                assert!(cursor.tds_client.lock_operation(replacement).await.is_ok());
+                state.release_operation(replacement);
+            } else {
+                assert_eq!(state.lifecycle(), ConnectionLifecycle::Broken);
+            }
+        }
+    }
 
     #[test]
     fn clear_result_state_discards_buffered_results() {

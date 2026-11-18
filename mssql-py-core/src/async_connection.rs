@@ -6,7 +6,7 @@
 //! Preview API — unstable. First use emits a `FutureWarning`.
 //!
 //! Invariant: one `TdsClient` and one TDS wire session per async connection.
-//! All cursors share that client and serialize access through the async mutex.
+//! Cursors retain a logical parent whose physical handle is revoked on close.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -15,11 +15,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use pyo3::exceptions::{PyFutureWarning, PyOverflowError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
-use tokio::sync::Mutex;
 use tracing::instrument::WithSubscriber;
 
 use mssql_tds::connection::client_context::TdsAuthenticationMethod;
-use mssql_tds::connection::tds_client::TdsClient;
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::error::Error as TdsError;
 
@@ -27,6 +25,7 @@ use crate::async_cursor::PyAsyncCursor;
 use crate::async_entra_credentials::BuiltInEntraCredential;
 use crate::async_entra_token_factory::AsyncPythonEntraIdTokenFactory;
 use crate::async_errors::InterfaceError;
+use crate::async_handle::LogicalConnection;
 use crate::async_session::{AsyncConnectionState, ClaimError, OperationId};
 use crate::connection::PyCoreConnection;
 use crate::python_logger_adapter::python_logger_dispatch;
@@ -184,8 +183,13 @@ where
     }
 }
 
-async fn close_client(client: Arc<Mutex<TdsClient>>, autocommit: bool) -> bool {
-    let mut guard = client.lock().await;
+/// Detach the direct handle before shutdown so retained cursors cannot reacquire it.
+/// Preserve the preview API's existing rollback and logged-cleanup-error policy.
+async fn close_client(client: Arc<LogicalConnection>, autocommit: bool) -> bool {
+    let Some(mut handle) = client.take_for_close().await else {
+        return true;
+    };
+    let guard = handle.client_mut();
     if !autocommit
         && guard.has_active_transaction()
         && let Err(error) = guard.rollback_transaction(None, None).await
@@ -214,8 +218,8 @@ async fn close_client(client: Arc<Mutex<TdsClient>>, autocommit: bool) -> bool {
 /// be reused.
 #[pyclass]
 pub struct PyAsyncConnection {
-    /// `Option` so `close()` can `take()`; `Arc<Mutex<>>` for cursor sharing.
-    tds_client: Option<Arc<Mutex<TdsClient>>>,
+    /// Removing this wrapper's reference does not revoke surviving cursor owners.
+    tds_client: Option<Arc<LogicalConnection>>,
     tracing_dispatch: Option<tracing::Dispatch>,
     /// Shared now so future cursor execution observes the connection mode.
     autocommit: Arc<AtomicBool>,
@@ -323,14 +327,15 @@ impl PyAsyncConnection {
                         .map_err(|error| map_connect_error(error, uses_async_auth))?;
 
                     tracing::info!("PyAsyncConnection::connect: connection established");
+                    let connection = Arc::new(LogicalConnection::new(client));
                     Python::attach(|py| {
                         Py::new(
                             py,
                             PyAsyncConnection {
-                                tds_client: Some(Arc::new(Mutex::new(client))),
+                                session_state: connection.state.clone(),
+                                tds_client: Some(connection),
                                 tracing_dispatch: dispatch,
                                 autocommit: Arc::new(AtomicBool::new(autocommit)),
-                                session_state: Arc::new(AsyncConnectionState::new()),
                                 default_query_timeout: 0,
                             },
                         )
@@ -481,7 +486,11 @@ impl PyAsyncConnection {
                         return Python::attach(|py| Ok(py.None()));
                     };
 
-                    let mut guard = client.lock().await;
+                    let Some(mut handle) = client.take_for_close().await else {
+                        session_state.mark_closed();
+                        return Python::attach(|py| Ok(py.None()));
+                    };
+                    let guard = handle.client_mut();
                     let finalize_result = if !autocommit && guard.has_active_transaction() {
                         if has_block_error {
                             guard
@@ -559,7 +568,10 @@ impl PyAsyncConnection {
                     let mut operation_guard =
                         ConnectionOperationGuard::new(session_state, operation_id);
                     let result = async {
-                        let mut client = client.lock().await;
+                        let mut client = client
+                            .lock_operation(operation_id)
+                            .await
+                            .map_err(map_claim_error)?;
                         if client.has_active_transaction() {
                             tracing::info!("PyAsyncConnection::commit: sending TM_COMMIT");
                             client
@@ -605,7 +617,10 @@ impl PyAsyncConnection {
                     let mut operation_guard =
                         ConnectionOperationGuard::new(session_state, operation_id);
                     let result = async {
-                        let mut client = client.lock().await;
+                        let mut client = client
+                            .lock_operation(operation_id)
+                            .await
+                            .map_err(map_claim_error)?;
                         if client.has_active_transaction() {
                             tracing::info!("PyAsyncConnection::rollback: sending TM_ROLLBACK");
                             client
@@ -658,8 +673,66 @@ mod tests {
     use mssql_tds::error::{Error, SqlErrorInfo, SqlServerDiagnostics, TimeoutErrorType};
     use pyo3::prelude::*;
 
-    use super::map_connect_error;
+    use super::{PyAsyncConnection, close_client, map_connect_error};
     use crate::async_errors::{DatabaseError, OperationalError};
+    use crate::async_handle::LogicalConnection;
+
+    #[test]
+    fn context_exit_after_handle_revocation_closes_without_io() {
+        let (client, transport) =
+            mssql_tds::test_client_support::tds_client_from_tokens_capturing(Vec::new());
+        let connection = std::sync::Arc::new(LogicalConnection::new(client));
+        drop(
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(connection.take_for_close())
+                .unwrap(),
+        );
+        let state = connection.state.clone();
+        let wrapper = PyAsyncConnection {
+            tds_client: Some(connection),
+            tracing_dispatch: None,
+            autocommit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_state: state.clone(),
+            default_query_timeout: 0,
+        };
+        Python::attach(|py| {
+            let globals = pyo3::types::PyDict::new(py);
+            globals
+                .set_item("conn", Py::new(py, wrapper).unwrap())
+                .unwrap();
+            py.run(
+                cr"import asyncio
+async def run():
+    assert await conn.__aexit__(None, None, None) is None
+    assert conn.closed
+    assert await conn.close() is None
+asyncio.run(run())",
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            state.lifecycle(),
+            crate::async_session::ConnectionLifecycle::Closed
+        );
+        assert_eq!(std::sync::Arc::strong_count(&transport), 1);
+        assert!(transport.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_after_handle_revocation_is_a_noop() {
+        let (client, transport) =
+            mssql_tds::test_client_support::tds_client_from_tokens_capturing(Vec::new());
+        let connection = std::sync::Arc::new(LogicalConnection::new(client));
+        drop(connection.take_for_close().await.unwrap());
+
+        assert!(close_client(connection.clone(), false).await);
+        assert!(close_client(connection.clone(), true).await);
+        assert_eq!(std::sync::Arc::strong_count(&transport), 1);
+        assert!(transport.lock().unwrap().is_empty());
+        assert!(connection.take_for_close().await.is_none());
+    }
 
     #[test]
     fn connect_transport_errors_are_independent_of_auth_mode() {
