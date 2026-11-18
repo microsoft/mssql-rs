@@ -234,17 +234,18 @@ connections use a socket and Secure Transport (TLS 1.2 maximum).
 
 ## Abandoned connection teardown
 
-`ClientContext::abort_on_drop` defaults to `false`. Setting it to `true`
-disables deferred TLS drain on abandoned transports. On macOS Network.framework
-this force-cancels the connection synchronously instead of scheduling the
-graceful close barrier. The policy applies from connection-attempt creation,
-including interrupted handshakes and login, through client destruction.
-Other backends already release their local transports synchronously on Drop.
-Explicitly awaited `close_connection()` still uses graceful shutdown.
+`TdsConnectionProvider::create_client` retains the transport's normal graceful
+Drop behavior. Owners that must release reserved capacity only after local
+discard can instead call `create_client_with_drop_behavior` with
+`ConnectionDropBehavior::Abort`. This is an ownership policy passed separately
+from `ClientContext`, not a connection-string option.
 
-Owners that release physical capacity on Drop can enable this policy so local
-discard finishes before capacity becomes available. Normal direct connections
-retain their existing graceful Drop behavior.
+On macOS Network.framework, Abort force-cancels the connection before Drop
+returns instead of scheduling a graceful drain of queued TLS writes. It applies
+before the first handshake, including redirected login and recovered transports,
+through client destruction. Other backends already release local transports
+synchronously on Drop. Explicitly awaited `close_connection()` remains graceful.
+Local cancellation does not guarantee immediate removal of a server-side session.
 
 ## Execution stack usage
 

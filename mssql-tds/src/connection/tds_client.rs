@@ -6,6 +6,7 @@ use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
 use crate::connection::client_context::{ClientContext, ExecutionColumnEncryptionSetting};
 use crate::connection::session_recovery::RecoveryContext;
 use crate::connection::transport::any_transport::AnyTransport;
+use crate::connection_provider::tds_connection_provider::ConnectionDropBehavior;
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
 use crate::datatypes::encoder::GenericEncoder;
 use crate::datatypes::row_writer::{DefaultRowWriter, DiscardRowWriter, RowWriter};
@@ -629,6 +630,7 @@ struct ResultSetClassification {
 #[derive(Debug)]
 pub struct TdsClient {
     pub(crate) transport: AnyTransport,
+    pub(crate) drop_behavior: ConnectionDropBehavior,
     pub(crate) negotiated_settings: NegotiatedSettings,
     pub(crate) execution_context: ExecutionContext,
     pub(crate) recovery_context: Box<RecoveryContext>,
@@ -867,6 +869,7 @@ impl TdsClient {
 
         Self {
             transport,
+            drop_behavior: ConnectionDropBehavior::Graceful,
             negotiated_settings,
             execution_context,
             recovery_context: Box::new(recovery_context),
@@ -1028,6 +1031,7 @@ impl TdsClient {
                         &reconnect_ctx,
                         &transport_context,
                         Some(Box::new((*snapshot).clone())),
+                        self.drop_behavior,
                         None,
                     ),
                 ),

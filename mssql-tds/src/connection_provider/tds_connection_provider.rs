@@ -54,6 +54,20 @@ type ConnectionParts = (
 /// Factory for establishing TDS connections and producing [`TdsClient`] instances.
 pub struct TdsConnectionProvider;
 
+/// Disposal behavior selected by the connection owner, not connection-string configuration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConnectionDropBehavior {
+    /// Retain the transport's normal graceful Drop behavior.
+    #[default]
+    Graceful,
+    /// Bypass deferred TLS draining when discarded, including interrupted opening.
+    ///
+    /// On macOS Network.framework this force-cancels before Drop returns.
+    /// Other backends already dispose of local transports synchronously.
+    /// Explicitly awaited connection close remains graceful.
+    Abort,
+}
+
 /// Where a diagnostic connection attempt ([`TdsConnectionProvider::diagnose_client`])
 /// stops.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -210,12 +224,33 @@ impl TdsConnectionProvider {
     /// ```
     pub async fn create_client(
         &self,
-        mut context: ClientContext,
+        context: ClientContext,
         datasource: &str,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<TdsClient> {
+        self.create_client_with_drop_behavior(
+            context,
+            datasource,
+            cancel_handle,
+            ConnectionDropBehavior::Graceful,
+        )
+        .await
+    }
+
+    /// Selects disposal behavior before opening, without changing connection settings.
+    ///
+    /// Owners that release reserved capacity on Drop can select
+    /// [`ConnectionDropBehavior::Abort`]. The policy covers opening, redirected
+    /// login and session recovery, not just the successfully opened client.
+    pub async fn create_client_with_drop_behavior(
+        &self,
+        mut context: ClientContext,
+        datasource: &str,
+        cancel_handle: Option<&CancelHandle>,
+        drop_behavior: ConnectionDropBehavior,
+    ) -> TdsResult<TdsClient> {
         let action_chain = Self::action_chain(&mut context, datasource)?;
-        self.execute_action_chain(&context, action_chain, cancel_handle, None)
+        self.execute_action_chain(&context, action_chain, cancel_handle, drop_behavior, None)
             .await
     }
 
@@ -263,7 +298,13 @@ impl TdsConnectionProvider {
         let diagnosis = Diagnosis::new(stop_after);
         let bound_ms = u64::from(context.connect_timeout) * 1000;
         let result = self
-            .execute_action_chain(&context, action_chain, None, Some(&diagnosis))
+            .execute_action_chain(
+                &context,
+                action_chain,
+                None,
+                ConnectionDropBehavior::Graceful,
+                Some(&diagnosis),
+            )
             .await;
         diagnosis.finish_extra_connects(bound_ms).await;
         if diagnosis.stopped() {
@@ -308,6 +349,7 @@ impl TdsConnectionProvider {
         context: &ClientContext,
         action_chain: ConnectionActionChain,
         cancel_handle: Option<&CancelHandle>,
+        drop_behavior: ConnectionDropBehavior,
         diagnosis: Option<&Diagnosis>,
     ) -> TdsResult<TdsClient> {
         // ODBC polls connections on the application's stack (128 KiB on musl).
@@ -355,7 +397,7 @@ impl TdsConnectionProvider {
                 let timeout_duration =
                     deadline.map(|dl| dl.saturating_duration_since(Instant::now()));
                 let connect_future =
-                    Self::connect_with_transport_context(context, &sm_transport, None, diagnosis);
+                    Self::connect_with_transport_context(context, &sm_transport, None, drop_behavior, diagnosis);
                 let sm_result = match timeout_duration.as_ref() {
                     Some(duration) => match timeout(*duration, connect_future).await {
                         Ok(result) => result,
@@ -367,7 +409,7 @@ impl TdsConnectionProvider {
                 };
                 // A route received over shared memory is followed over TCP like
                 // any other, instead of surfacing as a permanent failure below.
-                match Self::follow_redirects(context, sm_result, deadline, &mut redirect_count, diagnosis).await {
+                match Self::follow_redirects(context, sm_result, deadline, &mut redirect_count, drop_behavior, diagnosis).await {
                     Ok((transport, negotiated_settings, execution_context, info_messages, session_state_tokens)) => {
                         debug!("Shared Memory connection succeeded, skipping SSRP");
                         let mut client = TdsClient::new(
@@ -377,6 +419,7 @@ impl TdsConnectionProvider {
                             context.clone(),
                             session_state_tokens,
                         );
+                        client.drop_behavior = drop_behavior;
                         client.extend_info_messages(info_messages);
                         return Ok(client);
                     }
@@ -544,7 +587,7 @@ impl TdsConnectionProvider {
                         ));
                     }
 
-                    let connect_future = Self::connect_with_transport_context(&context, transport_ctx, None, diagnosis);
+                    let connect_future = Self::connect_with_transport_context(&context, transport_ctx, None, drop_behavior, diagnosis);
 
                     // Recompute remaining time budget before each timeout call
                     let remaining = deadline.map(|dl| dl.saturating_duration_since(Instant::now()));
@@ -560,7 +603,7 @@ impl TdsConnectionProvider {
                         None => connect_future.await,
                     };
 
-                    match Self::follow_redirects(&context, connection_result, deadline, &mut redirect_count, diagnosis).await {
+                    match Self::follow_redirects(&context, connection_result, deadline, &mut redirect_count, drop_behavior, diagnosis).await {
                         Ok((transport, negotiated_settings, execution_context, info_messages, session_state_tokens)) => {
                             debug!("Connection successful via action chain");
                             let mut client = TdsClient::new(
@@ -570,6 +613,7 @@ impl TdsConnectionProvider {
                                 context.clone(),
                                 session_state_tokens,
                             );
+                            client.drop_behavior = drop_behavior;
                             client.extend_info_messages(info_messages);
                             return Ok(client);
                         }
@@ -751,6 +795,7 @@ impl TdsConnectionProvider {
         mut result: TdsResult<ConnectionParts>,
         deadline: Option<Instant>,
         redirect_count: &mut u32,
+        drop_behavior: ConnectionDropBehavior,
         diagnosis: Option<&Diagnosis>,
     ) -> TdsResult<ConnectionParts> {
         while let Err(Error::Redirection {
@@ -783,6 +828,7 @@ impl TdsConnectionProvider {
                 routed_context.as_deref().unwrap_or(context),
                 &tcp_transport_context,
                 None,
+                drop_behavior,
                 diagnosis,
             );
             // Recompute remaining time budget for redirected connect
@@ -809,6 +855,7 @@ impl TdsConnectionProvider {
         context: &ClientContext,
         transport_context: &TransportContext,
         recovery_data: Option<Box<SessionRecoveryData>>,
+        drop_behavior: ConnectionDropBehavior,
         diagnosis: Option<&Diagnosis>,
     ) -> TdsResult<ConnectionParts> {
         if let Some(trace) = &context.connection_trace {
@@ -833,7 +880,7 @@ impl TdsConnectionProvider {
                 })?
                 .enabled,
             connect_timeout_ms,
-            context.abort_on_drop,
+            drop_behavior == ConnectionDropBehavior::Abort,
             diagnosis,
         )
         .await?;
@@ -958,8 +1005,13 @@ mod tests {
         let provider = TdsConnectionProvider::new();
         let mut context = ClientContext::default();
         let chain = TdsConnectionProvider::action_chain(&mut context, "localhost").unwrap();
-        let size =
-            std::mem::size_of_val(&provider.execute_action_chain(&context, chain, None, None));
+        let size = std::mem::size_of_val(&provider.execute_action_chain(
+            &context,
+            chain,
+            None,
+            ConnectionDropBehavior::Graceful,
+            None,
+        ));
         assert!(
             size <= MAX,
             "execute_action_chain future is {size} B, expected <= {MAX} B"
@@ -1028,6 +1080,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn abort_drop_policy_preserves_connect_cancellation() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let context = context_for_retry_test("127.0.0.1", port, 30, 0, 0);
+        let cancel = CancelHandle::new();
+        let datasource = format!("tcp:127.0.0.1,{port}");
+        let server = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            cancel.cancel();
+            let mut buf = [0u8; 512];
+            loop {
+                match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        };
+        let (result, closed) = tokio::join!(
+            TdsConnectionProvider.create_client_with_drop_behavior(
+                context,
+                &datasource,
+                Some(&cancel),
+                ConnectionDropBehavior::Abort,
+            ),
+            tokio::time::timeout(Duration::from_secs(10), server),
+        );
+        assert!(matches!(result, Err(OperationCancelledError(_))));
+        closed.expect("aborted opening must close its transport");
+    }
+
     #[test]
     fn transport_attempts_clear_stale_trace_ids_before_connecting() {
         use crate::trace_context::{self, ConnectionTrace, Context, Snapshot};
@@ -1082,6 +1167,7 @@ mod tests {
                         &context,
                         &context.transport_context,
                         None,
+                        ConnectionDropBehavior::Graceful,
                         None,
                     ));
                 assert!(result.is_err());
@@ -1756,9 +1842,14 @@ mod tests {
             port,
             instance_name: None,
         };
-        let result =
-            TdsConnectionProvider::connect_with_transport_context(&context, &attempted, None, None)
-                .await;
+        let result = TdsConnectionProvider::connect_with_transport_context(
+            &context,
+            &attempted,
+            None,
+            ConnectionDropBehavior::Graceful,
+            None,
+        )
+        .await;
         assert!(result.is_ok(), "connect failed: {:?}", result.err());
 
         assert_eq!(
