@@ -16,7 +16,9 @@ use async_trait::async_trait;
 use chrono::{Datelike, NaiveDate, NaiveTime, TimeDelta, Timelike};
 use mssql_tds::connection::bulk_copy::{BulkLoadRow, ResolvedColumnMapping};
 use mssql_tds::core::TdsResult;
-use mssql_tds::datatypes::bulk_copy_metadata::{BulkCopyColumnMetadata, SqlDbType};
+use mssql_tds::datatypes::bulk_copy_metadata::{
+    BulkCopyColumnMetadata, SqlDbType, VectorBulkInput,
+};
 use mssql_tds::datatypes::column_values::{ColumnValues, SqlDateTime2, SqlDateTimeOffset, SqlTime};
 use mssql_tds::datatypes::decoder::DecimalParts;
 use mssql_tds::datatypes::sql_json::SqlJson;
@@ -294,6 +296,33 @@ impl SourcePythonType {
             SourcePythonType::Other
         }
     }
+}
+
+/// Chooses a vector column's incoming bulk representation from a sample value.
+///
+/// As in Microsoft.Data.SqlClient, the client never converts between vector
+/// base types: a typed vector is sent with its own base type, and JSON text for
+/// a FLOAT16 column is sent as UTF-8 text. SQL Server converts both to the
+/// destination column. Other values (NULL, lists, JSON for FLOAT32) keep the
+/// destination representation. Returns `None` when no change is needed.
+pub(crate) fn vector_bulk_input_for(
+    sample: &Bound<'_, PyAny>,
+    destination: &BulkCopyColumnMetadata,
+) -> TdsResult<Option<VectorBulkInput>> {
+    if destination.sql_type != SqlDbType::Vector || destination.is_encrypted {
+        return Ok(None);
+    }
+    let destination_base_type = VectorBaseType::try_from(destination.scale)?;
+    if let Ok(vector) = sample.extract::<PyRef<'_, crate::vector::BulkCopyVector>>() {
+        let base_type = vector.value.base_type();
+        return Ok(
+            (base_type != destination_base_type).then_some(VectorBulkInput::Native(base_type))
+        );
+    }
+    if destination_base_type == VectorBaseType::Float16 && sample.is_instance_of::<PyString>() {
+        return Ok(Some(VectorBulkInput::Utf8Json));
+    }
+    Ok(None)
 }
 
 /// Adapter that wraps a Python tuple for bulk insert.
@@ -698,7 +727,8 @@ impl PythonRowAdapter {
                         != target_meta.vector_dimensions()?
                 {
                     return Err(Error::UsageError(format!(
-                        "Vector dimensions or base_type do not match column '{}'",
+                        "Vector dimensions or base_type do not match column '{}'; the first \
+                         row's vector sets the column's base type for the whole bulk copy",
                         target_meta.column_name
                     )));
                 }
@@ -1901,7 +1931,8 @@ impl PythonRowAdapter {
                 Ok(ColumnValues::Vector(vector))
             }
             VectorBaseType::Float16 => Err(Error::UsageError(format!(
-                "Float16 VECTOR column '{}' is not supported in Python bulk copy JSON coercion",
+                "JSON text for float16 VECTOR column '{}' is sent to SQL Server as text only \
+                 when the first row's value is text; use one representation per column",
                 target_meta.column_name
             ))),
         }

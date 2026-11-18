@@ -5,6 +5,7 @@ use mssql_tds::connection::bulk_copy::{
     BulkCopy, ColumnMapping as TdsColumnMapping, ColumnMappingSource,
 };
 use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet, StatementResult, TdsClient};
+use mssql_tds::datatypes::bulk_copy_metadata::VectorBulkInput;
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::decoder::DECIMAL_STR_LEN;
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
@@ -16,8 +17,8 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
-use crate::arrow_bulkcopy::{ArrowBatchRowAdapter, ColumnPlan, build_column_plans};
-use crate::bulkcopy::PythonRowAdapter;
+use crate::arrow_bulkcopy::{ArrowBatchRowAdapter, ColumnPlan, ColumnPlanKind, build_column_plans};
+use crate::bulkcopy::{PythonRowAdapter, vector_bulk_input_for};
 use crate::python_logger_adapter::scoped_tracing_bridge;
 use crate::utils::convert_tds_error;
 use arrow::array::{RecordBatch, StructArray};
@@ -456,7 +457,33 @@ impl PyCoreCursor {
             // Create true streaming iterator from Python data source
             // Chain first row (if exists) back with remaining rows for zero-copy streaming
             info!("bulkcopy: Creating streaming PythonRowAdapter iterator");
-            let metadata_arc = Arc::new(destination_metadata);
+            // Declare each vector column's incoming representation from its first-row
+            // value, as Microsoft.Data.SqlClient does; SQL Server converts it to the
+            // destination column.
+            let mut incoming_metadata = destination_metadata;
+            if let Some(Ok(first_row)) = &first_row_result
+                && let Ok(first_row) = first_row.cast::<PyTuple>()
+            {
+                for mapping in resolved_mappings_arc.iter() {
+                    let Ok(sample) = first_row.get_item(mapping.source_index) else {
+                        continue;
+                    };
+                    let destination = &incoming_metadata[mapping.destination_index];
+                    let Some(input) =
+                        vector_bulk_input_for(&sample, destination).map_err(convert_tds_error)?
+                    else {
+                        continue;
+                    };
+                    let incoming = destination
+                        .with_vector_bulk_input(input)
+                        .map_err(convert_tds_error)?;
+                    bulk_copy
+                        .set_vector_bulk_input(&incoming.column_name, input)
+                        .map_err(convert_tds_error)?;
+                    incoming_metadata[mapping.destination_index] = incoming;
+                }
+            }
+            let metadata_arc = Arc::new(incoming_metadata);
 
             // Build iterator: first row (if exists) + remaining rows from Python iterator
             let all_rows_iter = first_row_result
@@ -674,6 +701,28 @@ impl PyCoreCursor {
 
                 let plans = build_column_plans(&schema, &destination_metadata, &resolved_mappings)
                     .map_err(convert_tds_error)?;
+                // Arrow vectors are sent with their source base type and SQL Server
+                // converts them, as Microsoft.Data.SqlClient does for typed vectors.
+                let mut destination_metadata = destination_metadata;
+                for plan in &plans {
+                    let ColumnPlanKind::Vector { base_type } = plan.kind else {
+                        continue;
+                    };
+                    let destination = &destination_metadata[plan.destination_index];
+                    if VectorBaseType::try_from(destination.scale).map_err(convert_tds_error)?
+                        == base_type
+                    {
+                        continue;
+                    }
+                    let input = VectorBulkInput::Native(base_type);
+                    let incoming = destination
+                        .with_vector_bulk_input(input)
+                        .map_err(convert_tds_error)?;
+                    bulk_copy
+                        .set_vector_bulk_input(&incoming.column_name, input)
+                        .map_err(convert_tds_error)?;
+                    destination_metadata[plan.destination_index] = incoming;
+                }
                 let plans_arc = Arc::new(plans);
                 let dest_arc = Arc::new(destination_metadata);
 

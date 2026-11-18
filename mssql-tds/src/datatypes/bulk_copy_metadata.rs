@@ -750,7 +750,70 @@ impl BulkCopyColumnMetadata {
 
         Ok(payload_bytes / elem_size)
     }
+
+    /// Returns this vector column's metadata for an incoming representation.
+    ///
+    /// Bulk copy declares the incoming representation in INSERT BULK and
+    /// COLMETADATA, and SQL Server converts it to the destination column, as
+    /// Microsoft.Data.SqlClient does. The column name, nullability and
+    /// dimensions are preserved.
+    pub fn with_vector_bulk_input(&self, input: VectorBulkInput) -> crate::core::TdsResult<Self> {
+        use crate::datatypes::sqldatatypes::VECTOR_HEADER_SIZE;
+
+        if self.is_encrypted {
+            return Err(crate::error::Error::UsageError(format!(
+                "Vector input conversion is not supported for encrypted column '{}'",
+                self.column_name
+            )));
+        }
+        let dimensions = self.vector_dimensions()?;
+        let mut incoming = self.clone();
+        match input {
+            VectorBulkInput::Native(base_type) => {
+                let length =
+                    (VECTOR_HEADER_SIZE + dimensions * base_type.element_size_bytes()) as i32;
+                incoming.scale = base_type as u8;
+                incoming.length = length;
+                incoming.length_type = TypeLength::Variable(length);
+            }
+            VectorBulkInput::Utf8Json => {
+                incoming.sql_type = SqlDbType::VarChar;
+                incoming.tds_type = SqlDbType::VarChar.to_bulk_copy_tds_type();
+                incoming.length = -1;
+                incoming.length_type = TypeLength::Plp;
+                incoming.precision = 0;
+                incoming.scale = 0;
+                incoming.collation = Some(VECTOR_TEXT_COLLATION);
+                incoming.collation_name = Some(VECTOR_TEXT_COLLATION_NAME.to_string());
+                incoming.encoding = Some(EncodingType::Utf8);
+            }
+        }
+        Ok(incoming)
+    }
 }
+
+/// How bulk copy transmits a vector column's values.
+///
+/// SQL Server converts the declared representation to the destination column's
+/// base type (round-to-nearest; out-of-range values fail on the server).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorBulkInput {
+    /// Native vectors with this base type.
+    Native(crate::datatypes::sqldatatypes::VectorBaseType),
+    /// JSON array text, sent as `varchar(max)` with a UTF-8 binary collation.
+    Utf8Json,
+}
+
+/// Collation name used for vector JSON text, matching Microsoft.Data.SqlClient.
+pub const VECTOR_TEXT_COLLATION_NAME: &str = "Latin1_General_100_BIN2_UTF8";
+
+/// LCID 1033, version 2, BIN2 and UTF-8: the descriptor for [`VECTOR_TEXT_COLLATION_NAME`].
+const VECTOR_TEXT_COLLATION: SqlCollation = SqlCollation {
+    info: 0x2600_0409,
+    lcid_language_id: 0x0409,
+    col_flags: 0x60,
+    sort_id: 0,
+};
 
 impl Default for BulkCopyColumnMetadata {
     fn default() -> Self {
@@ -1546,6 +1609,78 @@ mod tests {
         assert_eq!(
             meta.get_sql_type_definition().unwrap(),
             "vector(3, float16)"
+        );
+    }
+
+    fn float16_vector_meta(dimensions: usize) -> BulkCopyColumnMetadata {
+        use crate::datatypes::sqldatatypes::VECTOR_HEADER_SIZE;
+        let length = (VECTOR_HEADER_SIZE + dimensions * 2) as i32;
+        BulkCopyColumnMetadata::new("v", SqlDbType::Vector, 0xF5)
+            .with_length(length, TypeLength::Variable(length))
+            .with_scale(1)
+            .with_nullable(false)
+    }
+
+    #[test]
+    fn vector_bulk_input_declares_source_base_type() {
+        use crate::datatypes::sqldatatypes::{VECTOR_HEADER_SIZE, VectorBaseType};
+        let destination = float16_vector_meta(3);
+        let incoming = destination
+            .with_vector_bulk_input(VectorBulkInput::Native(VectorBaseType::Float32))
+            .unwrap();
+        assert_eq!(incoming.get_sql_type_definition().unwrap(), "vector(3)");
+        assert_eq!(incoming.scale, VectorBaseType::Float32 as u8);
+        assert_eq!(incoming.length, (VECTOR_HEADER_SIZE + 3 * 4) as i32);
+        assert!(
+            matches!(incoming.length_type, TypeLength::Variable(len) if len == incoming.length)
+        );
+        assert_eq!(incoming.vector_dimensions().unwrap(), 3);
+        assert_eq!(incoming.column_name, "v");
+        assert!(!incoming.is_nullable);
+        // Declaring the destination's own base type is a no-op.
+        let same = destination
+            .with_vector_bulk_input(VectorBulkInput::Native(VectorBaseType::Float16))
+            .unwrap();
+        assert_eq!(same.scale, destination.scale);
+        assert_eq!(same.length, destination.length);
+    }
+
+    #[test]
+    fn vector_bulk_input_declares_utf8_json_text() {
+        let incoming = float16_vector_meta(3)
+            .with_vector_bulk_input(VectorBulkInput::Utf8Json)
+            .unwrap();
+        assert_eq!(incoming.sql_type, SqlDbType::VarChar);
+        assert_eq!(incoming.tds_type, 0xA7);
+        assert!(incoming.is_plp());
+        assert_eq!(incoming.get_sql_type_definition().unwrap(), "varchar(max)");
+        assert_eq!(
+            incoming.collation_name.as_deref(),
+            Some(VECTOR_TEXT_COLLATION_NAME)
+        );
+        let collation = incoming.collation.unwrap();
+        assert!(collation.utf8());
+        assert!(collation.binary2());
+        assert_eq!(collation.lcid_language_id(), 0x0409);
+        assert_eq!(collation.code_page(), Some(65001));
+        assert!(matches!(incoming.encoding, Some(EncodingType::Utf8)));
+        assert_eq!(incoming.column_name, "v");
+    }
+
+    #[test]
+    fn vector_bulk_input_rejects_non_vector_and_encrypted_columns() {
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+        let text = BulkCopyColumnMetadata::new("c", SqlDbType::VarChar, 0xA7)
+            .with_length(-1, TypeLength::Plp);
+        assert!(
+            text.with_vector_bulk_input(VectorBulkInput::Utf8Json)
+                .is_err()
+        );
+        let encrypted = float16_vector_meta(3).with_encrypted(true);
+        assert!(
+            encrypted
+                .with_vector_bulk_input(VectorBulkInput::Native(VectorBaseType::Float32))
+                .is_err()
         );
     }
 

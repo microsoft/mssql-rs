@@ -176,21 +176,14 @@ pub fn build_column_plans(
                     e
                 ))
             })?;
-            if dest_meta.sql_type == SqlDbType::Vector {
-                let base_type = VectorBaseType::try_from(dest_meta.scale)?;
-                let expected = match base_type {
-                    VectorBaseType::Float32 => "float32",
-                    VectorBaseType::Float16 => "float16",
-                };
-                if let Some(source_type) = field.metadata().get("mssql.vector.base_type")
-                    && source_type != expected
-                {
-                    return Err(Error::UsageError(format!(
-                        "Arrow vector base_type does not match destination column '{}'",
-                        dest_meta.column_name
-                    )));
-                }
-            }
+            let kind = match kind {
+                // Tagged Arrow vectors are sent with their source base type and
+                // SQL Server converts them; untagged ones use the destination's.
+                ColumnPlanKind::Vector { base_type } => ColumnPlanKind::Vector {
+                    base_type: arrow_vector_base_type(field)?.unwrap_or(base_type),
+                },
+                other => other,
+            };
             Ok(ColumnPlan {
                 source_index: m.source_index,
                 destination_index: m.destination_index,
@@ -198,6 +191,25 @@ pub fn build_column_plans(
             })
         })
         .collect()
+}
+
+/// SQL base type declared by an Arrow vector field's `mssql.vector.base_type`
+/// metadata, or `None` when the field is untagged.
+fn arrow_vector_base_type(field: &arrow::datatypes::Field) -> TdsResult<Option<VectorBaseType>> {
+    match field
+        .metadata()
+        .get("mssql.vector.base_type")
+        .map(String::as_str)
+    {
+        None => Ok(None),
+        Some("float32") => Ok(Some(VectorBaseType::Float32)),
+        Some("float16") => Ok(Some(VectorBaseType::Float16)),
+        Some(_) => Err(Error::UsageError(format!(
+            "Arrow field '{}' has unsupported mssql.vector.base_type metadata; expected \
+             'float32' or 'float16'",
+            field.name()
+        ))),
+    }
 }
 
 fn resolve_kind(arrow_ty: &DataType, dest: &BulkCopyColumnMetadata) -> TdsResult<ColumnPlanKind> {
@@ -933,20 +945,85 @@ mod tests {
         plans.into_iter().next().unwrap()
     }
 
+    fn vector_dest(base_type: VectorBaseType, dimensions: usize) -> BulkCopyColumnMetadata {
+        use mssql_tds::datatypes::sqldatatypes::VECTOR_HEADER_SIZE;
+        let mut dest = meta("v", SqlDbType::Vector, true);
+        dest.scale = base_type as u8;
+        dest.length = (VECTOR_HEADER_SIZE + dimensions * base_type.element_size_bytes()) as i32;
+        dest
+    }
+
+    fn vector_plan(
+        dest: &BulkCopyColumnMetadata,
+        dimensions: i32,
+        base_type_metadata: Option<&str>,
+    ) -> TdsResult<ColumnPlan> {
+        let mut field = Field::new(
+            "v",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, false)),
+                dimensions,
+            ),
+            true,
+        );
+        if let Some(value) = base_type_metadata {
+            field = field.with_metadata([("mssql.vector.base_type".into(), value.into())].into());
+        }
+        let mappings = [ResolvedColumnMapping {
+            source_index: 0,
+            destination_index: 0,
+            destination_name: dest.column_name.clone(),
+            destination_type: SqlDbType::Vector,
+        }];
+        build_column_plans(
+            &Schema::new(vec![field]),
+            std::slice::from_ref(dest),
+            &mappings,
+        )
+        .map(|mut plans| plans.remove(0))
+    }
+
+    #[test]
+    fn vector_source_base_type_comes_from_arrow_metadata() {
+        // Tagged vectors declare their own base type and SQL Server converts them;
+        // untagged ones take the destination's, like plain numeric lists.
+        for dest_base in [VectorBaseType::Float32, VectorBaseType::Float16] {
+            let dest = vector_dest(dest_base, 3);
+            for (metadata, expected) in [
+                (None, dest_base),
+                (Some("float32"), VectorBaseType::Float32),
+                (Some("float16"), VectorBaseType::Float16),
+            ] {
+                let plan = vector_plan(&dest, 3, metadata).unwrap();
+                assert!(
+                    matches!(plan.kind, ColumnPlanKind::Vector { base_type } if base_type == expected),
+                    "{dest_base:?} destination, {metadata:?} metadata: {:?}",
+                    plan.kind
+                );
+            }
+            let error = vector_plan(&dest, 3, Some("float64")).unwrap_err();
+            assert!(
+                error.to_string().contains("mssql.vector.base_type"),
+                "{error}"
+            );
+        }
+    }
+
     #[test]
     fn vector_float32_and_float16_values_and_nulls() {
         use arrow::datatypes::Float32Type;
-        use mssql_tds::datatypes::sqldatatypes::VECTOR_HEADER_SIZE;
 
-        for base_type in [VectorBaseType::Float32, VectorBaseType::Float16] {
-            let mut dest = meta("v", SqlDbType::Vector, true);
-            dest.scale = base_type as u8;
-            dest.length = (VECTOR_HEADER_SIZE + 3 * base_type.element_size_bytes()) as i32;
+        for (metadata, base_type) in [
+            (Some("float32"), VectorBaseType::Float32),
+            (Some("float16"), VectorBaseType::Float16),
+        ] {
+            // Values keep the source base type even for a destination of the other type.
+            let dest = vector_dest(VectorBaseType::Float32, 3);
             let arr = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
                 [Some(vec![Some(0.1), Some(-0.0), Some(1.0)]), None],
                 3,
             );
-            let plan = one_col_plan(arr.data_type().clone(), &dest);
+            let plan = vector_plan(&dest, 3, metadata).unwrap();
             let sliced = arr.slice(1, 1);
             assert_eq!(
                 plan.extract_value(&sliced, 0, &dest).unwrap(),
@@ -955,6 +1032,7 @@ mod tests {
             match plan.extract_value(&arr, 0, &dest).unwrap() {
                 ColumnValues::Vector(v) => {
                     assert_eq!(v.base_type(), base_type);
+                    // Float16 elements are held as f32 and narrowed only on serialization.
                     assert_eq!(v.as_f32().unwrap(), &[0.1, -0.0, 1.0]);
                 }
                 other => panic!("expected Vector, got {other:?}"),
@@ -965,29 +1043,25 @@ mod tests {
     #[test]
     fn vector_rejects_null_elements_and_out_of_range_values() {
         use arrow::datatypes::Float32Type;
-        use mssql_tds::datatypes::sqldatatypes::VECTOR_HEADER_SIZE;
 
-        for values in [
-            vec![Some(1.0), None],
-            vec![Some(f32::NAN), Some(0.0)],
-            vec![Some(f32::INFINITY), Some(0.0)],
-            vec![Some(65505.0), Some(0.0)],
+        for (values, metadata) in [
+            (vec![Some(1.0), None], None),
+            (vec![Some(f32::NAN), Some(0.0)], None),
+            (vec![Some(f32::INFINITY), Some(0.0)], None),
+            // A float16-tagged source must hold finite float16 values.
+            (vec![Some(65505.0), Some(0.0)], Some("float16")),
         ] {
-            let mut dest = meta("v", SqlDbType::Vector, true);
-            dest.scale = 1;
-            dest.length = (VECTOR_HEADER_SIZE + 4) as i32;
+            let dest = vector_dest(VectorBaseType::Float16, 2);
             let arr =
                 FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>([Some(values)], 2);
-            let plan = one_col_plan(arr.data_type().clone(), &dest);
+            let plan = vector_plan(&dest, 2, metadata).unwrap();
             assert!(plan.extract_value(&arr, 0, &dest).is_err());
         }
     }
 
     #[test]
-    fn vector_rejects_wrong_shape_type_and_base_type_metadata() {
-        use mssql_tds::datatypes::sqldatatypes::VECTOR_HEADER_SIZE;
-        let mut dest = meta("v", SqlDbType::Vector, true);
-        dest.length = (VECTOR_HEADER_SIZE + 12) as i32;
+    fn vector_rejects_wrong_shape_and_element_type() {
+        let dest = vector_dest(VectorBaseType::Float32, 3);
         for ty in [
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 3),
@@ -995,19 +1069,7 @@ mod tests {
         ] {
             assert!(resolve_kind(&ty, &dest).is_err());
         }
-        let field = Field::new(
-            "v",
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3),
-            true,
-        )
-        .with_metadata([("mssql.vector.base_type".into(), "float16".into())].into());
-        let mappings = [ResolvedColumnMapping {
-            source_index: 0,
-            destination_index: 0,
-            destination_name: "v".into(),
-            destination_type: SqlDbType::Vector,
-        }];
-        assert!(build_column_plans(&Schema::new(vec![field]), &[dest], &mappings).is_err());
+        assert!(vector_plan(&dest, 2, Some("float16")).is_err());
     }
 
     #[test]

@@ -63,7 +63,7 @@ use crate::connection::bulk_copy_state::{ATTENTION_TIMEOUT_SECONDS, BulkCopyTime
 use crate::connection::metadata_retriever::{FmtOnlyMetadataRetriever, MetadataRetriever};
 use crate::connection::tds_client::TdsClient;
 use crate::core::TdsResult;
-use crate::datatypes::bulk_copy_metadata::{BulkCopyColumnMetadata, SqlDbType};
+use crate::datatypes::bulk_copy_metadata::{BulkCopyColumnMetadata, SqlDbType, VectorBulkInput};
 use crate::error::Error;
 use crate::error::SqlInfoMessage;
 use crate::error::bulk_copy_errors::{
@@ -778,6 +778,41 @@ impl<'a> BulkCopy<'a> {
 
         // Resolve the mappings
         self.resolve_column_mappings(&destination_metadata)
+    }
+
+    /// Declare how a destination vector column's values are transmitted.
+    ///
+    /// By default a vector column is sent with the destination's base type. Call
+    /// this after [`Self::retrieve_destination_metadata`] and before writing rows
+    /// to send native vectors of another base type or UTF-8 JSON text instead;
+    /// SQL Server converts them to the destination column, matching
+    /// Microsoft.Data.SqlClient. Every value written to the column must then use
+    /// the declared representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if metadata has not been retrieved, the column does not
+    /// exist, or it is not an unencrypted vector column.
+    pub fn set_vector_bulk_input(
+        &mut self,
+        destination_column: &str,
+        input: VectorBulkInput,
+    ) -> TdsResult<()> {
+        let metadata = self.destination_metadata.as_mut().ok_or_else(|| {
+            Error::UsageError(
+                "Retrieve destination metadata before declaring vector bulk input".to_string(),
+            )
+        })?;
+        let column = metadata
+            .iter_mut()
+            .find(|column| column.column_name == destination_column)
+            .ok_or_else(|| {
+                Error::UsageError(format!(
+                    "Destination column '{destination_column}' does not exist"
+                ))
+            })?;
+        *column = column.with_vector_bulk_input(input)?;
+        Ok(())
     }
 
     /// Set a progress callback to receive notifications during the operation.
@@ -1515,6 +1550,46 @@ mod tests {
             Err(Error::UsageError(message))
                 if message == "Too many identifier parts: 4 (maximum is 3)"
         ));
+    }
+
+    #[tokio::test]
+    async fn set_vector_bulk_input_rewrites_cached_destination_metadata() {
+        use crate::datatypes::bulk_copy_metadata::TypeLength;
+        use crate::datatypes::sqldatatypes::{VECTOR_HEADER_SIZE, VectorBaseType};
+
+        let mut client = crate::test_client_support::tds_client_from_tokens(Vec::new());
+        let mut bulk_copy = BulkCopy::with_retriever(
+            &mut client,
+            "dbo.vectors",
+            Box::new(UnreachableMetadataRetriever),
+        );
+        let native = VectorBulkInput::Native(VectorBaseType::Float32);
+        assert!(bulk_copy.set_vector_bulk_input("v", native).is_err());
+
+        let length = (VECTOR_HEADER_SIZE + 3 * 2) as i32;
+        bulk_copy.destination_metadata = Some(vec![
+            BulkCopyColumnMetadata::new("id", SqlDbType::Int, 0x26)
+                .with_length(4, TypeLength::Fixed(4)),
+            BulkCopyColumnMetadata::new("v", SqlDbType::Vector, 0xF5)
+                .with_length(length, TypeLength::Variable(length))
+                .with_scale(VectorBaseType::Float16 as u8),
+        ]);
+        assert!(bulk_copy.set_vector_bulk_input("missing", native).is_err());
+        assert!(bulk_copy.set_vector_bulk_input("id", native).is_err());
+
+        bulk_copy.set_vector_bulk_input("v", native).unwrap();
+        let metadata = bulk_copy.retrieve_destination_metadata().await.unwrap();
+        assert_eq!(metadata[1].get_sql_type_definition().unwrap(), "vector(3)");
+        assert_eq!(metadata[0].sql_type, SqlDbType::Int);
+
+        bulk_copy
+            .set_vector_bulk_input("v", VectorBulkInput::Utf8Json)
+            .unwrap();
+        let metadata = bulk_copy.retrieve_destination_metadata().await.unwrap();
+        assert_eq!(
+            metadata[1].get_sql_type_definition().unwrap(),
+            "varchar(max)"
+        );
     }
 
     #[test]
