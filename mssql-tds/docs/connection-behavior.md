@@ -242,8 +242,8 @@ including interrupted handshakes and login, through client destruction.
 Other backends already release their local transports synchronously on Drop.
 Explicitly awaited `close_connection()` still uses graceful shutdown.
 
-The private native pool enables this policy in every `ConnectSpec`, so discard
-finishes before its capacity slot becomes available. Normal direct connections
+Owners that release physical capacity on Drop can enable this policy so local
+discard finishes before capacity becomes available. Normal direct connections
 retain their existing graceful Drop behavior.
 
 ## Execution stack usage
