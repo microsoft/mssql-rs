@@ -51,7 +51,7 @@ parameters:
 # Starts the Cobertura report detached instead of waiting for it, and skips
 # publishing it. The caller must join it with `background-step.sh wait
 # "$(Agent.TempDirectory)/rust-cobertura"` and publish target/cobertura.xml as
-# CoberturaCoverageRust_<osType>.
+# CoberturaCoverageRust_<osType>_$(coverageAttempt.value).
 - name: backgroundCoverageReport
   type: boolean
   default: false
@@ -67,6 +67,10 @@ parameters:
   default: false
 
 steps:
+- template: coverage-attempt-template.yml
+  parameters:
+    osType: ${{ parameters.osType }}
+
 - ${{ if eq(parameters.osType, 'MacOS') }}:
   - bash: |
       echo "##vso[task.setvariable variable=MACOSX_DEPLOYMENT_TARGET]${MACOSX_DEPLOYMENT_TARGET:-10.15}"
@@ -226,7 +230,7 @@ steps:
       displayName: "Publish Cobertura coverage artifact"
       inputs:
         targetPath: "$(Build.SourcesDirectory)/target/cobertura.xml"
-        artifactName: "CoberturaCoverageRust_${{ parameters.osType }}"
+        artifactName: "CoberturaCoverageRust_${{ parameters.osType }}_$(coverageAttempt.value)"
 
   - ${{ if eq(parameters.backgroundCoverageReport, true) }}:
     - script: bash .pipeline/scripts/background-step.sh start "$(Agent.TempDirectory)/rust-cobertura" cargo llvm-cov report --package mssql-tds --package mssqlodbc --package mssql-sqlcmd --ignore-filename-regex 'test_client_support\.rs' --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
@@ -302,7 +306,7 @@ steps:
     continueOnError: true
     inputs:
       targetPath: "$(Build.SourcesDirectory)/target/cobertura-odbc-e2e.xml"
-      artifactName: "CoberturaCoverageOdbcE2E_Windows"
+      artifactName: "CoberturaCoverageOdbcE2E_Windows_$(coverageAttempt.value)"
 
 - ${{ if eq(parameters.enableJsBuild, true) }}:
   - bash: |

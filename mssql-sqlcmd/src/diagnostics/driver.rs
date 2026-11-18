@@ -14,20 +14,44 @@
 use std::fmt;
 use std::sync::Arc;
 
+/// The columns of the session query, up to but not including its `FROM`.
+macro_rules! session_columns {
+    () => {
+        "SELECT CONVERT(int, SERVERPROPERTY('EngineEdition')), \
+         DATEDIFF(day, '19700101', t.now), \
+         DATEDIFF(millisecond, CONVERT(datetime2, CONVERT(date, t.now)), t.now)"
+    };
+}
+
+/// The rest of the session query. Leading space included.
+macro_rules! session_from {
+    () => {
+        " FROM (SELECT SYSUTCDATETIME() AS now) AS t"
+    };
+}
+
 /// The query the driver runs for session validation. One row: the engine
 /// edition and server clock (days and milliseconds since 1970). Native sqlcmd
 /// may append version, transport, server name and database when already known;
 /// the native callback executes only this query.
-pub const DRIVER_QUERY: &str = "SELECT CONVERT(int, SERVERPROPERTY('EngineEdition')), \
-     DATEDIFF(day, '19700101', t.now), \
-     DATEDIFF(millisecond, CONVERT(datetime2, CONVERT(date, t.now)), t.now) \
-     FROM (SELECT SYSUTCDATETIME() AS now) AS t";
+pub const DRIVER_QUERY: &str = concat!(session_columns!(), session_from!());
+
+/// [`DRIVER_QUERY`] with `extra` columns, written as `a, b`, after its own. The
+/// query is the same text with the columns inserted before its `FROM`, so there
+/// is one definition of it.
+pub(crate) fn session_query_with(extra: &str) -> String {
+    format!("{}, {extra}{}", session_columns!(), session_from!())
+}
 
 /// The columns of [`DRIVER_QUERY`]'s row.
 pub(crate) mod column {
     pub const ENGINE_EDITION: usize = 0;
     pub const DAYS: usize = 1;
     pub const MILLISECONDS: usize = 2;
+    /// The server version as native sqlcmd already knows it, in its own form
+    /// (ODBC's `SQL_DBMS_VER`, e.g. `17.00.4085`), not
+    /// `SERVERPROPERTY('ProductVersion')` (`17.0.4085.2`). Native does not query
+    /// for it. Usage telemetry does not report it.
     pub const VERSION: usize = 3;
     pub const TRANSPORT: usize = 4;
     pub const SERVER_NAME: usize = 5;
@@ -79,6 +103,16 @@ pub struct DriverOutcome {
 impl DriverOutcome {
     pub(crate) fn cell(&self, column: usize) -> Option<&str> {
         self.row.get(column).and_then(Option::as_deref)
+    }
+
+    /// The engine edition in the session query's row, or `None` when it has
+    /// none: the one definition of a usable row, for the report and for usage
+    /// telemetry.
+    pub(crate) fn engine_edition(&self) -> Option<i32> {
+        if self.query_failed {
+            return None;
+        }
+        self.cell(column::ENGINE_EDITION)?.trim().parse().ok()
     }
 }
 
@@ -134,6 +168,23 @@ pub(crate) fn driver_load_failure(state: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The session query has one definition: the plain query is the shared
+    /// text, and the one with extra columns is that text with them inserted
+    /// before its `FROM`.
+    #[test]
+    fn the_session_query_with_extra_columns_is_the_plain_query_with_them_inserted() {
+        assert_eq!(
+            DRIVER_QUERY,
+            "SELECT CONVERT(int, SERVERPROPERTY('EngineEdition')), \
+             DATEDIFF(day, '19700101', t.now), \
+             DATEDIFF(millisecond, CONVERT(datetime2, CONVERT(date, t.now)), t.now) \
+             FROM (SELECT SYSUTCDATETIME() AS now) AS t"
+        );
+        let with_extra = session_query_with("X, Y");
+        let (columns, from) = DRIVER_QUERY.split_once(" FROM ").expect("a FROM clause");
+        assert_eq!(with_extra, format!("{columns}, X, Y FROM {from}"));
+    }
 
     #[test]
     fn transports_are_named_as_the_report_names_them() {
