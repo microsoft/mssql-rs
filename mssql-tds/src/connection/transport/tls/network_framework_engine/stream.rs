@@ -462,6 +462,7 @@ pub(super) struct Options<'a> {
     pub(super) server_name: Option<&'a str>,
     pub(super) alpn: &'a str,
     pub(super) keep_alive: KeepAlive,
+    pub(super) abort_on_drop: bool,
 }
 
 /// TCP keep-alive timing, to the second, as for sockets.
@@ -477,6 +478,7 @@ pub(super) struct NwStream {
     /// The serial queue the connection's blocks run on.
     queue: Handle<Dispatch>,
     shared: Arc<Shared>,
+    abort_on_drop: bool,
 }
 
 impl NwStream {
@@ -516,6 +518,7 @@ impl NwStream {
             connection,
             queue,
             shared,
+            abort_on_drop: options.abort_on_drop,
         })
     }
 
@@ -669,7 +672,11 @@ fn cancel(connection: &Handle<Nw>) {
 
 impl Drop for NwStream {
     fn drop(&mut self) {
-        self.close();
+        if self.abort_on_drop {
+            self.abort();
+        } else {
+            self.close();
+        }
     }
 }
 

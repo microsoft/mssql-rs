@@ -60,6 +60,7 @@ struct Target {
     server_host_name: String,
     server_certificate_path: Option<PathBuf>,
     keep_alive: KeepAlive,
+    abort_on_drop: bool,
 }
 
 impl Connector {
@@ -67,6 +68,7 @@ impl Connector {
         params: &TlsConnectParams<'_>,
         keep_alive_in_ms: u32,
         keep_alive_interval_in_ms: u32,
+        abort_on_drop: bool,
     ) -> Self {
         Self(Arc::new(Target {
             validation: params.validation.clone(),
@@ -77,6 +79,7 @@ impl Connector {
                 idle: Duration::from_millis(keep_alive_in_ms.into()),
                 interval: Duration::from_millis(keep_alive_interval_in_ms.into()),
             },
+            abort_on_drop,
         }))
     }
 
@@ -120,6 +123,7 @@ impl Target {
             server_name: sni_host_name(&self.host_name),
             alpn: TDS_8_ALPN_PROTOCOL,
             keep_alive: self.keep_alive,
+            abort_on_drop: self.abort_on_drop,
         };
         let stream = NwStream::start(&options, Arc::clone(&verifier)).inspect_err(|e| {
             error!("Could not set up a Network.framework connection to {address}: {e}")
@@ -292,7 +296,7 @@ pub(crate) mod tests {
             server_host_name: HOST,
             server_certificate_path: pin,
         };
-        Connector::new(&params, 30_000, 1_000)
+        Connector::new(&params, 30_000, 1_000, false)
     }
 
     async fn connect(
@@ -441,6 +445,7 @@ pub(crate) mod tests {
     /// it takes no more, along with a way to tell when its connection has ended.
     async fn stalled_stream(
         release_by: Release,
+        abort_on_drop: bool,
     ) -> (
         NwStream,
         impl Fn() -> bool,
@@ -465,6 +470,7 @@ pub(crate) mod tests {
                 idle: Duration::from_secs(30),
                 interval: Duration::from_secs(1),
             },
+            abort_on_drop,
         };
         let verifier = Arc::new(Verifier::new(&trusting(), HOST, false));
         let mut stream = NwStream::start(&options, verifier).unwrap();
@@ -495,7 +501,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn dropping_a_stream_the_server_stopped_reading_still_ends_it() {
-        let (stream, ended, release, server) = stalled_stream(Release::Close).await;
+        let (stream, ended, release, server) = stalled_stream(Release::Close, false).await;
         let drain_started = stream.drain_probe();
         drop(stream);
 
@@ -509,8 +515,45 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn pooled_drop_aborts_a_stalled_stream_before_returning() {
+        let (stream, ended, release, server) = stalled_stream(Release::Close, true).await;
+        let drain_started = stream.drain_probe();
+
+        drop(stream);
+
+        assert!(ended(), "pooled drop must abort before returning");
+        assert!(
+            !drain_started(),
+            "pooled drop must not start graceful drain"
+        );
+        release.send(()).unwrap();
+        within(server).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pooled_connect_attempt_drop_aborts_before_returning() {
+        let (_listener, address) = listen().await;
+        let validation = trusting();
+        let params = TlsConnectParams {
+            validation: &validation,
+            host_name: HOST,
+            server_host_name: HOST,
+            server_certificate_path: None,
+        };
+        let connector = Connector::new(&params, 30_000, 1_000, true);
+        let (stream, _) = connector.0.start(address).unwrap();
+        let ended = stream.end_probe();
+        let drain_started = stream.drain_probe();
+
+        drop(stream);
+
+        assert!(ended(), "an abandoned pooled open must abort synchronously");
+        assert!(!drain_started());
+    }
+
+    #[tokio::test]
     async fn aborting_an_interrupted_write_never_starts_the_drain_barrier() {
-        let (mut stream, _, release, server) = stalled_stream(Release::Close).await;
+        let (mut stream, _, release, server) = stalled_stream(Release::Close, false).await;
         let cancelled = stream.cancellation_probe();
         let drain_started = stream.drain_probe();
         assert!(!drain_started());
@@ -527,7 +570,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn dropping_a_stream_after_a_stalled_shutdown_still_ends_it() {
-        let (mut stream, ended, release, server) = stalled_stream(Release::Close).await;
+        let (mut stream, ended, release, server) = stalled_stream(Release::Close, false).await;
         let shutdown = tokio::time::timeout(Duration::from_millis(250), stream.shutdown()).await;
         assert!(shutdown.is_err(), "the shutdown should wait for the server");
         drop(stream);
@@ -539,7 +582,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_shutdown_the_server_does_not_drain_times_out() {
-        let (mut stream, ended, release, server) = stalled_stream(Release::Close).await;
+        let (mut stream, ended, release, server) = stalled_stream(Release::Close, false).await;
 
         let error = within(stream.shutdown()).await.unwrap_err();
 
@@ -551,7 +594,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_shutdown_reports_written_data_the_server_reset_before_taking() {
-        let (mut stream, ended, release, server) = stalled_stream(Release::Reset).await;
+        let (mut stream, ended, release, server) = stalled_stream(Release::Reset, false).await;
         release.send(()).unwrap();
         within(server).await.unwrap();
 
@@ -863,7 +906,7 @@ pub(crate) mod tests {
             server_certificate_path: None,
         };
 
-        let stream = within(Connector::new(&params, 30_000, 1_000).connect(address))
+        let stream = within(Connector::new(&params, 30_000, 1_000, false).connect(address))
             .await
             .unwrap();
 

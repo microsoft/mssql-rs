@@ -87,7 +87,8 @@ Disabling `tls-network-framework` removes this added minimum.
 - [Client guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/client-guide.md)
   for request timeouts, response cleanup, vectors, and LOB parameters.
 - [Connection and decoding behavior](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md)
-  for connection policy, TLS, DNS caching, encoding, and runtime details.
+  for connection policy, TLS, opt-in synchronous discard (`ClientContext::abort_on_drop`),
+  DNS caching, encoding, and runtime details.
 
 ## License
 
