@@ -386,10 +386,6 @@ pub struct ClientContext {
     pub security_context_provider:
         Option<std::sync::Arc<dyn crate::security::SecurityContextProvider>>,
     pub(crate) transport_context: TransportContext,
-    /// Abort abandoned transports instead of draining TLS writes on Drop.
-    /// Pool owners use this to release physical capacity synchronously.
-    /// Defaults to `false`; explicitly awaited close remains graceful.
-    pub abort_on_drop: bool,
     /// Protocol vector version for feature negotiation.
     /// Default: [`VectorVersion::V2`].
     pub vector_version: VectorVersion,
@@ -605,7 +601,6 @@ impl ClientContext {
             workstation_id: ClientContext::default_workstation_id(hostname::get),
             access_token: None,
             security_context_provider: None,
-            abort_on_drop: false,
             transport_context: TransportContext::Tcp {
                 host: "localhost".to_string(),
                 port: 1433,
@@ -673,7 +668,6 @@ impl ClientContext {
             login_server_name: None,
             access_token: None,
             security_context_provider: None,
-            abort_on_drop: false,
             transport_context: TransportContext::Tcp {
                 host: "localhost".to_string(),
                 port: 1433,
@@ -991,7 +985,6 @@ impl Clone for ClientContext {
             access_token: self.access_token.clone(),
             security_context_provider: self.security_context_provider.clone(),
             transport_context: self.transport_context.clone(),
-            abort_on_drop: self.abort_on_drop,
             vector_version: self.vector_version,
             column_encryption_setting: self.column_encryption_setting,
             column_encryption_key_store_providers: self
@@ -1329,16 +1322,6 @@ impl TransportContext {
 #[allow(deprecated)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn abort_on_drop_is_opt_in_and_survives_cloning() {
-        assert!(!ClientContext::default().abort_on_drop);
-        assert!(!ClientContext::new().abort_on_drop);
-        let mut context = ClientContext::with_data_source("tcp:localhost,1433");
-        assert!(!context.abort_on_drop);
-        context.abort_on_drop = true;
-        assert!(context.clone().abort_on_drop);
-    }
 
     #[test]
     fn test_integrated_auth_config_for_uses_dialled_endpoint() {
