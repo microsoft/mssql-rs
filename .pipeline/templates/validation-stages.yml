@@ -615,7 +615,7 @@ stages:
         condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'), eq(variables['rustCoverageReady'], 'true'))
         inputs:
           targetPath: $(Build.SourcesDirectory)/target/cobertura.xml
-          artifactName: CoberturaCoverageRust_MacOS
+          artifactName: CoberturaCoverageRust_MacOS_$(coverageAttempt.value)
       - script: |
           set +e
           echo "=== Colima status ==="
@@ -1278,7 +1278,7 @@ stages:
 # (Build_Linux x64 and Build_Windows), and the mssql-py-core coverage from the
 # Python tests (Build_Linux) into one Cobertura report. ADO does not merge
 # coverage across stages/jobs, so it is combined here and published as
-# CoberturaCoverage (the artifact the GitHub diff-cover workflow consumes) and
+# CoberturaCoverage_<stage attempt>_<job attempt> for GitHub diff-cover and
 # to the ADO coverage tab.
 - stage: Coverage
   displayName: Merge Coverage
@@ -1288,60 +1288,67 @@ stages:
   jobs:
   - job: Merge_Coverage
     displayName: Merge Rust and Python coverage
+    workspace:
+      clean: all
+    variables:
+      windowsCoverageAttempt: $[ stageDependencies.Build.Build_Windows.outputs['coverageAttempt.value'] ]
+      linuxCoverageAttempt: $[ stageDependencies.Build.Build_Linux.outputs['coverageAttempt.value'] ]
+      macosCoverageAttempt: $[ stageDependencies.Build.Test_MacOS.outputs['coverageAttempt.value'] ]
     pool:
       name: ${{ parameters.utilPoolName }}
       demands:
         - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
       - checkout: self
+      - template: coverage-attempt-template.yml
       - task: DownloadPipelineArtifact@2
         displayName: Download Rust (mssql-tds) Windows coverage
         continueOnError: true
         inputs:
           buildType: 'current'
-          artifactName: 'CoberturaCoverageRust_Windows'
+          artifactName: 'CoberturaCoverageRust_Windows_$(windowsCoverageAttempt)'
           targetPath: '$(Pipeline.Workspace)/cov-rust-windows'
       - task: DownloadPipelineArtifact@2
         displayName: Download Rust (mssql-tds) Linux coverage
         continueOnError: true
         inputs:
           buildType: 'current'
-          artifactName: 'CoberturaCoverageRust_Linux'
+          artifactName: 'CoberturaCoverageRust_Linux_$(linuxCoverageAttempt)'
           targetPath: '$(Pipeline.Workspace)/cov-rust-linux'
       - task: DownloadPipelineArtifact@2
         displayName: Download ODBC e2e Linux coverage
         continueOnError: true
         inputs:
           buildType: 'current'
-          artifactName: 'CoberturaCoverageOdbcE2E_Linux'
+          artifactName: 'CoberturaCoverageOdbcE2E_Linux_$(linuxCoverageAttempt)'
           targetPath: '$(Pipeline.Workspace)/cov-odbc-e2e-linux'
       - task: DownloadPipelineArtifact@2
         displayName: Download ODBC e2e Windows coverage
         continueOnError: true
         inputs:
           buildType: 'current'
-          artifactName: 'CoberturaCoverageOdbcE2E_Windows'
+          artifactName: 'CoberturaCoverageOdbcE2E_Windows_$(windowsCoverageAttempt)'
           targetPath: '$(Pipeline.Workspace)/cov-odbc-e2e-windows'
       - task: DownloadPipelineArtifact@2
         displayName: Download Rust (mssql-tds) macOS coverage
         continueOnError: true
         inputs:
           buildType: 'current'
-          artifactName: 'CoberturaCoverageRust_MacOS'
+          artifactName: 'CoberturaCoverageRust_MacOS_$(macosCoverageAttempt)'
           targetPath: '$(Pipeline.Workspace)/cov-rust-macos'
       - task: DownloadPipelineArtifact@2
         displayName: Download Python (mssql-py-core) coverage
         continueOnError: true
         inputs:
           buildType: 'current'
-          artifactName: 'CoberturaCoveragePython'
+          artifactName: 'CoberturaCoveragePython_$(linuxCoverageAttempt)'
           targetPath: '$(Pipeline.Workspace)/cov-python'
       - task: DownloadPipelineArtifact@2
         displayName: Download Rust (mssql-py-core) coverage
         continueOnError: true
         inputs:
           buildType: 'current'
-          artifactName: 'CoberturaCoveragePyCoreRust'
+          artifactName: 'CoberturaCoveragePyCoreRust_$(linuxCoverageAttempt)'
           targetPath: '$(Pipeline.Workspace)/cov-pycore-rust'
       - bash: |
           set -euo pipefail
@@ -1382,7 +1389,7 @@ stages:
         displayName: Publish merged Cobertura coverage artifact
         inputs:
           targetPath: '$(Build.SourcesDirectory)/target/cobertura.xml'
-          artifactName: 'CoberturaCoverage'
+          artifactName: 'CoberturaCoverage_$(coverageAttempt.value)'
       # PublishCodeCoverageResults@2 renders the ADO coverage tab HTML with
       # ReportGenerator, which requires .NET. The slim Linux agent does not ship
       # it, so install it explicitly; otherwise the coverage tab reports that the

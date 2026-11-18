@@ -33,14 +33,14 @@ use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, Once, OnceLock, PoisonError};
 
 /// The libraries tried, in order: OpenSSL 4, 3, then 1.1.
 const LIBRARIES: [&CStr; 3] = [c"libssl.so.4", c"libssl.so.3", c"libssl.so.1.1"];
 
 /// The loaded `libssl` (its dependency `libcrypto` comes with it), or null when
-/// neither is installed.
-fn library() -> *mut c_void {
+/// neither is installed. Silent: see [`library`] for the report.
+fn load() -> *mut c_void {
     static HANDLE: OnceLock<usize> = OnceLock::new();
     *HANDLE.get_or_init(|| {
         for name in LIBRARIES {
@@ -53,9 +53,27 @@ fn library() -> *mut c_void {
                 return handle as usize;
             }
         }
-        eprintln!("mssql-sqlcmd: {}", not_found_message());
         0
     }) as *mut c_void
+}
+
+/// The loaded `libssl`, or null when none is installed, in which case the
+/// reason is written to stderr, once, because a caller that needs OpenSSL is
+/// about to fail.
+fn library() -> *mut c_void {
+    let handle = load();
+    if handle.is_null() {
+        static REPORTED: Once = Once::new();
+        REPORTED.call_once(|| eprintln!("mssql-sqlcmd: {}", not_found_message()));
+    }
+    handle
+}
+
+/// Whether an OpenSSL is installed, without the report [`library`] writes, for
+/// callers that can do without it and must not add output of their own.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn is_available() -> bool {
+    !load().is_null()
 }
 
 /// Why TLS is unavailable when no OpenSSL is installed, in the user's language.
@@ -200,14 +218,18 @@ forward! {
     PEM_read_bio_X509[](bio: P, out: P, callback: P, user_data: P) -> P => null_mut();
     SSL_CTX_ctrl[](ctx: P, cmd: c_int, larg: c_long, parg: P) -> c_long => 0;
     SSL_CTX_free[](ctx: P) => ();
+    SSL_CTX_get_cert_store[](ctx: P) -> P => null_mut();
     SSL_CTX_load_verify_locations[](ctx: P, ca_file: *const c_char, ca_path: *const c_char) -> c_int => 0;
     SSL_CTX_new[](method: P) -> P => null_mut();
     SSL_CTX_set_alpn_protos[](s: P, data: *const u8, len: c_uint) -> c_int => 1;
+    SSL_CTX_set_cert_store[](ctx: P, store: P) => ();
     SSL_CTX_set_cipher_list[](ssl: P, s: *const c_char) -> c_int => 0;
     SSL_CTX_set_default_verify_paths[](ctx: P) -> c_int => 0;
     SSL_CTX_set_options[](ctx: P, op: u64) -> u64 => 0;
     SSL_CTX_set_verify[](ctx: P, mode: c_int, verify_callback: P) => ();
     SSL_CTX_up_ref[](x: P) -> c_int => 0;
+    SSL_CTX_use_PrivateKey[](ctx: P, pkey: P) -> c_int => 0;
+    SSL_CTX_use_certificate[](ctx: P, x: P) -> c_int => 0;
     SSL_connect[](ssl: P) -> c_int => -1;
     SSL_ctrl[](ssl: P, cmd: c_int, larg: c_long, parg: P) -> c_long => 0;
     SSL_do_handshake[](ssl: P) -> c_int => -1;
@@ -228,10 +250,13 @@ forward! {
     SSL_set_verify[](ssl: P, mode: c_int, verify_callback: P) => ();
     SSL_shutdown[](ssl: P) -> c_int => -1;
     SSL_write_ex[](ssl: P, buf: P, num: usize, written: *mut usize) -> c_int => 0;
+    X509_STORE_add_cert[](store: P, x: P) -> c_int => 0;
+    X509_STORE_new[]() -> P => null_mut();
     X509_VERIFY_PARAM_set1_host[](param: P, name: *const c_char, namelen: usize) -> c_int => 0;
     X509_VERIFY_PARAM_set1_ip[](param: P, ip: *const u8, iplen: usize) -> c_int => 0;
     X509_VERIFY_PARAM_set_hostflags[](param: P, flags: c_uint) => ();
     X509_free[](x: P) => ();
+    X509_up_ref[](x: P) -> c_int => 0;
     X509_verify_cert_error_string[](n: c_long) -> *const c_char => std::ptr::null();
     d2i_X509[](a: P, pp: P, length: c_long) -> P => null_mut();
     i2d_X509[](x: P, buf: P) -> c_int => -1;
