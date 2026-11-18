@@ -14064,7 +14064,7 @@ pub(crate) mod tests {
                 format: FormatUse::Json,
             });
             let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::SessionValidation));
-            let target = diagnosis.connection_input().unwrap();
+            let target = input(&mut diagnosis).unwrap();
             let (hook, _) = fake_driver(driver::DriverOutcome {
                 connected: true,
                 query_failed,
