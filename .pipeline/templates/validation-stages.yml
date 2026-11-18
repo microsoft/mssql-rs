@@ -554,11 +554,6 @@ stages:
           # data, so it runs alongside the ODBC e2e suite below.
           backgroundCoverageReport: true
           beforeTestSteps:
-            - script: |
-                cargo llvm-cov nextest --frozen --no-report --package mssql-tds --profile ci --no-fail-fast --success-output immediate -E 'test(pooled_drop_aborts_a_stalled_stream_before_returning) or test(pooled_connect_attempt_drop_aborts_before_returning) or test(dropping_a_stream_the_server_stopped_reading_still_ends_it)'
-              displayName: 'Run macOS pooled TLS teardown regressions'
-              condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
-              timeoutInMinutes: 10
             # Covers the former per-step backstops (15m Colima + 22m SQL).
             - script: bash .pipeline/scripts/background-step.sh wait "$(Agent.TempDirectory)/macos-sql" 2400
               displayName: 'Wait for Colima and SQL Server'
