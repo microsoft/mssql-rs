@@ -1913,7 +1913,7 @@ def test_macos_pr_runs_native_odbc_e2e_against_existing_sql():
     assert coverage["task"] == "PublishPipelineArtifact@1"
     assert coverage["inputs"] == {
         "targetPath": "$(Build.SourcesDirectory)/target/cobertura.xml",
-        "artifactName": "CoberturaCoverageRust_MacOS",
+        "artifactName": "CoberturaCoverageRust_MacOS_$(coverageAttempt.value)",
     }
     for step in (install, run):
         assert step["condition"] == _PR
