@@ -1535,7 +1535,8 @@ msodbcsql build is measured.
 45. **Invalid narrow bytes from the server decode to U+FFFD per WHATWG.**
     When a `char`/`varchar` value holds bytes that are invalid in its
     collation's code page, both drivers replace them and return `SQL_SUCCESS`
-    with no diagnostic; neither raises `22018`. The replacement differs:
+    with no diagnostic; neither raises `22018`. The replacement can differ;
+    the measured cases are:
     - Under CP932, msodbcsql uses Windows best-fit decoding: an unassigned
       byte such as `0xFF` becomes U+F8F3, and a lead byte followed by an
       invalid trail (`0x8241`) becomes U+30FB, consuming the ASCII trail.
@@ -1577,9 +1578,14 @@ msodbcsql build is measured.
     msodbcsql 18.07.0001 against SQL Server 2025 (`17.00.4025`), reading
     values stored through `varbinary` literals into `Japanese_90_BIN` and
     `Latin1_General_100_CI_AS_SC_UTF8` columns, bounded and `varchar(max)`.
-    SQL Server will not store a trailing CP932 lead byte, and rejects some
-    invalid UTF-8, such as a lone `0x80`, in a bounded column (error 9833), so
-    those cases need a mock server. `MalformedServerBytesDecodeWithoutError`
+    Only CP932 and UTF-8 were measured. The `MultiByteToWideChar` call above
+    is the same for every narrow code page, so msodbcsql substitutes rather
+    than fails for the others this driver maps (437, 850, 874, 936, 949, 950,
+    1250–1258), but which characters each produces is unmeasured and may
+    differ from this driver's as CP932's do. SQL Server will not store a
+    trailing CP932 lead byte, and rejects some invalid UTF-8, such as a lone
+    `0x80`, in a bounded column (error 9833), so those cases need a mock
+    server. `MalformedServerBytesDecodeWithoutError`
     (`mssql-odbc/tests/e2e/tests/client_code_page_test.cpp`) asserts each
     driver's characters; `utf8_decode_replaces_invalid_sequences`
     (`mssql-tds/src/datatypes/sql_string.rs`) and
