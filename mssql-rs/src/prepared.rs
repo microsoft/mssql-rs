@@ -92,7 +92,7 @@ use std::sync::Arc;
 
 use crate::Client;
 use crate::error::{Error, Result};
-use crate::query::{ExecuteResult, QueryResult, ToSql};
+use crate::query::{ExecuteResult, QueryResult, ToSql, encode_string_parameters};
 
 /// A server-side prepared statement.
 ///
@@ -202,11 +202,7 @@ impl PreparedStatement {
             .iter()
             .enumerate()
             .map(|(index, param)| {
-                let value = match (param.to_sql()?, unicode) {
-                    (SqlType::NVarchar(value, len), false) => SqlType::Varchar(value, len),
-                    (SqlType::NVarcharMax(value), false) => SqlType::VarcharMax(value),
-                    (value, _) => value,
-                };
+                let value = encode_string_parameters(param.to_sql()?, unicode);
                 Ok(format!(
                     "@P{} {}",
                     index + 1,
@@ -334,7 +330,7 @@ mod tests {
         );
         assert_eq!(
             PreparedStatement::parameter_declaration(params, false).expect("valid ANSI parameters"),
-            "@P1 int, @P2 varchar(4000), @P3 bit"
+            "@P1 int, @P2 varchar(MAX), @P3 bit"
         );
         assert_eq!(
             PreparedStatement::parameter_declaration(&[], true)

@@ -320,7 +320,8 @@ impl Config {
 
     /// Controls whether `&str` and `String` parameters are sent as NVARCHAR.
     ///
-    /// Defaults to `true`. Set to `false` to send string parameters as VARCHAR.
+    /// Defaults to `true`. Set to `false` to send string parameters as
+    /// `VARCHAR(MAX)`, allowing for multibyte database encodings.
     pub fn send_string_parameters_as_unicode(&mut self, enabled: bool) -> &mut Self {
         self.send_string_parameters_as_unicode = enabled;
         self

@@ -393,7 +393,7 @@ async fn example() -> mssql_rs::Result<()> {
 
 ### `send_string_parameters_as_unicode(...)`
 
-Default is `true`, so `&str` and `String` parameters are sent as NVARCHAR. Set it to `false` only when you intentionally want VARCHAR parameter metadata for legacy schema, collation, or index behavior.
+Default is `true`, so `&str` and `String` parameters are sent as NVARCHAR. Set it to `false` only when you intentionally want VARCHAR parameter metadata for legacy schema, collation, or index behavior. The driver uses `VARCHAR(MAX)` because the database encoding can require more bytes than the inferred Unicode length, including for values supplied after a statement is prepared.
 
 ```rust,no_run
 async fn example() -> mssql_rs::Result<()> {

@@ -737,13 +737,13 @@ mod jiff_to_sql {
     }
 }
 
-fn encode_string_parameters(sql_type: SqlType, unicode: bool) -> SqlType {
+pub(crate) fn encode_string_parameters(sql_type: SqlType, unicode: bool) -> SqlType {
     if unicode {
         return sql_type;
     }
 
     match sql_type {
-        SqlType::NVarchar(value, len) => SqlType::Varchar(value, len),
+        SqlType::NVarchar(value, _) => SqlType::VarcharMax(value),
         SqlType::NVarcharMax(value) => SqlType::VarcharMax(value),
         other => other,
     }
@@ -1560,7 +1560,12 @@ mod tests {
     #[test]
     fn string_parameter_encoding_can_use_varchar() {
         let ty = encode_string_parameters("hello".to_sql().expect("valid parameter"), false);
-        assert!(matches!(ty, SqlType::Varchar(_, 4000)));
+        assert!(matches!(ty, SqlType::VarcharMax(_)));
+        let null = Option::<String>::None.to_sql().expect("valid parameter");
+        assert!(matches!(
+            encode_string_parameters(null, false),
+            SqlType::VarcharMax(None)
+        ));
     }
 
     #[test]

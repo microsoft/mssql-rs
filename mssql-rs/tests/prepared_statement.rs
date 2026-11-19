@@ -13,6 +13,54 @@ pub mod common;
 use mssql_rs::Client;
 
 #[tokio::test]
+async fn non_unicode_multibyte_parameters_roundtrip_in_utf8_database() {
+    let mut cfg = common::live_config_or_exit();
+    cfg.send_string_parameters_as_unicode(false);
+    let mut admin = Client::connect(&cfg).await.expect("admin connection");
+    let database = format!("mssql_rs_utf8_{}", uuid::Uuid::new_v4().simple());
+    admin
+        .simple_query(format!(
+            "CREATE DATABASE [{database}] COLLATE Latin1_General_100_CI_AS_SC_UTF8"
+        ))
+        .await
+        .expect("create UTF-8 test database");
+
+    let result = async {
+        cfg.database(&database);
+        let mut client = Client::connect(&cfg).await?;
+        let statement = client.prepare("SELECT @P1 AS value", &[&""]).await?;
+        let mut results = Vec::new();
+        for value in ["é".repeat(3000), "日".repeat(3000)] {
+            let rows = client
+                .query("SELECT @P1 AS value", &[&value])
+                .await?
+                .into_first_result();
+            let direct = rows.first().and_then(|row| row.get::<String, _>("value"));
+            let rows = statement
+                .query(&mut client, &[&value])
+                .await?
+                .into_first_result();
+            let prepared = rows.first().and_then(|row| row.get::<String, _>("value"));
+            results.push((value, direct, prepared));
+        }
+        statement.close(&mut client).await?;
+        Ok::<_, mssql_rs::Error>(results)
+    }
+    .await;
+
+    admin
+        .simple_query(format!(
+            "ALTER DATABASE [{database}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{database}]"
+        ))
+        .await
+        .expect("drop UTF-8 test database");
+    for (expected, direct, prepared) in result.expect("query multibyte parameters") {
+        assert_eq!(direct.as_deref(), Some(expected.as_str()));
+        assert_eq!(prepared.as_deref(), Some(expected.as_str()));
+    }
+}
+
+#[tokio::test]
 async fn prepared_handles_do_not_survive_transparent_recovery() {
     let cfg = common::live_config_or_exit();
     let mut client = Client::connect(&cfg).await.expect("connect");
