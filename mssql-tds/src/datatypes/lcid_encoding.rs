@@ -239,11 +239,11 @@ pub fn lcid_to_encoding(lcid: u32) -> Result<&'static Encoding, Error> {
 }
 
 /// Maps a Windows LCID to its ANSI code page, mirroring the server's
-/// `x_rgLocaleMap` (`Sql/Common/include/LocaleMap.h`). Used to resolve a
-/// Windows (sort-ID 0) collation's code page for `SQL_COLLATION_SEQ` the way
-/// msodbcsql's `CodePageFromTDSCollation` does — a broader set than
-/// [`lcid_to_encoding`], which covers only encodings this crate can decode.
-/// `None` for an LCID the server's locale map does not list.
+/// `x_rgLocaleMap` (`Sql/Common/include/LocaleMap.h`). Resolves a Windows
+/// (sort-ID 0) collation's code page the way msodbcsql's
+/// `CodePageFromTDSCollation` does, for `SQL_COLLATION_SEQ` and for the
+/// narrow encoding ahead of [`lcid_to_encoding`], which lacks LCIDs such as
+/// sort variants. `None` for an LCID the server's locale map does not list.
 pub(crate) fn lcid_to_code_page(lcid: u32) -> Option<u16> {
     let code_page = match lcid {
         0x0401 => 1256,
