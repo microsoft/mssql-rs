@@ -1,12 +1,12 @@
 # Template for running mssql-python tests on macOS
-# Builds mssql-py-core + ddbc_bindings natively, then starts SQL Server
-# via Colima (no TLS certs) and runs pytest with TrustServerCertificate=yes.
+# Builds mssql-py-core + ddbc_bindings while SQL Server starts via Colima
+# (no TLS certs), then runs pytest with TrustServerCertificate=yes.
 
 steps:
-# ── 0. Generate per-job SQL_PASSWORD ─────────────────────────────────────────
-- template: generate-sql-password-template.yml
+# Start infrastructure before the native builds; join before running tests.
+- template: sql-setup-template.yml
   parameters:
-    osType: MacOS
+    buildTarget: MacOS
 
 # ── 1. Python & Cargo setup ──────────────────────────────────────────────────
 - task: UsePythonVersion@0
@@ -99,18 +99,11 @@ steps:
     failTaskOnFailedTests: false
     failTaskOnMissingResultsFile: true
 
-# ── 4. Start Docker via Colima ───────────────────────────────────────────────
-- template: macos-docker-steps.yml
-  parameters:
-    condition: and(succeeded(), eq(variables['mssqlPythonReady'], 'true'))
-
-# ── 5. Start SQL Server (no TLS certs) ──────────────────────────────────────
-- script: bash .pipeline/scripts/start-sql-server-macos.sh
-  displayName: 'Start SQL Server (Docker, no TLS certs)'
+# Covers Colima's 32m retry budget, SQL's 20m budget, and cleanup.
+- script: bash .pipeline/scripts/background-step.sh wait "$(Agent.TempDirectory)/macos-sql" 3300
+  displayName: 'Wait for Colima and SQL Server'
   condition: and(succeeded(), eq(variables['mssqlPythonReady'], 'true'))
-  timeoutInMinutes: 22
-  env:
-    SQL_PASSWORD: $(SQL_PASSWORD)
+  timeoutInMinutes: 60
 
 # ── 6. Run tests ─────────────────────────────────────────────────────────────
 - script: |
@@ -144,10 +137,14 @@ steps:
     failTaskOnMissingResultsFile: true
 
 - script: |
-    docker stop sqlserver || true
-    docker rm sqlserver || true
+    set -euo pipefail
+    bash .pipeline/scripts/background-step.sh stop "$(Agent.TempDirectory)/macos-sql"
+    export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+    docker rm --force sqlserver || true
   displayName: Cleanup SQL Server
-  condition: and(always(), eq(variables['mssqlPythonReady'], 'true'))
+  condition: and(always(), eq(variables['macosSqlStarted'], 'true'))
+  env:
+    TOOLCHAIN_DIR: '$(Agent.TempDirectory)/docker-toolchain'
 
 - script: rm -rf $(Build.SourcesDirectory)/../mssql-python || true
   displayName: Cleanup

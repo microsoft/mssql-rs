@@ -538,7 +538,6 @@ stages:
       - template: sql-setup-template.yml
         parameters:
           buildTarget: MacOS
-          startMacOSSqlInBackground: true
       - template: cargo-authenticate-template.yml
         parameters:
           osType: MacOS
@@ -556,10 +555,10 @@ stages:
           # data, so it runs alongside the ODBC e2e suite below.
           backgroundCoverageReport: true
           beforeTestSteps:
-            # Covers the former per-step backstops (15m Colima + 22m SQL).
-            - script: bash .pipeline/scripts/background-step.sh wait "$(Agent.TempDirectory)/macos-sql" 2400
+            # Covers Colima's 32m retry budget, SQL's 20m budget, and cleanup.
+            - script: bash .pipeline/scripts/background-step.sh wait "$(Agent.TempDirectory)/macos-sql" 3300
               displayName: 'Wait for Colima and SQL Server'
-              timeoutInMinutes: 45
+              timeoutInMinutes: 60
             - script: |
                 set -euo pipefail
                 colima status

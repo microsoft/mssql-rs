@@ -1151,52 +1151,24 @@ def test_cross_repo_jobs_share_the_pinned_checkout(template):
     assert "mssql-python-branch" not in text
 
 
-def test_macos_docker_condition_preserves_other_callers():
+def test_macos_docker_setup_only_downloads_toolchain():
     template = load_template("macos-docker-steps.yml")
-    condition = next(p for p in template["parameters"] if p["name"] == "condition")
-    assert condition == {"name": "condition", "type": "string", "default": "succeeded()"}
-    start_colima = "${{ if eq(parameters.startColima, true) }}"
-    steps = []
-    for step in template["steps"]:
-        steps.extend(step.get(start_colima, [step]))
-    assert any("start-colima-macos.sh" in step.get("script", "") for step in steps)
-    for step in steps:
-        assert step["condition"] == "${{ parameters.condition }}"
-        assert not step.get("continueOnError", False)
-
-    sql_steps = load_template("sql-setup-template.yml")["steps"]
-    foreground = (
-        "${{ if and(eq(parameters.buildTarget, 'MacOS'), "
-        "eq(parameters.startMacOSSqlInBackground, false)) }}"
-    )
-    macos = next(step[foreground] for step in sql_steps if foreground in step)
-    docker = next(step for step in macos if step.get("template") == "macos-docker-steps.yml")
-    assert "condition" not in docker.get("parameters", {})
-    sql = next(step for step in macos if "start-sql-server-macos.sh" in step.get("script", ""))
-    assert sql.get("condition", "succeeded()") == "succeeded()"
+    assert [parameter["name"] for parameter in template["parameters"]] == ["toolchainVersion"]
+    assert all("start-colima-macos.sh" not in str(step) for step in template["steps"])
+    assert all("Install and start Colima" not in str(step) for step in template["steps"])
 
 
-def test_macos_sql_setup_can_start_in_the_background():
+def test_macos_sql_setup_always_starts_in_the_background():
     template = load_template("sql-setup-template.yml")
-    parameter = next(
-        p for p in template["parameters"] if p["name"] == "startMacOSSqlInBackground"
-    )
-    assert parameter == {
-        "name": "startMacOSSqlInBackground", "type": "boolean", "default": False,
-    }
-    background = (
-        "${{ if and(eq(parameters.buildTarget, 'MacOS'), "
-        "eq(parameters.startMacOSSqlInBackground, true)) }}"
-    )
+    assert all(p["name"] != "startMacOSSqlInBackground" for p in template["parameters"])
+    background = "${{ if eq(parameters.buildTarget, 'MacOS') }}"
     steps = next(step[background] for step in template["steps"] if background in step)
     docker, start = steps
-    assert docker == {
-        "template": "macos-docker-steps.yml", "parameters": {"startColima": False},
-    }
+    assert docker == {"template": "macos-docker-steps.yml"}
     script = start["script"]
-    assert script.startswith(
+    assert (
         'bash .pipeline/scripts/background-step.sh start "$(Agent.TempDirectory)/macos-sql"'
-    )
+    ) in script
     colima = script.index("start-colima-macos.sh &&")
     assert script.index('PATH="$TOOLCHAIN_DIR/bin:$PATH" bash .pipeline/scripts/'
                         "start-sql-server-macos.sh") > colima
@@ -1205,6 +1177,38 @@ def test_macos_sql_setup_can_start_in_the_background():
         "SQL_PASSWORD": "$(SQL_PASSWORD)",
     }
     assert start.get("condition", "succeeded()") == "succeeded()"
+    assert script.index("macosSqlStarted]true") > colima
+    assert (
+        'background-step.sh wait \\"$(Agent.TempDirectory)/macos-sql\\" 3300'
+    ) in script
+
+
+def test_macos_startup_budgets_allow_a_full_retry_and_fit_outer_limits():
+    def default(script, name):
+        text = (_ROOT / ".pipeline" / "scripts" / script).read_text(encoding="utf-8")
+        return int(re.search(rf"{name}=\$\{{{name}:-([0-9]+)\}}", text).group(1))
+
+    attempt = default("start-colima-macos.sh", "COLIMA_START_TIMEOUT_SECONDS")
+    attempts = default("start-colima-macos.sh", "COLIMA_START_ATTEMPTS")
+    colima = default("start-colima-macos.sh", "COLIMA_BUDGET_SECONDS")
+    sql = default("start-sql-server-macos.sh", "SETUP_BUDGET_SECONDS")
+    assert attempt >= 900
+    assert attempts >= 2
+    assert colima >= 2 * attempt + 120
+
+    stages = load_template("validation-stages.yml")["stages"]
+    build = next(stage for stage in stages if stage["stage"] == "Build")
+    tests = next(job for job in build["jobs"] if job.get("job") == "Test_MacOS")
+    rust = next(step for step in tests["steps"] if step.get("template") == "build-template.yml")
+    python = load_template("test-mssql-python-macos-template.yml")["steps"]
+    joins = [
+        rust["parameters"]["beforeTestSteps"][0],
+        next(step for step in python if step.get("displayName") == "Wait for Colima and SQL Server"),
+    ]
+    for join in joins:
+        timeout = int(join["script"].rsplit(" ", 1)[1])
+        assert timeout >= colima + sql + 180
+        assert join["timeoutInMinutes"] * 60 > timeout
 
 
 def _background_step(tmp_path, *args, timeout=30):
@@ -1253,7 +1257,8 @@ def test_background_step_timeout_counts_from_start(tmp_path, ignore_term):
 
 
 @pytest.mark.skipif(_BASH is None, reason="Bash is required")
-def test_background_step_timeout_stops_nested_run_bounded(tmp_path):
+@pytest.mark.parametrize("action", ["wait", "stop"])
+def test_background_step_stops_nested_run_bounded(tmp_path, action):
     shutil.copyfile(_ROOT / ".pipeline" / "scripts" / "run-bounded.sh",
                     tmp_path / "run-bounded.sh")
     started = _background_step(
@@ -1270,7 +1275,8 @@ def test_background_step_timeout_stops_nested_run_bounded(tmp_path):
     assert pid_file.exists()
     child_pid = pid_file.read_text(encoding="utf-8").strip()
     assert child_pid.isdecimal()
-    joined = _background_step(tmp_path, "wait", "state", "1")
+    args = ("wait", "state", "1") if action == "wait" else ("stop", "state")
+    joined = _background_step(tmp_path, *args)
     probe = subprocess.run(
         [_BASH, "-c", 'kill -0 "$1" 2>/dev/null', "_", child_pid],
         capture_output=True, text=True, timeout=10,
@@ -1281,8 +1287,11 @@ def test_background_step_timeout_stops_nested_run_bounded(tmp_path):
             capture_output=True, text=True, timeout=10,
         )
         assert cleanup.returncode == 0, cleanup.stderr
-    assert joined.returncode == 1
-    assert "did not finish within 1s of starting" in joined.stdout
+    assert joined.returncode == (1 if action == "wait" else 0), joined.stdout + joined.stderr
+    if action == "wait":
+        assert "did not finish within 1s of starting" in joined.stdout
+    else:
+        assert "Stopped background process group" in joined.stdout
     assert probe.returncode != 0, "Nested bounded process survived the timeout"
     assert not (tmp_path / "escaped").exists()
 
@@ -1324,6 +1333,56 @@ def test_run_bounded_still_returns_timeout_status(tmp_path):
 
 
 @pytest.mark.skipif(_BASH is None, reason="Bash is required")
+def test_run_bounded_counts_elapsed_time_instead_of_poll_iterations(tmp_path):
+    shutil.copyfile(_ROOT / ".pipeline" / "scripts" / "run-bounded.sh",
+                    tmp_path / "run-bounded.sh")
+    result = subprocess.run(
+        [_BASH, "-c", """
+set -euo pipefail
+. ./run-bounded.sh
+echo 100 > clock
+date() { cat clock; }
+sleep() {
+  if [ "$1" = 2 ]; then
+    echo 200 > clock
+    echo poll >> polls
+  else
+    command sleep 0.1
+  fi
+}
+run_bounded 60 bash -c 'sleep 30'
+"""],
+        cwd=tmp_path, capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert (tmp_path / "polls").read_text(encoding="utf-8").splitlines() == ["poll"]
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize("finished", [False, True])
+def test_background_step_stop_handles_missing_or_completed_work(tmp_path, finished):
+    if finished:
+        result = _background_step(tmp_path, "start", "state", "bash", "-c", "echo done")
+        assert result.returncode == 0, result.stdout + result.stderr
+        result = _background_step(tmp_path, "wait", "state", "20")
+        assert result.returncode == 0, result.stdout + result.stderr
+    result = _background_step(tmp_path, "stop", "state")
+    assert result.returncode == 0, result.stdout + result.stderr
+    expected = "already finished" if finished else "No background command was started"
+    assert expected in result.stdout
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+def test_background_step_stop_rejects_invalid_process_id(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "pid").write_text("0", encoding="utf-8")
+    result = _background_step(tmp_path, "stop", "state")
+    assert result.returncode == 1
+    assert "Invalid background process ID" in result.stdout
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
 def test_background_step_rejects_late_completion_before_wait(tmp_path):
     started = _background_step(tmp_path, "start", "state", "bash", "-c", "echo finished")
     assert started.returncode == 0, started.stdout + started.stderr
@@ -1340,7 +1399,7 @@ def test_background_step_rejects_late_completion_before_wait(tmp_path):
 @pytest.mark.parametrize(
     "args",
     [(), ("start",), ("start", "state"), ("wait", "state"), ("wait", "state", "x"),
-     ("join", "state", "1")],
+     ("join", "state", "1"), ("stop", "state", "extra")],
 )
 def test_background_step_rejects_bad_usage(tmp_path, args):
     result = _background_step(tmp_path, *args)
@@ -1407,17 +1466,23 @@ def test_build_template_test_overlap_parameters():
     assert start["workingDirectory"] == "$(Build.SourcesDirectory)"
 
 
-def test_mssql_python_macos_readiness_gates_provisioning():
+def test_mssql_python_macos_build_overlaps_startup_and_readiness_gates_tests():
     steps = load_template("test-mssql-python-macos-template.yml")["steps"]
     named = {step["displayName"]: step for step in steps if "displayName" in step}
     ready = "and(succeeded(), eq(variables['mssqlPythonReady'], 'true'))"
-    docker = next(step for step in steps if step.get("template") == "macos-docker-steps.yml")
-    assert docker["parameters"]["condition"] == ready
-    sql = named["Start SQL Server (Docker, no TLS certs)"]
+    sql = next(step for step in steps if step.get("template") == "sql-setup-template.yml")
+    assert sql["parameters"] == {"buildTarget": "MacOS"}
+    build = named["Build ddbc_bindings and mssql-py-core"]
+    join = named["Wait for Colima and SQL Server"]
     tests = named["Run mssql-python tests"]
-    assert sql["condition"] == tests["condition"] == ready
+    assert join["condition"] == tests["condition"] == ready
     smoke = named["Verify installed mssql-python runtime"]
-    assert steps.index(smoke) < steps.index(docker) < steps.index(sql) < steps.index(tests)
+    order = [steps.index(step) for step in (sql, build, smoke, join, tests)]
+    assert order == sorted(order)
+    assert join["script"].startswith(
+        'bash .pipeline/scripts/background-step.sh wait "$(Agent.TempDirectory)/macos-sql" '
+    )
+    assert not any(step.get("template") == "generate-sql-password-template.yml" for step in steps)
     assert smoke.get("condition", "succeeded()") == "succeeded()"
     for step in steps:
         assert not step.get("continueOnError", False)
@@ -1430,9 +1495,13 @@ def test_mssql_python_macos_readiness_gates_provisioning():
     )
     for publish in (setup_results, test_results):
         assert publish["inputs"]["failTaskOnMissingResultsFile"] is True
-    assert named["Cleanup SQL Server"]["condition"] == (
-        "and(always(), eq(variables['mssqlPythonReady'], 'true'))"
+    cleanup = named["Cleanup SQL Server"]
+    assert cleanup["condition"] == (
+        "and(always(), eq(variables['macosSqlStarted'], 'true'))"
     )
+    stop = cleanup["script"].index('background-step.sh stop "$(Agent.TempDirectory)/macos-sql"')
+    assert stop < cleanup["script"].index("docker rm --force sqlserver")
+    assert cleanup["env"]["TOOLCHAIN_DIR"] == "$(Agent.TempDirectory)/docker-toolchain"
     assert named["Cleanup"]["condition"] == "always()"
 
 
@@ -1968,16 +2037,16 @@ def test_macos_pr_runs_native_odbc_e2e_against_existing_sql():
     assert job["pool"]["vmImage"] == "macOS-latest"
     steps = job["steps"]
     sql = next(step for step in steps if step.get("template") == "sql-setup-template.yml")
-    assert sql["parameters"] == {"buildTarget": "MacOS", "startMacOSSqlInBackground": True}
+    assert sql["parameters"] == {"buildTarget": "MacOS"}
     rust = next(step for step in steps if step.get("template") == "build-template.yml")
     assert rust["parameters"].get("enableTests", True) is True
     assert rust["parameters"]["prebuildTests"] is True
     assert rust["parameters"]["backgroundCoverageReport"] is True
     join_sql, verify = rust["parameters"]["beforeTestSteps"]
     assert join_sql["script"] == (
-        'bash .pipeline/scripts/background-step.sh wait "$(Agent.TempDirectory)/macos-sql" 2400'
+        'bash .pipeline/scripts/background-step.sh wait "$(Agent.TempDirectory)/macos-sql" 3300'
     )
-    assert join_sql["timeoutInMinutes"] * 60 > 2400
+    assert join_sql["timeoutInMinutes"] * 60 > 3300
     assert verify["displayName"] == "Verify macOS SQL Server before tests"
     install = next(
         step for step in steps
