@@ -72,6 +72,7 @@ use crate::error::bulk_copy_errors::{
 use crate::message::transaction_management::TransactionIsolationLevel;
 use crate::sql_identifier::parse_bulk_copy_target_identifier;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// Options for configuring bulk copy operations.
@@ -359,6 +360,8 @@ pub struct BulkCopy<'a> {
     /// Cached destination table metadata (retrieved from server)
     destination_metadata: Option<Vec<BulkCopyColumnMetadata>>,
 
+    /// Original metadata of vector columns whose bulk input was redeclared, by column index
+    vector_destination_metadata: HashMap<usize, BulkCopyColumnMetadata>,
     /// Metadata retriever strategy
     metadata_retriever: Box<dyn MetadataRetriever + 'a>,
 
@@ -387,6 +390,7 @@ impl<'a> BulkCopy<'a> {
             column_mappings: Vec::new(),
             progress_callback: None,
             destination_metadata: None,
+            vector_destination_metadata: HashMap::new(),
             metadata_retriever: Box::new(FmtOnlyMetadataRetriever::new()),
             timeout_state: None,
         }
@@ -422,6 +426,7 @@ impl<'a> BulkCopy<'a> {
             column_mappings: Vec::new(),
             progress_callback: None,
             destination_metadata: None,
+            vector_destination_metadata: HashMap::new(),
             metadata_retriever: retriever,
             timeout_state: None,
         }
@@ -803,15 +808,25 @@ impl<'a> BulkCopy<'a> {
                 "Retrieve destination metadata before declaring vector bulk input".to_string(),
             )
         })?;
-        let column = metadata
-            .iter_mut()
-            .find(|column| column.column_name == destination_column)
+        let index = metadata
+            .iter()
+            .position(|column| column.column_name == destination_column)
             .ok_or_else(|| {
                 Error::UsageError(format!(
                     "Destination column '{destination_column}' does not exist"
                 ))
             })?;
-        *column = column.with_vector_bulk_input(input)?;
+        // Derive every declaration from the destination column, so a later
+        // declaration still sees its vector type after a JSON declaration.
+        let original = self
+            .vector_destination_metadata
+            .get(&index)
+            .unwrap_or(&metadata[index])
+            .clone();
+        metadata[index] = original.with_vector_bulk_input(input)?;
+        self.vector_destination_metadata
+            .entry(index)
+            .or_insert(original);
         Ok(())
     }
 
@@ -1590,6 +1605,24 @@ mod tests {
             metadata[1].get_sql_type_definition().unwrap(),
             "varchar(max)"
         );
+
+        // Later declarations derive from the destination vector column, not the JSON one.
+        bulk_copy
+            .set_vector_bulk_input("v", VectorBulkInput::Utf8Json)
+            .unwrap();
+        let metadata = bulk_copy.retrieve_destination_metadata().await.unwrap();
+        assert_eq!(metadata[1].sql_type, SqlDbType::VarChar);
+        bulk_copy
+            .set_vector_bulk_input("v", VectorBulkInput::Native(VectorBaseType::Float16))
+            .unwrap();
+        let metadata = bulk_copy.retrieve_destination_metadata().await.unwrap();
+        assert_eq!(metadata[1].sql_type, SqlDbType::Vector);
+        assert_eq!(metadata[1].scale, VectorBaseType::Float16 as u8);
+        assert_eq!(metadata[1].length, length);
+        bulk_copy.set_vector_bulk_input("v", native).unwrap();
+        let metadata = bulk_copy.retrieve_destination_metadata().await.unwrap();
+        assert_eq!(metadata[1].scale, VectorBaseType::Float32 as u8);
+        assert_eq!(metadata[1].length, (VECTOR_HEADER_SIZE + 3 * 4) as i32);
     }
 
     #[test]

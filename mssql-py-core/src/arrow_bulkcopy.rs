@@ -193,6 +193,47 @@ pub fn build_column_plans(
         .collect()
 }
 
+/// Reject a batch whose mapped vector fields carry different
+/// `mssql.vector.base_type` metadata than the schema the plans were built from.
+/// Each vector column's incoming base type is declared once from that schema,
+/// so a conflicting later batch would otherwise be encoded with the wrong type.
+pub fn validate_batch_vector_metadata(
+    planned: &Schema,
+    batch: &Schema,
+    plans: &[ColumnPlan],
+) -> TdsResult<()> {
+    for plan in plans {
+        if !matches!(plan.kind, ColumnPlanKind::Vector { .. }) {
+            continue;
+        }
+        let (Some(expected), Some(actual)) = (
+            planned.fields().get(plan.source_index),
+            batch.fields().get(plan.source_index),
+        ) else {
+            continue;
+        };
+        let (expected_type, actual_type) = (
+            arrow_vector_base_type(expected)?,
+            arrow_vector_base_type(actual)?,
+        );
+        if expected_type != actual_type {
+            let describe = |base_type: Option<VectorBaseType>| match base_type {
+                Some(VectorBaseType::Float32) => "'float32'",
+                Some(VectorBaseType::Float16) => "'float16'",
+                None => "no",
+            };
+            return Err(Error::UsageError(format!(
+                "Arrow field '{}' has {} mssql.vector.base_type metadata in a later batch but \
+                 {} in the first batch; all batches must use the same vector base type",
+                actual.name(),
+                describe(actual_type),
+                describe(expected_type)
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// SQL base type declared by an Arrow vector field's `mssql.vector.base_type`
 /// metadata, or `None` when the field is untagged.
 fn arrow_vector_base_type(field: &arrow::datatypes::Field) -> TdsResult<Option<VectorBaseType>> {
@@ -1010,6 +1051,67 @@ mod tests {
     }
 
     #[test]
+    fn later_batches_must_keep_vector_base_type_metadata() {
+        let field = |tag: Option<&str>| {
+            let field = Field::new(
+                "v",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3),
+                true,
+            );
+            match tag {
+                Some(value) => {
+                    field.with_metadata([("mssql.vector.base_type".into(), value.into())].into())
+                }
+                None => field,
+            }
+        };
+        let schema = |tag| Schema::new(vec![Field::new("id", DataType::Int32, true), field(tag)]);
+        let dest = vector_dest(VectorBaseType::Float16, 3);
+        let mappings = [ResolvedColumnMapping {
+            source_index: 1,
+            destination_index: 0,
+            destination_name: dest.column_name.clone(),
+            destination_type: SqlDbType::Vector,
+        }];
+        for planned_tag in [None, Some("float16"), Some("float32")] {
+            let planned = schema(planned_tag);
+            let plans =
+                build_column_plans(&planned, std::slice::from_ref(&dest), &mappings).unwrap();
+            for batch_tag in [None, Some("float16"), Some("float32")] {
+                let result = validate_batch_vector_metadata(&planned, &schema(batch_tag), &plans);
+                if batch_tag == planned_tag {
+                    result.unwrap();
+                } else {
+                    let error = result.unwrap_err().to_string();
+                    assert!(
+                        error.contains("Arrow field 'v'") && error.contains("later batch"),
+                        "{error}"
+                    );
+                }
+            }
+        }
+        // Non-vector plans and unmapped fields are not checked.
+        let int_dest = meta("id", SqlDbType::Int, true);
+        let int_plans = build_column_plans(
+            &schema(Some("float16")),
+            std::slice::from_ref(&int_dest),
+            &[ResolvedColumnMapping {
+                source_index: 0,
+                destination_index: 0,
+                destination_name: "id".into(),
+                destination_type: SqlDbType::Int,
+            }],
+        )
+        .unwrap();
+        validate_batch_vector_metadata(
+            &schema(Some("float16")),
+            &schema(Some("float32")),
+            &int_plans,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn vector_float32_and_float16_values_and_nulls() {
         use arrow::datatypes::Float32Type;
 
@@ -1020,22 +1122,33 @@ mod tests {
             // Values keep the source base type even for a destination of the other type.
             let dest = vector_dest(VectorBaseType::Float32, 3);
             let arr = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-                [Some(vec![Some(0.1), Some(-0.0), Some(1.0)]), None],
+                [
+                    Some(vec![Some(0.1), Some(-0.0), Some(1.0)]),
+                    None,
+                    Some(vec![Some(4.0), Some(-5.5), Some(6.25)]),
+                ],
                 3,
             );
             let plan = vector_plan(&dest, 3, metadata).unwrap();
-            let sliced = arr.slice(1, 1);
+            let sliced = arr.slice(1, 2);
             assert_eq!(
                 plan.extract_value(&sliced, 0, &dest).unwrap(),
                 ColumnValues::Null
             );
-            match plan.extract_value(&arr, 0, &dest).unwrap() {
-                ColumnValues::Vector(v) => {
-                    assert_eq!(v.base_type(), base_type);
-                    // Float16 elements are held as f32 and narrowed only on serialization.
-                    assert_eq!(v.as_f32().unwrap(), &[0.1, -0.0, 1.0]);
+            // A non-NULL row at a nonzero slice offset must read its own payload.
+            for (array, row, expected) in [
+                (&arr, 0, [0.1, -0.0, 1.0]),
+                (&sliced, 1, [4.0, -5.5, 6.25]),
+                (&arr.slice(2, 1), 0, [4.0, -5.5, 6.25]),
+            ] {
+                match plan.extract_value(array, row, &dest).unwrap() {
+                    ColumnValues::Vector(v) => {
+                        assert_eq!(v.base_type(), base_type);
+                        // Float16 elements are held as f32 and narrowed only on serialization.
+                        assert_eq!(v.as_f32().unwrap(), &expected);
+                    }
+                    other => panic!("expected Vector, got {other:?}"),
                 }
-                other => panic!("expected Vector, got {other:?}"),
             }
         }
     }

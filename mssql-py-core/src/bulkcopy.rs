@@ -727,8 +727,8 @@ impl PythonRowAdapter {
                         != target_meta.vector_dimensions()?
                 {
                     return Err(Error::UsageError(format!(
-                        "Vector dimensions or base_type do not match column '{}'; the first \
-                         row's vector sets the column's base type for the whole bulk copy",
+                        "Vector dimensions or base_type do not match column '{}'; the column's \
+                         first non-NULL vector sets its base type for the whole bulk copy",
                         target_meta.column_name
                     )));
                 }
@@ -2066,7 +2066,66 @@ impl BulkLoadRow for PythonRowAdapter {
         column_index: &mut usize,
     ) -> TdsResult<()> {
         // Step 1: Acquire GIL and convert Python values to ColumnValues
-        let column_values: Vec<_> = Python::attach(|py| {
+        let column_values = Python::attach(|py| self.convert_row(py))?;
+
+        // Step 2: outside the attach scope, write values to packet asynchronously
+        write_row_values(&column_values, writer, column_index).await
+    }
+}
+
+async fn write_row_values(
+    column_values: &[ColumnValues],
+    writer: &mut StreamingBulkLoadWriter<'_>,
+    column_index: &mut usize,
+) -> TdsResult<()> {
+    for value in column_values {
+        writer.write_column_value(*column_index, value).await?;
+        *column_index += 1;
+    }
+    Ok(())
+}
+
+/// A bulk-copy row that is either converted while it is written, or was converted
+/// earlier (for example while looking ahead) so later changes to mutable Python
+/// objects in the row cannot change what is sent.
+pub enum PythonBulkRow {
+    Live(PythonRowAdapter),
+    Converted(std::sync::Mutex<Option<TdsResult<Vec<ColumnValues>>>>),
+}
+
+impl PythonBulkRow {
+    /// Convert `adapter` now, keeping any conversion error until the row is written.
+    pub fn converted(adapter: &PythonRowAdapter, py: Python<'_>) -> Self {
+        Self::Converted(std::sync::Mutex::new(Some(adapter.convert_row(py))))
+    }
+}
+
+#[async_trait]
+impl BulkLoadRow for PythonBulkRow {
+    async fn write_to_packet(
+        &self,
+        writer: &mut StreamingBulkLoadWriter<'_>,
+        column_index: &mut usize,
+    ) -> TdsResult<()> {
+        match self {
+            Self::Live(adapter) => adapter.write_to_packet(writer, column_index).await,
+            Self::Converted(values) => {
+                let values = values
+                    .lock()
+                    .map_err(|_| Error::UsageError("Buffered bulk copy row is poisoned".into()))?
+                    .take()
+                    .ok_or_else(|| {
+                        Error::UsageError("Buffered bulk copy row was already written".into())
+                    })??;
+                write_row_values(&values, writer, column_index).await
+            }
+        }
+    }
+}
+
+impl PythonRowAdapter {
+    fn convert_row(&self, py: Python<'_>) -> TdsResult<Vec<ColumnValues>> {
+        {
             let tuple = self.row.bind(py).cast::<PyTuple>().map_err(|e| {
                 tracing::error!("Failed to cast row to tuple: {}", e);
                 Error::UsageError(format!("Expected tuple, got: {}", e))
@@ -2140,15 +2199,7 @@ impl BulkLoadRow for PythonRowAdapter {
 
                 Ok::<Vec<_>, Error>(values)
             }
-        })?;
-
-        // Step 2: outside the attach scope, write values to packet asynchronously
-        for value in column_values.iter() {
-            writer.write_column_value(*column_index, value).await?;
-            *column_index += 1;
         }
-
-        Ok(())
     }
 }
 
@@ -2156,6 +2207,96 @@ impl BulkLoadRow for PythonRowAdapter {
 mod tests {
     use super::*;
 
+    fn vector_metadata(dimensions: usize, base_type: VectorBaseType) -> BulkCopyColumnMetadata {
+        use mssql_tds::datatypes::bulk_copy_metadata::TypeLength;
+        let length = (mssql_tds::datatypes::sqldatatypes::VECTOR_HEADER_SIZE
+            + dimensions * base_type.element_size_bytes()) as i32;
+        BulkCopyColumnMetadata::new("embedding", SqlDbType::Vector, 0xF5)
+            .with_length(length, TypeLength::Variable(length))
+            .with_scale(base_type as u8)
+    }
+
+    fn vector_values(value: ColumnValues) -> (VectorBaseType, Vec<f32>) {
+        match value {
+            ColumnValues::Vector(vector) => (vector.base_type(), vector.as_f32().unwrap().to_vec()),
+            other => panic!("Expected a vector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_vector_must_match_declared_column_shape() {
+        use VectorBaseType::{Float16, Float32};
+        Python::attach(|py| {
+            for (base_type, other) in [(Float32, Float16), (Float16, Float32)] {
+                let typed = |values: Vec<f32>, base_type| {
+                    let value = crate::vector::make_vector(values, base_type).unwrap();
+                    Py::new(py, crate::vector::BulkCopyVector { value }).unwrap()
+                };
+                let meta = vector_metadata(3, base_type);
+                let matching = typed(vec![1.0, -2.5, 0.0], base_type);
+                let converted =
+                    PythonRowAdapter::convert_by_target_type(matching.bind(py).as_any(), &meta)
+                        .unwrap();
+                assert_eq!(vector_values(converted), (base_type, vec![1.0, -2.5, 0.0]));
+
+                for mismatch in [typed(vec![1.0, 2.0], base_type), typed(vec![1.0; 3], other)] {
+                    let error =
+                        PythonRowAdapter::convert_by_target_type(mismatch.bind(py).as_any(), &meta)
+                            .unwrap_err();
+                    assert!(
+                        matches!(&error, Error::UsageError(message)
+                            if message.contains("do not match column 'embedding'")),
+                        "{error}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn list_vector_rejects_bool_elements() {
+        Python::attach(|py| {
+            let meta = vector_metadata(3, VectorBaseType::Float32);
+            let numbers = pyo3::types::PyList::new(py, [1.0, 2.0, 3.0]).unwrap();
+            let converted =
+                PythonRowAdapter::convert_by_target_type(numbers.as_any(), &meta).unwrap();
+            assert_eq!(vector_values(converted).1, vec![1.0, 2.0, 3.0]);
+
+            let with_bool = py.eval(c"[1.0, True, 3.0]", None, None).unwrap();
+            let error = PythonRowAdapter::convert_by_target_type(&with_bool, &meta).unwrap_err();
+            assert!(
+                matches!(&error, Error::UsageError(message)
+                    if message.contains("index 1 must be a real number, not bool")),
+                "{error}"
+            );
+        });
+    }
+
+    #[test]
+    fn converted_row_is_not_changed_by_later_python_mutation() {
+        Python::attach(|py| {
+            let values = pyo3::types::PyList::new(py, [1.0]).unwrap();
+            let row = PyTuple::new(py, [values.as_any(), py.None().bind(py)]).unwrap();
+            let metadata = Arc::new(vec![
+                vector_metadata(1, VectorBaseType::Float32),
+                vector_metadata(1, VectorBaseType::Float32),
+            ]);
+            let adapter =
+                PythonRowAdapter::with_metadata(row.into_any().unbind(), metadata, None, Some(2));
+            let PythonBulkRow::Converted(converted) = PythonBulkRow::converted(&adapter, py) else {
+                panic!("Expected a converted row");
+            };
+            values.set_item(0, 2.0).unwrap();
+            let mut converted = converted.into_inner().unwrap().unwrap().unwrap();
+            assert!(matches!(converted.pop(), Some(ColumnValues::Null)));
+            assert_eq!(vector_values(converted.pop().unwrap()).1, vec![1.0]);
+            // The live adapter reads the row when written, so it sees the mutation.
+            assert_eq!(
+                vector_values(adapter.convert_row(py).unwrap().swap_remove(0)).1,
+                vec![2.0]
+            );
+        });
+    }
     fn convert(value: &str, sql_type: SqlDbType, scale: u8) -> TdsResult<ColumnValues> {
         let metadata = BulkCopyColumnMetadata::new("event_time", sql_type, sql_type.to_tds_type())
             .with_scale(scale);
