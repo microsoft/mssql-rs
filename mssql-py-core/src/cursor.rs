@@ -5,7 +5,7 @@ use mssql_tds::connection::bulk_copy::{
     BulkCopy, ColumnMapping as TdsColumnMapping, ColumnMappingSource,
 };
 use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet, StatementResult, TdsClient};
-use mssql_tds::datatypes::bulk_copy_metadata::VectorBulkInput;
+use mssql_tds::datatypes::bulk_copy_metadata::{SqlDbType, VectorBulkInput};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::decoder::DECIMAL_STR_LEN;
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
@@ -24,6 +24,9 @@ use crate::utils::convert_tds_error;
 use arrow::array::{RecordBatch, StructArray};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
+
+/// Rows scanned for a vector column's first non-NULL value when choosing its bulk input type.
+const VECTOR_BULK_INPUT_LOOKAHEAD_ROWS: usize = 1000;
 
 /// Python Cursor class for Core TDS backend
 #[pyclass]
@@ -455,19 +458,53 @@ impl PyCoreCursor {
             let resolved_mappings_arc = Arc::new(resolved_mappings);
 
             // Create true streaming iterator from Python data source
-            // Chain first row (if exists) back with remaining rows for zero-copy streaming
+            // Chain buffered look-ahead rows back with remaining rows for zero-copy streaming
             info!("bulkcopy: Creating streaming PythonRowAdapter iterator");
-            // Declare each vector column's incoming representation from its first-row
-            // value, as Microsoft.Data.SqlClient does; SQL Server converts it to the
-            // destination column.
+            // Declare each vector column's incoming representation from its first non-NULL
+            // value, as Microsoft.Data.SqlClient does for untyped sources; SQL Server converts
+            // it to the destination column. Rows are streamed, so look ahead a bounded number
+            // of rows and replay them; all-NULL prefixes keep the destination representation.
             let mut incoming_metadata = destination_metadata;
-            if let Some(Ok(first_row)) = &first_row_result
-                && let Ok(first_row) = first_row.cast::<PyTuple>()
-            {
-                for mapping in resolved_mappings_arc.iter() {
-                    let Ok(sample) = first_row.get_item(mapping.source_index) else {
+            let mut buffered_rows: Vec<PyResult<Bound<'_, PyAny>>> =
+                first_row_result.into_iter().collect();
+            let mut pending: Vec<usize> = resolved_mappings_arc
+                .iter()
+                .enumerate()
+                .filter(|(_, mapping)| {
+                    let destination = &incoming_metadata[mapping.destination_index];
+                    destination.sql_type == SqlDbType::Vector && !destination.is_encrypted
+                })
+                .map(|(index, _)| index)
+                .collect();
+            let mut row_index = 0;
+            while !pending.is_empty() {
+                if row_index == buffered_rows.len() {
+                    if buffered_rows.len() >= VECTOR_BULK_INPUT_LOOKAHEAD_ROWS {
+                        break;
+                    }
+                    match py_iter.next() {
+                        Some(row) => buffered_rows.push(row),
+                        None => break,
+                    }
+                }
+                // An iterator error ends the look-ahead; replay preserves existing handling.
+                let Ok(row) = &buffered_rows[row_index] else {
+                    break;
+                };
+                row_index += 1;
+                let Ok(row) = row.cast::<PyTuple>() else {
+                    continue;
+                };
+                let mut still_pending = Vec::with_capacity(pending.len());
+                for mapping_index in pending {
+                    let mapping = &resolved_mappings_arc[mapping_index];
+                    let Ok(sample) = row.get_item(mapping.source_index) else {
                         continue;
                     };
+                    if sample.is_none() {
+                        still_pending.push(mapping_index);
+                        continue;
+                    }
                     let destination = &incoming_metadata[mapping.destination_index];
                     let Some(input) =
                         vector_bulk_input_for(&sample, destination).map_err(convert_tds_error)?
@@ -482,11 +519,12 @@ impl PyCoreCursor {
                         .map_err(convert_tds_error)?;
                     incoming_metadata[mapping.destination_index] = incoming;
                 }
+                pending = still_pending;
             }
             let metadata_arc = Arc::new(incoming_metadata);
 
-            // Build iterator: first row (if exists) + remaining rows from Python iterator
-            let all_rows_iter = first_row_result
+            // Build iterator: buffered look-ahead rows + remaining rows from Python iterator
+            let all_rows_iter = buffered_rows
                 .into_iter()
                 .chain(py_iter)
                 .map(|result| match result {

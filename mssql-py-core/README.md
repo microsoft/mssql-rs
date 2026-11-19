@@ -58,9 +58,9 @@ Like Microsoft.Data.SqlClient's SqlBulkCopy, the client never converts between
 FLOAT32 and FLOAT16. Each vector column is declared in INSERT BULK and
 COLMETADATA with its source base type, and SQL Server converts it to the
 destination (round-to-nearest; values outside the FLOAT16 range fail on the
-server). For row sources, the first row's `BulkCopyVector` sets the column's
-base type and every later vector must share it; a first-row NULL keeps the
-destination type. JSON text for a FLOAT16 column is sent as
+server). For row sources, the first non-NULL `BulkCopyVector` in a column
+(within the first 1000 rows) sets the column's base type and every later vector
+must share it; a column with no vector in those rows keeps the destination type. JSON text for a FLOAT16 column is sent as
 `varchar(max) COLLATE Latin1_General_100_BIN2_UTF8` for SQL Server to parse.
 List cells and JSON for FLOAT32 columns are converted to the destination base
 type, as before. Host drivers can declare a representation directly with
