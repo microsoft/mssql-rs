@@ -7,14 +7,6 @@ parameters:
   - Linux
   - MacOS
 
-# MacOS only. Boots Colima and starts SQL Server detached so the caller can
-# compile while they come up (about 18 minutes on hosted Intel agents). The
-# caller must run `background-step.sh wait "$(Agent.TempDirectory)/macos-sql"`
-# before anything uses docker or SQL Server.
-- name: startMacOSSqlInBackground
-  type: boolean
-  default: false
-
 steps:
 - template: generate-sql-password-template.yml
   parameters:
@@ -265,27 +257,16 @@ steps:
       exit 0
     displayName: "Update CA certificates on the client"
 
-- ${{ if and(eq(parameters.buildTarget, 'MacOS'), eq(parameters.startMacOSSqlInBackground, false)) }}:
+- ${{ if eq(parameters.buildTarget, 'MacOS') }}:
   - template: macos-docker-steps.yml
 
-  - script: bash .pipeline/scripts/start-sql-server-macos.sh
-    displayName: 'Start SQL Server (Docker, no TLS certs)'
-    timeoutInMinutes: 22
-    env:
-      SQL_PASSWORD: $(SQL_PASSWORD)
-
-# The two scripts' own wall-clock budgets still apply. PATH is set explicitly
-# because start-colima-macos.sh exposes docker to later steps via
-# task.prependpath, which only takes effect when the wait step replays the log.
-- ${{ if and(eq(parameters.buildTarget, 'MacOS'), eq(parameters.startMacOSSqlInBackground, true)) }}:
-  - template: macos-docker-steps.yml
-    parameters:
-      startColima: false
-
-  - script: >-
-      bash .pipeline/scripts/background-step.sh start "$(Agent.TempDirectory)/macos-sql"
+  - script: |
+      set -euo pipefail
+      bash .pipeline/scripts/background-step.sh start "$(Agent.TempDirectory)/macos-sql" \
       bash -c 'bash .pipeline/scripts/start-colima-macos.sh &&
       PATH="$TOOLCHAIN_DIR/bin:$PATH" bash .pipeline/scripts/start-sql-server-macos.sh'
+      echo "##[section]Colima and SQL Server are starting in the background. Add a later step: bash .pipeline/scripts/background-step.sh wait \"$(Agent.TempDirectory)/macos-sql\" 3300"
+      echo "##vso[task.setvariable variable=macosSqlStarted]true"
     displayName: 'Start Colima and SQL Server in the background'
     env:
       TOOLCHAIN_DIR: '$(Agent.TempDirectory)/docker-toolchain'
