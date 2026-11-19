@@ -483,10 +483,15 @@ impl PyCoreCursor {
                 })
                 .map(|(index, _)| index)
                 .collect();
+            if !pending.is_empty() {
+                // Rows read ahead count toward the bulk copy timeout, which the write keeps.
+                bulk_copy.start_timeout();
+            }
             while !pending.is_empty() && buffered_rows.len() < VECTOR_BULK_INPUT_LOOKAHEAD_ROWS {
                 let Some(row) = first_row.take().or_else(|| py_iter.next()) else {
                     break;
                 };
+                bulk_copy.check_timeout().map_err(convert_tds_error)?;
                 // An iterator error ends the look-ahead; replay preserves existing handling.
                 let row = match row {
                     Ok(row) => row,

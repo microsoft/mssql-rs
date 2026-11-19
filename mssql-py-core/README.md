@@ -63,13 +63,18 @@ Like Microsoft.Data.SqlClient's SqlBulkCopy, the client never converts between
 FLOAT32 and FLOAT16. Each vector column is declared in INSERT BULK and
 COLMETADATA with its source base type, and SQL Server converts it to the
 destination (round-to-nearest; values outside the FLOAT16 range fail on the
-server). For row sources, the first non-NULL `BulkCopyVector` in a column
-(within the first 1000 rows) sets the column's base type and every later vector
-must share it; a column with no vector in those rows keeps the destination type. JSON text for a FLOAT16 column is sent as
-`varchar(max) COLLATE Latin1_General_100_BIN2_UTF8` for SQL Server to parse.
-List cells and JSON for FLOAT32 columns are converted to the destination base
-type, as before. Host drivers can declare a representation directly with
-`BulkCopy::set_vector_bulk_input` in mssql-tds.
+server). For row sources, each vector column's representation is fixed by its
+first non-NULL cell, looking ahead up to 1000 rows. A `BulkCopyVector` declares
+its own base type. JSON text in a FLOAT16 column is declared as
+`varchar(max) COLLATE Latin1_General_100_BIN2_UTF8` for SQL Server to parse. A
+list, JSON text in a FLOAT32 column, or no non-NULL cell in those rows keeps the
+destination base type. Later cells use that declaration: a `BulkCopyVector` must
+have the declared base type, lists are encoded with the declared base type, JSON
+text is parsed only for a FLOAT32 declaration, and a column declared as JSON
+text accepts only JSON text. So a list followed by a `BulkCopyVector` of the
+other base type is rejected, while lists after a cross-base `BulkCopyVector` are
+sent with that vector's base type. Host drivers can declare a representation
+directly with `BulkCopy::set_vector_bulk_input` in mssql-tds.
 
 Arrow bulk copy accepts `fixed_size_list<float32>` for both SQL vector base
 types. The list size must match destination dimensions. Field metadata

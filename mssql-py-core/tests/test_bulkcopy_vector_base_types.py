@@ -4,10 +4,13 @@
 """Bulk copy of vectors whose base type differs from the destination column.
 
 Each vector column is declared with its source base type (row sources: the
-column's first non-NULL ``BulkCopyVector``; Arrow: ``mssql.vector.base_type``
+column's first non-NULL cell; Arrow: ``mssql.vector.base_type``
 metadata) and SQL Server converts it. Source columns are deliberately ordered
 differently from the destination so a wrong column index is detected.
 """
+
+import struct
+import time
 
 import pytest
 import mssql_py_core
@@ -103,6 +106,49 @@ def test_row_bulkcopy_lookahead_snapshots_reused_mutable_cells(cursor):
 
     assert cursor.bulkcopy(TABLE, rows())["rows_copied"] == 3
     assert _rows(cursor) == [(1, [1.0], None), (2, [2.0], None), (3, [3.0], None)]
+
+
+@pytest.mark.integration
+def test_row_bulkcopy_first_non_null_cell_fixes_declaration(cursor):
+    _create_mixed_table(cursor)
+    # A list first keeps the FLOAT32 destination type, so a FLOAT16 vector is rejected.
+    with pytest.raises(Exception, match="base"):
+        cursor.bulkcopy(
+            TABLE,
+            iter(
+                [
+                    (1, None, [1.0, 2.0, 3.0]),
+                    (2, None, BulkCopyVector([1.0, 2.0, 3.0], "float16")),
+                ]
+            ),
+        )
+    cursor.execute(f"DELETE FROM {TABLE}")
+    # Lists after a cross-base vector are sent with that vector's base type.
+    cursor.bulkcopy(
+        TABLE,
+        iter(
+            [
+                (1, None, BulkCopyVector([1.0, 2.0, 3.0], "float16")),
+                (2, None, [0.1, 0.2, 0.3]),
+            ]
+        ),
+    )
+    as_float16 = [struct.unpack("<e", struct.pack("<e", v))[0] for v in (0.1, 0.2, 0.3)]
+    assert _rows(cursor) == [(1, None, [1.0, 2.0, 3.0]), (2, None, as_float16)]
+
+
+@pytest.mark.integration
+def test_row_bulkcopy_lookahead_counts_toward_timeout(cursor):
+    cursor.execute(f"IF OBJECT_ID('{TABLE}', 'U') IS NOT NULL DROP TABLE {TABLE}")
+    cursor.execute(f"CREATE TABLE {TABLE} (id INT, a VECTOR(3) NULL)")
+
+    def rows():
+        yield (1, None)
+        time.sleep(2)
+        yield (2, None)
+
+    with pytest.raises(TimeoutError, match="(?i)timed out"):
+        cursor.bulkcopy(TABLE, rows(), batch_size=1, timeout=1)
 
 
 def _vector_field(pa, name, tag):

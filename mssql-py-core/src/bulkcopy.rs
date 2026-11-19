@@ -1840,11 +1840,21 @@ impl PythonRowAdapter {
                         idx, target_meta.column_name
                     )));
                 }
+                if base_type == VectorBaseType::Float16 && as_f32.abs() > 65504.0 {
+                    return Err(Error::UsageError(format!(
+                        "VECTOR element at index {} in column '{}' is outside the Float16 range",
+                        idx, target_meta.column_name
+                    )));
+                }
 
                 values.push(as_f32);
             }
 
-            let vector = crate::vector::make_vector(values, base_type)?;
+            // Elements were validated above, so build the vector without a second pass.
+            let vector = match base_type {
+                VectorBaseType::Float32 => SqlVector::try_from_f32(values)?,
+                VectorBaseType::Float16 => SqlVector::try_from_f16(values)?,
+            };
             Ok(ColumnValues::Vector(vector))
         }
     }
@@ -1932,7 +1942,7 @@ impl PythonRowAdapter {
             }
             VectorBaseType::Float16 => Err(Error::UsageError(format!(
                 "JSON text for float16 VECTOR column '{}' is sent to SQL Server as text only \
-                 when the first row's value is text; use one representation per column",
+                 when it is the column's first non-NULL value; use one representation per column",
                 target_meta.column_name
             ))),
         }
@@ -2267,6 +2277,29 @@ mod tests {
             assert!(
                 matches!(&error, Error::UsageError(message)
                     if message.contains("index 1 must be a real number, not bool")),
+                "{error}"
+            );
+        });
+    }
+
+    #[test]
+    fn list_vector_checks_float16_range_in_one_pass() {
+        Python::attach(|py| {
+            let meta = vector_metadata(2, VectorBaseType::Float16);
+            let in_range = pyo3::types::PyList::new(py, [65504.0, -65504.0]).unwrap();
+            let converted =
+                PythonRowAdapter::convert_by_target_type(in_range.as_any(), &meta).unwrap();
+            assert_eq!(
+                vector_values(converted),
+                (VectorBaseType::Float16, vec![65504.0, -65504.0])
+            );
+            let too_large = pyo3::types::PyList::new(py, [1.0, 65505.0]).unwrap();
+            let error =
+                PythonRowAdapter::convert_by_target_type(too_large.as_any(), &meta).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("index 1 in column 'embedding' is outside the Float16 range"),
                 "{error}"
             );
         });
