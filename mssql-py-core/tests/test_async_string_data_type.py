@@ -324,6 +324,8 @@ def test_delayed_string_query_allows_independent_completion(client_context, use_
                     )
 
                 assert await delayed is slow_cursor
+                if slow_cursor.description is None:
+                    assert await slow_cursor.nextset() is True
                 assert await slow_cursor.fetchall() == [(value,)]
                 await slow_cursor.execute(
                     "SELECT CAST(? AS nvarchar(max)) WHERE 1 = 0",
