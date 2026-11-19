@@ -494,13 +494,15 @@ fn emit_process_key_digest() {
 
 #[test]
 fn process_keys_are_private() {
-    let child = || {
+    let child = |threads: &str| {
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "connection_key::tests::emit_process_key_digest",
                 "--ignored",
                 "--nocapture",
+                "--test-threads",
+                threads,
             ])
             .output()
             .unwrap();
@@ -512,9 +514,12 @@ fn process_keys_are_private() {
         String::from_utf8(output.stdout)
             .unwrap()
             .lines()
-            .find_map(|line| line.strip_prefix("PROCESS_KEY_DIGEST="))
+            .find_map(|line| {
+                line.split_once("PROCESS_KEY_DIGEST=")
+                    .map(|(_, digest)| digest)
+            })
             .expect("child must report an opaque digest")
             .to_owned()
     };
-    assert_ne!(child(), child());
+    assert_ne!(child("1"), child("2"));
 }
