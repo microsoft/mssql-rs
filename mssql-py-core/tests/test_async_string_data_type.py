@@ -210,14 +210,18 @@ ENCODING_CONVERSION_CASES = [
 ]
 
 
+async def connect(client_context, *, autocommit=True, **overrides):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        return await mssql_py_core.PyAsyncConnection.connect(
+            {**client_context, **overrides}, autocommit=autocommit
+        )
+
+
 async def round_trip(
     client_context, sql_type, value, use_prepare, *, collation="Latin1_General_100_BIN2"
 ):
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", FutureWarning)
-        conn = await mssql_py_core.PyAsyncConnection.connect(
-            client_context, autocommit=True
-        )
+    conn = await connect(client_context)
     try:
         cursor = conn.cursor()
         # A local temp table created inside a prepared RPC would leave scope.
@@ -246,11 +250,7 @@ async def round_trip(
 
 
 async def fetch_query(client_context, operation, parameters, use_prepare):
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", FutureWarning)
-        conn = await mssql_py_core.PyAsyncConnection.connect(
-            client_context, autocommit=True
-        )
+    conn = await connect(client_context)
     try:
         cursor = conn.cursor()
         await cursor.execute(operation, *parameters, use_prepare=use_prepare)
@@ -279,59 +279,76 @@ def test_delayed_string_query_allows_independent_completion(client_context, use_
         connections = []
         delayed = None
         value = "delayed:\u6f22\U0001f600\x00e\u0301"
+        table = f"##async_strings_{uuid.uuid4().hex}"
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", FutureWarning)
-                for _ in range(2):
-                    connections.append(
-                        await mssql_py_core.PyAsyncConnection.connect(
-                            client_context, autocommit=True
-                        )
-                    )
-            slow_cursor, fast_cursor = [conn.cursor() for conn in connections]
-            delayed = asyncio.ensure_future(slow_cursor.execute(
-                "WAITFOR DELAY '00:00:02'; SELECT CAST(? AS nvarchar(max))",
-                value,
-                use_prepare=use_prepare,
-            ))
-            done, pending = await asyncio.wait([delayed], timeout=0.05)
-            assert not done
-            assert pending == {delayed}
-
-            assert await fast_cursor.execute(
-                "SELECT CAST(? AS nvarchar(32))",
-                "independent:\u4f60\u597d",
-                use_prepare=use_prepare,
-            ) is fast_cursor
-            assert await fast_cursor.fetchall() == [("independent:\u4f60\u597d",)]
-            assert not delayed.done()
-
-            assert await delayed is slow_cursor
-            assert await slow_cursor.fetchall() == [(value,)]
-            await slow_cursor.execute(
-                "SELECT CAST(? AS nvarchar(max)) WHERE 1 = 0",
-                "must not reuse the previous string",
-                use_prepare=use_prepare,
+            for _ in range(3):
+                connections.append(await connect(client_context))
+            control, slow_cursor, fast_cursor = [
+                conn.cursor() for conn in connections
+            ]
+            await control.execute(
+                f"CREATE TABLE {table} (id int PRIMARY KEY, value nvarchar(max))",
+                use_prepare=False,
             )
-            assert await slow_cursor.fetchone() is None
-            assert await slow_cursor.fetchall() == []
-        finally:
             try:
-                if delayed is not None:
-                    await delayed
+                await control.execute(
+                    f"INSERT INTO {table} VALUES (0, N'baseline')", use_prepare=False
+                )
+                await slow_cursor.execute("SELECT @@SPID", use_prepare=False)
+                [(session_id,)] = await slow_cursor.fetchall()
+                try:
+                    await control.execute(
+                        f"BEGIN TRANSACTION; SELECT id FROM {table} "
+                        "WITH (TABLOCKX, HOLDLOCK)",
+                        use_prepare=False,
+                    )
+                    assert await control.fetchall() == [(0,)]
+                    delayed = slow_cursor.execute(
+                        f"INSERT INTO {table} VALUES (1, ?); "
+                        f"SELECT value FROM {table} WHERE id = 1",
+                        value,
+                        use_prepare=use_prepare,
+                    )
+                    await wait_for_lock_wait(control, session_id, delayed)
+
+                    assert await fast_cursor.execute(
+                        "SELECT CAST(? AS nvarchar(32))",
+                        "independent:\u4f60\u597d",
+                        use_prepare=use_prepare,
+                    ) is fast_cursor
+                    assert await fast_cursor.fetchall() == [("independent:\u4f60\u597d",)]
+                    assert not delayed.done()
+                finally:
+                    await control.execute(
+                        "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION", use_prepare=False
+                    )
+
+                assert await delayed is slow_cursor
+                assert await slow_cursor.fetchall() == [(value,)]
+                await slow_cursor.execute(
+                    "SELECT CAST(? AS nvarchar(max)) WHERE 1 = 0",
+                    "must not reuse the previous string",
+                    use_prepare=use_prepare,
+                )
+                assert await slow_cursor.fetchone() is None
+                assert await slow_cursor.fetchall() == []
             finally:
-                await asyncio.gather(*(conn.close() for conn in connections))
+                try:
+                    if delayed is not None:
+                        await delayed
+                finally:
+                    await control.execute(
+                        f"DROP TABLE IF EXISTS {table}", use_prepare=False
+                    )
+        finally:
+            await asyncio.gather(*(conn.close() for conn in connections))
 
     asyncio.run(run())
 
 
 def test_string_result_set_transitions(client_context, use_prepare):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        conn = await connect(client_context)
         try:
             cursor = conn.cursor()
             value = "\u6f22\U0001f600\x00e\u0301" * 2048
@@ -410,11 +427,7 @@ def test_legacy_connection_collation_explicit_ansi_binding(
     client_context, use_prepare, code_page, collation, encoding, text
 ):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            admin = await mssql_py_core.PyAsyncConnection.connect(
-                {**client_context, "database": "master"}, autocommit=True
-            )
+        admin = await connect(client_context, database="master")
         database = f"pycore_cp{code_page}_{uuid.uuid4().hex}"
         admin_cursor = admin.cursor()
         database_created = False
@@ -425,11 +438,7 @@ def test_legacy_connection_collation_explicit_ansi_binding(
                 use_prepare=False,
             )
             database_created = True
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", FutureWarning)
-                conn = await mssql_py_core.PyAsyncConnection.connect(
-                    {**client_context, "database": database}, autocommit=True
-                )
+            conn = await connect(client_context, database=database)
             cursor = conn.cursor()
             await cursor.execute(
                 "SELECT CONVERT(int, COLLATIONPROPERTY(CONVERT(nvarchar(128), "
@@ -490,11 +499,7 @@ def test_legacy_connection_collation_explicit_ansi_binding(
 )
 def test_cross_code_page_column_conversion(client_context, use_prepare, value, expected):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        conn = await connect(client_context)
         try:
             cursor = conn.cursor()
             await cursor.execute(
@@ -535,11 +540,7 @@ def test_cross_code_page_column_conversion(client_context, use_prepare, value, e
 
 def test_cross_collation_conflict_and_explicit_resolution(client_context, use_prepare):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        conn = await connect(client_context)
         try:
             cursor = conn.cursor()
             await cursor.execute(
@@ -605,11 +606,7 @@ def test_cp1252_undefined_byte_decoding(client_context, use_prepare, byte):
 
 def test_cp1252_rebinding_and_nvarchar_conversion(client_context, use_prepare):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        conn = await connect(client_context)
         try:
             cursor = conn.cursor()
             await cursor.execute(
@@ -674,11 +671,7 @@ def test_string_ownership_survives_await_and_connection_close(
     client_context, use_prepare, character, length
 ):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        conn = await connect(client_context)
         try:
             cursor = conn.cursor()
             value = character * length + "\x00tail"
@@ -688,11 +681,11 @@ def test_string_ownership_survives_await_and_connection_close(
                 parameters,
                 use_prepare=use_prepare,
             )
-            assert not (await asyncio.wait([pending], timeout=0.01))[0]
             value += character * length
             parameters[0] = value
             parameters.extend(["replacement"] * 64)
             del value, parameters
+            assert not (await asyncio.wait([pending], timeout=0.01))[0]
             assert await pending is cursor
             row = await cursor.fetchone()
             assert await cursor.fetchone() is None
@@ -709,11 +702,7 @@ def test_dropped_execute_future_preserves_string_and_releases_resources(
     client_context, use_prepare
 ):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        conn = await connect(client_context)
         try:
             cursor = conn.cursor()
             await cursor.execute(
@@ -728,9 +717,10 @@ def test_dropped_execute_future_preserves_string_and_releases_resources(
                 parameters,
                 use_prepare=use_prepare,
             )
+            del value, parameters
             assert not (await asyncio.wait([pending], timeout=0.01))[0]
             reference = weakref.ref(pending)
-            del pending, value, parameters
+            del pending
             gc.collect()
 
             for _ in range(600):
@@ -756,20 +746,12 @@ def test_dropped_execute_future_preserves_string_and_releases_resources(
 
 def test_cancelled_execute_with_large_string_closes_safely(client_context, use_prepare):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            independent = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        independent = await connect(client_context)
         async with independent:
             independent_cursor = independent.cursor()
             references = []
             for cycle in range(3):
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", FutureWarning)
-                    conn = await mssql_py_core.PyAsyncConnection.connect(
-                        client_context, autocommit=True
-                    )
+                conn = await connect(client_context)
                 async with conn:
                     cursor = conn.cursor()
                     value = "\u6f22\U0001f600e\u0301\x00" * 65536
@@ -833,11 +815,7 @@ def test_cancel_after_completion_does_not_cancel_next_string_query(
     client_context, use_prepare
 ):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        conn = await connect(client_context)
         async with conn:
             cursor = conn.cursor()
             completed_execute = cursor.execute(
@@ -870,11 +848,7 @@ def test_cancel_after_completion_does_not_cancel_next_string_query(
 
 def test_encoding_conversion_after_fetch_cancellation(client_context, use_prepare):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        conn = await connect(client_context)
         pending = None
         try:
             cursor = conn.cursor()
@@ -929,11 +903,7 @@ def test_encoding_conversion_after_fetch_cancellation(client_context, use_prepar
 
 def test_cancelled_large_string_insert_rolls_back_on_close(client_context, use_prepare):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            owner = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        owner = await connect(client_context)
         async with owner:
             control = owner.cursor()
             table = f"##async_strings_{uuid.uuid4().hex}"
@@ -945,11 +915,7 @@ def test_cancelled_large_string_insert_rolls_back_on_close(client_context, use_p
                 await control.execute(
                     f"INSERT INTO {table} VALUES (0, N'baseline')", use_prepare=False
                 )
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", FutureWarning)
-                    writer = await mssql_py_core.PyAsyncConnection.connect(
-                        client_context, autocommit=False
-                    )
+                writer = await connect(client_context, autocommit=False)
                 async with writer:
                     pending = None
                     try:
@@ -995,11 +961,7 @@ def test_cancelled_large_string_insert_rolls_back_on_close(client_context, use_p
 @pytest.mark.parametrize("interruption", ["timeout", "terminate-session"])
 def test_interrupted_large_string_fetch(client_context, use_prepare, interruption):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            owner = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        owner = await connect(client_context)
         async with owner:
             control = owner.cursor()
             table = f"##async_strings_{uuid.uuid4().hex}"
@@ -1013,11 +975,7 @@ def test_interrupted_large_string_fetch(client_context, use_prepare, interruptio
                     "\u6f22\U0001f600" * 262144, "\u4f60\U0001f680" * 262144,
                     use_prepare=False,
                 )
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", FutureWarning)
-                    reader = await mssql_py_core.PyAsyncConnection.connect(
-                        {**client_context, "connect_retry_count": 0}, autocommit=True
-                    )
+                reader = await connect(client_context, connect_retry_count=0)
                 async with reader:
                     fetching = None
                     try:
@@ -1055,11 +1013,7 @@ def test_interrupted_large_string_fetch(client_context, use_prepare, interruptio
                         else:
                             await wait_for_lock_wait(control, session_id, fetching)
                             assert not fetching.done()
-                            with warnings.catch_warnings():
-                                warnings.simplefilter("ignore", FutureWarning)
-                                actor = await mssql_py_core.PyAsyncConnection.connect(
-                                    client_context, autocommit=True
-                                )
+                            actor = await connect(client_context)
                             async with actor:
                                 await actor.cursor().execute(
                                     f"KILL {session_id}", use_prepare=False
@@ -1094,11 +1048,7 @@ def test_dropped_connection_reference_keeps_pending_string_valid(
     client_context, use_prepare
 ):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        conn = await connect(client_context)
         cursor = conn.cursor()
         pending = None
         try:
@@ -1110,10 +1060,10 @@ def test_dropped_connection_reference_keeps_pending_string_valid(
                 parameters,
                 use_prepare=use_prepare,
             )
-            assert not (await asyncio.wait([pending], timeout=0.01))[0]
             del conn, value, parameters
             gc.collect()
 
+            assert not (await asyncio.wait([pending], timeout=0.01))[0]
             assert await pending is cursor
             assert await cursor.fetchall() == [(sample * 65536 + "tail",)]
         finally:
@@ -1239,11 +1189,7 @@ def test_unicode_character_round_trip(client_context, use_prepare, sql_type, val
 )
 def test_rejects_invalid_unicode_without_inserting(client_context, use_prepare, value):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        conn = await connect(client_context)
         try:
             cursor = conn.cursor()
             await cursor.execute(
@@ -1358,11 +1304,7 @@ def test_fixed_width_capacity_boundary(
 )
 def test_bounded_string_overflow(client_context, use_prepare, sql_type, value):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        conn = await connect(client_context)
         try:
             cursor = conn.cursor()
             await cursor.execute(
@@ -1438,11 +1380,7 @@ def test_explicit_max_to_bounded_string_conversion(
     client_context, use_prepare, sql_type, length
 ):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        conn = await connect(client_context)
         try:
             cursor = conn.cursor()
             await cursor.execute("SET ANSI_WARNINGS ON", use_prepare=False)
@@ -1565,11 +1503,7 @@ def test_nchar_padding_counts_utf16_units(client_context, use_prepare, value):
 @pytest.mark.parametrize("parameter_style", ["positional", "named"])
 def test_executemany_string_batch_integrity(client_context, use_prepare, parameter_style):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        conn = await connect(client_context)
         try:
             cursor = conn.cursor()
             await cursor.execute(
@@ -1641,11 +1575,7 @@ def test_executemany_string_batch_integrity(client_context, use_prepare, paramet
 
 def test_fetch_100000_string_rows(client_context, use_prepare):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        conn = await connect(client_context)
         try:
             cursor = conn.cursor()
             prefix = "row-\u6f22\U0001f600-"
@@ -1690,9 +1620,7 @@ def test_concurrent_unicode_inserts_and_retrieval(
 
     async def worker(worker_id):
         sql_type, collation, encoding, text = ENCODING_CONVERSION_CASES[worker_id]
-        conn = await mssql_py_core.PyAsyncConnection.connect(
-            client_context, autocommit=True
-        )
+        conn = await connect(client_context)
         try:
             cursor = conn.cursor()
             await cursor.execute(
@@ -1777,11 +1705,7 @@ def test_100_concurrent_string_queries(client_context, use_prepare):
         dispatched = asyncio.Event()
         issued = 0
         tasks = []
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            owner = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        owner = await connect(client_context)
         async with owner:
             control = owner.cursor()
             table = f"##async_strings_{uuid.uuid4().hex}"
@@ -1791,11 +1715,7 @@ def test_100_concurrent_string_queries(client_context, use_prepare):
 
             async def worker(worker_id):
                 nonlocal issued
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", FutureWarning)
-                    conn = await mssql_py_core.PyAsyncConnection.connect(
-                        client_context, autocommit=True
-                    )
+                conn = await connect(client_context)
                 async with conn:
                     conn.timeout = 60
                     cursor = conn.cursor()
@@ -1864,11 +1784,7 @@ def test_100_concurrent_string_queries(client_context, use_prepare):
 @pytest.mark.parametrize("same_cursor", [False, True], ids=["other-cursor", "same-cursor"])
 def test_overlapping_string_execute_is_rejected(client_context, use_prepare, same_cursor):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        conn = await connect(client_context)
         async with conn:
             owner = conn.cursor()
             contender = owner if same_cursor else conn.cursor()
@@ -1909,11 +1825,7 @@ def test_explicit_varchar_and_nvarchar_parameter_mapping(
     client_context, use_prepare, parameter_style
 ):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        conn = await connect(client_context)
         try:
             cursor = conn.cursor()
             ansi_value = "ASCII ? ' \\ tail  "
@@ -1957,11 +1869,7 @@ def test_explicit_varchar_and_nvarchar_parameter_mapping(
 @pytest.mark.parametrize("execution", ["execute", "executemany"])
 def test_string_update_and_delete_matrix(client_context, use_prepare, sql_type, execution):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        conn = await connect(client_context)
         try:
             cursor = conn.cursor()
             await cursor.execute(
@@ -2032,11 +1940,7 @@ def test_mixed_strings_across_rows_and_fetch_methods(
     client_context, use_prepare, parameter_style
 ):
     async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(
-                client_context, autocommit=True
-            )
+        conn = await connect(client_context)
         try:
             cursor = conn.cursor()
             await cursor.execute(
