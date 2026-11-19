@@ -358,7 +358,8 @@ add_executable(client_code_page_test
     lib/odbc_skip_aware_main.cpp
 )
 target_link_libraries(client_code_page_test PRIVATE odbc_test_lib)
-foreach(code_page IN ITEMS 1252 65001 932 1251)
+foreach(code_page IN ITEMS
+        437 850 874 932 936 949 950 1250 1251 1252 1253 1254 1255 1256 1257 1258 65001)
     set(test_name client_code_page_${code_page})
     if(ODBC_E2E_CONCURRENT)
         add_test(NAME ${test_name}
