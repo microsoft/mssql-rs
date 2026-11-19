@@ -16,7 +16,7 @@ use mssql_tds::core::{CancelHandle, EncryptionSetting, TdsResult};
 use mssql_tds::error::Error;
 use tokio::sync::{Notify, oneshot};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum RecoveryFailure {
     ProviderCancellation,
     FactoryCancellation,
@@ -137,6 +137,8 @@ async fn recovery_stops_on_cancellation_but_retries_connection_errors() {
             })
             .await
             .unwrap();
+            // Exercise recovery cancellation independently of when the OS exposes the peer's FIN.
+            client.mark_connection_dead();
 
             let cancel = CancelHandle::new();
             let requests_admitted = client.requests_admitted();
@@ -153,7 +155,9 @@ async fn recovery_stops_on_cancellation_but_retries_connection_errors() {
                     | RecoveryFailure::FinalAttemptCommandCancellation
             ) {
                 let (result, ()) = tokio::join!(execute, async {
-                    recovery_started.notified().await;
+                    tokio::time::timeout(Duration::from_secs(15), recovery_started.notified())
+                        .await
+                        .expect("recovery did not reach the token factory");
                     cancel.cancel();
                 });
                 result
@@ -167,9 +171,15 @@ async fn recovery_stops_on_cancellation_but_retries_connection_errors() {
             } else {
                 let error = result.unwrap_err();
                 if matches!(failure, RecoveryFailure::ProviderCancellation) {
-                    assert!(matches!(error, Error::TokenAcquisitionCancelled));
+                    assert!(
+                        matches!(error, Error::TokenAcquisitionCancelled),
+                        "{failure:?}, retry_count={retry_count}: {error:?}"
+                    );
                 } else {
-                    assert!(matches!(error, Error::OperationCancelledError(_)));
+                    assert!(
+                        matches!(error, Error::OperationCancelledError(_)),
+                        "{failure:?}, retry_count={retry_count}: {error:?}"
+                    );
                 }
             }
 
