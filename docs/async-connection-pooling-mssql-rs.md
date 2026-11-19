@@ -903,12 +903,11 @@ trait ConnectionFactory: Send + Sync {
 ```
 
 The pool reserves capacity first and invokes `open` only for a physical open. The production
-adapter calls `TdsConnectionProvider::create_client_with_drop_behavior` with
-`ConnectionDropBehavior::Abort`, passing the context, datasource and cancellation
-handle explicitly. Disposal is an owner-selected runtime policy, not part of
-`ClientContext` or the connection string. The pool owns isolation/reset/return
-policy, not the factory. Deterministic tests inject a Rust factory returning
-scripted clients.
+adapter calls `TdsConnectionProvider::create_client`, passing the context,
+datasource and cancellation handle explicitly. macOS Network.framework always
+force-cancels on Drop; no pool-specific disposal option is required. The pool owns
+isolation/reset/return policy, not the factory. Deterministic tests inject a Rust
+factory returning scripted clients.
 
 The factory supports SQL/trusted auth, a raw pre-acquired token, or the public async
 `EntraIdTokenFactory` installed in `ClientContext` for FEDAUTHINFO. That callback currently
@@ -1315,11 +1314,11 @@ Fresh login and initialization failures propagate without retry.
 All stages retain the original absolute acquisition deadline, cancellation
 signal and pool generation. Operation guards cancel TDS handles on interruption;
 caller-owned parallel TCP attempts drop synchronously before slot release.
-The pooled `SqlConnectionFactory` selects `ConnectionDropBehavior::Abort` through
-the provider's lifecycle API before physical opening, without changing connection
-configuration. Network.framework connections then force-cancel on Drop, including
-interrupted opens and initialization, rather than draining TLS asynchronously
-after capacity has been released. Direct connections retain graceful teardown.
+Network.framework connections always force-cancel on Drop, including interrupted
+opens and initialization, rather than draining TLS asynchronously after capacity
+has been released. This behavior applies to ordinary and pooled connections
+without changing connection configuration. Explicitly awaited close remains
+graceful.
 No application SQL is replayed.
 
 This slice enables SQL-password login only, rejects nonzero session-recovery

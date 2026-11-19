@@ -28,7 +28,7 @@ For native SQL initialization and reuse, see
 | `TokenExpiry` and `AuthMetadata` in [connection.rs](connection.rs) | Distinguish non-token authentication, known UTC expiry and unknown raw-token expiry. Metadata carries the binding to compare with the expected one; it does not implement credential refresh or reuse policy. |
 | `ConnectSpec` in [connection.rs](connection.rs) | Immutable per-call effective options and expected authentication binding. Native checkout calls `validate_pool()` before reservation to validate the context and reject nonzero recovery counts, unsupported authentication and Always Encrypted. |
 | `ConnectionFactory` in [connection.rs](connection.rs) | Object-safe physical-open interface receiving the current call's specification and TDS cancellation handle explicitly. |
-| `SqlConnectionFactory` in [connection.rs](connection.rs) | Opens a SQL-password connection through `TdsConnectionProvider` using the current call's specification and owner-selected abort-on-drop behavior. The disposal policy is separate from connection settings. After successful login, returns the expected binding and non-token authentication metadata. |
+| `SqlConnectionFactory` in [connection.rs](connection.rs) | Opens a SQL-password connection through `TdsConnectionProvider::create_client` using the current call's specification. After successful login, returns the expected binding and non-token authentication metadata. |
 | `OpenedConnection` in [connection.rs](connection.rs) | Owns one `TdsClient` and its authentication metadata by value. `into_parts()` moves both to the next owner; no shared raw-client owner escapes this handoff. |
 | `Isolation` in [session.rs](session.rs) | Selects one concrete transaction isolation SET; rejects `NoChange` before checkout. |
 | `AsyncPoolManager::acquire` in [session.rs](session.rs) | Validates pooled options, reserves a Deadpool slot, initializes a fresh connection or resets a cached candidate, and publishes only after authentication checks and fully drained, quiescent initialization. |
@@ -72,11 +72,9 @@ owns key construction, logical connection/cursor ownership and result delivery.
   still live. The slot adaptation requires local client destruction before
   returning an empty slot; bare Drop is not successful clean return.
 - `PoolLease` Drop destroys the client before releasing capacity.
-  `SqlConnectionFactory` selects `ConnectionDropBehavior::Abort` through the
-  provider's lifecycle API, separately from `ConnectSpec` connection options.
-  The policy applies from the start of physical opening, including macOS
-  Network.framework TLS; discarded clients
-  cannot keep a deferred graceful drain alive after releasing their slot.
+  macOS Network.framework always force-cancels on Drop, including interrupted
+  physical opens; discarded clients cannot keep a deferred graceful drain alive
+  after releasing their slot. No pool-specific disposal option is required.
   `return_quiescent()` is test-only, not a production check-in API. Safe,
   awaited return belongs to AB#50052.
 - The caller constructs canonical keys and expected authentication bindings.

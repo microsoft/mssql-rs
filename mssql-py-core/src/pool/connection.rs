@@ -9,9 +9,7 @@ use mssql_tds::connection::{
     client_context::{ClientContext, ColumnEncryptionSetting, TdsAuthenticationMethod},
     tds_client::TdsClient,
 };
-use mssql_tds::connection_provider::tds_connection_provider::{
-    ConnectionDropBehavior, TdsConnectionProvider,
-};
+use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::CancelHandle;
 
 use super::error::{OpenError, PoolError, PoolResult};
@@ -184,11 +182,10 @@ impl ConnectionFactory for SqlConnectionFactory {
         cancel: &CancelHandle,
     ) -> Result<OpenedConnection, OpenError> {
         let client = TdsConnectionProvider {}
-            .create_client_with_drop_behavior(
+            .create_client(
                 spec.context().clone(),
                 &spec.context().data_source,
                 Some(cancel),
-                ConnectionDropBehavior::Abort,
             )
             .await
             .map_err(|error| OpenError::Tds(Box::new(error)))?;
