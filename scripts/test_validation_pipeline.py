@@ -262,6 +262,10 @@ case "$cmd" in
           echo "error: workspace root manifest at /workspace/Cargo.toml does not exist" >&2
           exit 101
         fi
+        if [[ "$*" == *"--archive-file"* ]] && [ ! -d "$root/workspace/mssql-rs" ]; then
+          echo "error: for mssql-rs, current directory /workspace/mssql-rs is not a directory" >&2
+          exit 101
+        fi
         if [ ! -f "$root/workspace/.config/nextest.toml" ]; then
           echo "error: profile ci not found" >&2
           exit 101
@@ -281,7 +285,7 @@ def _kerberos_runner(tmp_path, *, lockfile=False, archive=True, config=True):
     shutil.copyfile(_ROOT / "kerberos-test" / "run-kerberos-tests.sh", runner)
     (runner.parent / ".env").write_text("KERBEROS_TEST_USER_PASSWORD=pw\n", newline="\n")
     (repo / "Cargo.toml").write_text("# full workspace manifest\n")
-    for crate in ("mssql-tds", "mssql-tds-cli", "mssql-mock-tds"):
+    for crate in ("mssql-tds", "mssql-tds-cli", "mssql-mock-tds", "mssql-rs"):
         (repo / crate / "target").mkdir(parents=True)
         (repo / crate / "Cargo.toml").write_text(f'[package]\nname = "{crate}"\n')
         (repo / crate / "target" / "stale").write_text("")
@@ -326,9 +330,11 @@ def test_kerberos_runner_stages_workspace_before_tests(tmp_path, args, runs, loc
     assert result.returncode == 0, result.stdout + result.stderr
     assert test_runs == runs
     manifest = (workspace / "Cargo.toml").read_text()
-    assert '"mssql-tds",' in manifest and "full workspace manifest" not in manifest
+    assert '"mssql-tds",' in manifest and '"mssql-rs",' in manifest
+    assert "full workspace manifest" not in manifest
     assert (workspace / ".config" / "nextest.toml").is_file()
     assert (workspace / "mssql-tds" / "Cargo.toml").is_file()
+    assert (workspace / "mssql-rs" / "Cargo.toml").is_file()
     assert not (workspace / "mssql-tds" / "target").exists()
     # CI checkouts have no Cargo.lock (it is gitignored); tar must not fail on it.
     assert (workspace / "Cargo.lock").exists() == lockfile
