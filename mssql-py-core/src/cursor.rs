@@ -737,10 +737,15 @@ impl PyCoreCursor {
             ColumnValues::Float(f) => (*f).into_pyobject(py).unwrap().to_owned().into_any(),
             ColumnValues::Real(f) => (*f as f64).into_pyobject(py).unwrap().to_owned().into_any(),
             ColumnValues::String(s) => s
-                .to_utf8_string()
-                .into_pyobject(py)
-                .unwrap()
-                .to_owned()
+                .try_to_utf8_string()
+                .map_err(|error| {
+                    crate::async_errors::map_tds_error(
+                        "Failed to decode string column",
+                        error,
+                        Vec::new(),
+                    )
+                })?
+                .into_pyobject(py)?
                 .into_any(),
             ColumnValues::Uuid(u) => {
                 // Convert Rust UUID to Python UUID object
