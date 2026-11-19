@@ -554,6 +554,15 @@ mod tests {
                 Err(Error::TypeConversionError(_))
             ));
         }
+        let utf8_lcid = SqlCollation {
+            col_flags: 0x40,
+            ..collation(0x0409)
+        };
+        let value = SqlString::new(b"\x80".to_vec(), EncodingType::LcidBased(utf8_lcid));
+        assert!(matches!(
+            value.try_to_utf8_string(),
+            Err(Error::TypeConversionError(_))
+        ));
         let unresolved = SqlString::new(b"value".to_vec(), EncodingType::DelayedSet);
         assert!(matches!(
             unresolved.try_to_utf8_string(),

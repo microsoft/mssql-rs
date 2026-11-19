@@ -38,8 +38,10 @@ do not require OpenSSL.
 
 For SDK authors integrating the native runtime:
 
-- Synchronous and asynchronous cursor fetches report malformed UTF-8 string
-  results as `mssql_py_core.DataError` rather than panicking during decoding.
+- Async cursor fetches report malformed UTF-8 string results as
+  `mssql_py_core.DataError`. This intentionally differs from synchronous fetches
+  and the ODBC backend, which retain replacement-character decoding. UTF-16 and
+  legacy code-page decoding are unchanged.
 - Async cursors retain their logical connection when the connection wrapper is
   collected. Explicit `await connection.close()` revokes cursor access;
   `await cursor.close()` leaves the parent and sibling cursors usable. The last

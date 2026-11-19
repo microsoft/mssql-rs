@@ -22,8 +22,9 @@ use crate::cursor::PyCoreCursor;
 /// a Python tuple when the GIL is available.
 ///
 /// During the async TDS decode (GIL released), values are stored as
-/// `ColumnValues`. After re-acquiring the GIL, `to_py_tuple()` converts
-/// everything to Python objects in a single pass.
+/// `ColumnValues`. After re-acquiring the GIL, async fetches use
+/// `to_async_py_tuple()` to reject malformed UTF-8 without changing
+/// synchronous materialization.
 pub(crate) struct PyRowWriter {
     row: Vec<ColumnValues>,
 }
@@ -36,6 +37,15 @@ impl PyRowWriter {
     }
 
     pub fn to_py_tuple<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        let values = self
+            .row
+            .iter()
+            .map(|col_val| PyCoreCursor::column_value_to_python(py, col_val))
+            .collect::<PyResult<Vec<_>>>()?;
+        PyTuple::new(py, values)
+    }
+
+    pub fn to_async_py_tuple<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         let values = self
             .row
             .iter()
