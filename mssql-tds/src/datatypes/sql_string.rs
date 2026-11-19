@@ -366,7 +366,11 @@ impl SqlString {
     ///
     /// UTF-16 and legacy code pages retain their replacement-character behavior.
     pub fn try_to_utf8_string(&self) -> TdsResult<String> {
-        match self.encoding_type {
+        let encoding_type = match self.encoding_type {
+            EncodingType::LcidBased(collation) if collation.utf8() => EncodingType::Utf8,
+            encoding => encoding,
+        };
+        match encoding_type {
             EncodingType::Utf8 => std::str::from_utf8(&self.bytes)
                 .map(str::to_owned)
                 .map_err(|error| Error::TypeConversionError(format!("Invalid UTF-8: {error}"))),
