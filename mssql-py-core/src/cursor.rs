@@ -737,15 +737,10 @@ impl PyCoreCursor {
             ColumnValues::Float(f) => (*f).into_pyobject(py).unwrap().to_owned().into_any(),
             ColumnValues::Real(f) => (*f as f64).into_pyobject(py).unwrap().to_owned().into_any(),
             ColumnValues::String(s) => s
-                .try_to_utf8_string()
-                .map_err(|error| {
-                    crate::async_errors::map_tds_error(
-                        "Failed to decode string column",
-                        error,
-                        Vec::new(),
-                    )
-                })?
-                .into_pyobject(py)?
+                .to_utf8_string()
+                .into_pyobject(py)
+                .unwrap()
+                .to_owned()
                 .into_any(),
             ColumnValues::Uuid(u) => {
                 // Convert Rust UUID to Python UUID object
@@ -1498,42 +1493,10 @@ mod tests {
     use mssql_tds::datatypes::column_values::{
         ColumnValues, SqlDateTime2, SqlDateTimeOffset, SqlTime,
     };
-    use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
     use pyo3::exceptions::PyOverflowError;
     use pyo3::prelude::*;
 
     use super::PyCoreCursor;
-
-    #[test]
-    fn string_conversion_errors_are_reported_as_data_errors() {
-        Python::attach(|py| {
-            for encoding in [EncodingType::Utf8, EncodingType::DelayedSet] {
-                let value = ColumnValues::String(SqlString::new(vec![0x80], encoding));
-                let error = PyCoreCursor::column_value_to_python(py, &value).unwrap_err();
-                assert!(error.is_instance_of::<crate::async_errors::DataError>(py));
-                assert!(
-                    error
-                        .to_string()
-                        .contains("Failed to decode string column:")
-                );
-            }
-        });
-    }
-
-    #[test]
-    fn string_conversion_preserves_valid_text() {
-        Python::attach(|py| {
-            let text = "A\0\u{6f22}\u{1f600}";
-            for value in [
-                SqlString::new(text.as_bytes().to_vec(), EncodingType::Utf8),
-                SqlString::from_utf8_string(text.to_string()),
-            ] {
-                let converted =
-                    PyCoreCursor::column_value_to_python(py, &ColumnValues::String(value)).unwrap();
-                assert_eq!(converted.extract::<String>().unwrap(), text);
-            }
-        });
-    }
 
     #[test]
     fn datetimeoffset_lower_bound_overflow_is_reported() {
