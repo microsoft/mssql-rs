@@ -931,55 +931,83 @@ def test_cancel_after_completion_does_not_cancel_next_string_query(
 
 def test_encoding_conversion_after_fetch_cancellation(client_context, use_prepare):
     async def run():
-        conn = await connect(client_context)
-        pending = None
-        try:
-            cursor = conn.cursor()
-            await cursor.execute("SELECT @@SPID", use_prepare=False)
-            [(session_id,)] = await cursor.fetchall()
-            await cursor.execute(
-                "SELECT REPLICATE(CAST(? COLLATE Japanese_CI_AS AS varchar(max)), "
-                "4194304)",
-                "\u65e5\u672c\u8a9e",
-                use_prepare=use_prepare,
+        owner = await connect(client_context)
+        async with owner:
+            control = owner.cursor()
+            table = f"##async_strings_{uuid.uuid4().hex}"
+            await control.execute(
+                f"CREATE TABLE {table} (id int PRIMARY KEY, "
+                "value varchar(max) COLLATE Japanese_CI_AS)",
+                use_prepare=False,
             )
-            pending = cursor.fetchone()
-            await asyncio.sleep(0)
-            assert pending.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await pending
-
-            probe = conn.cursor()
-            for sql_type, collation, encoding, text in ENCODING_CONVERSION_CASES:
-                value = f"{encoding}:{text * 1024}\x00tail"
-                statement = (
-                    "SELECT @@SPID, value, DATALENGTH(value), "
-                    "CONVERT(varbinary(max), value) FROM (VALUES "
-                    f"(CAST(? COLLATE {collation} AS {sql_type}))) AS source(value)"
+            try:
+                await control.execute(
+                    f"INSERT INTO {table} VALUES (1, ?), (2, ?)",
+                    "\u65e5\u672c\u8a9e" * 262144, "\u65e5\u672c\u8a9e",
+                    use_prepare=False,
                 )
-                deadline = asyncio.get_running_loop().time() + 6
-                while True:
+                conn = await connect(client_context)
+                async with conn:
+                    pending = None
                     try:
-                        await probe.execute(
-                            statement, value, use_prepare=use_prepare
+                        cursor = conn.cursor()
+                        await cursor.execute("SELECT @@SPID", use_prepare=False)
+                        [(session_id,)] = await cursor.fetchall()
+                        await control.execute(
+                            f"BEGIN TRANSACTION; UPDATE {table} WITH (ROWLOCK) "
+                            "SET value = value WHERE id = 2",
+                            use_prepare=False,
                         )
-                        break
-                    except RuntimeError as error:
-                        if "busy" not in str(error).lower():
-                            raise
-                        if asyncio.get_running_loop().time() >= deadline:
-                            pytest.fail("Cancelled fetch left the connection permanently busy")
-                        await asyncio.sleep(0.01)
-                encoded = value.encode(encoding)
-                assert await probe.fetchall() == [
-                    (session_id, value, len(encoded), encoded)
-                ]
-        finally:
-            if pending is not None and not pending.done():
-                pending.cancel()
-                with pytest.raises(asyncio.CancelledError):
-                    await pending
-            await conn.close()
+                        await cursor.execute(
+                            f"SELECT value FROM {table} "
+                            "WITH (READCOMMITTEDLOCK, ROWLOCK, INDEX(1)) "
+                            "ORDER BY id OPTION (MAXDOP 1)",
+                            use_prepare=use_prepare,
+                        )
+                        pending = cursor.fetchall()
+                        await wait_for_lock_wait(control, session_id, pending)
+                        assert pending.cancel()
+                        with pytest.raises(asyncio.CancelledError):
+                            await pending
+
+                        probe = conn.cursor()
+                        for sql_type, collation, encoding, text in ENCODING_CONVERSION_CASES:
+                            value = f"{encoding}:{text * 1024}\x00tail"
+                            statement = (
+                                "SELECT @@SPID, value, DATALENGTH(value), "
+                                "CONVERT(varbinary(max), value) FROM (VALUES "
+                                f"(CAST(? COLLATE {collation} AS {sql_type}))) AS source(value)"
+                            )
+                            deadline = asyncio.get_running_loop().time() + 6
+                            while True:
+                                try:
+                                    await probe.execute(
+                                        statement, value, use_prepare=use_prepare
+                                    )
+                                    break
+                                except RuntimeError as error:
+                                    if "busy" not in str(error).lower():
+                                        raise
+                                    if asyncio.get_running_loop().time() >= deadline:
+                                        pytest.fail("Cancelled fetch left the connection permanently busy")
+                                    await asyncio.sleep(0.01)
+                            encoded = value.encode(encoding)
+                            assert await probe.fetchall() == [
+                                (session_id, value, len(encoded), encoded)
+                            ]
+                    finally:
+                        try:
+                            if pending is not None and not pending.done():
+                                pending.cancel()
+                                with pytest.raises(asyncio.CancelledError):
+                                    await pending
+                        finally:
+                            await control.execute(
+                                "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
+                                use_prepare=False,
+                            )
+            finally:
+                await control.execute(f"DROP TABLE IF EXISTS {table}", use_prepare=False)
 
     asyncio.run(run())
 
