@@ -2772,10 +2772,7 @@ unsafe fn deliver_encoded_string(
     }
     if client_char {
         let text = if matches!(encoding, EncodingType::Utf8) {
-            match std::str::from_utf8(&bytes) {
-                Ok(text) => Cow::Borrowed(text),
-                Err(_) => return RowOutcome::Error(RowIssue::InvalidCharacter),
-            }
+            String::from_utf8_lossy(&bytes)
         } else {
             let Some(encoding) = encoding.resolved_encoding() else {
                 return RowOutcome::Error(RowIssue::Unsupported);
@@ -3245,6 +3242,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn bound_client_text_replaces_invalid_utf8() {
+        let expected = cp1252_loss_bytes("A\u{FFFD}B");
+        let mut output = [0xcc_u8; 8];
+        let mut length = -99;
+        let binding = binding(1, SQL_C_CHAR, output.as_mut_ptr().cast(), 8, &mut length);
+        let outcome = unsafe {
+            deliver_encoded_string(
+                &binding,
+                0,
+                0,
+                Cow::Borrowed(&[0x41, 0xFF, 0x42]),
+                EncodingType::Utf8,
+                client_output(1252, false),
+            )
+        };
+        assert_eq!(outcome, client_text_outcome(false, false));
+        assert_eq!(length, expected.len() as SqlLen);
+        assert_eq!(&output[..expected.len()], expected.as_slice());
+        assert_eq!(output[expected.len()], 0);
     }
 
     #[test]
@@ -7940,11 +7959,9 @@ mod tests {
         );
         let bindings = [invalid_binding];
         let mut writer = BoundRowWriter::new(&bindings, 0, 0, TextOutput::UTF8);
-        writer.write_string(0, Cow::Borrowed(&[0xFF]), EncodingType::Utf8);
-        assert_eq!(
-            writer.outcome,
-            RowOutcome::Error(RowIssue::InvalidCharacter)
-        );
+        writer.write_string(0, Cow::Borrowed(&[0x41, 0xFF, 0x42]), EncodingType::Utf8);
+        assert_eq!(writer.outcome, RowOutcome::Success);
+        assert_eq!(&invalid[..6], "A\u{FFFD}B\0".as_bytes());
 
         let mut probe = [0_u16; 1];
         let mut probe_indicator = 0;

@@ -8,7 +8,7 @@ use crate::{
     token::tokens::{CODE_PAGE_FROM_SORT_ID, SqlCollation},
 };
 use core::fmt;
-use std::{fmt::Debug, fmt::Display};
+use std::{borrow::Cow, fmt::Debug, fmt::Display};
 use tracing::warn;
 
 mod encoding;
@@ -61,45 +61,47 @@ pub fn fit_narrow_byte_limit(bytes: &[u8], maximum: usize) -> TdsResult<&[u8]> {
 /// Resolves `collation` to its narrow encoding, or `None` when neither the
 /// UTF-8 flag, the SQL sort ID, nor the LCID names one this crate maps.
 ///
+/// Derived from [`collation_code_page`] so the encoding and the
+/// `SQL_COLLATION_SEQ` code page cannot drift apart. The server's locale map
+/// behind it is authoritative for collation LCIDs, including sort variants
+/// such as Japanese_Unicode (`0x1_0411`) that [`lcid_to_encoding`] lacks; that
+/// table still covers locales the map omits.
+///
 /// Split from [`resolve_collation`] so a caller with its own fallback -- the
 /// parameter serializer's `VARCHAR | CHAR | TEXT` arm keeps a Latin-1 one --
 /// can share the resolution order without inheriting the Windows-1252 default.
 pub(crate) fn try_resolve_collation(collation: SqlCollation) -> Option<ResolvedEncoding> {
-    if collation.utf8() {
-        return Some(encoding_rs::UTF_8.into());
-    }
-    if let Some(code_page) = CODE_PAGE_FROM_SORT_ID[usize::from(collation.sort_id)] {
-        let encoding = match code_page {
-            437 => return Some(ResolvedEncoding::Oem437),
-            850 => return Some(ResolvedEncoding::Oem850),
-            874 => encoding_rs::WINDOWS_874,
-            932 => encoding_rs::SHIFT_JIS,
-            936 => encoding_rs::GBK,
-            949 => encoding_rs::EUC_KR,
-            950 => encoding_rs::BIG5,
-            1250 => encoding_rs::WINDOWS_1250,
-            1251 => encoding_rs::WINDOWS_1251,
-            1252 => encoding_rs::WINDOWS_1252,
-            1253 => encoding_rs::WINDOWS_1253,
-            1254 => encoding_rs::WINDOWS_1254,
-            1255 => encoding_rs::WINDOWS_1255,
-            1256 => encoding_rs::WINDOWS_1256,
-            1257 => encoding_rs::WINDOWS_1257,
-            _ => {
-                warn!(
-                    "Unsupported code page {} for SQL sort ID {}, falling back to LCID",
-                    code_page, collation.sort_id
-                );
-                return lcid_to_encoding(collation.info & 0x000F_FFFF)
-                    .ok()
-                    .map(Into::into);
-            }
-        };
-        return Some(encoding.into());
-    }
-    lcid_to_encoding(collation.info & 0x000F_FFFF)
-        .ok()
-        .map(Into::into)
+    collation_code_page(collation)
+        .and_then(encoding_for_code_page)
+        .or_else(|| {
+            lcid_to_encoding(collation.info & 0x000F_FFFF)
+                .ok()
+                .map(Into::into)
+        })
+}
+
+fn encoding_for_code_page(code_page: u16) -> Option<ResolvedEncoding> {
+    let encoding = match code_page {
+        65001 => encoding_rs::UTF_8,
+        437 => return Some(ResolvedEncoding::Oem437),
+        850 => return Some(ResolvedEncoding::Oem850),
+        874 => encoding_rs::WINDOWS_874,
+        932 => encoding_rs::SHIFT_JIS,
+        936 => encoding_rs::GBK,
+        949 => encoding_rs::EUC_KR,
+        950 => encoding_rs::BIG5,
+        1250 => encoding_rs::WINDOWS_1250,
+        1251 => encoding_rs::WINDOWS_1251,
+        1252 => encoding_rs::WINDOWS_1252,
+        1253 => encoding_rs::WINDOWS_1253,
+        1254 => encoding_rs::WINDOWS_1254,
+        1255 => encoding_rs::WINDOWS_1255,
+        1256 => encoding_rs::WINDOWS_1256,
+        1257 => encoding_rs::WINDOWS_1257,
+        1258 => encoding_rs::WINDOWS_1258,
+        _ => return None,
+    };
+    Some(encoding.into())
 }
 
 fn resolve_collation(collation: SqlCollation) -> ResolvedEncoding {
@@ -301,11 +303,6 @@ impl EncodingType {
     /// Retained for compatibility with callers using `encoding_rs` directly.
     /// New conversion code should use [`Self::resolved_encoding`] to include
     /// the OEM codecs.
-    ///
-    /// Decoding through this substitutes U+FFFD on malformed input, whereas
-    /// [`SqlString::to_utf8_string`] panics on invalid UTF-8 under
-    /// [`EncodingType::Utf8`]. Use this when replacement is the wanted
-    /// behaviour, not as a drop-in for `to_utf8_string`.
     pub fn encoding(&self) -> Option<&'static encoding_rs::Encoding> {
         self.resolved_encoding()
             .and_then(ResolvedEncoding::as_encoding_rs)
@@ -358,6 +355,7 @@ impl SqlString {
     }
 
     /// Decodes the stored bytes into a Rust `String` according to the encoding type.
+    /// See [`Self::decode`] for how malformed input is handled.
     pub fn to_utf8_string(&self) -> String {
         Self::decode(&self.bytes, self.encoding_type)
     }
@@ -387,11 +385,24 @@ impl SqlString {
     /// Lets a writer handed borrowed bytes by
     /// [`RowWriter::write_string`](crate::datatypes::row_writer::RowWriter::write_string)
     /// decode them without first copying into an owned [`SqlString`].
+    ///
+    /// Malformed sequences decode to U+FFFD rather than failing; a warning is
+    /// logged for UTF-8 and LCID-based input when that happens.
+    ///
+    /// # Panics
+    ///
+    /// Panics for [`EncodingType::DelayedSet`], which names no encoding.
     pub fn decode(bytes: &[u8], encoding_type: EncodingType) -> String {
         match encoding_type {
-            // TODO: Investigation needed. When creating a Utf8 strings from the vector, the string is weirdly encoded.
-            // UTF16 decode works better.
-            EncodingType::Utf8 => String::from_utf8(bytes.to_vec()).unwrap(),
+            // UTF-8 collation columns can hold invalid sequences (SQL Server accepts
+            // some on insert), so replace them like the LCID and UTF-16 branches.
+            EncodingType::Utf8 => match String::from_utf8_lossy(bytes) {
+                Cow::Borrowed(text) => text.to_owned(),
+                Cow::Owned(text) => {
+                    warn!("Invalid UTF-8 in a value declared as UTF-8; replaced with U+FFFD.");
+                    text
+                }
+            },
             EncodingType::Utf16 => {
                 // Use encoding_rs for efficient UTF-16LE decoding without intermediate Vec<u16> allocation
                 let (decoded, _) = encoding_rs::UTF_16LE.decode_without_bom_handling(bytes);
@@ -568,6 +579,15 @@ mod tests {
             let value = SqlString::new(bytes, encoding);
             assert_eq!(value.try_to_utf8_string().unwrap(), value.to_utf8_string());
         }
+    fn utf8_decode_replaces_invalid_sequences() {
+        assert_eq!(
+            SqlString::decode(&[0x41, 0xFF, 0x42], EncodingType::Utf8),
+            "A\u{FFFD}B"
+        );
+        assert_eq!(
+            SqlString::decode(&[0xC3, 0x28], EncodingType::Utf8),
+            "\u{FFFD}("
+        );
     }
 
     #[test]
@@ -615,6 +635,56 @@ mod tests {
             EncodingType::LcidBased(collation(unmapped)).encoding(),
             Some(encoding_rs::WINDOWS_1252)
         );
+    }
+
+    #[test]
+    fn every_locale_map_lcid_resolves_to_its_code_page() {
+        let mut checked = 0;
+        for lcid in 0..=0x000F_FFFF_u32 {
+            let Some(code_page) = lcid_to_code_page(lcid) else {
+                continue;
+            };
+            checked += 1;
+            let expected = encoding_for_code_page(code_page);
+            assert!(expected.is_some(), "LCID {lcid:#x} code page {code_page}");
+            assert_eq!(
+                try_resolve_collation(collation(lcid)),
+                expected,
+                "LCID {lcid:#x}"
+            );
+            // Collations both tables know keep their previous encoding.
+            if let Ok(encoding) = lcid_to_encoding(lcid) {
+                assert_eq!(Some(encoding.into()), expected, "LCID {lcid:#x}");
+            }
+        }
+        assert!(checked > 60);
+    }
+
+    #[test]
+    fn every_sort_id_code_page_resolves() {
+        for (sort_id, code_page) in CODE_PAGE_FROM_SORT_ID.iter().enumerate() {
+            if let Some(code_page) = *code_page {
+                assert!(
+                    encoding_for_code_page(code_page).is_some(),
+                    "sort ID {sort_id} code page {code_page}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn locale_map_lcids_missing_from_the_encoding_table_round_trip() {
+        // Japanese_Unicode (a sort variant) and Azeri_Cyrillic_100 once fell
+        // back to Windows-1252.
+        for (lcid, text, bytes) in [
+            (0x1_0411, "日", &[0x93, 0xFA][..]),
+            (0x082C, "Я", &[0xDF][..]),
+        ] {
+            assert!(lcid_to_encoding(lcid).is_err(), "LCID {lcid:#x}");
+            let sql_str = SqlString::new(bytes.to_vec(), EncodingType::LcidBased(collation(lcid)));
+            assert_eq!(sql_str.to_utf8_string(), text);
+            assert_eq!(encode_narrow(text, collation(lcid)).bytes, bytes);
+        }
     }
 
     #[test]

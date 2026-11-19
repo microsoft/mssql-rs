@@ -16,7 +16,6 @@ use mssql_tds::error::{Error, SqlInfoMessage};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
-use tokio::sync::Mutex;
 #[cfg(debug_assertions)]
 use tokio::sync::oneshot;
 use tracing::instrument::WithSubscriber;
@@ -24,6 +23,7 @@ use tracing::instrument::WithSubscriber;
 use crate::async_cursor::{PyAsyncCursor, map_claim_error};
 use crate::async_description::{DescriptionState, materialize};
 use crate::async_errors::{InternalError, map_tds_error};
+use crate::async_handle::LogicalConnection;
 use crate::async_session::{
     AsyncConnectionState, ClaimError, CursorId, FetchCompletion, FetchId, OperationId,
 };
@@ -204,9 +204,9 @@ impl BufferedResults {
     }
 }
 
-/// Python-independent resources captured before constructing a fetch future.
+/// Fetch snapshot retaining the revocable logical parent, not physical client ownership.
 pub(crate) struct FetchResources {
-    client: Arc<Mutex<TdsClient>>,
+    client: Arc<LogicalConnection>,
     dispatch: Option<tracing::Dispatch>,
     session_state: Arc<AsyncConnectionState>,
     cursor_id: CursorId,
@@ -219,7 +219,7 @@ pub(crate) struct FetchResources {
 impl FetchResources {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        client: Arc<Mutex<TdsClient>>,
+        client: Arc<LogicalConnection>,
         dispatch: Option<tracing::Dispatch>,
         session_state: Arc<AsyncConnectionState>,
         cursor_id: CursorId,
@@ -652,7 +652,10 @@ fn fetch<'py>(
         );
 
         let (result, info_messages, has_open_batch, connection_dead) = {
-            let mut client = client.lock().await;
+            let mut client = client.lock_operation(operation_id).await.map_err(|error| {
+                fetch_guard.fail(false);
+                map_claim_error(error)
+            })?;
             let result = fetch_rows_on_client(&mut client, limit).await;
             let has_open_batch = client.has_open_batch();
             let info_messages = if matches!(result, Err(Error::SqlServerError { .. })) {
@@ -683,7 +686,11 @@ fn fetch<'py>(
                     FetchCompletion::Published | FetchCompletion::NoLongerActive => {}
                     FetchCompletion::CancellationRequested => {
                         let (has_open_batch, connection_dead) = {
-                            let mut client = client.lock().await;
+                            let mut client =
+                                client.lock_operation(operation_id).await.map_err(|error| {
+                                    fetch_guard.fail(false);
+                                    map_claim_error(error)
+                                })?;
                             if client.has_open_batch() {
                                 let _ = client
                                     .send_attention_with_timeout(ATTENTION_SETTLEMENT_TIMEOUT)
@@ -920,6 +927,7 @@ pub(crate) fn nextset<'py>(
     } = resources;
     if buffered_results.has_current() {
         return next_buffered_set(
+            cursor,
             py,
             dispatch,
             session_state,
@@ -966,7 +974,10 @@ pub(crate) fn nextset<'py>(
         );
 
         let (result, info_messages, has_open_batch, connection_dead) = {
-            let mut client = client.lock().await;
+            let mut client = client.lock_operation(operation_id).await.map_err(|error| {
+                fetch_guard.fail(false);
+                map_claim_error(error)
+            })?;
             let result = client.advance().await.map(|result| {
                 let metadata =
                     matches!(result, StatementResult::Rows).then(|| client.get_metadata().clone());
@@ -1018,7 +1029,11 @@ pub(crate) fn nextset<'py>(
                     FetchCompletion::Published | FetchCompletion::NoLongerActive => {}
                     FetchCompletion::CancellationRequested => {
                         let (has_open_batch, connection_dead) = {
-                            let mut client = client.lock().await;
+                            let mut client =
+                                client.lock_operation(operation_id).await.map_err(|error| {
+                                    fetch_guard.fail(false);
+                                    map_claim_error(error)
+                                })?;
                             if client.has_open_batch() {
                                 let _ = client
                                     .send_attention_with_timeout(ATTENTION_SETTLEMENT_TIMEOUT)
@@ -1102,8 +1117,10 @@ pub(crate) fn nextset<'py>(
     }
 }
 
+/// Advance materialized results while retaining the cursor and its logical parent.
 #[allow(clippy::too_many_arguments)]
 fn next_buffered_set<'py>(
+    cursor: Py<PyAsyncCursor>,
     py: Python<'py>,
     dispatch: Option<tracing::Dispatch>,
     session_state: Arc<AsyncConnectionState>,
@@ -1133,6 +1150,7 @@ fn next_buffered_set<'py>(
     let guard_dispatch = dispatch.clone();
 
     let future = async move {
+        let _cursor = cursor;
         let mut fetch_guard = FetchGuard::new(
             future_state,
             operation_id,

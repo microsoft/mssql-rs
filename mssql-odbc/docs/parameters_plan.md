@@ -535,8 +535,10 @@ Treat these paths as opt-in rather than unreachable.
   read, `String::from_utf8`, `SqlString::from_utf8_string` transcoding to UTF-16
   at double size, `ColumnValues::String(v.clone())`, then `serialize_string`
   decoding back to UTF-8 to encode to the collation code page. Tagging the bytes
-  `EncodingType::Utf8` removes two, but `sql_string.rs` carries an unresolved
-  TODO claiming UTF-8 decode "is weirdly encoded", so this needs e2e evidence.
+  `EncodingType::Utf8` removes two; `SqlString`'s UTF-8 decode is covered by
+  the `client_code_page_test.cpp` collation and malformed-byte e2e tests, so
+  the remaining work is removing the copies and the redundant pre-sanitising in
+  `transcode`.
 - P6: msodbcsql's narrow -> wide arm checks the running count *before*
   incrementing (`:2928`), so exactly one character of overflow escapes: retail
   18.05.0002 silently truncates `"abcd"` to `"abc"` in a `wvarchar(3)` and

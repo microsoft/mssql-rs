@@ -69,6 +69,7 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 
 use crate::i18n;
+use crate::server_info::RawServerInfo;
 use redact::Category;
 use stages::{ConnectStagesOnly, Stage, StageRecorder, Step};
 use target::{Protocol, Target};
@@ -3858,6 +3859,12 @@ impl Diagnosis {
                         .push(Check::skipped(CheckId::SessionValidation, Skip::Canceled));
                 } else {
                     self.driver_session(&outcome, probe_midpoint_unix_ms);
+                    // After the check, whose timing comes from the callback, so
+                    // that telemetry cannot change what it reports. With
+                    // telemetry off there is no session and this does nothing.
+                    if let Some(raw) = driver_server_info(&outcome) {
+                        crate::telemetry::record_server_info(&raw);
+                    }
                 }
             }
             self.enrich_driver_check(driver_check, endpoint.as_ref())
@@ -4085,12 +4092,10 @@ impl Diagnosis {
         let mut check = Check::new(CheckId::SessionValidation, Coverage::Passed);
         check.duration_ms = Some(outcome.query_ms);
         check.deadline_ms = Some(self.request.timeout_ms());
-        let edition = outcome
-            .cell(driver::column::ENGINE_EDITION)
-            .and_then(|e| e.trim().parse::<i32>().ok());
+        let edition = outcome.engine_edition();
         // Retries are the driver's own, which sqlcmd does not see.
-        session_fields(&mut check, !outcome.query_failed && edition.is_some(), None);
-        if outcome.query_failed || edition.is_none() {
+        session_fields(&mut check, edition.is_some(), None);
+        if edition.is_none() {
             let records = driver_records(outcome, CheckId::SessionValidation);
             let first = first_driver_message(outcome, CheckId::SessionValidation);
             // SQL Server's own error has its severity; the driver's own have
@@ -5159,13 +5164,22 @@ impl Diagnosis {
     async fn session_validation(&mut self, client: &mut TdsClient) {
         let mut check = Check::new(CheckId::SessionValidation, Coverage::Passed);
         check.deadline_ms = Some(self.request.timeout_ms());
+        // Decided before the clock starts: it validates the telemetry
+        // destination, which is not part of what this check measures.
+        let collect = crate::telemetry::enabled();
         let sent_unix_ms = unix_ms_now();
         let started = Instant::now();
-        let result = tokio::time::timeout(self.request.timeout(), session_probe(client)).await;
+        let result =
+            tokio::time::timeout(self.request.timeout(), session_probe(client, collect)).await;
         check.duration_ms = Some(millis(started));
         let received_unix_ms = unix_ms_now();
         let error = match result {
-            Ok(Ok(probe)) => {
+            Ok(Ok((probe, server_info))) => {
+                // After the timing is taken, so telemetry cannot skew the
+                // reported duration or the clock offset.
+                if let Some(raw) = server_info {
+                    crate::telemetry::record_server_info(&raw);
+                }
                 self.session_probed(check, &probe, sent_unix_ms, received_unix_ms);
                 return;
             }
@@ -5600,15 +5614,32 @@ struct SessionProbe {
 /// The minimal session operation: the engine edition and the server's UTC
 /// clock, in one query. The clock is read as days plus milliseconds, which
 /// every supported version can compute (`DATEDIFF_BIG` needs 2016).
-async fn session_probe(client: &mut TdsClient) -> Result<SessionProbe, Error> {
-    let mut result = client.execute(driver::DRIVER_QUERY.to_string(), ()).await?;
+///
+/// With `collect`, the server properties for usage telemetry ride in the same
+/// query, so they cost no round trip; they are returned for the caller to
+/// record, so that nothing about telemetry happens inside the timed query.
+/// Without it the query is [`driver::DRIVER_QUERY`], unchanged.
+async fn session_probe(
+    client: &mut TdsClient,
+    collect: bool,
+) -> Result<(SessionProbe, Option<RawServerInfo>), Error> {
+    let query = if collect {
+        driver::session_query_with(crate::server_info::EXTRA_COLUMNS)
+    } else {
+        driver::DRIVER_QUERY.to_string()
+    };
+    let mut result = client.execute(query, ()).await?;
     let mut probe = None;
+    let mut server_info = None;
     loop {
         match result {
             StatementResult::Rows => {
                 while let Some(row) = client.next_row().await? {
                     if probe.is_none() {
                         probe = probe_from_row(&row);
+                        if collect {
+                            server_info = raw_server_info_from_row(&row);
+                        }
                     }
                 }
             }
@@ -5617,8 +5648,54 @@ async fn session_probe(client: &mut TdsClient) -> Result<SessionProbe, Error> {
         }
         result = client.advance().await?;
     }
-    probe.ok_or_else(|| {
+    let probe = probe.ok_or_else(|| {
         Error::ProtocolError("the session validation query returned no row".to_string())
+    })?;
+    Ok((probe, server_info))
+}
+
+/// The text of a string column, or `None` for `NULL` or another type.
+fn text_column(value: Option<&ColumnValues>) -> Option<String> {
+    match value {
+        Some(ColumnValues::String(text)) => Some(text.to_utf8_string()),
+        _ => None,
+    }
+}
+
+/// The columns before the telemetry ones: the engine edition and the two clock
+/// columns. The columns `server_info::EXTRA_COLUMNS` adds follow them, in the
+/// order of `RawServerInfo`: version, OS, architecture.
+const SESSION_PROBE_COLUMNS: usize = 3;
+
+/// The server properties that follow the probe's own columns, or `None` for a
+/// row without an engine edition. A `NULL` column, as for the OS and
+/// architecture on Azure SQL Database, is an absent value.
+fn raw_server_info_from_row(row: &[ColumnValues]) -> Option<RawServerInfo> {
+    let Some(ColumnValues::Int(edition)) = row.first() else {
+        return None;
+    };
+    Some(RawServerInfo {
+        engine_edition: *edition,
+        product_version: text_column(row.get(SESSION_PROBE_COLUMNS)),
+        os: text_column(row.get(SESSION_PROBE_COLUMNS + 1)),
+        arch: text_column(row.get(SESSION_PROBE_COLUMNS + 2)),
+    })
+}
+
+/// The server properties from the row of sqlcmd's own driver query, for usage
+/// telemetry, or `None` when the query failed or gave no engine edition. Only
+/// the engine edition is reported. The row has no operating system or
+/// architecture, so those are absent, as for Azure SQL Database. The version in
+/// it is native sqlcmd's own form (`SQL_DBMS_VER`, `17.00.4085`), not the
+/// `ProductVersion` the other paths report, so it is left out rather than send
+/// two values for one version. The columns of `server_info::EXTRA_COLUMNS` are
+/// deliberately not appended to the callback's query: native's own columns sit
+/// at the fixed indices of `driver::column`, so they would be read as the
+/// transport and the server name.
+fn driver_server_info(outcome: &driver::DriverOutcome) -> Option<RawServerInfo> {
+    Some(RawServerInfo {
+        engine_edition: outcome.engine_edition()?,
+        ..RawServerInfo::default()
     })
 }
 
@@ -13845,6 +13922,183 @@ pub(crate) mod tests {
         assert_eq!(probe_from_row(&[ColumnValues::Null]), None);
         assert_eq!(probe_from_row(&[]), None);
     }
+
+    fn text(value: &str) -> ColumnValues {
+        ColumnValues::String(
+            mssql_tds::datatypes::sql_string::SqlString::from_utf8_string(value.to_string()),
+        )
+    }
+
+    /// The telemetry columns are read from where `EXTRA_COLUMNS` puts them: after
+    /// the probe's three, as version, OS and architecture.
+    #[test]
+    fn the_server_properties_are_read_from_the_columns_after_the_probes() {
+        let row = [
+            ColumnValues::Int(2),
+            ColumnValues::Int(20_000),
+            ColumnValues::Int(3_723_456),
+            text("17.0.5015.4"),
+            text("windows"),
+            text("x64"),
+        ];
+        assert_eq!(
+            raw_server_info_from_row(&row),
+            Some(RawServerInfo {
+                engine_edition: 2,
+                product_version: Some("17.0.5015.4".to_string()),
+                os: Some("windows".to_string()),
+                arch: Some("x64".to_string()),
+            })
+        );
+        // The same row selects the probe's own columns unchanged.
+        assert_eq!(
+            probe_from_row(&row).map(|probe| probe.engine_edition),
+            Some(2)
+        );
+    }
+
+    /// Azure SQL Database has no OS or architecture in `@@VERSION`, so they are
+    /// `NULL` and come out absent while the rest is kept.
+    #[test]
+    fn null_os_and_architecture_are_absent_values() {
+        let row = [
+            ColumnValues::Int(5),
+            ColumnValues::Int(20_000),
+            ColumnValues::Int(1),
+            text("12.0.2000.8"),
+            ColumnValues::Null,
+            ColumnValues::Null,
+        ];
+        assert_eq!(
+            raw_server_info_from_row(&row),
+            Some(RawServerInfo {
+                engine_edition: 5,
+                product_version: Some("12.0.2000.8".to_string()),
+                os: None,
+                arch: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_row_without_an_edition_or_telemetry_columns_gives_no_properties_it_cannot_read() {
+        assert_eq!(raw_server_info_from_row(&[]), None);
+        assert_eq!(raw_server_info_from_row(&[ColumnValues::Null]), None);
+        // A probe row without the extra columns (telemetry off) has none to read.
+        assert_eq!(
+            raw_server_info_from_row(&[
+                ColumnValues::Int(2),
+                ColumnValues::Int(20_000),
+                ColumnValues::Int(1),
+            ]),
+            Some(RawServerInfo {
+                engine_edition: 2,
+                ..RawServerInfo::default()
+            })
+        );
+        // A string where a number is expected is not an edition.
+        assert_eq!(raw_server_info_from_row(&[text("2")]), None);
+    }
+
+    /// Native sqlcmd's own driver query gives the edition; the version native
+    /// appends is its own form (`SQL_DBMS_VER`), not `ProductVersion`, so only
+    /// the edition is reported, whatever version is there.
+    #[test]
+    fn the_drivers_row_gives_only_the_edition() {
+        let outcome = |row: Vec<Option<String>>, query_failed: bool| driver::DriverOutcome {
+            connected: true,
+            query_failed,
+            row,
+            ..driver::DriverOutcome::default()
+        };
+        let edition_only = Some(RawServerInfo {
+            engine_edition: 2,
+            ..RawServerInfo::default()
+        });
+        // With a version in either form, with none, and with the version NULL.
+        assert_eq!(
+            driver_server_info(&outcome(driver_row("TCP"), false)),
+            edition_only
+        );
+        let mut dbms_ver = driver_row("TCP");
+        dbms_ver[driver::column::VERSION] = Some("17.00.4085".to_string());
+        assert_eq!(driver_server_info(&outcome(dbms_ver, false)), edition_only);
+        let mut short = driver_row("TCP");
+        short.truncate(driver::column::VERSION);
+        assert_eq!(driver_server_info(&outcome(short, false)), edition_only);
+        let mut null_version = driver_row("TCP");
+        null_version[driver::column::VERSION] = None;
+        assert_eq!(
+            driver_server_info(&outcome(null_version, false)),
+            edition_only
+        );
+        // A failed query, no row, or an edition that is not a number gives none.
+        assert_eq!(driver_server_info(&outcome(driver_row("TCP"), true)), None);
+        assert_eq!(driver_server_info(&outcome(Vec::new(), false)), None);
+        let mut garbled = driver_row("TCP");
+        garbled[driver::column::ENGINE_EDITION] = Some("two".to_string());
+        assert_eq!(driver_server_info(&outcome(garbled, false)), None);
+        let mut missing = driver_row("TCP");
+        missing[driver::column::ENGINE_EDITION] = None;
+        assert_eq!(driver_server_info(&outcome(missing, false)), None);
+    }
+
+    /// Through sqlcmd's own driver the diagnostic connection stops at the
+    /// transport, so session validation does not run and the driver's row is
+    /// the only place the server's properties are read. With telemetry on the
+    /// edition is recorded from it, and the event goes out with it. The version
+    /// native appends is its own form (`SQL_DBMS_VER`) and is not sent.
+    #[test]
+    fn a_connected_run_through_the_driver_reports_the_edition_only() {
+        use crate::telemetry::tests::{TEST_CONNECTION_STRING, TestEnv, event_properties};
+        use crate::telemetry::{Command, FlushOutcome, FormatUse, Invocation};
+
+        let mut dbms_ver_row = driver_row("TCP");
+        dbms_ver_row[driver::column::VERSION] = Some("17.00.4085".to_string());
+        for (query_failed, row) in [(false, dbms_ver_row), (true, Vec::new())] {
+            let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
+            let requests = guard.capture_requests();
+            crate::telemetry::record_usage(Invocation {
+                version: Some("18.5"),
+                command: Command::Diagnose,
+                format: FormatUse::Json,
+            });
+            let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::SessionValidation));
+            let target = input(&mut diagnosis).unwrap();
+            let (hook, _) = fake_driver(driver::DriverOutcome {
+                connected: true,
+                query_failed,
+                row,
+                ..driver::DriverOutcome::default()
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(diagnosis.driver_attempt(hook, &target, None));
+
+            assert_eq!(
+                crate::telemetry::shutdown(Duration::from_secs(1)),
+                FlushOutcome::Completed,
+                "{query_failed}"
+            );
+            let properties = event_properties(&requests.try_recv().expect("one request"));
+            assert_eq!(
+                properties.contains_key("sqlcmdcli_engine_edition"),
+                !query_failed
+            );
+            if !query_failed {
+                assert_eq!(properties["sqlcmdcli_engine_edition"], "2");
+            }
+            // Neither the version in native's form, nor the OS or architecture
+            // the row does not have.
+            assert!(!properties.contains_key("sqlcmdcli_server_version"));
+            assert!(!properties.contains_key("sqlcmdcli_server_os"));
+            assert!(!properties.contains_key("sqlcmdcli_server_platform"));
+            assert!(requests.try_recv().is_err(), "one event only");
+        }
+    }
+
     /// How a failed session query is classified: SQL Server's own error is
     /// diagnosed and about the server; a timeout, the network or the client
     /// leaves it inconclusive with the area undetermined, as for the
