@@ -33,7 +33,7 @@ use tokio::sync::Mutex;
 use tracing::instrument::WithSubscriber;
 
 use crate::async_description::DescriptionState;
-use crate::async_errors::ProgrammingError;
+use crate::async_errors::{map_connection_claim, map_tds_error};
 use crate::async_execute::{ExecuteResources, PreparedState, release_prepared_statements};
 use crate::async_fetch::{BufferedResults, FetchState};
 use crate::async_handle::LogicalConnection;
@@ -44,13 +44,7 @@ use crate::async_tracing::{in_cursor_operation_span, record_result_set_status};
 
 /// Converts a failed session claim into a Python error with operation-specific busy text.
 fn map_claim_error_with_busy_message(error: ClaimError, busy_message: &'static str) -> PyErr {
-    match error {
-        ClaimError::Closing => PyRuntimeError::new_err("Connection is closing"),
-        ClaimError::Closed => PyRuntimeError::new_err("Connection is closed"),
-        ClaimError::Broken => PyRuntimeError::new_err("Connection is broken"),
-        ClaimError::Busy => PyRuntimeError::new_err(busy_message),
-        ClaimError::NoResultSet => ProgrammingError::new_err("No active result set"),
-    }
+    map_connection_claim(error, busy_message)
 }
 
 /// Converts a failed cursor operation claim into a Python error.
@@ -123,7 +117,7 @@ impl CursorCleanup {
             (result, has_open_batch)
         };
 
-        cleanup_guard.settle(has_open_batch);
+        cleanup_guard.settle(result.is_err() || has_open_batch);
         // Cleanup consumes the close attempt even when draining or unprepare fails.
         self.clear_result_state();
         self.closed.store(true, Ordering::Release);
@@ -185,7 +179,8 @@ impl Drop for FinalizerCompletionGuard {
 /// Create instances with `PyAsyncConnection.cursor()`. Cursors on one
 /// connection share a TDS session, so only one cursor may own an active batch.
 /// A row-producing execute retains ownership until the same cursor is
-/// re-executed or closed; other cursors and `commit()` or `rollback()` report busy.
+/// re-executed or closed. Other cursors report busy; connection transaction
+/// completion drains dormant results before proceeding.
 /// This API is a preview and may change between minor releases.
 #[pyclass]
 pub struct PyAsyncCursor {
@@ -367,17 +362,40 @@ impl Drop for PyAsyncCursor {
             }
         };
         let operation_id = claim.operation_id;
-        let finalizer = FinalizerCleanup {
-            cleanup: Some(cleanup),
-            completion_guard: FinalizerCompletionGuard::new(session_state, self.cursor_id),
+        let cursor_id = self.cursor_id;
+        let future = async move {
+            let finalizer = FinalizerCleanup {
+                cleanup: Some(cleanup),
+                completion_guard: FinalizerCompletionGuard::new(session_state, cursor_id),
+            };
+            in_cursor_operation_span(
+                finalizer.run(claim),
+                cursor_id,
+                operation_id,
+                "finalize",
+                "closing",
+            )
+            .await;
         };
-        pyo3_async_runtimes::tokio::get_runtime().spawn(in_cursor_operation_span(
-            finalizer.run(claim),
-            self.cursor_id,
-            operation_id,
-            "finalize",
-            "closing",
-        ));
+        match self.session_state.spawn_task(future) {
+            Ok((receiver, _)) => {
+                let state = self.session_state.clone();
+                pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+                    if let Err(error) = receiver.await {
+                        state.mark_broken();
+                        tracing::warn!(%error, "PyAsyncCursor finalizer task was interrupted");
+                    }
+                });
+            }
+            Err(ClaimError::Closing | ClaimError::Closed) => {
+                self.session_state.release_operation(operation_id);
+                self.closed.store(true, Ordering::Release);
+            }
+            Err(error) => {
+                self.session_state.abandon_cursor(cursor_id);
+                tracing::warn!(?error, "PyAsyncCursor finalizer registration failed");
+            }
+        }
     }
 }
 
@@ -472,6 +490,12 @@ mod tests {
             globals
                 .set_item("cursor", Py::new(py, cursor).unwrap())
                 .unwrap();
+            globals
+                .set_item(
+                    "InterfaceError",
+                    py.get_type::<crate::async_errors::InterfaceError>(),
+                )
+                .unwrap();
             let claimed = std::sync::Mutex::new(Some(claimed_rx));
             let wait_for_claim = PyCFunction::new_closure(py, None, None, move |args, _| {
                 let claimed = claimed.lock().unwrap().take().unwrap();
@@ -515,7 +539,7 @@ async def run():
 {await_claim}    revoke()
     try:
         await asyncio.wait_for(pending, 5)
-    except RuntimeError as error:
+    except InterfaceError as error:
         assert str(error) == 'Connection is {expected}', str(error)
     else:
         raise AssertionError('queued {operation} reached the client')
@@ -583,6 +607,7 @@ asyncio.run(run())
 
             cursor.cleanup().run(claim).await.unwrap();
 
+            assert!(!state.is_broken());
             assert!(cursor.closed.load(Ordering::Acquire));
             assert!(cursor.fetch_state.status() == FetchStatus::NoResultSet);
             assert!(!cursor.buffered_results.has_current());
@@ -658,6 +683,61 @@ asyncio.run(run())
 
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Open);
         assert!(state.claim_execute(2).is_ok());
+    }
+
+    #[test]
+    fn failed_finalizer_drain_prevents_clean_exit_commit() {
+        use mssql_tds::connection::tds_client::ExecuteOptions;
+        use mssql_tds::test_client_support::{
+            col_metadata_empty, done_no_more, env_change_begin_transaction, sql_error,
+        };
+        let runtime = pyo3_async_runtimes::tokio::get_runtime();
+        runtime.block_on(async {
+            let (mut client, transport) = tds_client_from_tokens_capturing(vec![
+                env_change_begin_transaction(7),
+                col_metadata_empty(),
+                sql_error(50000, 16, "finalizer drain failed"),
+                done_no_more(),
+            ]);
+            client
+                .execute("SELECT 1".into(), ExecuteOptions::default())
+                .await
+                .unwrap();
+            let initial_bytes = transport.lock().unwrap().len();
+            let connection = Arc::new(LogicalConnection::new(client));
+            let state = connection.state.clone();
+            let execute = state.claim_execute(1).unwrap();
+            state.finish_execute(execute.operation_id, true);
+            let cursor = PyAsyncCursor::new(
+                connection.clone(),
+                None,
+                Arc::new(AtomicBool::new(false)),
+                state.clone(),
+                1,
+                0,
+            );
+            let claim = state.claim_cursor_close(1).unwrap();
+            super::FinalizerCleanup {
+                cleanup: Some(cursor.cleanup()),
+                completion_guard: FinalizerCompletionGuard::new(state.clone(), 1),
+            }
+            .run(claim)
+            .await;
+            assert!(state.is_broken());
+            let error = LogicalConnection::wait_closed(connection.start_close(
+                crate::async_handle::CloseMode::Commit,
+                crate::async_handle::CLOSE_TIMEOUT,
+                None,
+            ))
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Cannot commit a broken connection")
+            );
+            assert_eq!(transport.lock().unwrap().len(), initial_bytes);
+        });
     }
 
     #[test]
@@ -825,7 +905,7 @@ impl PyAsyncCursor {
             cleanup.run(claim).await.map_err(|error| {
                 record_result_set_status("error");
                 tracing::error!("PyAsyncCursor::close: failed: {error}");
-                PyRuntimeError::new_err(format!("Cursor close failed: {error}"))
+                map_tds_error("Cursor close failed", error, Vec::new())
             })?;
             record_result_set_status("closed");
             Python::attach(|py| Ok(py.None()))
@@ -837,7 +917,10 @@ impl PyAsyncCursor {
                 None => future.await,
             }
         };
-        match pyo3_async_runtimes::tokio::future_into_py(py, future) {
+        match pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            session_state.clone().run_tracked(future),
+        ) {
             Ok(awaitable) => Ok(awaitable),
             Err(error) => {
                 session_state.release_operation(operation_id);

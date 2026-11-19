@@ -84,7 +84,7 @@ def test_retained_cursor_rejects_work_after_connection_close(
             "execute": ("SELECT 1",),
             "executemany": ("SELECT ?", [(1,)]),
         }
-        with pytest.raises(RuntimeError, match="Connection is closed"):
+        with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
             await getattr(cursor, operation)(*arguments.get(operation, ()))
         assert await cursor.close() is None
 
@@ -107,7 +107,7 @@ def test_buffered_cursor_rejects_work_after_connection_close(
         finally:
             await conn.close()
 
-        with pytest.raises(RuntimeError, match="Connection is closed"):
+        with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
             await getattr(cursor, operation)()
         assert await cursor.close() is None
 
@@ -172,7 +172,7 @@ def test_cursor_close_can_retry_after_another_cursor_releases_results(
             blocked = conn.cursor()
             await owner.execute("SELECT 1", use_prepare=False)
 
-            with pytest.raises(RuntimeError, match="busy with another cursor"):
+            with pytest.raises(mssql_py_core.InterfaceError, match="busy with another cursor"):
                 blocked.close()
 
             await owner.close()
@@ -242,7 +242,7 @@ def test_dropped_idle_cursor_does_not_break_another_cursor(mock_client_context):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("transaction_method", ["commit", "rollback"])
-def test_transaction_operation_rejects_pending_cursor_results(
+def test_transaction_operation_drains_pending_cursor_results(
     client_context, transaction_method
 ):
     async def run():
@@ -250,8 +250,7 @@ def test_transaction_operation_rejects_pending_cursor_results(
         try:
             cursor = conn.cursor()
             await cursor.execute("SELECT 1", use_prepare=False)
-            with pytest.raises(RuntimeError, match="busy with another operation"):
-                await getattr(conn, transaction_method)()
+            assert await getattr(conn, transaction_method)() is None
             await cursor.close()
             assert await getattr(conn, transaction_method)() is None
         finally:
@@ -277,7 +276,7 @@ def test_async_api_exposes_user_facing_docstrings():
     cursor_doc = " ".join(mssql_py_core.PyAsyncCursor.__doc__.split())
     assert "only one cursor may own an active batch" in cursor_doc
     assert "row-producing execute retains ownership" in cursor_doc
-    assert "`commit()` or `rollback()` report busy" in cursor_doc
+    assert "transaction completion drains dormant results" in cursor_doc
     assert "Positional parameters use `?` markers" in mssql_py_core.PyAsyncCursor.execute.__doc__
     assert "consumed only after" in mssql_py_core.PyAsyncCursor.setinputsizes.__doc__
     close_doc = " ".join(mssql_py_core.PyAsyncCursor.close.__doc__.split())
@@ -329,7 +328,7 @@ def test_conn_cursor_after_close_raises_connection_closed(mock_client_context):
             warnings.simplefilter("ignore", FutureWarning)
             conn = await mssql_py_core.PyAsyncConnection.connect(mock_client_context)
             await conn.close()
-            with pytest.raises(RuntimeError, match="Connection is closed"):
+            with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
                 conn.cursor()
 
     asyncio.run(run())

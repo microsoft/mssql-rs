@@ -3,12 +3,49 @@
 
 //! Revocable physical ownership shared by async connections, cursors, and work.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use mssql_tds::connection::tds_client::TdsClient;
-use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard};
+use mssql_tds::core::TdsResult;
+use mssql_tds::error::{Error, TimeoutErrorType};
+use pyo3::prelude::*;
+use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard, watch};
+use tokio::time::{Instant, timeout_at};
+use tracing::instrument::WithSubscriber;
 
+use crate::async_errors::{OperationalError, map_tds_error};
 use crate::async_session::{AsyncConnectionState, ClaimError, OperationId};
+
+pub(crate) const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy)]
+pub(crate) enum CloseMode {
+    Rollback,
+    Commit,
+}
+
+type CloseResult = Result<(), Arc<PyErr>>;
+type CloseReceiver = watch::Receiver<Option<CloseResult>>;
+
+struct CloseCompletion {
+    state: Arc<AsyncConnectionState>,
+    sender: watch::Sender<Option<CloseResult>>,
+    completed: bool,
+}
+
+impl Drop for CloseCompletion {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.state.mark_broken();
+            self.state.mark_closed();
+            self.sender
+                .send_replace(Some(Err(Arc::new(OperationalError::new_err(
+                    "Connection cleanup was interrupted; connection discarded",
+                )))));
+        }
+    }
+}
 
 /// Unique physical ownership; pooled handles are a separate implementation slice.
 pub(crate) enum ConnHandle {
@@ -28,6 +65,7 @@ impl ConnHandle {
 pub(crate) struct LogicalConnection {
     handle: Mutex<Option<ConnHandle>>,
     pub(crate) state: Arc<AsyncConnectionState>,
+    close: StdMutex<Option<CloseReceiver>>,
 }
 
 impl LogicalConnection {
@@ -36,6 +74,123 @@ impl LogicalConnection {
         Self {
             handle: Mutex::new(Some(ConnHandle::Direct(client))),
             state: Arc::new(AsyncConnectionState::new()),
+            close: StdMutex::new(None),
+        }
+    }
+
+    /// The first close owns teardown; cancelling a waiter does not cancel that owner.
+    pub(crate) fn start_close(
+        self: &Arc<Self>,
+        mode: CloseMode,
+        budget: Duration,
+        dispatch: Option<tracing::Dispatch>,
+    ) -> CloseReceiver {
+        let mut close = self.close.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(receiver) = close.as_ref() {
+            return receiver.clone();
+        }
+        let deadline = Instant::now() + budget;
+        let mut tasks = self.state.take_close_tasks();
+        let (sender, receiver) = watch::channel(None);
+        *close = Some(receiver.clone());
+        let connection = self.clone();
+        let completion = CloseCompletion {
+            state: self.state.clone(),
+            sender,
+            completed: false,
+        };
+        let future = async move {
+            let mut completion = completion;
+            let settled = timeout_at(deadline, async {
+                while let Some(result) = tasks.join_next().await {
+                    if let Err(error) = result {
+                        connection.state.mark_broken();
+                        tracing::warn!(%error, "Async operation interrupted during close");
+                    }
+                }
+            })
+            .await;
+            let result = if settled.is_err() {
+                connection.state.mark_broken();
+                tasks.abort_all();
+                // Join even after the deadline: an abort request is not destruction.
+                while tasks.join_next().await.is_some() {}
+                drop(connection.handle.lock().await.take());
+                Err(OperationalError::new_err(
+                    "Connection cleanup timed out while settling operations; connection discarded",
+                ))
+            } else {
+                let handle = connection.handle.lock().await.take();
+                match handle {
+                    None => Ok(()),
+                    Some(handle) if connection.state.is_broken() => {
+                        drop(handle);
+                        match mode {
+                            CloseMode::Commit => Err(OperationalError::new_err(
+                                "Cannot commit a broken connection; connection discarded",
+                            )),
+                            CloseMode::Rollback => Ok(()),
+                        }
+                    }
+                    Some(handle) => {
+                        match timeout_at(deadline, Self::finalize_handle(handle, mode, deadline))
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => Err(OperationalError::new_err(
+                                "Connection cleanup timed out; connection discarded",
+                            )),
+                        }
+                    }
+                }
+            }
+            .and_then(|()| {
+                Self::check_cleanup_deadline(deadline)
+                    .map_err(|error| map_tds_error("Connection cleanup failed", error, Vec::new()))
+            });
+            if result.is_err() {
+                connection.state.mark_broken();
+            }
+            connection.state.mark_closed();
+            completion
+                .sender
+                .send_replace(Some(result.map_err(Arc::new)));
+            completion.completed = true;
+            tracing::info!(
+                discard = connection.state.must_discard(),
+                "PyAsyncConnection::close: connection closed"
+            );
+        };
+        pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+            match dispatch {
+                Some(dispatch) => future.with_subscriber(dispatch).await,
+                None => future.await,
+            }
+        });
+        receiver
+    }
+
+    pub(crate) async fn wait_closed(mut receiver: CloseReceiver) -> PyResult<()> {
+        loop {
+            let result = receiver.borrow_and_update().clone();
+            if let Some(result) = result {
+                return result.map_err(|error| {
+                    Python::attach(|py| {
+                        let original = error.value(py);
+                        let value = original.get_type().call1((original.str()?,))?;
+                        for attribute in ["sql_errors", "info_messages"] {
+                            if original.hasattr(attribute)? {
+                                value.setattr(attribute, original.getattr(attribute)?)?;
+                            }
+                        }
+                        Ok::<_, PyErr>(PyErr::from_value(value))
+                    })
+                    .unwrap_or_else(|error| error)
+                });
+            }
+            receiver.changed().await.map_err(|_| {
+                OperationalError::new_err("Connection cleanup ended without an outcome")
+            })?;
         }
     }
 
@@ -52,8 +207,46 @@ impl LogicalConnection {
         Ok(client)
     }
 
-    /// Revoke physical access for surviving owners after the current borrow ends.
-    /// This does not join detached operations or coordinate concurrent close callers.
+    fn check_cleanup_deadline(deadline: Instant) -> TdsResult<()> {
+        if Instant::now() >= deadline {
+            return Err(Error::TimeoutError(TimeoutErrorType::String(
+                "Connection cleanup timed out; connection discarded".to_owned(),
+            )));
+        }
+        Ok(())
+    }
+
+    async fn finalize_handle(
+        mut handle: ConnHandle,
+        mode: CloseMode,
+        deadline: Instant,
+    ) -> PyResult<()> {
+        let client = handle.client_mut();
+        let result = async {
+            Self::check_cleanup_deadline(deadline)?;
+            client.close_query().await?;
+            Self::check_cleanup_deadline(deadline)?;
+            if client.has_active_transaction() {
+                match mode {
+                    CloseMode::Commit => client.commit_transaction(None, None).await?,
+                    CloseMode::Rollback => client.rollback_transaction(None, None).await?,
+                }
+            }
+            Self::check_cleanup_deadline(deadline)?;
+            client.close_connection().await?;
+            Self::check_cleanup_deadline(deadline)
+        }
+        .await;
+        result.map_err(|error| {
+            map_tds_error(
+                "Connection cleanup failed",
+                error,
+                client.take_info_messages(),
+            )
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) async fn take_for_close(&self) -> Option<ConnHandle> {
         self.state.begin_close();
         self.handle.lock().await.take()
@@ -193,7 +386,7 @@ mod tests {
         drop(handle);
         assert_eq!(Arc::strong_count(&transport), 1);
         assert!(
-            connection
+            !connection
                 .state
                 .cancel_fetch(fetch.operation_id, fetch.fetch_id)
         );
@@ -201,7 +394,7 @@ mod tests {
             connection
                 .state
                 .finish_fetch(fetch.operation_id, fetch.fetch_id, false, true),
-            crate::async_session::FetchCompletion::CancellationRequested
+            crate::async_session::FetchCompletion::NoLongerActive
         );
         assert!(matches!(
             connection.lock_operation(fetch.operation_id).await,
@@ -227,5 +420,309 @@ mod tests {
         drop(sibling);
         assert!(weak.upgrade().is_none());
         assert_eq!(Arc::strong_count(&transport), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_close_waits_for_registered_work_even_after_waiter_is_dropped() {
+        let (connection, transport) = connection();
+        let operation = connection.state.claim_connection_operation().unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let worker = connection.clone();
+        let (result, _) = connection
+            .state
+            .spawn_task(async move {
+                let _client = worker.lock_operation(operation).await.unwrap();
+                started.send(()).unwrap();
+                wait.await.unwrap();
+            })
+            .unwrap();
+        ready.await.unwrap();
+        let first = connection.start_close(CloseMode::Rollback, CLOSE_TIMEOUT, None);
+        assert!(first.borrow().is_none());
+        drop(first);
+        let second = connection.start_close(CloseMode::Commit, Duration::ZERO, None);
+        assert!(second.borrow().is_none());
+        assert_eq!(connection.state.ensure_open(), Err(ClaimError::Closing));
+        release.send(()).unwrap();
+        LogicalConnection::wait_closed(second).await.unwrap();
+        result.await.unwrap();
+        assert_eq!(Arc::strong_count(&transport), 1);
+        assert!(connection.handle.lock().await.is_none());
+        assert!(transport.lock().unwrap().is_empty());
+        connection.state.mark_broken();
+        assert_eq!(connection.state.ensure_open(), Err(ClaimError::Closed));
+    }
+
+    #[tokio::test]
+    async fn close_timeout_joins_task_destruction_before_reporting_outcome() {
+        let (connection, transport) = connection();
+        let operation = connection.state.claim_connection_operation().unwrap();
+        let worker = connection.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (result, _) = connection
+            .state
+            .spawn_task(async move {
+                let _client = worker.lock_operation(operation).await.unwrap();
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
+        ready.await.unwrap();
+        let receiver = connection.start_close(CloseMode::Commit, Duration::from_millis(10), None);
+        let error = LogicalConnection::wait_closed(receiver).await.unwrap_err();
+        Python::attach(|py| assert!(error.is_instance_of::<OperationalError>(py)));
+        assert!(result.await.is_err());
+        assert_eq!(Arc::strong_count(&transport), 1);
+        assert!(connection.handle.lock().await.is_none());
+        let error = LogicalConnection::wait_closed(connection.start_close(
+            CloseMode::Rollback,
+            CLOSE_TIMEOUT,
+            None,
+        ))
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn expired_cleanup_budget_cannot_send_a_commit_or_report_success() {
+        use mssql_tds::connection::tds_client::ExecuteOptions;
+        use mssql_tds::test_client_support::{
+            col_metadata_empty, done_no_more, env_change_begin_transaction,
+            env_change_commit_transaction,
+        };
+        let (mut client, transport) = tds_client_from_tokens_capturing(vec![
+            env_change_begin_transaction(7),
+            col_metadata_empty(),
+            done_no_more(),
+            env_change_commit_transaction(),
+            done_no_more(),
+        ]);
+        client
+            .execute("SELECT 1".into(), ExecuteOptions::default())
+            .await
+            .unwrap();
+        let initial_bytes = transport.lock().unwrap().len();
+        let connection = Arc::new(LogicalConnection::new(client));
+        let error = LogicalConnection::wait_closed(connection.start_close(
+            CloseMode::Commit,
+            Duration::from_nanos(1),
+            None,
+        ))
+        .await
+        .unwrap_err();
+        Python::attach(|py| assert!(error.is_instance_of::<OperationalError>(py)));
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(transport.lock().unwrap().len(), initial_bytes);
+        assert_eq!(Arc::strong_count(&transport), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drained_client_keeps_the_original_cleanup_deadline() {
+        use mssql_tds::connection::tds_client::ExecuteOptions;
+        use mssql_tds::test_client_support::{
+            col_metadata_empty, done_no_more, env_change_begin_transaction,
+            env_change_commit_transaction,
+        };
+        let (mut client, transport) = tds_client_from_tokens_capturing(vec![
+            env_change_begin_transaction(7),
+            col_metadata_empty(),
+            done_no_more(),
+            env_change_commit_transaction(),
+            done_no_more(),
+        ]);
+        client
+            .execute("SELECT 1".into(), ExecuteOptions::default())
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        client.close_query().await.unwrap();
+        let initial_bytes = transport.lock().unwrap().len();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let error = LogicalConnection::finalize_handle(
+            ConnHandle::Direct(client),
+            CloseMode::Commit,
+            deadline,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(transport.lock().unwrap().len(), initial_bytes);
+        assert_eq!(Arc::strong_count(&transport), 1);
+    }
+
+    #[tokio::test]
+    async fn broken_clean_exit_reports_failure_without_sending_a_commit() {
+        for mode in [CloseMode::Commit, CloseMode::Rollback] {
+            let (connection, transport) = connection();
+            connection.state.mark_broken();
+            let result =
+                LogicalConnection::wait_closed(connection.start_close(mode, CLOSE_TIMEOUT, None))
+                    .await;
+            match mode {
+                CloseMode::Commit => {
+                    let error = result.unwrap_err();
+                    Python::attach(|py| assert!(error.is_instance_of::<OperationalError>(py)));
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("Cannot commit a broken connection")
+                    );
+                }
+                CloseMode::Rollback => result.unwrap(),
+            }
+            assert_eq!(Arc::strong_count(&transport), 1);
+            assert!(transport.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn close_takes_dormant_results_and_drains_before_transaction_completion() {
+        use mssql_tds::connection::tds_client::ExecuteOptions;
+        use mssql_tds::test_client_support::{
+            col_metadata_empty, done_no_more, env_change_begin_transaction,
+            env_change_commit_transaction, env_change_rollback_transaction,
+        };
+        for mode in [CloseMode::Commit, CloseMode::Rollback] {
+            let ack = match mode {
+                CloseMode::Commit => env_change_commit_transaction(),
+                CloseMode::Rollback => env_change_rollback_transaction(),
+            };
+            let (mut client, transport) = tds_client_from_tokens_capturing(vec![
+                env_change_begin_transaction(7),
+                col_metadata_empty(),
+                done_no_more(),
+                ack,
+                done_no_more(),
+            ]);
+            client
+                .execute("SELECT 1".into(), ExecuteOptions::default())
+                .await
+                .unwrap();
+            assert!(client.has_open_batch());
+            assert!(client.has_active_transaction());
+            let connection = Arc::new(LogicalConnection::new(client));
+            let claim = connection.state.claim_execute(1).unwrap();
+            connection.state.finish_execute(claim.operation_id, true);
+            LogicalConnection::wait_closed(connection.start_close(mode, CLOSE_TIMEOUT, None))
+                .await
+                .unwrap();
+            assert!(!connection.state.must_discard());
+            assert_eq!(Arc::strong_count(&transport), 1);
+            let bytes = transport.lock().unwrap();
+            let first_packet_length = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
+            assert_eq!(
+                bytes[first_packet_length], 14,
+                "transaction request follows drain"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_commit_is_not_retried_or_followed_by_rollback() {
+        use mssql_tds::test_client_support::tds_client_from_tokens_in_transaction;
+        let client = tds_client_from_tokens_in_transaction(Vec::new(), 7);
+        let connection = Arc::new(LogicalConnection::new(client));
+        let error = LogicalConnection::wait_closed(connection.start_close(
+            CloseMode::Commit,
+            CLOSE_TIMEOUT,
+            None,
+        ))
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("Connection cleanup failed"));
+        assert!(connection.state.must_discard());
+        assert!(connection.handle.lock().await.is_none());
+        let repeated = LogicalConnection::wait_closed(connection.start_close(
+            CloseMode::Rollback,
+            CLOSE_TIMEOUT,
+            None,
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(repeated.to_string(), error.to_string());
+    }
+
+    #[tokio::test]
+    async fn delayed_drain_error_never_sends_a_transaction_request() {
+        use mssql_tds::connection::tds_client::ExecuteOptions;
+        use mssql_tds::test_client_support::{
+            col_metadata_empty, done_no_more, env_change_begin_transaction, sql_error,
+        };
+        let (mut client, transport) = tds_client_from_tokens_capturing(vec![
+            env_change_begin_transaction(7),
+            col_metadata_empty(),
+            sql_error(50000, 16, "delayed failure"),
+            done_no_more(),
+        ]);
+        client
+            .execute("SELECT 1".into(), ExecuteOptions::default())
+            .await
+            .unwrap();
+        let connection = Arc::new(LogicalConnection::new(client));
+        let error = LogicalConnection::wait_closed(connection.start_close(
+            CloseMode::Commit,
+            CLOSE_TIMEOUT,
+            None,
+        ))
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("delayed failure"));
+        let bytes = transport.lock().unwrap();
+        let first_packet_length = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
+        assert_eq!(
+            bytes.len(),
+            first_packet_length,
+            "only the original batch was sent"
+        );
+        assert_eq!(Arc::strong_count(&transport), 1);
+    }
+
+    #[tokio::test]
+    async fn settled_cancellation_does_not_silently_replace_a_clean_exit_commit() {
+        use mssql_tds::connection::tds_client::ExecuteOptions;
+        use mssql_tds::test_client_support::{
+            col_metadata_empty, done_no_more, env_change_begin_transaction,
+            env_change_commit_transaction,
+        };
+        let (mut client, transport) = tds_client_from_tokens_capturing(vec![
+            env_change_begin_transaction(7),
+            col_metadata_empty(),
+            done_no_more(),
+            env_change_commit_transaction(),
+            done_no_more(),
+        ]);
+        client
+            .execute("SELECT 1".into(), ExecuteOptions::default())
+            .await
+            .unwrap();
+        let connection = Arc::new(LogicalConnection::new(client));
+        let execute = connection.state.claim_execute(1).unwrap();
+        connection.state.finish_execute(execute.operation_id, true);
+        let fetch = connection.state.claim_fetch(1).unwrap();
+        assert!(
+            connection
+                .state
+                .cancel_fetch(fetch.operation_id, fetch.fetch_id)
+        );
+        connection.state.release_operation(fetch.operation_id);
+        assert!(connection.state.must_discard());
+        assert!(!connection.state.is_broken());
+        LogicalConnection::wait_closed(connection.start_close(
+            CloseMode::Commit,
+            CLOSE_TIMEOUT,
+            None,
+        ))
+        .await
+        .unwrap();
+        assert!(!connection.state.is_broken());
+        assert!(connection.state.must_discard());
+        let bytes = transport.lock().unwrap();
+        let first_packet_length = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
+        assert_eq!(
+            bytes[first_packet_length], 14,
+            "clean exit still sends its transaction request"
+        );
     }
 }

@@ -1,10 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use mssql_tds::core::CancelHandle;
+use pyo3::prelude::*;
+use tokio::sync::oneshot;
+use tokio::task::{AbortHandle, JoinSet};
+
+use crate::async_errors::{OperationalError, map_connection_claim};
 
 pub(crate) type CursorId = u64;
 pub(crate) type FetchId = u64;
@@ -81,7 +87,9 @@ pub(crate) struct ActiveOperation {
 #[derive(Debug)]
 struct AsyncSessionState {
     lifecycle: ConnectionLifecycle,
+    broken: bool,
     active_operation: Option<ActiveOperation>,
+    tasks: JoinSet<()>,
 }
 
 /// Connection-wide coordinator shared by the connection and all its cursors.
@@ -90,7 +98,23 @@ pub(crate) struct AsyncConnectionState {
     next_cursor_id: AtomicU64,
     next_fetch_id: AtomicU64,
     next_operation_id: AtomicU64,
+    discard: AtomicBool,
     inner: Mutex<AsyncSessionState>,
+}
+
+struct TaskCancellation {
+    state: Arc<AsyncConnectionState>,
+    abort: AbortHandle,
+    completed: bool,
+}
+
+impl Drop for TaskCancellation {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.state.mark_broken();
+            self.abort.abort();
+        }
+    }
 }
 
 /// Releases an operation claim and poisons the session if interrupted.
@@ -139,11 +163,91 @@ impl AsyncConnectionState {
             next_cursor_id: AtomicU64::new(1),
             next_fetch_id: AtomicU64::new(1),
             next_operation_id: AtomicU64::new(1),
+            discard: AtomicBool::new(false),
             inner: Mutex::new(AsyncSessionState {
                 lifecycle: ConnectionLifecycle::Open,
+                broken: false,
                 active_operation: None,
+                tasks: JoinSet::new(),
             }),
         }
+    }
+
+    /// Registration and close admission share the same lock, before work can run.
+    pub(crate) fn spawn_task<F, T>(
+        self: &Arc<Self>,
+        future: F,
+    ) -> Result<(oneshot::Receiver<T>, AbortHandle), ClaimError>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let mut state = self.lock();
+        match state.lifecycle {
+            ConnectionLifecycle::Open => {}
+            ConnectionLifecycle::Closing => return Err(ClaimError::Closing),
+            ConnectionLifecycle::Closed => return Err(ClaimError::Closed),
+            ConnectionLifecycle::Broken => return Err(ClaimError::Broken),
+        }
+        while let Some(result) = state.tasks.try_join_next() {
+            if let Err(error) = result {
+                self.discard.store(true, Ordering::Release);
+                tracing::warn!(%error, "Async connection task did not complete");
+            }
+        }
+        let (sender, receiver) = oneshot::channel();
+        let task_state = self.clone();
+        let abort = state.tasks.spawn_on(
+            async move {
+                let result = future.await;
+                if sender.send(result).is_err() {
+                    task_state.mark_for_discard();
+                    tracing::debug!(
+                        "Async operation result was not delivered; connection will be discarded"
+                    );
+                }
+            },
+            pyo3_async_runtimes::tokio::get_runtime().handle(),
+        );
+        Ok((receiver, abort))
+    }
+
+    pub(crate) async fn run_tracked<F, T>(self: Arc<Self>, future: F) -> PyResult<T>
+    where
+        F: Future<Output = PyResult<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (receiver, abort) = self.spawn_task(future).map_err(|error| {
+            map_connection_claim(error, "Connection is busy with another operation")
+        })?;
+        let mut cancellation = TaskCancellation {
+            state: self,
+            abort,
+            completed: false,
+        };
+        let result = receiver.await.map_err(|_| {
+            cancellation.state.mark_broken();
+            OperationalError::new_err("Connection operation was interrupted")
+        });
+        cancellation.completed = true;
+        result?
+    }
+
+    pub(crate) fn must_discard(&self) -> bool {
+        self.discard.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_broken(&self) -> bool {
+        self.lock().broken
+    }
+
+    pub(crate) fn mark_for_discard(&self) {
+        self.discard.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn take_close_tasks(&self) -> JoinSet<()> {
+        self.begin_close();
+        std::mem::take(&mut self.lock().tasks)
     }
 
     pub(crate) fn allocate_cursor_id(&self) -> CursorId {
@@ -236,7 +340,11 @@ impl AsyncConnectionState {
             ConnectionLifecycle::Closed => return Err(ClaimError::Closed),
             ConnectionLifecycle::Broken => return Err(ClaimError::Broken),
         }
-        if state.active_operation.is_some() {
+        if state
+            .active_operation
+            .as_ref()
+            .is_some_and(|active| active.phase != OperationPhase::Fetching)
+        {
             return Err(ClaimError::Busy);
         }
 
@@ -396,6 +504,7 @@ impl AsyncConnectionState {
                 return false;
             };
             active.cancel_requested = true;
+            self.mark_for_discard();
             cancel_handle
         };
 
@@ -423,22 +532,51 @@ impl AsyncConnectionState {
         {
             state.active_operation = None;
         }
-        state.lifecycle = ConnectionLifecycle::Broken;
+        self.mark_for_discard();
+        state.broken = true;
+        if state.lifecycle == ConnectionLifecycle::Open {
+            state.lifecycle = ConnectionLifecycle::Broken;
+        }
     }
 
     pub(crate) fn begin_close(&self) {
         let mut state = self.lock();
-        if state.lifecycle == ConnectionLifecycle::Open {
+        if matches!(
+            state.lifecycle,
+            ConnectionLifecycle::Open | ConnectionLifecycle::Broken
+        ) {
             state.lifecycle = ConnectionLifecycle::Closing;
+        }
+        if let Some(active) = state.active_operation.as_mut()
+            && !matches!(
+                active.phase,
+                OperationPhase::Fetching | OperationPhase::Closing
+            )
+        {
+            self.mark_for_discard();
+            if active.phase == OperationPhase::FetchingRow {
+                active.cancel_requested = true;
+            }
+            if let Some(cancel) = &active.cancel_handle {
+                cancel.cancel();
+            }
+            state.broken = true;
         }
     }
 
     pub(crate) fn mark_closed(&self) {
-        self.lock().lifecycle = ConnectionLifecycle::Closed;
+        let mut state = self.lock();
+        state.lifecycle = ConnectionLifecycle::Closed;
+        state.active_operation = None;
     }
 
     pub(crate) fn mark_broken(&self) {
-        self.lock().lifecycle = ConnectionLifecycle::Broken;
+        self.mark_for_discard();
+        let mut state = self.lock();
+        state.broken = true;
+        if state.lifecycle == ConnectionLifecycle::Open {
+            state.lifecycle = ConnectionLifecycle::Broken;
+        }
     }
 
     #[allow(dead_code)]
@@ -709,10 +847,11 @@ mod tests {
         state.begin_close();
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Closed);
         state.mark_broken();
-        assert_eq!(state.lifecycle(), ConnectionLifecycle::Broken);
-        assert_eq!(state.ensure_open(), Err(ClaimError::Broken));
+        assert_eq!(state.lifecycle(), ConnectionLifecycle::Closed);
+        assert_eq!(state.ensure_open(), Err(ClaimError::Closed));
+        assert!(state.must_discard());
         state.begin_close();
-        assert_eq!(state.lifecycle(), ConnectionLifecycle::Broken);
+        assert_eq!(state.lifecycle(), ConnectionLifecycle::Closed);
     }
 
     #[test]

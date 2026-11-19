@@ -824,7 +824,8 @@ pub(crate) fn execute<'py>(
         }
     };
 
-    match pyo3_async_runtimes::tokio::future_into_py(py, future) {
+    match pyo3_async_runtimes::tokio::future_into_py(py, session_state.clone().run_tracked(future))
+    {
         Ok(awaitable) => Ok(awaitable),
         Err(error) => {
             session_state.release_operation(operation_id);
@@ -864,6 +865,7 @@ pub(crate) fn executemany<'py>(
     } = resources;
     let seq_of_parameters = seq_of_parameters.clone().unbind();
     let trace_dispatch = dispatch.clone();
+    let task_state = session_state.clone();
 
     let future = async move {
         let started = Instant::now();
@@ -1069,7 +1071,7 @@ pub(crate) fn executemany<'py>(
         }
     };
 
-    pyo3_async_runtimes::tokio::future_into_py(py, future)
+    pyo3_async_runtimes::tokio::future_into_py(py, task_state.run_tracked(future))
 }
 
 #[cfg(test)]

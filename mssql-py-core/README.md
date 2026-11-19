@@ -41,8 +41,16 @@ For SDK authors integrating the native runtime:
 - Async cursors retain their logical connection when the connection wrapper is
   collected. Explicit `await connection.close()` revokes cursor access;
   `await cursor.close()` leaves the parent and sibling cursors usable. The last
-  logical owner discards any remaining direct client. This does not enable
-  connection pooling or add concurrent-close coordination.
+  logical owner discards any remaining direct client.
+- Concurrent async connection closes await one teardown outcome. Cancelling a
+  close waiter does not stop cleanup. Direct close uses one five-second budget
+  to settle operations, drain results, finalize transactions and close the
+  transport. Explicit close rolls back active transactions even in autocommit
+  mode; clean context exit commits only when autocommit is off. Cleanup failures
+  are reported, without masking an existing block exception. A broken connection
+  is discarded, and a clean exit requiring commit reports failure. Cursor
+  finalization racing close preserves the same transaction intent. This does not
+  enable connection pooling.
 - [Connection settings](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md#connection-policy-and-migration)
   for native connection options and defaults.
 - [Bulk-copy behavior](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/docs/bulk-copy.md)

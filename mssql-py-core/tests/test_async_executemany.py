@@ -989,12 +989,12 @@ def test_executemany_exhausted_nextset_checks_connection_lifecycle(client_contex
 
             close_awaitable = conn.close()
             # Shutdown may complete before this coroutine gets its next turn.
-            with pytest.raises(RuntimeError, match=r"Connection is (?:closing|closed)"):
+            with pytest.raises(mssql_py_core.InterfaceError, match=r"Connection is (?:closing|closed)"):
                 await cursor.nextset()
             assert cursor.description == description
 
             await close_awaitable
-            with pytest.raises(RuntimeError, match="Connection is closed"):
+            with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
                 await cursor.nextset()
             assert cursor.description == description
         finally:
@@ -1495,15 +1495,15 @@ def test_executemany_logs_interruption_during_execution(client_context):
             else:
                 pytest.fail("ExecuteMany did not start wire execution")
 
+            probe = conn.cursor()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
 
-            probe = conn.cursor()
             for _ in range(100):
                 try:
                     await probe.execute("SELECT 1", use_prepare=False)
-                except RuntimeError as error:
+                except mssql_py_core.InterfaceError as error:
                     if "busy" in str(error).lower():
                         await asyncio.sleep(0.01)
                         continue

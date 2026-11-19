@@ -512,12 +512,18 @@ where
     F: Future<Output = PyResult<T>> + Send + 'static,
     T: Send + 'static,
 {
-    let mut cancellation_guard =
-        FetchCancellationGuard::new(session_state, operation_id, fetch_id, operation, dispatch);
-    let result = tokio::spawn(future).await;
+    let mut cancellation_guard = FetchCancellationGuard::new(
+        session_state.clone(),
+        operation_id,
+        fetch_id,
+        operation,
+        dispatch,
+    );
+    let (receiver, _) = session_state.spawn_task(future).map_err(map_claim_error)?;
+    let result = receiver.await;
     cancellation_guard.complete();
     result.map_err(|error| {
-        PyRuntimeError::new_err(format!(
+        crate::async_errors::OperationalError::new_err(format!(
             "PyAsyncCursor.{operation} background task failed: {error}"
         ))
     })?
@@ -818,6 +824,8 @@ fn fetch_buffered<'py>(
             operation,
             guard_dispatch,
         );
+        #[cfg(debug_assertions)]
+        pause_fetch_publication_if_armed().await;
         let (rows, exhausted, has_next) = buffered_results.take_rows(limit);
         fetch_state.set(if exhausted {
             FetchStatus::Exhausted
@@ -843,6 +851,14 @@ fn fetch_buffered<'py>(
             None => future.await,
         }
     };
+    let future = run_fetch_in_background(
+        future,
+        session_state.clone(),
+        operation_id,
+        fetch_id,
+        operation,
+        None,
+    );
     match pyo3_async_runtimes::tokio::future_into_py(py, future) {
         Ok(awaitable) => Ok(awaitable),
         Err(error) => {
@@ -1158,6 +1174,8 @@ fn next_buffered_set<'py>(
             "nextset",
             guard_dispatch,
         );
+        #[cfg(debug_assertions)]
+        pause_fetch_publication_if_armed().await;
         let metadata = buffered_results.advance();
         let has_result = metadata.is_some();
         let description = match materialize(metadata).await {
@@ -1188,6 +1206,14 @@ fn next_buffered_set<'py>(
             None => future.await,
         }
     };
+    let future = run_fetch_in_background(
+        future,
+        session_state.clone(),
+        operation_id,
+        fetch_id,
+        "nextset",
+        None,
+    );
     match pyo3_async_runtimes::tokio::future_into_py(py, future) {
         Ok(awaitable) => Ok(awaitable),
         Err(error) => {
