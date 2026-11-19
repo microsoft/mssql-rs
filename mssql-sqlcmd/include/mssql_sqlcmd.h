@@ -25,6 +25,7 @@ extern "C" {
 #define MSSQL_SQLCMD_INTERNAL_ERROR 3
 #define MSSQL_SQLCMD_INVALID_ARGUMENT 4
 #define MSSQL_SQLCMD_UNSUPPORTED 5 /* not in this build: diagnostics when 32-bit */
+#define MSSQL_SQLCMD_TELEMETRY_TIMEOUT 6
 
 /* How the run ended: the end argument of mssql_sqlcmd_json_render. With the
    exit code it decides executionStatus and operationOutcome. */
@@ -60,6 +61,61 @@ typedef struct MssqlSqlcmdText {
    with a nonzero length returns MSSQL_SQLCMD_NULL_ARGUMENT and leaves the
    locale unchanged. */
 int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_set_locale(MssqlSqlcmdText locale);
+
+/* Product usage telemetry: one privacy-safe Application Insights event per run.
+   On by default (the destination is built in); off when SQLCMD_TELEMETRY_OPTOUT
+   is 1, true or yes, or when SQLCMD_TELEMETRY_CONNECTION_STRING is set to
+   something that is not a valid connection string. Every function here is
+   fail-open: failures are ignored and never affect sqlcmd. */
+
+/* mssql_sqlcmd_telemetry_record_usage's command and format arguments. */
+#define MSSQL_SQLCMD_COMMAND_NONE 0     /* not a command that is measured by name */
+#define MSSQL_SQLCMD_COMMAND_DIAGNOSE 1
+#define MSSQL_SQLCMD_FORMAT_ABSENT 0    /* --format was not given */
+#define MSSQL_SQLCMD_FORMAT_JSON 1
+#define MSSQL_SQLCMD_FORMAT_UNRECOGNIZED 2 /* given with a value that is not supported */
+#define MSSQL_SQLCMD_FORMAT_MISSING 3   /* given with no value */
+
+/* Records what this run is. Call once after the command line is parsed.
+   sqlcmd_version is included only when it is a bounded version-like value.
+   On Windows, a first run (no device ID yet) can wait up to 500 ms here while
+   another first run creates it. */
+void MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_record_usage(
+    MssqlSqlcmdText sqlcmd_version,
+    int32_t command,
+    int32_t format);
+
+/* Nonzero when this run reports telemetry. Read the server properties only
+   when it is. */
+int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_enabled(void);
+
+/* The SELECT that reads the server properties: four columns, in the order of
+   MssqlSqlcmdServerInfo. A static NUL-terminated UTF-8 string with no statement
+   terminator; do not free it. Send it in a batch sqlcmd already sends, ahead of
+   a SET statement in that batch and separated from it by a newline or ';': the
+   SET resets @@ROWCOUNT to 0, so no round trip is added and the session's
+   @@ROWCOUNT is what it would be without telemetry. */
+const char* MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_server_info_query(void);
+
+/* The row of that SELECT. A NULL column is data == NULL with len == 0. Each text
+   is at most 128 UTF-16 code units. engine_edition is negative when not read. */
+typedef struct MssqlSqlcmdServerInfo {
+    int32_t engine_edition;
+    MssqlSqlcmdText product_version;
+    MssqlSqlcmdText os;
+    MssqlSqlcmdText arch;
+} MssqlSqlcmdServerInfo;
+
+/* Records the server properties of the first successful connection, which
+   completes the event and starts sending it. Later connections are ignored.
+   Returns 0, 1 for a null pointer, or 3 on an internal error. */
+int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_record_connection(
+    const MssqlSqlcmdServerInfo* info);
+
+/* Sends the event if it has not been sent, and waits for it for timeout_ms,
+   capped at 500. Returns 0 when completed, off, or already started; 6 on
+   timeout; or 3 on failure or panic. */
+int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_shutdown(uint32_t timeout_ms);
 
 /* A result-set column, as the driver describes it. Only the name is always
    given; a negative number or a NULL or empty type name means the driver did
@@ -260,7 +316,13 @@ typedef struct MssqlSqlcmdDriverResult {
     int64_t connect_ms;        /* connection/setup from callback entry; excludes query/disconnect */
     int32_t query_failed;      /* non-zero when the query ran and failed */
     int64_t query_ms;          /* minimal query only; excludes disconnect/result cleanup */
-    const MssqlSqlcmdText* values; /* the query's first row; a NULL data is SQL NULL */
+    const MssqlSqlcmdText* values; /* the query's first row; a NULL data is SQL NULL.
+                                      Values 3 to 6 are optional and positional: the
+                                      server version as SQL_DBMS_VER gives it (e.g.
+                                      17.00.4085, not ProductVersion), the transport
+                                      (e.g. TCP), the server name and the database.
+                                      Pass NULL data for one that is not known;
+                                      value_count may end after the last one given */
     size_t value_count;
     const MssqlSqlcmdDriverRecord* records; /* the connection's, then the query's */
     size_t record_count;
