@@ -535,21 +535,26 @@ mod chrono_to_sql {
         })
     }
 
-    fn naive_time_to_sql(t: &NaiveTime) -> SqlTime {
+    fn naive_time_to_sql(t: &NaiveTime) -> Result<SqlTime> {
+        if t.nanosecond() >= 1_000_000_000 {
+            return Err(Error::Conversion(
+                "SQL Server time types do not support leap seconds".into(),
+            ));
+        }
         // SqlTime.time_nanoseconds is actually in 100-nanosecond units (mirrors
         // the FromSql side in row.rs).
         let nanos_since_midnight =
             (t.num_seconds_from_midnight() as u64) * 1_000_000_000 + t.nanosecond() as u64;
-        SqlTime {
+        Ok(SqlTime {
             time_nanoseconds: nanos_since_midnight / 100,
             scale: DEFAULT_VARTIME_SCALE,
-        }
+        })
     }
 
     fn naive_dt_to_sql(dt: &NaiveDateTime) -> Result<SqlDateTime2> {
         Ok(SqlDateTime2 {
             days: naive_date_to_sql(&dt.date())?.get_days(),
-            time: naive_time_to_sql(&dt.time()),
+            time: naive_time_to_sql(&dt.time())?,
         })
     }
 
@@ -561,7 +566,7 @@ mod chrono_to_sql {
 
     impl ToSql for NaiveTime {
         fn to_sql(&self) -> Result<SqlType> {
-            Ok(SqlType::Time(Some(naive_time_to_sql(self))))
+            Ok(SqlType::Time(Some(naive_time_to_sql(self)?)))
         }
     }
 
@@ -1349,6 +1354,62 @@ mod tests {
             .and_then(|date| date.and_hms_opt(0, 0, 0))
             .expect("chrono supports years after 9999");
         assert!(matches!(datetime.to_sql(), Err(Error::Conversion(_))));
+    }
+
+    #[test]
+    fn chrono_time_conversions_reject_leap_seconds() -> TestResult {
+        use chrono::{FixedOffset, TimeZone, Utc};
+
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 6, 30).expect("valid date");
+        for (hour, minute) in [(12, 34), (23, 59)] {
+            let leap = chrono::NaiveTime::from_hms_nano_opt(hour, minute, 59, 1_500_000_000)
+                .expect("valid chrono leap second");
+            let datetime = date.and_time(leap);
+            let utc = Utc.from_utc_datetime(&datetime);
+            let offset = utc.with_timezone(&FixedOffset::east_opt(19_800).expect("valid offset"));
+            for value in [
+                &leap as &dyn ToSql,
+                &datetime as &dyn ToSql,
+                &utc as &dyn ToSql,
+                &offset as &dyn ToSql,
+            ] {
+                ensure(
+                    matches!(value.to_sql(), Err(Error::Conversion(_))),
+                    "expected leap-second conversion error",
+                )?;
+            }
+            for result in [
+                crate::compat::IntoSql::into_sql(leap),
+                crate::compat::IntoSql::into_sql(datetime),
+                crate::compat::IntoSql::into_sql(utc),
+                crate::compat::IntoSql::into_sql(offset),
+            ] {
+                ensure(
+                    matches!(result, Err(Error::Conversion(_))),
+                    "expected compatibility leap-second conversion error",
+                )?;
+            }
+            ensure(
+                matches!(
+                    crate::compat::Query::new("SELECT @P1").bind(leap),
+                    Err(Error::Conversion(_))
+                ),
+                "expected leap-second binding error",
+            )?;
+        }
+
+        let time = chrono::NaiveTime::from_hms_nano_opt(12, 34, 59, 500_000_000)
+            .expect("ordinary fractional second");
+        let SqlType::Time(Some(sql_time)) = time.to_sql()? else {
+            return Err("expected SQL time".into());
+        };
+        ensure_equal(
+            crate::FromSql::from_sql(&mssql_tds::datatypes::column_values::ColumnValues::Time(
+                sql_time,
+            )),
+            Some(time),
+        )?;
+        Ok(())
     }
 
     #[test]
