@@ -643,26 +643,40 @@ def test_executemany_preflight_cancellation_keeps_session_usable(request, contex
     async def run():
         logger = RecordingLogger()
         conn = await connect(request.getfixturevalue(context_fixture), logger)
-        try:
-            cursor = conn.cursor()
-            logger.events.clear()
-            task = asyncio.ensure_future(
-                cursor.executemany("SELECT ?", itertools.repeat((1,)))
-            )
-            await asyncio.sleep(0)
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+        started = threading.Event()
 
-            assert await cursor.execute("SET NOCOUNT ON", use_prepare=False) is cursor
-            assert any(
+        def rows():
+            started.set()
+            yield from itertools.repeat((1,))
+
+        async def wait_for_preflight():
+            while not started.is_set():
+                await asyncio.sleep(0)
+
+        async def wait_for_interruption():
+            while not any(
                 level == 30
                 and "PyAsyncCursor::executemany: interrupted during parameter preflight"
                 in message
                 and "connection remains usable" in message
                 and module == "async_execute.rs"
                 for level, message, module in logger.events
+            ):
+                await asyncio.sleep(0)
+
+        try:
+            cursor = conn.cursor()
+            logger.events.clear()
+            task = asyncio.ensure_future(
+                cursor.executemany("SELECT ?", rows())
             )
+            await asyncio.wait_for(wait_for_preflight(), 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            await asyncio.wait_for(wait_for_interruption(), 5)
+            assert await cursor.execute("SET NOCOUNT ON", use_prepare=False) is cursor
         finally:
             await conn.close()
 
@@ -1560,6 +1574,8 @@ def test_executemany_logs_interruption_during_execution(client_context):
                     pytest.fail("Cancelled executemany left the connection reusable")
             else:
                 pytest.fail("Cancelled executemany left the connection permanently busy")
+
+            assert not conn.closed
 
             for _ in range(100):
                 if any(

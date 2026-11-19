@@ -466,6 +466,47 @@ def test_failed_close_awaitable_construction_still_closes(client_context):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
+@pytest.mark.parametrize("transaction_method", ["commit", "rollback"])
+def test_failed_transaction_awaitable_construction_preserves_pending_work(
+    client_context, transaction_method
+):
+    table = f"##aqe_b3_construction_{uuid4().hex}"
+
+    async def setup():
+        observer = await mssql_py_core.PyAsyncConnection.connect(
+            client_context, autocommit=True
+        )
+        probe = observer.cursor()
+        await probe.execute(f"CREATE TABLE {table} (value int)", use_prepare=False)
+        worker = await mssql_py_core.PyAsyncConnection.connect(
+            client_context, autocommit=False
+        )
+        cursor = worker.cursor()
+        await cursor.execute(f"INSERT INTO {table} VALUES (1)", use_prepare=False)
+        return observer, probe, worker, cursor
+
+    observer, probe, worker, cursor = asyncio.run(setup())
+
+    async def verify():
+        assert await cursor.execute("SET NOCOUNT ON", use_prepare=False) is cursor
+        await worker.commit()
+        await probe.execute(f"SELECT COUNT(*) FROM {table}", use_prepare=False)
+        assert await probe.fetchall() == [(1,)]
+
+    async def cleanup():
+        await worker.close()
+        await probe.close()
+        await observer.close()
+
+    try:
+        with pytest.raises(RuntimeError, match="running event loop"):
+            getattr(worker, transaction_method)()
+        asyncio.run(verify())
+    finally:
+        asyncio.run(cleanup())
+
+
+@pytest.mark.integration
 def test_commit_without_active_transaction_is_noop(client_context):
     async def run():
         with warnings.catch_warnings():

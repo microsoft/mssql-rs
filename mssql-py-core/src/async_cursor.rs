@@ -25,7 +25,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
-use mssql_tds::error::Error;
+use mssql_tds::error::{Error, SqlInfoMessage};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
@@ -85,10 +85,10 @@ impl CursorCleanup {
     }
 
     /// Borrow through the close claim; a revoked parent needs only local cursor cleanup.
-    async fn run(self, claim: CursorCloseClaim) -> Result<(), Error> {
+    async fn run(self, claim: CursorCloseClaim) -> Result<(), (Error, Vec<SqlInfoMessage>)> {
         let mut cleanup_guard =
             SessionOperationGuard::new(self.session_state.clone(), claim.operation_id);
-        let (result, has_open_batch) = {
+        let (result, has_open_batch, info_messages) = {
             let mut client = match self.client.lock_operation(claim.operation_id).await {
                 Ok(client) => client,
                 Err(ClaimError::Closing | ClaimError::Closed) => {
@@ -99,9 +99,10 @@ impl CursorCleanup {
                 }
                 Err(error) => {
                     cleanup_guard.settle(false);
-                    return Err(Error::UsageError(format!(
-                        "Cursor cleanup rejected: {error:?}"
-                    )));
+                    return Err((
+                        Error::UsageError(format!("Cursor cleanup rejected: {error:?}")),
+                        Vec::new(),
+                    ));
                 }
             };
             let result = async {
@@ -114,14 +115,19 @@ impl CursorCleanup {
             }
             .await;
             let has_open_batch = client.has_open_batch();
-            (result, has_open_batch)
+            let info_messages = if result.is_err() {
+                client.take_info_messages()
+            } else {
+                Vec::new()
+            };
+            (result, has_open_batch, info_messages)
         };
 
         cleanup_guard.settle(result.is_err() || has_open_batch);
         // Cleanup consumes the close attempt even when draining or unprepare fails.
         self.clear_result_state();
         self.closed.store(true, Ordering::Release);
-        result?;
+        result.map_err(|error| (error, info_messages))?;
         Ok(())
     }
 }
@@ -142,7 +148,7 @@ struct FinalizerCompletionGuard {
 impl FinalizerCleanup {
     async fn run(mut self, claim: CursorCloseClaim) {
         let cleanup = self.cleanup.take().expect("finalizer cleanup is available");
-        if let Err(error) = cleanup.run(claim).await {
+        if let Err((error, _)) = cleanup.run(claim).await {
             record_result_set_status("error");
             tracing::warn!("PyAsyncCursor finalizer cleanup failed: {error}");
         } else {
@@ -630,8 +636,9 @@ asyncio.run(run())
                 Some(state.claim_connection_operation().unwrap())
             };
 
-            let error = cursor.cleanup().run(claim).await.unwrap_err();
+            let (error, info_messages) = cursor.cleanup().run(claim).await.unwrap_err();
 
+            assert!(info_messages.is_empty());
             assert!(matches!(error, Error::UsageError(message) if message ==
                 format!("Cursor cleanup rejected: {}", if broken { "Broken" } else { "Busy" })));
             assert!(!cursor.closed.load(Ordering::Acquire));
@@ -902,10 +909,10 @@ impl PyAsyncCursor {
         let operation_id = claim.operation_id;
         let cursor_id = cleanup.cursor_id;
         let future = async move {
-            cleanup.run(claim).await.map_err(|error| {
+            cleanup.run(claim).await.map_err(|(error, info_messages)| {
                 record_result_set_status("error");
                 tracing::error!("PyAsyncCursor::close: failed: {error}");
-                map_tds_error("Cursor close failed", error, Vec::new())
+                map_tds_error("Cursor close failed", error, info_messages)
             })?;
             record_result_set_status("closed");
             Python::attach(|py| Ok(py.None()))

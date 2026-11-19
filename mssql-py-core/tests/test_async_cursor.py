@@ -284,6 +284,29 @@ def test_async_api_exposes_user_facing_docstrings():
     assert "table-valued parameter" in mssql_py_core.TableValuedParameter.__doc__
 
 
+@pytest.mark.integration
+def test_cursor_close_preserves_buffered_server_diagnostics(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "SELECT 1; PRINT 'b3 cleanup details';"
+                "RAISERROR ('b3 cleanup failure', 16, 1)",
+                use_prepare=False,
+            )
+            with pytest.raises(mssql_py_core.DatabaseError, match="b3 cleanup failure") as error:
+                await cursor.close()
+            assert any(
+                message["message"] == "b3 cleanup details"
+                for message in error.value.info_messages
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
 def test_two_cursors_can_be_created(mock_client_context):
     """A second cursor on the same connection is allowed (documented behavior)."""
     async def run():

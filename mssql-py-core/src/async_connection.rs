@@ -347,7 +347,11 @@ impl PyAsyncConnection {
     /// True after `close()` has been called. Cheap LBYL check; performs no I/O.
     #[getter]
     fn closed(&self) -> bool {
-        self.tds_client.is_none() || self.session_state.ensure_open().is_err()
+        self.tds_client.is_none()
+            || matches!(
+                self.session_state.ensure_open(),
+                Err(ClaimError::Closing | ClaimError::Closed)
+            )
     }
 
     /// Inverse of `.closed`, provided for sync-path parity with `PyCoreConnection`.
@@ -450,10 +454,10 @@ impl PyAsyncConnection {
         let operation_id = state
             .claim_connection_operation()
             .map_err(map_claim_error)?;
-        let guard = ConnectionOperationGuard::new(state.clone(), operation_id);
+        let future_state = state.clone();
         let dispatch = self.tracing_dispatch.clone();
         let future = async move {
-            let mut guard = guard;
+            let mut guard = ConnectionOperationGuard::new(future_state, operation_id);
             let mut client = client
                 .lock_operation(operation_id)
                 .await
@@ -483,10 +487,18 @@ impl PyAsyncConnection {
             result?;
             Python::attach(|py| Ok(py.None()))
         };
-        pyo3_async_runtimes::tokio::future_into_py(
+        match pyo3_async_runtimes::tokio::future_into_py(
             py,
-            state.run_tracked(with_optional_dispatch(future, dispatch)),
-        )
+            state
+                .clone()
+                .run_tracked(with_optional_dispatch(future, dispatch)),
+        ) {
+            Ok(awaitable) => Ok(awaitable),
+            Err(error) => {
+                state.release_operation(operation_id);
+                Err(error)
+            }
+        }
     }
 
     fn close_awaitable<'py>(

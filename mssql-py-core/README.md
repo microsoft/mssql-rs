@@ -53,6 +53,8 @@ For SDK authors integrating the native runtime:
   enable connection pooling.
 - Cancelling `executemany` during parameter binding leaves the connection and
   existing transaction usable.
+- A broken connection still needs `await connection.close()`. The `closed`
+  property indicates teardown, not whether the connection is healthy.
 - [Connection settings](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md#connection-policy-and-migration)
   for native connection options and defaults.
 - [Bulk-copy behavior](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/docs/bulk-copy.md)
