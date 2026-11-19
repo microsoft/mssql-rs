@@ -635,10 +635,14 @@ def test_executemany_preflight_yields_to_event_loop(mock_client_context):
     asyncio.run(run())
 
 
-def test_executemany_preflight_cancellation_keeps_session_usable(mock_client_context):
+@pytest.mark.parametrize(
+    "context_fixture",
+    ["mock_client_context", pytest.param("client_context", marks=pytest.mark.integration)],
+)
+def test_executemany_preflight_cancellation_keeps_session_usable(request, context_fixture):
     async def run():
         logger = RecordingLogger()
-        conn = await connect(mock_client_context, logger)
+        conn = await connect(request.getfixturevalue(context_fixture), logger)
         try:
             cursor = conn.cursor()
             logger.events.clear()
@@ -661,6 +665,49 @@ def test_executemany_preflight_cancellation_keeps_session_usable(mock_client_con
             )
         finally:
             await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("completion", ["commit", "context_exit"])
+def test_cancelled_executemany_preflight_preserves_transaction(client_context, completion):
+    async def run():
+        table = f"##aqe_b3_preflight_{uuid.uuid4().hex}"
+        observer = await connect(client_context)
+        probe = observer.cursor()
+        worker = None
+        started = threading.Event()
+
+        def rows():
+            started.set()
+            yield from itertools.repeat((1,))
+
+        async def wait_for_preflight():
+            while not started.is_set():
+                await asyncio.sleep(0)
+
+        try:
+            await execute(probe, f"CREATE TABLE {table} (value int)")
+            worker = await connect(client_context, autocommit=False)
+            async with worker:
+                cursor = worker.cursor()
+                await execute(cursor, f"INSERT INTO {table} VALUES (1)")
+                task = asyncio.ensure_future(cursor.executemany("SELECT ?", rows()))
+                await asyncio.wait_for(wait_for_preflight(), 5)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert await execute(cursor, "SET NOCOUNT ON") is cursor
+                if completion == "commit":
+                    await worker.commit()
+            await execute(probe, f"SELECT COUNT(*) FROM {table}")
+            assert await probe.fetchall() == [(1,)]
+        finally:
+            if worker is not None and not worker.closed:
+                await worker.close()
+            await probe.close()
+            await observer.close()
 
     asyncio.run(run())
 

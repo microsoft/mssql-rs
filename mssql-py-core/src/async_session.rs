@@ -105,13 +105,16 @@ pub(crate) struct AsyncConnectionState {
 struct TaskCancellation {
     state: Arc<AsyncConnectionState>,
     abort: AbortHandle,
+    poison_on_cancel: bool,
     completed: bool,
 }
 
 impl Drop for TaskCancellation {
     fn drop(&mut self) {
         if !self.completed {
-            self.state.mark_broken();
+            if self.poison_on_cancel {
+                self.state.mark_broken();
+            }
             self.abort.abort();
         }
     }
@@ -217,12 +220,34 @@ impl AsyncConnectionState {
         F: Future<Output = PyResult<T>> + Send + 'static,
         T: Send + 'static,
     {
+        self.run_tracked_inner(future, true).await
+    }
+
+    /// Preflight has no session claim; its operation guard owns later interruption.
+    pub(crate) async fn run_tracked_preflight<F, T>(self: Arc<Self>, future: F) -> PyResult<T>
+    where
+        F: Future<Output = PyResult<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.run_tracked_inner(future, false).await
+    }
+
+    async fn run_tracked_inner<F, T>(
+        self: Arc<Self>,
+        future: F,
+        poison_on_cancel: bool,
+    ) -> PyResult<T>
+    where
+        F: Future<Output = PyResult<T>> + Send + 'static,
+        T: Send + 'static,
+    {
         let (receiver, abort) = self.spawn_task(future).map_err(|error| {
             map_connection_claim(error, "Connection is busy with another operation")
         })?;
         let mut cancellation = TaskCancellation {
             state: self,
             abort,
+            poison_on_cancel,
             completed: false,
         };
         let result = receiver.await.map_err(|_| {
@@ -595,6 +620,7 @@ mod tests {
 
     use super::{
         AsyncConnectionState, ClaimError, ConnectionLifecycle, FetchCompletion, OperationPhase,
+        SessionOperationGuard,
     };
 
     #[test]
@@ -603,6 +629,43 @@ mod tests {
 
         assert_eq!(state.allocate_cursor_id(), 1);
         assert_eq!(state.allocate_cursor_id(), 2);
+    }
+
+    #[tokio::test]
+    async fn preflight_cancellation_only_breaks_after_its_own_claim() {
+        for (claim_before_cancel, unrelated_operation) in
+            [(false, false), (false, true), (true, false)]
+        {
+            let state = Arc::new(AsyncConnectionState::new());
+            let previous = unrelated_operation.then(|| state.claim_execute(2).unwrap());
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let task_state = state.clone();
+            let task = tokio::spawn(state.clone().run_tracked_preflight(async move {
+                let guard = claim_before_cancel.then(|| {
+                    let claim = task_state.claim_execute(1).unwrap();
+                    SessionOperationGuard::new(task_state, claim.operation_id)
+                });
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+                drop(guard);
+                Ok(())
+            }));
+            ready.await.unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+
+            let mut tasks = std::mem::take(&mut state.lock().tasks);
+            while let Some(result) = tasks.join_next().await {
+                assert!(result.unwrap_err().is_cancelled());
+            }
+            assert_eq!(state.is_broken(), claim_before_cancel);
+            assert_eq!(state.must_discard(), claim_before_cancel);
+            if let Some(previous) = previous {
+                assert_eq!(state.validate_operation(previous.operation_id), Ok(()));
+            } else if !claim_before_cancel {
+                assert!(state.claim_execute(1).is_ok());
+            }
+        }
     }
 
     #[test]

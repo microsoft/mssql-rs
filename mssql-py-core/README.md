@@ -51,6 +51,8 @@ For SDK authors integrating the native runtime:
   is discarded, and a clean exit requiring commit reports failure. Cursor
   finalization racing close preserves the same transaction intent. This does not
   enable connection pooling.
+- Cancelling `executemany` during parameter binding leaves the connection and
+  existing transaction usable.
 - [Connection settings](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md#connection-policy-and-migration)
   for native connection options and defaults.
 - [Bulk-copy behavior](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/docs/bulk-copy.md)

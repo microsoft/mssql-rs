@@ -104,8 +104,12 @@ impl LogicalConnection {
             let settled = timeout_at(deadline, async {
                 while let Some(result) = tasks.join_next().await {
                     if let Err(error) = result {
-                        connection.state.mark_broken();
-                        tracing::warn!(%error, "Async operation interrupted during close");
+                        if error.is_cancelled() {
+                            tracing::debug!(%error, "Joining cancelled async operation during close");
+                        } else {
+                            connection.state.mark_broken();
+                            tracing::warn!(%error, "Async operation interrupted during close");
+                        }
                     }
                 }
             })
@@ -452,6 +456,30 @@ mod tests {
         assert!(transport.lock().unwrap().is_empty());
         connection.state.mark_broken();
         assert_eq!(connection.state.ensure_open(), Err(ClaimError::Closed));
+    }
+
+    #[tokio::test]
+    async fn cancelled_preflight_does_not_break_clean_close() {
+        let (connection, transport) = connection();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let pending = tokio::spawn(connection.state.clone().run_tracked_preflight(async move {
+            started.send(()).unwrap();
+            std::future::pending::<PyResult<()>>().await
+        }));
+        ready.await.unwrap();
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+
+        LogicalConnection::wait_closed(connection.start_close(
+            CloseMode::Commit,
+            CLOSE_TIMEOUT,
+            None,
+        ))
+        .await
+        .unwrap();
+        assert!(!connection.state.is_broken());
+        assert!(connection.handle.lock().await.is_none());
+        assert_eq!(Arc::strong_count(&transport), 1);
     }
 
     #[tokio::test]

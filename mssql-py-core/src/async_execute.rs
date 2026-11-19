@@ -1071,7 +1071,7 @@ pub(crate) fn executemany<'py>(
         }
     };
 
-    pyo3_async_runtimes::tokio::future_into_py(py, task_state.run_tracked(future))
+    pyo3_async_runtimes::tokio::future_into_py(py, task_state.run_tracked_preflight(future))
 }
 
 #[cfg(test)]
