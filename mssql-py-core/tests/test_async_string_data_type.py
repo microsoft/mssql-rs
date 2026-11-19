@@ -45,6 +45,7 @@ import uuid
 import warnings
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 
 import mssql_py_core
 import pytest
@@ -272,6 +273,36 @@ async def wait_for_lock_wait(cursor, session_id, pending):
         assert not pending.done(), "Query ended before reaching its lock wait"
         await asyncio.sleep(0.01)
     pytest.fail("Query did not reach its server-side lock wait")
+
+
+@asynccontextmanager
+async def locked_string_table(client_context):
+    conn = await connect(client_context)
+    async with conn:
+        control = conn.cursor()
+        table = f"##async_strings_{uuid.uuid4().hex}"
+        await control.execute(
+            f"CREATE TABLE {table} (id int PRIMARY KEY)", use_prepare=False
+        )
+        try:
+            await control.execute(
+                f"INSERT INTO {table} VALUES (1)", use_prepare=False
+            )
+            await control.execute(
+                f"BEGIN TRANSACTION; SELECT id FROM {table} WITH (TABLOCKX, HOLDLOCK)",
+                use_prepare=False,
+            )
+            assert await control.fetchall() == [(1,)]
+            yield control, table
+        finally:
+            try:
+                await control.execute(
+                    "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION", use_prepare=False
+                )
+            finally:
+                await control.execute(
+                    f"DROP TABLE IF EXISTS {table}", use_prepare=False
+                )
 
 
 def test_delayed_string_query_allows_independent_completion(client_context, use_prepare):
@@ -687,7 +718,6 @@ def test_string_ownership_survives_await_and_connection_close(
             parameters[0] = value
             parameters.extend(["replacement"] * 64)
             del value, parameters
-            assert not (await asyncio.wait([pending], timeout=0.01))[0]
             assert await pending is cursor
             row = await cursor.fetchone()
             assert await cursor.fetchone() is None
@@ -704,44 +734,53 @@ def test_dropped_execute_future_preserves_string_and_releases_resources(
     client_context, use_prepare
 ):
     async def run():
-        conn = await connect(client_context)
-        try:
-            cursor = conn.cursor()
-            await cursor.execute(
-                "CREATE TABLE #async_strings (value nvarchar(max))",
-                use_prepare=False,
-            )
-            sample = "\u6f22\U0001f600e\u0301\x00"
-            value = sample * 65536 + "tail"
-            parameters = [value]
-            pending = cursor.execute(
-                "WAITFOR DELAY '00:00:00.200'; INSERT INTO #async_strings VALUES (?)",
-                parameters,
-                use_prepare=use_prepare,
-            )
-            del value, parameters
-            assert not (await asyncio.wait([pending], timeout=0.01))[0]
-            reference = weakref.ref(pending)
-            del pending
-            gc.collect()
+        async with locked_string_table(client_context) as (control, table):
+            conn = await connect(client_context)
+            try:
+                cursor = conn.cursor()
+                await cursor.execute(
+                    "CREATE TABLE #async_strings (value nvarchar(max))",
+                    use_prepare=False,
+                )
+                await cursor.execute("SELECT @@SPID", use_prepare=False)
+                [(session_id,)] = await cursor.fetchall()
+                sample = "\u6f22\U0001f600e\u0301\x00"
+                value = sample * 65536 + "tail"
+                parameters = [value]
+                try:
+                    pending = cursor.execute(
+                        f"UPDATE {table} SET id = id WHERE id = 1; "
+                        "INSERT INTO #async_strings VALUES (?)",
+                        parameters,
+                        use_prepare=use_prepare,
+                    )
+                    del value, parameters
+                    await wait_for_lock_wait(control, session_id, pending)
+                    reference = weakref.ref(pending)
+                    del pending
+                    gc.collect()
+                finally:
+                    await control.execute(
+                        "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION", use_prepare=False
+                    )
 
-            for _ in range(600):
-                if reference() is None:
-                    break
-                await asyncio.sleep(0.01)
-            else:
-                pytest.fail("Abandoned execute future was not released after completion")
+                for _ in range(600):
+                    if reference() is None:
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    pytest.fail("Abandoned execute future was not released after completion")
 
-            await cursor.execute(
-                "SELECT value, DATALENGTH(value) FROM #async_strings",
-                use_prepare=use_prepare,
-            )
-            expected = sample * 65536 + "tail"
-            assert await cursor.fetchall() == [
-                (expected, len(expected.encode("utf-16-le")))
-            ]
-        finally:
-            await conn.close()
+                await cursor.execute(
+                    "SELECT value, DATALENGTH(value) FROM #async_strings",
+                    use_prepare=use_prepare,
+                )
+                expected = sample * 65536 + "tail"
+                assert await cursor.fetchall() == [
+                    (expected, len(expected.encode("utf-16-le")))
+                ]
+            finally:
+                await conn.close()
 
     asyncio.run(run())
 
@@ -751,56 +790,86 @@ def test_cancelled_execute_with_large_string_closes_safely(client_context, use_p
         independent = await connect(client_context)
         async with independent:
             independent_cursor = independent.cursor()
+            await independent_cursor.execute("SELECT @@SPID", use_prepare=False)
+            [(independent_session_id,)] = await independent_cursor.fetchall()
             references = []
             for cycle in range(3):
-                conn = await connect(client_context)
-                async with conn:
-                    cursor = conn.cursor()
-                    value = "\u6f22\U0001f600e\u0301\x00" * 65536
-                    parameters = [value]
-                    pending = cursor.execute(
-                        "WAITFOR DELAY '00:00:02'; SELECT CAST(? AS nvarchar(max))",
-                        parameters,
-                        use_prepare=use_prepare,
-                    )
-                    marker = f"independent-{cycle}:\u4f60\u597d"
-                    other = independent_cursor.execute(
-                        "WAITFOR DELAY '00:00:00.200'; SELECT CAST(? AS nvarchar(64))",
-                        marker,
-                        use_prepare=use_prepare,
-                    )
-                    assert not (await asyncio.wait([pending], timeout=0.01))[0]
-                    del value, parameters
-                    assert pending.cancel()
-                    assert not pending.cancel()
-                    with pytest.raises(asyncio.CancelledError):
-                        await pending
-
-                    for _ in range(100):
+                async with locked_string_table(client_context) as (control, table):
+                    conn = await connect(client_context)
+                    async with conn:
+                        cursor = conn.cursor()
+                        await cursor.execute("SELECT @@SPID", use_prepare=False)
+                        [(session_id,)] = await cursor.fetchall()
+                        pending = None
+                        other = None
                         try:
-                            await cursor.execute(
-                                "SELECT N'after cancellation'", use_prepare=use_prepare
-                            )
-                        except RuntimeError as error:
-                            if "busy" not in str(error).lower():
-                                assert str(error) == "Connection is broken"
-                                break
-                            await asyncio.sleep(0.01)
-                        else:
-                            pytest.fail("Cancelled execute left the connection reusable")
-                    else:
-                        pytest.fail("Cancelled execute left the connection permanently busy")
+                            try:
+                                value = "\u6f22\U0001f600e\u0301\x00" * 65536
+                                parameters = [value]
+                                pending = cursor.execute(
+                                    f"UPDATE {table} SET id = id WHERE id = 1; "
+                                    "SELECT CAST(? AS nvarchar(max))",
+                                    parameters,
+                                    use_prepare=use_prepare,
+                                )
+                                marker = f"independent-{cycle}:\u4f60\u597d"
+                                other = independent_cursor.execute(
+                                    f"UPDATE {table} SET id = id WHERE id = 1; "
+                                    "SELECT CAST(? AS nvarchar(64))",
+                                    marker,
+                                    use_prepare=use_prepare,
+                                )
+                                await wait_for_lock_wait(control, session_id, pending)
+                                await wait_for_lock_wait(
+                                    control, independent_session_id, other
+                                )
+                                del value, parameters
+                                assert pending.cancel()
+                                assert not pending.cancel()
+                                with pytest.raises(asyncio.CancelledError):
+                                    await pending
 
-                    assert await other is independent_cursor
-                    assert await independent_cursor.fetchall() == [(marker,)]
-                    await conn.close()
-                    assert conn.closed
-                    with pytest.raises(RuntimeError, match="Connection is closed"):
-                        await cursor.execute(
-                            "SELECT N'after close'", use_prepare=use_prepare
-                        )
-                    references.append(weakref.ref(pending))
-                    del pending
+                                for _ in range(100):
+                                    try:
+                                        await cursor.execute(
+                                            "SELECT N'after cancellation'", use_prepare=use_prepare
+                                        )
+                                    except RuntimeError as error:
+                                        if "busy" not in str(error).lower():
+                                            assert str(error) == "Connection is broken"
+                                            break
+                                        await asyncio.sleep(0.01)
+                                    else:
+                                        pytest.fail("Cancelled execute left the connection reusable")
+                                else:
+                                    pytest.fail("Cancelled execute left the connection permanently busy")
+                                assert not other.done()
+                            finally:
+                                await control.execute(
+                                    "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION", use_prepare=False
+                                )
+
+                            assert await other is independent_cursor
+                            if independent_cursor.description is None:
+                                assert await independent_cursor.nextset() is True
+                            assert await independent_cursor.fetchall() == [(marker,)]
+                            await conn.close()
+                            assert conn.closed
+                            with pytest.raises(RuntimeError, match="Connection is closed"):
+                                await cursor.execute(
+                                    "SELECT N'after close'", use_prepare=use_prepare
+                                )
+                            references.append(weakref.ref(pending))
+                        finally:
+                            try:
+                                if pending is not None and not pending.done():
+                                    pending.cancel()
+                                    with pytest.raises(asyncio.CancelledError):
+                                        await pending
+                            finally:
+                                if other is not None:
+                                    await other
+                        del pending, other
 
             gc.collect()
             for _ in range(600):
@@ -817,33 +886,45 @@ def test_cancel_after_completion_does_not_cancel_next_string_query(
     client_context, use_prepare
 ):
     async def run():
-        conn = await connect(client_context)
-        async with conn:
-            cursor = conn.cursor()
-            completed_execute = cursor.execute(
-                "SELECT CAST(? AS nvarchar(max))",
-                "completed:\u6f22\U0001f600",
-                use_prepare=use_prepare,
-            )
-            assert await completed_execute is cursor
-            completed_fetch = cursor.fetchall()
-            assert await completed_fetch == [("completed:\u6f22\U0001f600",)]
-
-            value = "next:\u6f22\U0001f600\x00" * 4097
-            pending = cursor.execute(
-                "WAITFOR DELAY '00:00:00.200'; SELECT CAST(? AS nvarchar(max))",
-                value,
-                use_prepare=use_prepare,
-            )
-            try:
-                assert not (await asyncio.wait([pending], timeout=0.01))[0]
-                assert not completed_execute.cancel()
-                assert not completed_fetch.cancel()
-                assert await pending is cursor
-                assert await cursor.fetchall() == [(value,)]
+        async with locked_string_table(client_context) as (control, table):
+            conn = await connect(client_context)
+            async with conn:
+                cursor = conn.cursor()
+                await cursor.execute("SELECT @@SPID", use_prepare=False)
+                [(session_id,)] = await cursor.fetchall()
+                completed_execute = cursor.execute(
+                    "SELECT CAST(? AS nvarchar(max))",
+                    "completed:\u6f22\U0001f600",
+                    use_prepare=use_prepare,
+                )
+                assert await completed_execute is cursor
+                completed_fetch = cursor.fetchall()
                 assert await completed_fetch == [("completed:\u6f22\U0001f600",)]
-            finally:
-                await pending
+
+                value = "next:\u6f22\U0001f600\x00" * 4097
+                pending = cursor.execute(
+                    f"UPDATE {table} SET id = id WHERE id = 1; "
+                    "SELECT CAST(? AS nvarchar(max))",
+                    value,
+                    use_prepare=use_prepare,
+                )
+                try:
+                    try:
+                        await wait_for_lock_wait(control, session_id, pending)
+                        assert not completed_execute.cancel()
+                        assert not completed_fetch.cancel()
+                        assert not pending.done()
+                    finally:
+                        await control.execute(
+                            "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION", use_prepare=False
+                        )
+                    assert await pending is cursor
+                    if cursor.description is None:
+                        assert await cursor.nextset() is True
+                    assert await cursor.fetchall() == [(value,)]
+                    assert await completed_fetch == [("completed:\u6f22\U0001f600",)]
+                finally:
+                    await pending
 
     asyncio.run(run())
 
@@ -1050,30 +1131,42 @@ def test_dropped_connection_reference_keeps_pending_string_valid(
     client_context, use_prepare
 ):
     async def run():
-        conn = await connect(client_context)
-        cursor = conn.cursor()
-        pending = None
-        try:
-            sample = "\u6f22\U0001f600e\u0301\x00"
-            value = sample * 65536 + "tail"
-            parameters = [value]
-            pending = cursor.execute(
-                "WAITFOR DELAY '00:00:00.200'; SELECT CAST(? AS nvarchar(max))",
-                parameters,
-                use_prepare=use_prepare,
-            )
-            del conn, value, parameters
-            gc.collect()
-
-            assert not (await asyncio.wait([pending], timeout=0.01))[0]
-            assert await pending is cursor
-            assert await cursor.fetchall() == [(sample * 65536 + "tail",)]
-        finally:
+        async with locked_string_table(client_context) as (control, table):
+            conn = await connect(client_context)
+            cursor = conn.cursor()
+            pending = None
             try:
-                if pending is not None:
-                    await pending
+                try:
+                    await cursor.execute("SELECT @@SPID", use_prepare=False)
+                    [(session_id,)] = await cursor.fetchall()
+                    sample = "\u6f22\U0001f600e\u0301\x00"
+                    value = sample * 65536 + "tail"
+                    parameters = [value]
+                    pending = cursor.execute(
+                        f"UPDATE {table} SET id = id WHERE id = 1; "
+                        "SELECT CAST(? AS nvarchar(max))",
+                        parameters,
+                        use_prepare=use_prepare,
+                    )
+                    del conn, value, parameters
+                    gc.collect()
+
+                    await wait_for_lock_wait(control, session_id, pending)
+                    assert not pending.done()
+                finally:
+                    await control.execute(
+                        "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION", use_prepare=False
+                    )
+                assert await pending is cursor
+                if cursor.description is None:
+                    assert await cursor.nextset() is True
+                assert await cursor.fetchall() == [(sample * 65536 + "tail",)]
             finally:
-                await cursor.close()
+                try:
+                    if pending is not None:
+                        await pending
+                finally:
+                    await cursor.close()
 
     asyncio.run(run())
 
@@ -1759,7 +1852,19 @@ def test_100_concurrent_string_queries(client_context, use_prepare):
                     asyncio.create_task(worker(worker_id))
                     for worker_id in range(worker_count)
                 ]
-                await asyncio.wait_for(dispatched.wait(), timeout=45)
+                waiter = asyncio.create_task(dispatched.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        [waiter, *tasks],
+                        timeout=45,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in done - {waiter}:
+                        task.result()
+                    assert waiter in done, "Not all workers dispatched their queries"
+                finally:
+                    waiter.cancel()
+                    await asyncio.gather(waiter, return_exceptions=True)
                 assert issued == worker_count
                 assert all(not task.done() for task in tasks)
 
@@ -1786,38 +1891,51 @@ def test_100_concurrent_string_queries(client_context, use_prepare):
 @pytest.mark.parametrize("same_cursor", [False, True], ids=["other-cursor", "same-cursor"])
 def test_overlapping_string_execute_is_rejected(client_context, use_prepare, same_cursor):
     async def run():
-        conn = await connect(client_context)
-        async with conn:
-            owner = conn.cursor()
-            contender = owner if same_cursor else conn.cursor()
-            statement = (
-                "WAITFOR DELAY '00:00:00.200'; SELECT CAST(? AS nvarchar(max))"
-            )
-            original = "original:\u6f22\U0001f600\x00" * 2048
-            replacement = "after rejection:\u0928\u4f60\U0001f680"
-            pending = owner.execute(statement, original, use_prepare=use_prepare)
-            try:
-                assert not (await asyncio.wait([pending], timeout=0.01))[0]
-                with pytest.raises(RuntimeError, match="busy with another cursor operation"):
-                    await contender.execute(
+        async with locked_string_table(client_context) as (control, table):
+            conn = await connect(client_context)
+            async with conn:
+                owner = conn.cursor()
+                contender = owner if same_cursor else conn.cursor()
+                await owner.execute("SELECT @@SPID", use_prepare=False)
+                [(session_id,)] = await owner.fetchall()
+                statement = (
+                    f"UPDATE {table} SET id = id WHERE id = 1; "
+                    "SELECT CAST(? AS nvarchar(max))"
+                )
+                original = "original:\u6f22\U0001f600\x00" * 2048
+                replacement = "after rejection:\u0928\u4f60\U0001f680"
+                pending = owner.execute(statement, original, use_prepare=use_prepare)
+                try:
+                    try:
+                        await wait_for_lock_wait(control, session_id, pending)
+                        with pytest.raises(RuntimeError, match="busy with another cursor operation"):
+                            await contender.execute(
+                                statement,
+                                replacement,
+                                use_prepare=use_prepare,
+                                reset_cursor=False,
+                            )
+                    finally:
+                        await control.execute(
+                            "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION", use_prepare=False
+                        )
+                    assert await pending is owner
+                    if owner.description is None:
+                        assert await owner.nextset() is True
+                    assert await owner.fetchall() == [(original,)]
+                    assert await owner.nextset() is False
+
+                    assert await contender.execute(
                         statement,
                         replacement,
                         use_prepare=use_prepare,
                         reset_cursor=False,
-                    )
-                assert await pending is owner
-                assert await owner.fetchall() == [(original,)]
-                assert await owner.nextset() is False
-
-                assert await contender.execute(
-                    statement,
-                    replacement,
-                    use_prepare=use_prepare,
-                    reset_cursor=False,
-                ) is contender
-                assert await contender.fetchall() == [(replacement,)]
-            finally:
-                await pending
+                    ) is contender
+                    if contender.description is None:
+                        assert await contender.nextset() is True
+                    assert await contender.fetchall() == [(replacement,)]
+                finally:
+                    await pending
 
     asyncio.run(run())
 
