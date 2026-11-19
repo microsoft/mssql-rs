@@ -192,10 +192,11 @@ impl AsyncConnectionState {
             ConnectionLifecycle::Closed => return Err(ClaimError::Closed),
             ConnectionLifecycle::Broken => return Err(ClaimError::Broken),
         }
+        let mut task_errors = Vec::new();
         while let Some(result) = state.tasks.try_join_next() {
             if let Err(error) = result {
                 self.discard.store(true, Ordering::Release);
-                tracing::warn!(%error, "Async connection task did not complete");
+                task_errors.push(error);
             }
         }
         let (sender, receiver) = oneshot::channel();
@@ -212,6 +213,11 @@ impl AsyncConnectionState {
             },
             pyo3_async_runtimes::tokio::get_runtime().handle(),
         );
+        // Python logger callbacks can re-enter this connection.
+        drop(state);
+        for error in task_errors {
+            tracing::warn!(%error, "Async connection task did not complete");
+        }
         Ok((receiver, abort))
     }
 
@@ -635,6 +641,10 @@ impl AsyncConnectionState {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
     use super::{
         AsyncConnectionState, ClaimError, ConnectionLifecycle, FetchCompletion, OperationPhase,
@@ -647,6 +657,42 @@ mod tests {
 
         assert_eq!(state.allocate_cursor_id(), 1);
         assert_eq!(state.allocate_cursor_id(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_task_diagnostics_allow_session_reentry() {
+        struct CheckUnlocked {
+            state: Arc<AsyncConnectionState>,
+            observed: Arc<AtomicBool>,
+        }
+
+        impl<S: Subscriber> Layer<S> for CheckUnlocked {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    assert!(self.state.inner.try_lock().is_ok());
+                    self.observed.store(true, Ordering::Release);
+                }
+            }
+        }
+
+        let state = Arc::new(AsyncConnectionState::new());
+        let (receiver, abort) = state.spawn_task(std::future::pending::<()>()).unwrap();
+        abort.abort();
+        assert!(receiver.await.is_err());
+        while !abort.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let observed = Arc::new(AtomicBool::new(false));
+        let subscriber = tracing_subscriber::Registry::default().with(CheckUnlocked {
+            state: state.clone(),
+            observed: observed.clone(),
+        });
+        let (receiver, _) =
+            tracing::subscriber::with_default(subscriber, || state.spawn_task(async {})).unwrap();
+        receiver.await.unwrap();
+        assert!(observed.load(Ordering::Acquire));
+        assert!(state.must_discard());
+        assert_eq!(state.ensure_open(), Ok(()));
     }
 
     #[tokio::test]
