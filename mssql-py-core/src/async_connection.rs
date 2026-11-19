@@ -451,7 +451,7 @@ impl PyAsyncConnection {
             .ok_or_else(|| InterfaceError::new_err("Connection is closed"))?
             .clone();
         let state = self.session_state.clone();
-        let operation_id = state
+        let (operation_id, previous) = state
             .claim_connection_operation()
             .map_err(map_claim_error)?;
         let future_state = state.clone();
@@ -495,7 +495,7 @@ impl PyAsyncConnection {
         ) {
             Ok(awaitable) => Ok(awaitable),
             Err(error) => {
-                state.release_operation(operation_id);
+                state.restore_connection_operation(operation_id, previous);
                 Err(error)
             }
         }
@@ -558,7 +558,7 @@ mod tests {
             mssql_tds::test_client_support::tds_client_from_tokens_capturing(Vec::new());
         let connection = std::sync::Arc::new(LogicalConnection::new(client));
         let state = connection.state.clone();
-        let operation = state.claim_connection_operation().unwrap();
+        let (operation, _) = state.claim_connection_operation().unwrap();
         let (started, ready) = tokio::sync::oneshot::channel();
         let (release, wait) = tokio::sync::oneshot::channel();
         let worker = connection.clone();

@@ -477,7 +477,7 @@ mod tests {
         let (locked_tx, locked_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
         let holding = runtime.spawn(async move {
-            let operation_id = held_connection.state.claim_connection_operation().unwrap();
+            let (operation_id, _) = held_connection.state.claim_connection_operation().unwrap();
             let held = held_connection.lock_operation(operation_id).await.unwrap();
             held_connection.state.release_operation(operation_id);
             locked_tx.send(()).unwrap();
@@ -633,7 +633,7 @@ asyncio.run(run())
                 None
             } else {
                 state.release_operation(claim.operation_id);
-                Some(state.claim_connection_operation().unwrap())
+                Some(state.claim_connection_operation().unwrap().0)
             };
 
             let (error, info_messages) = cursor.cleanup().run(claim).await.unwrap_err();

@@ -357,7 +357,9 @@ impl AsyncConnectionState {
         })
     }
 
-    pub(crate) fn claim_connection_operation(&self) -> Result<OperationId, ClaimError> {
+    pub(crate) fn claim_connection_operation(
+        &self,
+    ) -> Result<(OperationId, Option<ActiveOperation>), ClaimError> {
         let mut state = self.lock();
         match state.lifecycle {
             ConnectionLifecycle::Open => {}
@@ -374,7 +376,7 @@ impl AsyncConnectionState {
         }
 
         let operation_id = self.allocate_operation_id();
-        state.active_operation = Some(ActiveOperation {
+        let previous = state.active_operation.replace(ActiveOperation {
             cursor_id: None,
             operation_id,
             fetch_id: None,
@@ -382,7 +384,23 @@ impl AsyncConnectionState {
             cancel_handle: None,
             cancel_requested: false,
         });
-        Ok(operation_id)
+        Ok((operation_id, previous))
+    }
+
+    pub(crate) fn restore_connection_operation(
+        &self,
+        operation_id: OperationId,
+        previous: Option<ActiveOperation>,
+    ) {
+        let mut state = self.lock();
+        if state.lifecycle == ConnectionLifecycle::Open
+            && state
+                .active_operation
+                .as_ref()
+                .is_some_and(|active| active.operation_id == operation_id)
+        {
+            state.active_operation = previous;
+        }
     }
 
     pub(crate) fn claim_fetch(&self, cursor_id: CursorId) -> Result<FetchClaim, ClaimError> {
@@ -721,9 +739,42 @@ mod tests {
         );
         state.release_operation(execute.operation_id);
 
-        let connection_operation = state.claim_connection_operation().unwrap();
+        let (connection_operation, _) = state.claim_connection_operation().unwrap();
         assert_eq!(state.claim_execute(1).unwrap_err(), ClaimError::Busy);
         state.release_operation(connection_operation);
+    }
+
+    #[test]
+    fn failed_connection_construction_restores_only_its_displaced_owner() {
+        for interrupted in [false, true] {
+            let state = AsyncConnectionState::new();
+            let execute = state.claim_execute(1).unwrap();
+            state.finish_execute(execute.operation_id, true);
+            let (operation, previous) = state.claim_connection_operation().unwrap();
+            let replacement = if interrupted {
+                state.release_operation(operation);
+                Some(state.claim_execute(2).unwrap())
+            } else {
+                None
+            };
+            state.restore_connection_operation(operation, previous);
+
+            if let Some(replacement) = replacement {
+                assert!(state.validate_operation(replacement.operation_id).is_ok());
+                assert_eq!(state.claim_fetch(1).unwrap_err(), ClaimError::Busy);
+            } else {
+                let fetch = state.claim_fetch(1).unwrap();
+                assert_eq!(fetch.operation_id, execute.operation_id);
+            }
+        }
+
+        let state = AsyncConnectionState::new();
+        let execute = state.claim_execute(1).unwrap();
+        state.finish_execute(execute.operation_id, true);
+        let (operation, previous) = state.claim_connection_operation().unwrap();
+        state.begin_close();
+        state.restore_connection_operation(operation, previous);
+        assert_eq!(state.claim_fetch(1).unwrap_err(), ClaimError::Closing);
     }
 
     #[test]

@@ -55,6 +55,8 @@ For SDK authors integrating the native runtime:
   existing transaction usable.
 - A broken connection still needs `await connection.close()`. The `closed`
   property indicates teardown, not whether the connection is healthy.
+- If creating a `commit()` or `rollback()` awaitable fails before native work
+  starts, pending transactions and unread cursor results remain available.
 - [Connection settings](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md#connection-policy-and-migration)
   for native connection options and defaults.
 - [Bulk-copy behavior](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/docs/bulk-copy.md)

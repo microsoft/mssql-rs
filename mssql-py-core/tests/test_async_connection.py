@@ -483,11 +483,15 @@ def test_failed_transaction_awaitable_construction_preserves_pending_work(
         )
         cursor = worker.cursor()
         await cursor.execute(f"INSERT INTO {table} VALUES (1)", use_prepare=False)
+        await cursor.execute(
+            "SELECT 10 AS value UNION ALL SELECT 20 AS value", use_prepare=False
+        )
         return observer, probe, worker, cursor
 
     observer, probe, worker, cursor = asyncio.run(setup())
 
     async def verify():
+        assert await cursor.fetchall() == [(10,), (20,)]
         assert await cursor.execute("SET NOCOUNT ON", use_prepare=False) is cursor
         await worker.commit()
         await probe.execute(f"SELECT COUNT(*) FROM {table}", use_prepare=False)

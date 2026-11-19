@@ -274,7 +274,7 @@ mod tests {
     #[tokio::test]
     async fn valid_operation_borrows_without_transferring_ownership() {
         let (connection, transport) = connection();
-        let operation = connection.state.claim_connection_operation().unwrap();
+        let (operation, _) = connection.state.claim_connection_operation().unwrap();
         let client = connection.lock_operation(operation).await.unwrap();
         assert!(!client.has_open_batch());
         assert_eq!(Arc::strong_count(&transport), 2);
@@ -286,7 +286,7 @@ mod tests {
     #[tokio::test]
     async fn queued_operation_is_rejected_after_close_begins() {
         let (connection, _) = connection();
-        let operation = connection.state.claim_connection_operation().unwrap();
+        let (operation, _) = connection.state.claim_connection_operation().unwrap();
         let held = connection.handle.lock().await;
         let mut queued = Box::pin(connection.lock_operation(operation));
         assert!(matches!(
@@ -303,7 +303,7 @@ mod tests {
     #[tokio::test]
     async fn queued_operation_is_rejected_after_ownership_changes() {
         let (connection, _) = connection();
-        let operation = connection.state.claim_connection_operation().unwrap();
+        let (operation, _) = connection.state.claim_connection_operation().unwrap();
         let held = connection.handle.lock().await;
         let mut queued = Box::pin(connection.lock_operation(operation));
         assert!(matches!(
@@ -313,7 +313,7 @@ mod tests {
             Poll::Pending
         ));
         connection.state.release_operation(operation);
-        let replacement = connection.state.claim_connection_operation().unwrap();
+        let (replacement, _) = connection.state.claim_connection_operation().unwrap();
         drop(held);
         assert!(matches!(queued.await, Err(ClaimError::Busy)));
         assert!(connection.lock_operation(replacement).await.is_ok());
@@ -326,7 +326,7 @@ mod tests {
             connection.lock_operation(0).await,
             Err(ClaimError::Busy)
         ));
-        let operation = connection.state.claim_connection_operation().unwrap();
+        let (operation, _) = connection.state.claim_connection_operation().unwrap();
         connection.state.mark_broken();
         assert!(matches!(
             connection.lock_operation(operation).await,
@@ -342,7 +342,7 @@ mod tests {
     #[tokio::test]
     async fn close_waits_for_the_current_borrow_before_removing_the_handle() {
         let (connection, transport) = connection();
-        let operation = connection.state.claim_connection_operation().unwrap();
+        let (operation, _) = connection.state.claim_connection_operation().unwrap();
         let held = connection.lock_operation(operation).await.unwrap();
         let mut closing = Box::pin(connection.take_for_close());
         assert!(matches!(
@@ -363,7 +363,7 @@ mod tests {
     #[tokio::test]
     async fn closed_cell_cannot_lend_the_removed_client() {
         let (connection, transport) = connection();
-        let operation = connection.state.claim_connection_operation().unwrap();
+        let (operation, _) = connection.state.claim_connection_operation().unwrap();
         let cursor = connection.clone();
         let handle = connection.take_for_close().await.unwrap();
         connection.state.mark_closed();
@@ -429,7 +429,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_close_waits_for_registered_work_even_after_waiter_is_dropped() {
         let (connection, transport) = connection();
-        let operation = connection.state.claim_connection_operation().unwrap();
+        let (operation, _) = connection.state.claim_connection_operation().unwrap();
         let (started, ready) = tokio::sync::oneshot::channel();
         let (release, wait) = tokio::sync::oneshot::channel();
         let worker = connection.clone();
@@ -485,7 +485,7 @@ mod tests {
     #[tokio::test]
     async fn close_timeout_joins_task_destruction_before_reporting_outcome() {
         let (connection, transport) = connection();
-        let operation = connection.state.claim_connection_operation().unwrap();
+        let (operation, _) = connection.state.claim_connection_operation().unwrap();
         let worker = connection.clone();
         let (started, ready) = tokio::sync::oneshot::channel();
         let (result, _) = connection
