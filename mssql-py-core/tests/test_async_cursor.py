@@ -201,7 +201,7 @@ def test_dropped_cursor_with_unread_rows_does_not_leave_connection_busy(
                 probe = conn.cursor()
                 try:
                     await probe.execute("SET NOCOUNT ON", use_prepare=False)
-                except RuntimeError as error:
+                except mssql_py_core.InterfaceError as error:
                     if "busy" in str(error).lower():
                         continue
                     assert "broken" in str(error).lower()
