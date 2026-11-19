@@ -63,6 +63,8 @@
 //! Explicit ordinal mappings must follow destination column order, with source
 //! ordinals starting at zero and no gaps. The streaming row interface cannot
 //! reorder or skip source values. Name-based source mappings are unsupported.
+//! Compatibility and Arrow rows widen integers for wider integer columns and
+//! reject other values incompatible with the destination's wire type.
 //!
 //! # Options
 //!
@@ -213,6 +215,71 @@ fn normalize_adapter_value(
     value: &mut ColumnValues,
     metadata: &BulkCopyColumnMetadata,
 ) -> TdsResult<()> {
+    let widened = match (&*value, metadata.sql_type) {
+        (ColumnValues::TinyInt(v), SqlDbType::SmallInt) => {
+            Some(ColumnValues::SmallInt(i16::from(*v)))
+        }
+        (ColumnValues::TinyInt(v), SqlDbType::Int) => Some(ColumnValues::Int(i32::from(*v))),
+        (ColumnValues::TinyInt(v), SqlDbType::BigInt) => Some(ColumnValues::BigInt(i64::from(*v))),
+        (ColumnValues::SmallInt(v), SqlDbType::Int) => Some(ColumnValues::Int(i32::from(*v))),
+        (ColumnValues::SmallInt(v), SqlDbType::BigInt) => Some(ColumnValues::BigInt(i64::from(*v))),
+        (ColumnValues::Int(v), SqlDbType::BigInt) => Some(ColumnValues::BigInt(i64::from(*v))),
+        _ => None,
+    };
+    if let Some(widened) = widened {
+        *value = widened;
+    }
+
+    let compatible = matches!(
+        (&*value, metadata.sql_type),
+        (ColumnValues::Null, _)
+            | (_, SqlDbType::Variant)
+            | (ColumnValues::TinyInt(_), SqlDbType::TinyInt)
+            | (ColumnValues::SmallInt(_), SqlDbType::SmallInt)
+            | (ColumnValues::Int(_), SqlDbType::Int)
+            | (ColumnValues::BigInt(_), SqlDbType::BigInt)
+            | (ColumnValues::Bit(_), SqlDbType::Bit)
+            | (ColumnValues::Real(_), SqlDbType::Real)
+            | (ColumnValues::Float(_), SqlDbType::Float)
+            | (
+                ColumnValues::Decimal(_) | ColumnValues::Numeric(_),
+                SqlDbType::Decimal | SqlDbType::Numeric
+            )
+            | (ColumnValues::Money(_), SqlDbType::Money)
+            | (ColumnValues::SmallMoney(_), SqlDbType::SmallMoney)
+            | (ColumnValues::Date(_), SqlDbType::Date)
+            | (ColumnValues::Time(_), SqlDbType::Time)
+            | (ColumnValues::DateTime(_), SqlDbType::DateTime)
+            | (ColumnValues::SmallDateTime(_), SqlDbType::SmallDateTime)
+            | (ColumnValues::DateTime2(_), SqlDbType::DateTime2)
+            | (ColumnValues::DateTimeOffset(_), SqlDbType::DateTimeOffset)
+            | (
+                ColumnValues::String(_),
+                SqlDbType::Char
+                    | SqlDbType::VarChar
+                    | SqlDbType::Text
+                    | SqlDbType::NChar
+                    | SqlDbType::NVarChar
+                    | SqlDbType::NText
+                    | SqlDbType::Xml
+                    | SqlDbType::Json
+            )
+            | (
+                ColumnValues::Bytes(_),
+                SqlDbType::Binary | SqlDbType::VarBinary | SqlDbType::Image | SqlDbType::Udt
+            )
+            | (ColumnValues::Xml(_), SqlDbType::Xml)
+            | (ColumnValues::Json(_), SqlDbType::Json)
+            | (ColumnValues::Uuid(_), SqlDbType::UniqueIdentifier)
+            | (ColumnValues::Vector(_), SqlDbType::Vector)
+    ) || (metadata.is_encrypted && matches!(value, ColumnValues::Bytes(_)));
+    if !compatible {
+        return Err(TdsError::TypeConversionError(format!(
+            "Bulk value is incompatible with {:?} destination column '{}'",
+            metadata.sql_type, metadata.column_name
+        )));
+    }
+
     match (value, metadata.sql_type) {
         (ColumnValues::Time(time), SqlDbType::Time)
         | (
@@ -562,6 +629,28 @@ impl<'a> BulkInsert<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_rejects_mismatched_scalars_and_accepts_variants() {
+        let integer = BulkCopyColumnMetadata::new("n", SqlDbType::Int, 0x26);
+        let real = BulkCopyColumnMetadata::new("f", SqlDbType::Real, 0x6d);
+        let variant = BulkCopyColumnMetadata::new("v", SqlDbType::Variant, 0x62);
+        for (mut value, metadata) in [
+            (ColumnValues::Real(1.0), &integer),
+            (ColumnValues::Int(1), &real),
+        ] {
+            assert!(normalize_adapter_value(&mut value, metadata).is_err());
+        }
+        for (mut value, metadata) in [
+            (ColumnValues::Int(1), &integer),
+            (ColumnValues::Real(1.0), &real),
+            (ColumnValues::Null, &integer),
+            (ColumnValues::Real(1.0), &variant),
+            (ColumnValues::Int(1), &variant),
+        ] {
+            normalize_adapter_value(&mut value, metadata).expect("compatible value");
+        }
+    }
 
     #[test]
     fn adapter_decimal_rescaling_is_exact() {

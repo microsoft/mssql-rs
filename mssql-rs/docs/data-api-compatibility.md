@@ -109,6 +109,11 @@ Rows with inconsistent widths are rejected by `send` without changing the
 request. Schema-dependent width, type, and length checks happen during
 `finalize`; recognized input failures surface as `Error::BulkInput`. Dropping
 the request before finalization sends no rows and leaves the connection usable.
+Compatibility and Arrow bulk values must match the destination's wire type;
+incompatible scalar types return a TDS type-conversion error rather than being
+reinterpreted. Narrower integers are widened to the destination integer type.
+SQL `NULL`, `sql_variant`, and string, binary, and decimal wire-compatible
+types remain supported.
 For large inputs, the native `BulkInsert::send` accepts an iterator and streams
 rows instead of retaining the compatibility request's entire input.
 

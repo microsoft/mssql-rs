@@ -16,11 +16,165 @@ use std::sync::{
 };
 
 use arrow_array::{
-    BooleanArray, Date64Array, Decimal128Array, Float64Array, Int32Array, RecordBatch, StringArray,
-    Time64NanosecondArray, TimestampMicrosecondArray,
+    BooleanArray, Date64Array, Decimal128Array, Float32Array, Float64Array, Int16Array, Int32Array,
+    RecordBatch, StringArray, Time64NanosecondArray, TimestampMicrosecondArray, UInt8Array,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use mssql_rs::{Client, IntoRow};
+
+#[tokio::test]
+async fn bulk_adapters_reject_incompatible_scalars() {
+    let cfg = common::live_config_or_exit();
+    for (arrow, real_destination) in [(true, false), (true, true), (false, false), (false, true)] {
+        let mut client = Client::connect(&cfg).await.expect("connect");
+        let sql_type = if real_destination { "REAL" } else { "INT" };
+        client
+            .simple_query(format!("CREATE TABLE #BulkMismatch (v {sql_type})"))
+            .await
+            .expect("create table");
+        let result = if arrow {
+            let (field_type, values): (DataType, Arc<dyn arrow_array::Array>) = if real_destination
+            {
+                (DataType::Int32, Arc::new(Int32Array::from(vec![1])))
+            } else {
+                (DataType::Float32, Arc::new(Float32Array::from(vec![1.0])))
+            };
+            let schema = Arc::new(Schema::new(vec![Field::new("v", field_type, false)]));
+            let batch = RecordBatch::try_new(schema, vec![values]).expect("batch");
+            client
+                .bulk_insert("#BulkMismatch")
+                .send_arrow(batch)
+                .await
+                .map(|_| ())
+        } else {
+            let row = if real_destination {
+                1i32.into_row().expect("row")
+            } else {
+                1.0f32.into_row().expect("row")
+            };
+            let mut request = client
+                .bulk_insert("#BulkMismatch")
+                .await
+                .expect("bulk request");
+            request.send(row).await.expect("buffer row");
+            request.finalize().await.map(|_| ())
+        };
+        assert!(matches!(
+            result,
+            Err(mssql_rs::Error::Tds(
+                mssql_tds::error::Error::TypeConversionError(_)
+            ))
+        ));
+        let rows = client
+            .simple_query("SELECT COUNT(*) AS n FROM #BulkMismatch")
+            .await
+            .expect("query after rejected row")
+            .into_first_result();
+        assert_eq!(rows.first().expect("count").get::<i32, _>("n"), Some(0));
+    }
+}
+
+#[tokio::test]
+async fn bulk_adapters_preserve_matching_null_and_variant_values() {
+    let cfg = common::live_config_or_exit();
+    let mut client = Client::connect(&cfg).await.expect("connect");
+    client
+        .simple_query("CREATE TABLE #BulkScalarControls (n INT, f REAL, v SQL_VARIANT)")
+        .await
+        .expect("create table");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("n", DataType::Int32, true),
+        Field::new("f", DataType::Float32, true),
+        Field::new("v", DataType::Float32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![Some(1), None])),
+            Arc::new(Float32Array::from(vec![Some(1.0), None])),
+            Arc::new(Float32Array::from(vec![Some(1.0), None])),
+        ],
+    )
+    .expect("batch");
+    client
+        .bulk_insert("#BulkScalarControls")
+        .keep_nulls(true)
+        .send_arrow(batch)
+        .await
+        .expect("Arrow insert");
+    let mut request = client
+        .bulk_insert("#BulkScalarControls")
+        .keep_nulls(true)
+        .await
+        .expect("bulk request");
+    request
+        .send((1i32, 1.0f32, 1.0f32).into_row().expect("row"))
+        .await
+        .expect("buffer row");
+    request
+        .send(
+            (None::<i32>, None::<f32>, None::<f32>)
+                .into_row()
+                .expect("null row"),
+        )
+        .await
+        .expect("buffer null row");
+    request.finalize().await.expect("compatibility insert");
+    let rows = client
+        .simple_query(
+            "SELECT COUNT(*) AS n FROM #BulkScalarControls WHERE (n = 1 AND f = 1 AND CONVERT(REAL, v) = 1 AND SQL_VARIANT_PROPERTY(v, 'BaseType') = 'real') OR (n IS NULL AND f IS NULL AND v IS NULL)",
+        )
+        .await
+        .expect("read values")
+        .into_first_result();
+    assert_eq!(rows.first().expect("count").get::<i32, _>("n"), Some(4));
+}
+
+#[tokio::test]
+async fn bulk_adapters_widen_integers_without_losing_sign() {
+    let cfg = common::live_config_or_exit();
+    let mut client = Client::connect(&cfg).await.expect("connect");
+    client
+        .simple_query("CREATE TABLE #BulkIntegerWidths (a SMALLINT, b INT, c BIGINT)")
+        .await
+        .expect("create table");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::UInt8, false),
+        Field::new("b", DataType::Int16, false),
+        Field::new("c", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(UInt8Array::from(vec![123])),
+            Arc::new(Int16Array::from(vec![-123])),
+            Arc::new(Int32Array::from(vec![-123])),
+        ],
+    )
+    .expect("batch");
+    client
+        .bulk_insert("#BulkIntegerWidths")
+        .send_arrow(batch)
+        .await
+        .expect("Arrow insert");
+    let mut request = client
+        .bulk_insert("#BulkIntegerWidths")
+        .await
+        .expect("bulk request");
+    request
+        .send((123u8, -123i16, -123i32).into_row().expect("row"))
+        .await
+        .expect("buffer row");
+    request.finalize().await.expect("compatibility insert");
+    let rows = client
+        .simple_query(
+            "SELECT COUNT(*) AS n FROM #BulkIntegerWidths WHERE a = 123 AND b = -123 AND c = -123",
+        )
+        .await
+        .expect("read values")
+        .into_first_result();
+    assert_eq!(rows.first().expect("count").get::<i32, _>("n"), Some(2));
+}
 
 #[tokio::test]
 async fn bulk_adapter_values_use_destination_scale() {
