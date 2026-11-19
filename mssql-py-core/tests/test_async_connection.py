@@ -245,10 +245,15 @@ def test_connection_operations_reuse_connect_logger(client_context):
 
         logger.messages.clear()
         await conn.close()
-        assert any(
-            "PyAsyncConnection::close: connection closed" in message
-            for message in logger.messages
-        )
+
+        async def wait_for_close_log():
+            while not any(
+                "PyAsyncConnection::close: connection closed" in message
+                for message in logger.messages
+            ):
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_close_log(), 5)
 
     asyncio.run(run())
 
