@@ -5,10 +5,14 @@
 #include "odbc_test_fixture.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <iterator>
+#include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -57,6 +61,112 @@ std::string VarcharQuery(const ServerText& text, const char* type = "varchar(max
     return "SELECT CAST((" + std::string(text.expression) + ") COLLATE " + text.collation +
            " AS " + type + ")";
 }
+
+bool ComparingMsodbcsql() {
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    return target != nullptr && std::string(target) == "msodbcsql";
+}
+
+std::string Utf16ToUtf8(const std::u16string& units) {
+    std::string out;
+    for (size_t i = 0; i < units.size(); ++i) {
+        char32_t cp = units[i];
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < units.size() && units[i + 1] >= 0xDC00 &&
+            units[i + 1] <= 0xDFFF) {
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (units[i + 1] - 0xDC00);
+            ++i;
+        }
+        if (cp < 0x80) {
+            out.push_back(static_cast<char>(cp));
+        } else if (cp < 0x800) {
+            out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else if (cp < 0x10000) {
+            out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else {
+            out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+    }
+    return out;
+}
+
+std::string Hex(const std::string& bytes) {
+    static const char kDigits[] = "0123456789ABCDEF";
+    std::string out;
+    for (const unsigned char byte : bytes) {
+        if (!out.empty()) {
+            out.push_back(' ');
+        }
+        out.push_back(kDigits[byte >> 4]);
+        out.push_back(kDigits[byte & 0xF]);
+    }
+    return out;
+}
+
+constexpr SQLLEN kTextBytes = 1024;
+
+// Returns the problem with a complete text result, or an empty string after
+// storing it as UTF-8 (SQL_C_WCHAR) or client bytes (SQL_C_CHAR) in |value|.
+std::string DecodeText(const SQLWCHAR* buffer, SQLLEN indicator, SQLSMALLINT c_type,
+                       std::string& value) {
+    const SQLLEN unit = c_type == SQL_C_CHAR ? 1 : static_cast<SQLLEN>(sizeof(SQLWCHAR));
+    if (indicator < 0 || indicator % unit != 0 || indicator + unit > kTextBytes) {
+        return "indicator " + std::to_string(indicator);
+    }
+    if (c_type == SQL_C_CHAR) {
+        const char* bytes = reinterpret_cast<const char*>(buffer);
+        if (bytes[indicator] != '\0') {
+            return "missing terminator";
+        }
+        value.assign(bytes, static_cast<size_t>(indicator));
+        return "";
+    }
+    const size_t units = static_cast<size_t>(indicator) / sizeof(SQLWCHAR);
+    if (buffer[units] != 0) {
+        return "missing terminator";
+    }
+    value = Utf16ToUtf8(std::u16string(buffer, buffer + units));
+    return "";
+}
+
+SQLRETURN ExecOn(SQLHSTMT stmt, const std::string& sql) {
+    SqlTString text = ODBCTestUtils::ToSqlTStr(sql);
+    return SQLExecDirect(stmt, const_cast<SQLTCHAR*>(text.c_str()), SQL_NTS);
+}
+
+// Only a successfully created, randomly named database is ever dropped.
+struct PrivateDatabase {
+    SQLHSTMT stmt;
+    std::string name;
+    bool created = false;
+
+    explicit PrivateDatabase(SQLHSTMT statement) : stmt(statement) {
+        std::random_device device;
+        std::mt19937_64 generator(device());
+        char suffix[17] = {};
+        std::snprintf(suffix, sizeof(suffix), "%016llx",
+                      static_cast<unsigned long long>(generator()));
+        name = "odbc_db_collation_" + std::string(suffix);
+    }
+
+    ~PrivateDatabase() {
+        if (!created) {
+            return;
+        }
+        SQLFreeStmt(stmt, SQL_CLOSE);
+        SQLFreeStmt(stmt, SQL_UNBIND);
+        SQLFreeStmt(stmt, SQL_RESET_PARAMS);
+        EXPECT_SQL_OK(ExecOn(stmt, "USE [master]"), SQL_HANDLE_STMT, stmt);
+        SQLFreeStmt(stmt, SQL_CLOSE);
+        EXPECT_SQL_OK(ExecOn(stmt, "DROP DATABASE [" + name + "]"), SQL_HANDLE_STMT, stmt);
+        SQLFreeStmt(stmt, SQL_CLOSE);
+    }
+};
 
 class ClientCodePageTest : public ODBCTest {
 protected:
@@ -149,9 +259,81 @@ protected:
 
     unsigned client_code_page_ = 0;
 
-    SQLRETURN Execute(const std::string& sql) {
-        SqlTString text = ODBCTestUtils::ToSqlTStr(sql);
-        return SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(text.c_str()), SQL_NTS);
+    SQLRETURN Execute(const std::string& sql) { return ExecOn(stmt_, sql); }
+
+    // Reads the first |count| columns of every row as |c_type| through
+    // SQLGetData or bound buffers. Each call must return SQL_SUCCESS; returns
+    // the first problem, or an empty string.
+    std::string ReadRows(const std::string& sql, SQLUSMALLINT count, SQLSMALLINT c_type,
+                         bool bound, std::vector<std::vector<std::string>>& rows) {
+        rows.clear();
+        std::vector<std::vector<SQLWCHAR>> buffers(
+            bound ? count : 1, std::vector<SQLWCHAR>(kTextBytes / sizeof(SQLWCHAR)));
+        std::vector<SQLLEN> indicators(buffers.size(), 0);
+        auto describe = [this](const char* call, SQLRETURN rc) {
+            return std::string(call) + " returned " + std::to_string(rc) + ": " +
+                   ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        };
+        auto read = [&]() -> std::string {
+            SQLRETURN rc = Execute(sql);
+            if (rc != SQL_SUCCESS) {
+                return describe("SQLExecDirect", rc);
+            }
+            for (SQLUSMALLINT column = 1; bound && column <= count; ++column) {
+                rc = SQLBindCol(stmt_, column, c_type, buffers[column - 1].data(), kTextBytes,
+                                &indicators[column - 1]);
+                if (rc != SQL_SUCCESS) {
+                    return describe("SQLBindCol", rc);
+                }
+            }
+            while (true) {
+                for (auto& buffer : buffers) {
+                    std::fill(buffer.begin(), buffer.end(), static_cast<SQLWCHAR>(0xCCCC));
+                }
+                rc = SQLFetch(stmt_);
+                if (rc == SQL_NO_DATA) {
+                    return "";
+                }
+                if (rc != SQL_SUCCESS) {
+                    return describe("SQLFetch", rc);
+                }
+                std::vector<std::string> row(count);
+                for (SQLUSMALLINT column = 1; column <= count; ++column) {
+                    const size_t slot = bound ? column - 1 : 0;
+                    if (!bound) {
+                        std::fill(buffers[0].begin(), buffers[0].end(),
+                                  static_cast<SQLWCHAR>(0xCCCC));
+                        rc = SQLGetData(stmt_, column, c_type, buffers[0].data(), kTextBytes,
+                                        &indicators[0]);
+                        if (rc != SQL_SUCCESS) {
+                            return describe("SQLGetData", rc);
+                        }
+                    }
+                    const std::string problem =
+                        DecodeText(buffers[slot].data(), indicators[slot], c_type, row[column - 1]);
+                    if (!problem.empty()) {
+                        return "column " + std::to_string(column) + ": " + problem;
+                    }
+                }
+                rows.push_back(std::move(row));
+            }
+        };
+        const std::string problem = read();
+        SQLFreeStmt(stmt_, SQL_CLOSE);
+        if (bound) {
+            SQLFreeStmt(stmt_, SQL_UNBIND);
+        }
+        return problem;
+    }
+
+    // Expected SQL_C_CHAR bytes for UTF-8 text, or the reason there are none.
+    std::string NarrowFor(const std::string& utf8, std::string& problem) const {
+        try {
+            return ODBCTestUtils::Utf8ToCodePage(utf8, client_code_page_);
+        } catch (const std::exception& error) {
+            problem = error.what();
+            return "";
+        }
     }
 };
 
@@ -170,6 +352,62 @@ std::string MissingConverterMessage(unsigned code_page) {
     return "host iconv cannot convert UTF-8 to code page " + std::to_string(code_page) +
            " (musl before 1.2.5 has no cp932; RHEL needs glibc-gconv-extra)";
 }
+
+struct Route {
+    bool bound;
+    SQLSMALLINT c_type;
+    const char* name;
+};
+
+const Route kRoutes[] = {
+    {false, SQL_C_WCHAR, "SQLGetData SQL_C_WCHAR"},
+    {false, SQL_C_CHAR, "SQLGetData SQL_C_CHAR"},
+    {true, SQL_C_WCHAR, "SQLBindCol SQL_C_WCHAR"},
+    {true, SQL_C_CHAR, "SQLBindCol SQL_C_CHAR"},
+};
+
+// One character from each script the sweep's code pages cover, plus a
+// supplementary-plane pair that only the UTF-8 collations can hold.
+const char* const kSweepText =
+    "NCHAR(65)+NCHAR(8364)+NCHAR(208)+NCHAR(321)+NCHAR(1071)+NCHAR(937)+NCHAR(351)+"
+    "NCHAR(1488)+NCHAR(1576)+NCHAR(257)+NCHAR(432)+NCHAR(20320)+NCHAR(20013)+"
+    "NCHAR(12354)+NCHAR(54620)+NCHAR(3585)+NCHAR(165)+NCHAR(216)+NCHAR(55357)+"
+    "NCHAR(56832)+NCHAR(66)";
+
+// Bytes no conforming encoder produces, with what each driver decodes them to
+// (docs/parity-deviations.md, entry 45). Bounded Japanese columns drop a
+// trailing partial lead byte on insert, so those cases use varchar(max) only.
+struct MalformedValue {
+    const char* collation;
+    unsigned code_page;
+    const char* type;
+    const char* hex;
+    std::u16string mssql_odbc;
+    std::u16string msodbcsql;
+};
+
+const MalformedValue kMalformedValues[] = {
+    {"Japanese_90_BIN", 932, "varchar(10)", "0x41FF42", u"A\uFFFDB", u"A\uF8F3B"},
+    {"Japanese_90_BIN", 932, "varchar(max)", "0x41FF42", u"A\uFFFDB", u"A\uF8F3B"},
+    {"Japanese_90_BIN", 932, "varchar(10)", "0x8241", u"\uFFFDA", u"\u30FB"},
+    {"Japanese_90_BIN", 932, "varchar(max)", "0x8241", u"\uFFFDA", u"\u30FB"},
+    {"Japanese_90_BIN", 932, "varchar(10)", "0xFF", u"\uFFFD", u"\uF8F3"},
+    {"Japanese_90_BIN", 932, "varchar(max)", "0xFF", u"\uFFFD", u"\uF8F3"},
+    {"Japanese_90_BIN", 932, "varchar(10)", "0x80", u"\x0080", u"\x0080"},
+    {"Japanese_90_BIN", 932, "varchar(max)", "0x80", u"\x0080", u"\x0080"},
+    {"Latin1_General_100_CI_AS_SC_UTF8", 65001, "varchar(10)", "0xC328", u"\uFFFD(",
+     u"\uFFFD("},
+    {"Latin1_General_100_CI_AS_SC_UTF8", 65001, "varchar(max)", "0xC328", u"\uFFFD(",
+     u"\uFFFD("},
+    {"Latin1_General_100_CI_AS_SC_UTF8", 65001, "varchar(10)", "0x41FF42", u"A\uFFFDB",
+     u"A\uFFFDB"},
+    {"Latin1_General_100_CI_AS_SC_UTF8", 65001, "varchar(max)", "0x41FF42", u"A\uFFFDB",
+     u"A\uFFFDB"},
+    {"Latin1_General_100_CI_AS_SC_UTF8", 65001, "varchar(10)", "0xEDA080",
+     u"\uFFFD\uFFFD\uFFFD", u"\uFFFD\uFFFD"},
+    {"Latin1_General_100_CI_AS_SC_UTF8", 65001, "varchar(max)", "0xEDA080",
+     u"\uFFFD\uFFFD\uFFFD", u"\uFFFD\uFFFD"},
+};
 
 }  // namespace
 
@@ -417,4 +655,286 @@ ODBC_TEST_F(ClientCodePageTest, TerminatorOnlyBuffersAreLengthProbes) {
     EXPECT_EQ("probe",
               std::string(reinterpret_cast<const char*>(narrow_output), 5));
     ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// Every distinct server code-page mapping, including each SQL_ sort ID, must
+// decode the bytes SQL Server produced the way SQL Server itself decodes them.
+// Benefits-from-mock-tds: scripted COLMETADATA could pin each collation's
+// code page without SQL Server converting the probe text first.
+ODBC_TEST_F(ClientCodePageTest, CollationSweepMatchesServerDecoding) {
+    if (!ODBCTestUtils::HasCodePageConverter(client_code_page_)) {
+        GTEST_SKIP() << MissingConverterMessage(client_code_page_);
+    }
+    // Windows collations differing only in sensitivity flags share a code page;
+    // SQL_ collations keep their own row because each has its own sort ID.
+    const std::string list_sql =
+        "SELECT name, CONVERT(int, COLLATIONPROPERTY(name, 'CodePage')), "
+        "CONVERT(int, SUBSTRING(CONVERT(varbinary(5), COLLATIONPROPERTY(name, "
+        "'TDSCollation')), 5, 1)) FROM (SELECT name, ROW_NUMBER() OVER (PARTITION BY "
+        "CASE WHEN name LIKE 'SQL[_]%' THEN name ELSE '' END, "
+        "COLLATIONPROPERTY(name, 'LCID'), COLLATIONPROPERTY(name, 'Version'), "
+        "CASE WHEN name LIKE '%[_]UTF8%' THEN 1 ELSE 0 END, "
+        "CASE WHEN name LIKE '%[_]BIN2%' THEN 2 WHEN name LIKE '%[_]BIN%' THEN 1 ELSE 0 END "
+        "ORDER BY name) rn FROM sys.fn_helpcollations() "
+        "WHERE COLLATIONPROPERTY(name, 'CodePage') <> 0) c WHERE rn = 1 ORDER BY name";
+    std::vector<std::vector<std::string>> rows;
+    ASSERT_EQ("", ReadRows(list_sql, 3, SQL_C_CHAR, false, rows));
+
+    struct Collation {
+        std::string name;
+        std::string code_page;
+    };
+    std::vector<Collation> collations;
+    const bool msodbcsql = ComparingMsodbcsql();
+    for (const auto& row : rows) {
+        // msodbcsql's sort-ID table lacks the IDs SQL Server 2022 added
+        // (get_data_test.cpp, Issue627SqlServerExtendedSortIds*).
+        const int sort_id = std::stoi(row[2]);
+        if (msodbcsql && (sort_id == 122 || sort_id >= 210)) {
+            continue;
+        }
+        collations.push_back({row[0], row[1]});
+    }
+    ASSERT_GT(collations.size(), 100u);
+
+    std::vector<std::string> failures;
+    constexpr size_t kBatch = 64;
+    for (size_t begin = 0; begin < collations.size(); begin += kBatch) {
+        const size_t end = (std::min)(begin + kBatch, collations.size());
+        // Per collation: SQL Server's own decoding, then bounded and PLP values.
+        std::string sql = "SELECT ";
+        for (size_t i = begin; i < end; ++i) {
+            const std::string value = "t.v COLLATE " + collations[i].name;
+            sql += (i == begin ? "" : ", ") + std::string("CAST(CAST(") + value +
+                   " AS varchar(200)) AS nvarchar(200)), CAST(" + value +
+                   " AS varchar(200)), CAST(" + value + " AS varchar(max))";
+        }
+        sql += " FROM (SELECT " + std::string(kSweepText) + " AS v) t";
+        const auto columns = static_cast<SQLUSMALLINT>((end - begin) * 3);
+        const std::string range = collations[begin].name + ".." + collations[end - 1].name;
+
+        std::string problem = ReadRows(sql, columns, SQL_C_WCHAR, false, rows);
+        if (problem.empty() && rows.size() != 1) {
+            problem = std::to_string(rows.size()) + " rows";
+        }
+        if (!problem.empty()) {
+            failures.push_back(range + " server decoding: " + problem);
+            continue;
+        }
+        const std::vector<std::string> truth = rows[0];
+
+        for (const Route& route : kRoutes) {
+            problem = ReadRows(sql, columns, route.c_type, route.bound, rows);
+            if (problem.empty() && rows.size() != 1) {
+                problem = std::to_string(rows.size()) + " rows";
+            }
+            if (!problem.empty()) {
+                failures.push_back(range + " " + route.name + ": " + problem);
+                continue;
+            }
+            for (size_t i = begin; i < end; ++i) {
+                const size_t column = (i - begin) * 3;
+                std::string expected = truth[column];
+                if (route.c_type == SQL_C_CHAR) {
+                    std::string reason;
+                    expected = NarrowFor(truth[column], reason);
+                    if (!reason.empty()) {
+                        failures.push_back(collations[i].name + " " + route.name + ": " + reason);
+                        continue;
+                    }
+                }
+                for (size_t offset : {1, 2}) {
+                    const std::string& actual = rows[0][column + offset];
+                    if (actual != expected) {
+                        failures.push_back(collations[i].name + " (" + collations[i].code_page +
+                                           ") " + (offset == 1 ? "varchar(200) " : "varchar(max) ") +
+                                           route.name + ": expected " + Hex(expected) + " got " +
+                                           Hex(actual));
+                    }
+                }
+            }
+        }
+    }
+    std::string report;
+    for (size_t i = 0; i < failures.size() && i < 20; ++i) {
+        report += "\n  " + failures[i];
+    }
+    EXPECT_TRUE(failures.empty()) << failures.size() << " mismatches across "
+                                  << collations.size() << " collations:" << report;
+}
+
+// Columns without COLLATE take the database default, which differs from the
+// server default here; narrow parameters must also follow the new database.
+// Each run creates a database, so the concurrent modes would create hundreds.
+// Benefits-from-mock-tds: a scripted ENVCHANGE could switch the database
+// collation without CREATE DATABASE permission.
+ODBC_TEST_F_MODES(ClientCodePageTest, DatabaseDefaultCollationDiffersFromServer,
+                  odbc_concurrency::kSingle | odbc_concurrency::kCrossThread) {
+    if (!ODBCTestUtils::HasCodePageConverter(client_code_page_)) {
+        GTEST_SKIP() << MissingConverterMessage(client_code_page_);
+    }
+    std::vector<std::vector<std::string>> rows;
+    ASSERT_EQ("", ReadRows("SELECT CONVERT(int, COLLATIONPROPERTY(CONVERT(sysname, "
+                           "SERVERPROPERTY('Collation')), 'CodePage'))",
+                           1, SQL_C_CHAR, false, rows));
+    ASSERT_EQ(1u, rows.size());
+
+    struct DatabaseText {
+        const char* collation;
+        const char* code_page;
+        const char* expression;
+        const char* utf8;
+        const char* stored;
+        SQLWCHAR unit;
+    };
+    const DatabaseText text =
+        rows[0][0] == "949"
+            ? DatabaseText{"Cyrillic_General_100_CI_AS", "1251", "NCHAR(1071)", "\xD0\xAF",
+                           "0xDF", 0x042F}
+            : DatabaseText{"Korean_100_CI_AS", "949", "NCHAR(54620)", "\xED\x95\x9C", "0xC7D1",
+                           0xD55C};
+
+    PrivateDatabase database(stmt_);
+    SQLRETURN rc =
+        Execute("CREATE DATABASE [" + database.name + "] COLLATE " + text.collation);
+    if (!SQL_SUCCEEDED(rc)) {
+        const std::string reason = ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        SQLFreeStmt(stmt_, SQL_CLOSE);
+        GTEST_SKIP() << "CREATE DATABASE unavailable: " << reason;
+    }
+    database.created = true;
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(Execute("USE [" + database.name + "]"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ("", ReadRows("SELECT CONVERT(int, COLLATIONPROPERTY(CONVERT(sysname, "
+                           "DATABASEPROPERTYEX(DB_NAME(), 'Collation')), 'CodePage'))",
+                           1, SQL_C_CHAR, false, rows));
+    ASSERT_EQ(1u, rows.size());
+    ASSERT_EQ(text.code_page, rows[0][0]);
+
+    // Real tables: #temp columns would take tempdb's collation instead.
+    const std::string expression = text.expression;
+    ASSERT_SQL_OK(Execute("CREATE TABLE dbo.t(d varchar(20), o varchar(20) COLLATE "
+                          "Greek_100_CI_AS, m varchar(max)); INSERT dbo.t VALUES(" +
+                          expression + ", NCHAR(937), " + expression + ")"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+
+    const std::vector<std::string> wide = {text.utf8, "\xCE\xA9", text.utf8, text.utf8};
+    std::vector<std::string> narrow;
+    for (const auto& value : wide) {
+        narrow.push_back(ODBCTestUtils::Utf8ToCodePage(value, client_code_page_));
+    }
+    const std::string select =
+        "SELECT d, o, m, CAST(" + expression + " AS varchar(20)) FROM dbo.t";
+    for (const Route& route : kRoutes) {
+        SCOPED_TRACE(route.name);
+        ASSERT_EQ("", ReadRows(select, 4, route.c_type, route.bound, rows));
+        ASSERT_EQ(1u, rows.size());
+        const auto& expected = route.c_type == SQL_C_CHAR ? narrow : wide;
+        for (size_t column = 0; column < expected.size(); ++column) {
+            EXPECT_EQ(Hex(expected[column]), Hex(rows[0][column])) << "column " << column + 1;
+        }
+    }
+
+    ASSERT_SQL_OK(Execute("CREATE TABLE dbo.p(v varchar(20))"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    SQLWCHAR value[2] = {text.unit, 0};
+    SQLLEN indicator = SQL_NTS;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_VARCHAR, 20, 0,
+                                   value, sizeof(value), &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    rc = Execute("INSERT dbo.p VALUES(?)");
+    const std::string reason = ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    SQLFreeStmt(stmt_, SQL_CLOSE);
+    SQLFreeStmt(stmt_, SQL_RESET_PARAMS);
+    ASSERT_TRUE(SQL_SUCCEEDED(rc)) << reason;
+    ASSERT_EQ("", ReadRows("SELECT v, CONVERT(varchar(20), CONVERT(varbinary(20), v), 1) "
+                           "FROM dbo.p",
+                           2, SQL_C_WCHAR, false, rows));
+    ASSERT_EQ(1u, rows.size());
+    EXPECT_EQ(Hex(text.utf8), Hex(rows[0][0]));
+    EXPECT_EQ(text.stored, rows[0][1]);
+}
+
+// sql_variant values carry their own collation, so one column can need a
+// different decoder on every row.
+// Benefits-from-mock-tds: a scripted sql_variant payload could pair any
+// collation with any bytes, including ones SQL Server would not store.
+ODBC_TEST_F(ClientCodePageTest, SqlVariantCarriesPerValueCollation) {
+    if (!ODBCTestUtils::HasCodePageConverter(client_code_page_)) {
+        GTEST_SKIP() << MissingConverterMessage(client_code_page_);
+    }
+    std::vector<const ServerText*> texts;
+    for (const auto& text : kServerCollations) {
+        if (text.code_page != 0) {
+            texts.push_back(&text);
+        }
+    }
+    for (const auto& text : kServerText) {
+        texts.push_back(&text);
+    }
+    std::string sql = "SELECT n, v FROM (VALUES ";
+    for (size_t i = 0; i < texts.size(); ++i) {
+        sql += (i == 0 ? "(" : ", (") + std::to_string(i) + ", CAST(CAST((" +
+               texts[i]->expression + ") COLLATE " + texts[i]->collation +
+               " AS varchar(20)) AS sql_variant))";
+    }
+    sql += ") t(n, v) ORDER BY n";
+
+    for (const Route& route : kRoutes) {
+        SCOPED_TRACE(route.name);
+        std::vector<std::vector<std::string>> rows;
+        ASSERT_EQ("", ReadRows(sql, 2, route.c_type, route.bound, rows));
+        ASSERT_EQ(texts.size(), rows.size());
+        for (size_t i = 0; i < texts.size(); ++i) {
+            SCOPED_TRACE(texts[i]->collation);
+            EXPECT_EQ(std::to_string(i), rows[i][0]);
+            const std::string expected =
+                route.c_type == SQL_C_CHAR
+                    ? ODBCTestUtils::Utf8ToCodePage(texts[i]->utf8, client_code_page_)
+                    : texts[i]->utf8;
+            EXPECT_EQ(Hex(expected), Hex(rows[i][1]));
+        }
+    }
+}
+
+// Invalid server bytes decode with replacement characters and SQL_SUCCESS on
+// both drivers; neither raises 22018 (docs/parity-deviations.md, entry 45).
+// Benefits-from-mock-tds: a mock could send sequences SQL Server refuses to
+// store, such as a trailing CP932 lead byte or a lone UTF-8 lead byte.
+ODBC_TEST_F(ClientCodePageTest, MalformedServerBytesDecodeWithoutError) {
+    if (!ODBCTestUtils::HasCodePageConverter(client_code_page_)) {
+        GTEST_SKIP() << MissingConverterMessage(client_code_page_);
+    }
+    const bool msodbcsql = ComparingMsodbcsql();
+    for (const auto& value : kMalformedValues) {
+        SCOPED_TRACE(std::string(value.collation) + " " + value.type + " " + value.hex);
+        const std::string prefix = "SET NOCOUNT ON; DECLARE @t TABLE(v " +
+                                   std::string(value.type) + " COLLATE " + value.collation +
+                                   "); INSERT @t VALUES(" + value.hex + "); SELECT ";
+        std::vector<std::vector<std::string>> rows;
+        ASSERT_EQ("", ReadRows(prefix + "CONVERT(varchar(20), CONVERT(varbinary(20), v), 1) "
+                                        "FROM @t",
+                               1, SQL_C_CHAR, false, rows));
+        ASSERT_EQ(1u, rows.size());
+        ASSERT_EQ(value.hex, rows[0][0]) << "SQL Server changed the stored bytes";
+
+        const std::string wide = Utf16ToUtf8(msodbcsql ? value.msodbcsql : value.mssql_odbc);
+        for (const Route& route : kRoutes) {
+            // Same-page narrow output is not pinned: it may pass the server
+            // bytes through rather than replace them.
+            if (route.c_type == SQL_C_CHAR && value.code_page == client_code_page_) {
+                continue;
+            }
+            SCOPED_TRACE(route.name);
+            const std::string expected =
+                route.c_type == SQL_C_CHAR
+                    ? ODBCTestUtils::Utf8ToCodePage(wide, client_code_page_)
+                    : wide;
+            ASSERT_EQ("", ReadRows(prefix + "v FROM @t", 1, route.c_type, route.bound, rows));
+            ASSERT_EQ(1u, rows.size());
+            EXPECT_EQ(Hex(expected), Hex(rows[0][0]));
+        }
+    }
 }

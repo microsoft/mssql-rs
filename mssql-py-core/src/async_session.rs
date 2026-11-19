@@ -163,6 +163,27 @@ impl AsyncConnectionState {
         }
     }
 
+    /// Reject a queued claim if close or another operation won before physical access.
+    /// Call while holding the logical handle mutex, without holding this state lock across I/O.
+    pub(crate) fn validate_operation(&self, operation_id: OperationId) -> Result<(), ClaimError> {
+        let state = self.lock();
+        match state.lifecycle {
+            ConnectionLifecycle::Open => {}
+            ConnectionLifecycle::Closing => return Err(ClaimError::Closing),
+            ConnectionLifecycle::Closed => return Err(ClaimError::Closed),
+            ConnectionLifecycle::Broken => return Err(ClaimError::Broken),
+        }
+        if state
+            .active_operation
+            .as_ref()
+            .is_some_and(|active| active.operation_id == operation_id)
+        {
+            Ok(())
+        } else {
+            Err(ClaimError::Busy)
+        }
+    }
+
     pub(crate) fn claim_execute(&self, cursor_id: CursorId) -> Result<ExecuteClaim, ClaimError> {
         let mut state = self.lock();
         match state.lifecycle {
