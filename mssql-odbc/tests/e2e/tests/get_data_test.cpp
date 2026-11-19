@@ -105,6 +105,11 @@ void ExpectEveryTruncatedChunkFull(SQLHSTMT stmt, SQLUSMALLINT column, SQLSMALLI
             ASSERT_EQ(SQL_SUCCESS_WITH_INFO, rc)
                 << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt);
             EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt, "01004");
+            SQLINTEGER diagnostic_count = -1;
+            ASSERT_SQL_OK(SQLGetDiagField(SQL_HANDLE_STMT, stmt, 0, SQL_DIAG_NUMBER,
+                                          &diagnostic_count, 0, nullptr),
+                          SQL_HANDLE_STMT, stmt);
+            EXPECT_EQ(1, diagnostic_count);
         } else {
             ASSERT_EQ(SQL_SUCCESS, rc) << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt);
         }
@@ -3781,6 +3786,48 @@ ODBC_TEST_F_MODES(GetDataLiveTest, PlpSubMinimalBufferDrainsWithoutLossAndProbeI
     EXPECT_EQ(RepeatToken("abc", 200), ReadCharDataInChunks(stmt_, 1, 8192));
 
     SQLCloseCursor(stmt_);
+}
+
+ODBC_TEST_F_MODES(GetDataLiveTest, WcharOddByteBuffersPreserveWholeUnits,
+                  odbc_concurrency::kAllModes) {
+    const std::string expected = WorkerToken("odd");
+    for (const std::string type : {"varchar(64)", "nvarchar(64)", "varchar(max)", "nvarchar(max)"}) {
+        SCOPED_TRACE(type);
+        for (SQLLEN buffer_bytes : {SQLLEN{5}, SQLLEN{7}, SQLLEN{9}}) {
+            SCOPED_TRACE(buffer_bytes);
+            ASSERT_SQL_OK(ExecDirect("SELECT CAST('" + expected + "' AS " + type + ")"),
+                          SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+            SQLWCHAR buffer[5];
+            std::memset(buffer, 0x5A, sizeof(buffer));
+            SQLLEN indicator = -1;
+            ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+                      SQLGetData(stmt_, 1, SQL_C_WCHAR, buffer, buffer_bytes, &indicator))
+                << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+            EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+            SQLINTEGER diagnostic_count = -1;
+            ASSERT_SQL_OK(SQLGetDiagField(SQL_HANDLE_STMT, stmt_, 0, SQL_DIAG_NUMBER,
+                                          &diagnostic_count, 0, nullptr),
+                          SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ(1, diagnostic_count);
+
+            const size_t payload_units = static_cast<size_t>(buffer_bytes) / sizeof(SQLWCHAR) - 1;
+            for (size_t i = 0; i < payload_units; ++i) {
+                EXPECT_EQ(static_cast<SQLWCHAR>(expected[i]), buffer[i]);
+            }
+            EXPECT_EQ(0, buffer[payload_units]);
+            const auto* bytes = reinterpret_cast<const unsigned char*>(buffer);
+            for (size_t i = (payload_units + 1) * sizeof(SQLWCHAR); i < sizeof(buffer); ++i) {
+                EXPECT_EQ(0x5A, bytes[i]) << "byte " << i;
+            }
+            if (indicator != SQL_NO_TOTAL) {
+                EXPECT_EQ(static_cast<SQLLEN>(expected.size() * sizeof(SQLWCHAR)), indicator);
+            }
+            EXPECT_EQ(expected.substr(payload_units), ReadWCharDataInChunksAsUtf8(stmt_, 1, 8192));
+            SQLCloseCursor(stmt_);
+        }
+    }
 }
 
 // The same boundary on the widening path (varchar(max) -> SQL_C_WCHAR), where
