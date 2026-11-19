@@ -4,6 +4,7 @@
 #
 #   background-step.sh start <state-dir> <command> [args...]
 #   background-step.sh wait  <state-dir> <timeout-seconds>
+#   background-step.sh stop  <state-dir>
 #
 # `wait` replays the command's output and exits with its status. Replaying in
 # the wait step is what makes the command's ##[error] lines and ##vso commands
@@ -15,6 +16,7 @@ set -euo pipefail
 usage() {
   echo "usage: $0 start <state-dir> <command> [args...]" >&2
   echo "       $0 wait <state-dir> <timeout-seconds>" >&2
+  echo "       $0 stop <state-dir>" >&2
   exit 2
 }
 
@@ -76,6 +78,29 @@ fail_timeout() {
   exit 1
 }
 
+stop() {
+  [ $# -eq 0 ] || usage
+  if [ -f "$state/status" ]; then
+    echo "The background command has already finished."
+    return 0
+  fi
+  if [ ! -f "$state/pid" ]; then
+    echo "No background command was started in $state."
+    return 0
+  fi
+  local pid
+  pid=$(cat "$state/pid")
+  if [[ ! "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    echo "##[error]Invalid background process ID in $state"
+    return 1
+  fi
+  if ! terminate_group "$pid"; then
+    echo "##[error]Could not stop background process group $pid"
+    return 1
+  fi
+  echo "Stopped background process group $pid."
+}
+
 join() {
   [ $# -eq 1 ] || usage
   [[ $1 =~ ^[0-9]+$ ]] || usage
@@ -118,5 +143,6 @@ join() {
 case "$action" in
   start) start "$@" ;;
   wait) join "$@" ;;
+  stop) stop "$@" ;;
   *) usage ;;
 esac
