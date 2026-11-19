@@ -47,6 +47,10 @@ parameters:
   default: false
 
 steps:
+- template: coverage-attempt-template.yml
+  parameters:
+    osType: Linux
+
 # On ARM64 PRs, the cross-pool poll step below replaces this job-local password
 # with the Sql_Host_build_arm password it receives through the key exchange.
 - template: generate-sql-password-template.yml
@@ -391,7 +395,7 @@ steps:
     continueOnError: true
     inputs:
       targetPath: $(Build.SourcesDirectory)/target/cobertura.xml
-      artifactName: CoberturaCoverageRust_Linux
+      artifactName: CoberturaCoverageRust_Linux_$(coverageAttempt.value)
 
 # ODBC C++ e2e coverage: the instrumented driver is exercised through the
 # unixODBC Driver Manager as a separate process, so this report adds coverage
@@ -405,7 +409,7 @@ steps:
     continueOnError: true
     inputs:
       targetPath: $(Build.SourcesDirectory)/target/cobertura-odbc-e2e.xml
-      artifactName: CoberturaCoverageOdbcE2E_Linux
+      artifactName: CoberturaCoverageOdbcE2E_Linux_$(coverageAttempt.value)
 
 - script: |
     if [ -f "$(Build.SourcesDirectory)/tdslib-nextest.tar.zst" ]; then
@@ -496,7 +500,7 @@ steps:
     continueOnError: true
     inputs:
       targetPath: $(Build.SourcesDirectory)/target/pycore-rust-cobertura.xml
-      artifactName: CoberturaCoveragePyCoreRust
+      artifactName: CoberturaCoveragePyCoreRust_$(coverageAttempt.value)
 
 - script: |
     BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
@@ -537,7 +541,7 @@ steps:
     continueOnError: true
     inputs:
       targetPath: $(Build.SourcesDirectory)/target/pycore-cobertura.xml
-      artifactName: CoberturaCoveragePython
+      artifactName: CoberturaCoveragePython_$(coverageAttempt.value)
 
 # Release the cross-pool SQL host: publishing this sentinel is what unblocks
 # Sql_Host_build_arm's wait-for-teardown step. always() so failures and

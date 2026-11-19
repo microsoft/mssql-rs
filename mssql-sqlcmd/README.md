@@ -80,6 +80,17 @@ its keys, ids, codes and statuses are the same in every locale.
 See the [localization guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-sqlcmd/docs/localization.md)
 for how sqlcmd's text is translated end to end: the message catalogs, how translations reach the package and native sqlcmd, how the language is chosen, and what is not localized.
 
+## Telemetry
+
+The library sends one privacy-safe usage event per run directly to Application
+Insights. It is on by default (the destination is built in) and
+`SQLCMD_TELEMETRY_OPTOUT` set to `1`, `true` or `yes` turns it off;
+`SQLCMD_TELEMETRY_CONNECTION_STRING` overrides the destination for testing. The
+fields are a proposal until the privacy review is done. See the
+[telemetry architecture](https://github.com/microsoft/mssql-rs/blob/main/mssql-sqlcmd/docs/telemetry.md)
+for the notice text, the C ABI, the proposed schema, privacy rules, bounded
+shutdown, and exact Application Insights envelope behavior.
+
 ## Build from source
 
 From the repository root:

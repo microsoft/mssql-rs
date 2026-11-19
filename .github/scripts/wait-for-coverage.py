@@ -126,15 +126,45 @@ def canceled(build: dict) -> bool:
     return build["status"] == "cancelling" or build.get("result") == "canceled"
 
 
-def has_coverage(build_id: int, *, deadline: float) -> bool:
+def coverage_artifact(build_id: int, *, deadline: float) -> str | None:
     artifacts = get_json(f"{BUILD_API}/builds/{build_id}/artifacts?api-version=7.1", deadline=deadline)["value"]
-    matches = [item for item in artifacts if item["name"] == "CoberturaCoverage"]
-    if len(matches) > 1:
+    matches = [
+        item["name"] for item in artifacts
+        if re.fullmatch(r"CoberturaCoverage(?:_[1-9][0-9]*_[1-9][0-9]*)?", item["name"])
+    ]
+    if len(matches) != len(set(matches)):
         raise ValueError("Multiple CoberturaCoverage artifacts found")
-    return bool(matches)
+    if not matches:
+        return None
+    if matches == ["CoberturaCoverage"]:
+        return matches[0]
+    records = get_json(f"{BUILD_API}/builds/{build_id}/timeline?api-version=7.1", deadline=deadline)["records"]
+    stage = next(
+        (record for record in records
+         if record["type"] == "Stage" and record.get("identifier") == "Coverage"),
+        None,
+    )
+    job = next(
+        (record for record in records
+         if record["type"] == "Job"
+         and record.get("identifier") == "Coverage.Merge_Coverage.__default"),
+        None,
+    )
+    # Older immutable artifacts remain visible while a newer attempt is running.
+    if not stage or not job or any(
+        record.get("state") != "completed"
+        or record.get("result") not in ("succeeded", "succeededWithIssues")
+        for record in (stage, job)
+    ):
+        return None
+    attempts = (stage["attempt"], job["attempt"])
+    if any(type(attempt) is not int or attempt <= 0 for attempt in attempts):
+        raise ValueError("Invalid coverage stage or job attempt")
+    expected = f"CoberturaCoverage_{attempts[0]}_{attempts[1]}"
+    return expected if expected in matches else None
 
 
-def duplicate_coverage(pr_number: str, build: dict, head_sha: str, *, deadline: float) -> int | None:
+def duplicate_coverage(pr_number: str, build: dict, head_sha: str, *, deadline: float) -> tuple[int, str] | None:
     if build["status"] != "completed" or build.get("result") != "succeeded":
         return None
     records = get_json(f"{BUILD_API}/builds/{build['id']}/timeline?api-version=7.1", deadline=deadline)["records"]
@@ -156,13 +186,14 @@ def duplicate_coverage(pr_number: str, build: dict, head_sha: str, *, deadline: 
                     or current["triggerInfo"]["pr.sourceSha"] != head_sha
                     or canceled(current) or current.get("result") == "failed"):
                 raise CoverageBuildChanged
-            if has_coverage(prior["id"], deadline=deadline):
+            artifact = coverage_artifact(prior["id"], deadline=deadline)
+            if artifact is not None:
                 print(f"Using coverage from build {prior['id']} for duplicate build {build['id']}...", flush=True)
-                return prior["id"]
+                return prior["id"], artifact
     return None
 
 
-def wait_for_artifact(pr_number: str, timeout: float = 150 * 60) -> tuple[int, str]:
+def wait_for_artifact(pr_number: str, timeout: float = 150 * 60) -> tuple[int, str, str]:
     if not re.fullmatch(r"[1-9][0-9]*", pr_number):
         raise ValueError("Invalid PR number")
     deadline = time.monotonic() + timeout
@@ -183,18 +214,19 @@ def wait_for_artifact(pr_number: str, timeout: float = 150 * 60) -> tuple[int, s
                 if build.get("result") == "failed":
                     raise RuntimeError(f"Azure DevOps build {build_id} failed; cannot report coverage")
                 print(f"Checking coverage artifact for build {build_id} ({build['status']})...", flush=True)
-                coverage_id = (
-                    build_id if has_coverage(build_id, deadline=deadline)
+                artifact = coverage_artifact(build_id, deadline=deadline)
+                coverage = (
+                    (build_id, artifact) if artifact is not None
                     else duplicate_coverage(pr_number, build, head_sha, deadline=deadline)
                 )
-                if coverage_id is not None:
+                if coverage is not None:
                     # A push can precede its ADO build, including during this request.
                     current = latest_build(pr_number, deadline=deadline)
                     if (current is not None and current["id"] == build_id
                             and current["triggerInfo"]["pr.sourceSha"] == head_sha
                             and not canceled(current) and current.get("result") != "failed"
                             and github_head(pr_number, deadline=deadline) == head_sha):
-                        return coverage_id, head_sha
+                        return coverage[0], head_sha, coverage[1]
                     retry_delay = 10
                     continue
                 delay = random.randint(300, 600)
@@ -223,9 +255,9 @@ def main() -> None:
     parser.add_argument("--pr-number", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    build_id, head_sha = wait_for_artifact(args.pr_number)
+    build_id, head_sha, artifact = wait_for_artifact(args.pr_number)
     with args.output.open("a", encoding="utf-8", newline="\n") as output:
-        output.write(f"build_id={build_id}\nhead_sha={head_sha}\n")
+        output.write(f"build_id={build_id}\nhead_sha={head_sha}\nartifact_name={artifact}\n")
 
 
 if __name__ == "__main__":
