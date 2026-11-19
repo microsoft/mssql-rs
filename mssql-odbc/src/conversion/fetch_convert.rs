@@ -40,7 +40,6 @@ use crate::conversion::numeric::{
 use mssql_tds::datatypes::column_values::{
     ColumnValues, SqlDate, SqlDateTime2, SqlDateTimeOffset, SqlTime,
 };
-use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 
 use super::client_encoding::ClientEncoding;
 
@@ -85,17 +84,6 @@ impl TextOutput {
             }
         }
         Ok(false)
-    }
-}
-
-/// Decodes a character column without the panicking paths in
-/// `SqlString::to_utf8_string` (its UTF-8 branch unwraps); the UTF-16 and LCID
-/// branches decode through `encoding_rs`, which substitutes replacement
-/// characters rather than failing.
-pub(crate) fn sql_string_to_text(s: &SqlString) -> Option<String> {
-    match s.encoding_type() {
-        EncodingType::Utf8 => String::from_utf8(s.bytes.clone()).ok(),
-        _ => Some(s.to_utf8_string()),
     }
 }
 
@@ -187,7 +175,7 @@ fn numeric_source(value: &ColumnValues) -> Result<NumericSource, ConvError> {
 /// text that is not a number (`22018`) and digits that overflow (`22003`).
 fn numeric_source_or_parse(value: &ColumnValues) -> Result<NumericSource, ConvError> {
     if let ColumnValues::String(s) = value {
-        let text = sql_string_to_text(s).ok_or(ConvError::InvalidCharacterValue)?;
+        let text = s.to_utf8_string();
         return parse_numeric_text(&text);
     }
     numeric_source(value)
@@ -557,8 +545,7 @@ pub(crate) unsafe fn convert_datetime_c(
     let p = match value {
         // A character column must hold a valid literal for the target.
         ColumnValues::String(s) => {
-            let text = sql_string_to_text(s).ok_or(ConvError::InvalidCharacterValue)?;
-            parse_datetime_literal(&text).ok_or(ConvError::InvalidCharacterValue)?
+            parse_datetime_literal(&s.to_utf8_string()).ok_or(ConvError::InvalidCharacterValue)?
         }
         // A date/time C target for a non-temporal column is illegal.
         _ => extract_datetime_parts(value)?,
@@ -725,6 +712,7 @@ pub(crate) fn format_datetime_parts(p: &DateTimeParts) -> String {
 mod tests {
     use super::*;
     use crate::api::odbc_types::SqlPointer;
+    use mssql_tds::datatypes::sql_string::SqlString;
 
     mod memory_safety {
         use super::*;
