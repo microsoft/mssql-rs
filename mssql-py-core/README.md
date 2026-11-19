@@ -41,7 +41,9 @@ For SDK authors integrating the native runtime:
 - Async cursors retain their logical connection when the connection wrapper is
   collected. Explicit `await connection.close()` revokes cursor access;
   `await cursor.close()` leaves the parent and sibling cursors usable. The last
-  logical owner discards any remaining direct client.
+  logical owner discards any remaining direct client. After parent revocation,
+  cursor close releases local results even if an earlier close attempt was
+  interrupted by connection shutdown.
 - Concurrent async connection closes await one teardown outcome. Cancelling a
   close waiter does not stop cleanup. Direct close uses one five-second budget
   to settle operations, drain results, finalize transactions and close the

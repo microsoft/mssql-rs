@@ -472,6 +472,7 @@ mod tests {
         ));
         let connection = cursor.tds_client.clone();
         let state = cursor.session_state.clone();
+        let fetch_state = cursor.fetch_state.clone();
         let runtime = pyo3_async_runtimes::tokio::get_runtime();
         let held_connection = connection.clone();
         let (locked_tx, locked_rx) = oneshot::channel();
@@ -557,6 +558,7 @@ asyncio.run(run())
             py.run(&code, Some(&globals), None).unwrap();
         });
         runtime.block_on(holding).unwrap();
+        assert!(fetch_state.status() == FetchStatus::NoResultSet);
         assert_eq!(
             state.lifecycle(),
             if closed {
@@ -588,6 +590,13 @@ asyncio.run(run())
             for closed in [false, true] {
                 assert_queued_operation_rejected(operation, closed);
             }
+        }
+    }
+
+    #[test]
+    fn queued_cursor_close_cleans_local_results_after_parent_revocation() {
+        for closed in [false, true] {
+            assert_queued_operation_rejected("close", closed);
         }
     }
 
@@ -875,6 +884,17 @@ impl PyAsyncCursor {
     fn close<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let (cleanup, cleanup_started, dispatch) = {
             let cursor = slf.borrow(py);
+            if matches!(
+                cursor.session_state.ensure_open(),
+                Err(ClaimError::Closing | ClaimError::Closed)
+            ) {
+                clear_result_state(
+                    &cursor.fetch_state,
+                    &cursor.description_state,
+                    &cursor.buffered_results,
+                );
+                cursor.closed.store(true, Ordering::Release);
+            }
             if cursor.closed.load(Ordering::Acquire)
                 || cursor
                     .cleanup_started
