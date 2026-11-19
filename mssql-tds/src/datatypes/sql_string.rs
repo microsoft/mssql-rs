@@ -579,6 +579,9 @@ mod tests {
             let value = SqlString::new(bytes, encoding);
             assert_eq!(value.try_to_utf8_string().unwrap(), value.to_utf8_string());
         }
+    }
+
+    #[test]
     fn utf8_decode_replaces_invalid_sequences() {
         assert_eq!(
             SqlString::decode(&[0x41, 0xFF, 0x42], EncodingType::Utf8),

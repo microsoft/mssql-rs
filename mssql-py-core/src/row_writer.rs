@@ -39,20 +39,7 @@ impl PyRowWriter {
         let values = self
             .row
             .iter()
-            .map(|col_val| match col_val {
-                ColumnValues::String(value) => Ok(value
-                    .try_to_utf8_string()
-                    .map_err(|error| {
-                        crate::async_errors::map_tds_error(
-                            "Failed to decode async string column",
-                            error,
-                            Vec::new(),
-                        )
-                    })?
-                    .into_pyobject(py)?
-                    .into_any()),
-                _ => PyCoreCursor::column_value_to_python(py, col_val),
-            })
+            .map(|col_val| PyCoreCursor::column_value_to_python(py, col_val))
             .collect::<PyResult<Vec<_>>>()?;
         PyTuple::new(py, values)
     }
