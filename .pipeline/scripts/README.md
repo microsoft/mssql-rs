@@ -290,7 +290,7 @@ once the Python-side fix is pinned.
 
 The macOS job owns the locally built Rust and source-matched ODBC wheels and
 installs upstream editable with `--no-deps`. Its `requirements.txt` supplies
-third-party dependencies. Before SQL startup, `verify-mssql-python.py` runs as a
+third-party dependencies. Before driver tests, `verify-mssql-python.py` runs as a
 pytest smoke check of the installed runtime: direct dependency versions/markers
 and the provider ID/driver path. Only the two native version pins are exempt.
 New missing/incompatible requirements fail setup; extras or URL requirements
@@ -298,10 +298,13 @@ require explicit setup support rather than a custom dependency resolver.
 
 Provider API/id/path drift fails PR/local runs but produces a warning and a
 skipped smoke test on non-PR runs. Pytest publishes the setup result in either
-case; Docker/Colima provisioning, SQL startup, and driver tests run only after
-a successful smoke check. An advisory skip also skips Docker cleanup, but the
-upstream checkout is always cleaned up. The shared Docker template defaults to
-`succeeded()` for other callers. Native builds,
+case; driver tests run only after a successful smoke check. Colima and SQL
+Server start in the background before the native builds and are joined after
+the smoke check succeeds. Cleanup stops unfinished background work and removes
+the SQL container even if the build fails, the smoke check skips, or the job is
+canceled. The upstream checkout is always cleaned up. The macOS Docker template
+only downloads the toolchain; all macOS SQL setup uses background startup and
+must join it before accessing Docker or SQL Server. Native builds,
 packaging/install commands, dependency failures, import/loader errors, and
 unexpected exceptions remain blocking. Focused YAML assertions cover readiness
 gates and the shared default; actual PR jobs validate the build/install wiring.
@@ -378,12 +381,13 @@ Enables Named Pipes and Shared Memory protocols for SQL Server via registry modi
 ### run-bounded.sh
 Sourced helper providing `run_bounded <seconds> <command...>`. macOS ships no
 coreutils `timeout`, so long-running commands are bounded by running them in the
-background and killing them on overrun. Returns 124 on timeout. On external
-SIGTERM, it stops the bounded process group before exiting.
+background and killing them on overrun. Deadlines use elapsed wall-clock time,
+not the number of polling sleeps, so scheduling delays count too. Returns 124
+on timeout. On external SIGTERM, it stops the bounded process group before exiting.
 
 ### start-colima-macos.sh
 Boots a Colima VM on a hosted macOS agent from the packaged toolchain, retrying
-on the transient lima hostagent boot failures seen in ~3% of runs. VM size stays
+on transient lima hostagent boot failures and startup timeouts. VM size stays
 at the long-standing 4 GiB / 4 CPU.
 
 Nothing is installed or downloaded here. `TOOLCHAIN_DIR` points at a payload
@@ -402,14 +406,19 @@ nothing ever exercises.
 
 Each `colima start` is bounded by `COLIMA_START_TIMEOUT_SECONDS` so a wedged
 boot still reaches the delete/retry path rather than running until the pipeline
-step timeout. That bound sits above the slowest healthy boot observed (509s over
-113 runs in 2026-08; re-measured 2026-09 at max 453s over 123 runs) — the real
-failures give up within seconds, so a shorter bound would only kill
-slow-but-healthy boots. `COLIMA_BUDGET_SECONDS` then caps the retries as a whole.
+step timeout. November 16–19 logs showed healthy boots reaching 565s and a
+530s PR p95, too close to the previous nominal 540s limit. Startup failures
+also increased from 5/121 attempts on macOS 15 to 17/53 on macOS 26 as
+`macOS-latest` changed images; the logs do not establish whether those timed-out
+boots would eventually finish. Keep `macOS-latest`, but allow 900s per attempt
+and 1920s overall, enough for two full attempts plus cleanup. The old 480s
+retry budget prevented any retry after a timeout.
 
 **Environment overrides:** `TOOLCHAIN_DIR` (required), `COLIMA_CPU`,
 `COLIMA_MEMORY`, `COLIMA_DISK`, `COLIMA_START_ATTEMPTS` (3),
-`COLIMA_START_TIMEOUT_SECONDS` (540), `COLIMA_BUDGET_SECONDS` (480).
+`COLIMA_START_TIMEOUT_SECONDS` (900), `COLIMA_BUDGET_SECONDS` (1920).
+Background callers allow 3300s for Colima, SQL Server's existing 1200s budget,
+and cleanup, with a 60-minute wait-step backstop inside the 120-minute jobs.
 
 ### build-macos-docker-toolchain.py
 Assembles the macOS docker toolchain payload for one architecture: the install
@@ -513,11 +522,12 @@ pull, recreates the container when SQL Server hits a SQLPAL startup crash
 (~13% of macOS runs), dumps container state plus logs on every failed attempt,
 and exits non-zero when the server never becomes reachable.
 
-The macOS job is capped at 60 minutes, so every retry is bounded by wall clock
-as well as by attempt count: `SETUP_BUDGET_SECONDS` covers the whole step,
+The macOS jobs are capped at 120 minutes, so startup retries must leave time
+for tests. Every retry is bounded by wall clock as well as by attempt count:
+`SETUP_BUDGET_SECONDS` covers the whole setup,
 `PULL_BUDGET_SECONDS` carves out the pull phase so a slow registry cannot
 starve the retries, and `READY_TIMEOUT_SECONDS` bounds each container attempt.
-The pipeline step adds a `timeoutInMinutes` backstop over the top.
+The background wait step adds a `background-step.sh wait` wall-clock backstop.
 
 Every bound is sized above the measured worst case of the *successful* runs, so
 it only ever catches a hang: pulls run p50 292s / p95 478s / max 724s over 112
@@ -535,6 +545,7 @@ Runs a command detached from one pipeline step and joins it in a later one:
 ```bash
 background-step.sh start <state-dir> <command> [args...]
 background-step.sh wait  <state-dir> <timeout-seconds>
+background-step.sh stop  <state-dir>
 ```
 
 `wait` replays the command's output and exits with its status. The agent parses
@@ -543,14 +554,19 @@ background-step.sh wait  <state-dir> <timeout-seconds>
 `start` and bounds the command's total runtime, including when it finishes
 before `wait`. On timeout, the command's process group is terminated before
 `wait` returns. `wait` fails at once if the command exits without recording a
-status. The command must not depend on a later step's output.
+status. `stop` terminates unfinished work without waiting for its deadline;
+it is safe when no work was started or the command has already completed.
+The command must not depend on a later step's output.
 
-The macOS Test job uses it to hide two serial phases:
+The macOS jobs use it to overlap infrastructure, builds, and reporting:
 
-- `sql-setup-template.yml` with `startMacOSSqlInBackground: true` boots Colima
-  and SQL Server while the Rust test binaries compile. The job joins them
+- `sql-setup-template.yml` boots Colima and SQL Server in the background while
+  the Rust test binaries compile. The job joins them
   before the tests run, through `build-template.yml`'s `prebuildTests` and
   `beforeTestSteps`.
+- `test-mssql-python-macos-template.yml` uses the same SQL setup while building
+  the native bindings. It joins before pytest and stops unfinished startup
+  during cleanup, including failed builds and advisory smoke-check skips.
 - `build-template.yml` with `backgroundCoverageReport: true` generates the Rust
   Cobertura report while the ODBC e2e suite runs. The job then joins and
   publishes it.
