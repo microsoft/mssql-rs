@@ -503,9 +503,7 @@ impl TdsConnectionProvider {
             let (transport_contexts, context) = (action_chain.resolve_transport_contexts_with_context(&exec_context), context.clone());
 
             if transport_contexts.is_empty() {
-                return Err(Error::ProtocolError(
-                    "No transport protocols available in action chain".to_string()
-                ));
+                return Err(Self::no_transport_error(&action_chain));
             }
 
             debug!("Resolved {} transport context(s) from action chain", transport_contexts.len());
@@ -738,9 +736,10 @@ impl TdsConnectionProvider {
 
         #[cfg(windows)]
         if let Some(pipe) = pipe_path {
-            // Normalize for local connections: \\COMPUTERNAME\pipe\... → \\.\pipe\...
-            // This avoids SMB round-trips and "Access is denied" errors.
-            let pipe = crate::connection::transport::named_pipes::localize_pipe_path(&pipe);
+            // The listed pipe on the server as given (`.` for this computer),
+            // as SNI opens it, not on the name the Browser's machine gives
+            // itself.
+            let pipe = crate::connection::transport::named_pipes::pipe_on_server(&pipe, &server);
             debug!(pipe = %pipe, "SSRP resolved named pipe path");
             stage.record(connect_stage::PIPE_PATH, pipe.as_str());
             exec_context.store_outcome(ActionOutcome::SsrpResolvedPipe { pipe_path: pipe });
@@ -756,6 +755,26 @@ impl TdsConnectionProvider {
             ssrp::DEFAULT_SSRP_TIMEOUT_MS
         } else {
             ssrp_timeout_ms
+        }
+    }
+
+    /// The error for a chain left with no transport to try. After SQL Server
+    /// Browser answered, it listed no endpoint for the protocol the prefix
+    /// asks for (`tcp:` and no TCP port, `np:` and no pipe): SNI's "Server
+    /// doesn't support requested protocol" (open.cpp).
+    fn no_transport_error(chain: &ConnectionActionChain) -> Error {
+        let instance = chain.actions().iter().find_map(|a| match a {
+            ConnectionAction::QuerySsrp { instance, .. } => Some(instance),
+            _ => None,
+        });
+        match instance {
+            Some(instance) => Error::ConnectionError(format!(
+                "Server doesn't support requested protocol: SQL Server Browser listed no \
+                 endpoint for instance '{instance}' over the protocol requested."
+            )),
+            None => {
+                Error::ProtocolError("No transport protocols available in action chain".to_string())
+            }
         }
     }
 
@@ -1996,6 +2015,58 @@ mod tests {
                 assert_eq!(
                     stages[lookup].field(stage::INSTANCE),
                     Some("NoSuchDiagnoseInstance")
+                );
+            }
+        }
+
+        /// A prefix whose protocol SQL Server Browser's answer did not list
+        /// leaves nothing to try: SNI's "Server doesn't support requested
+        /// protocol". `np:` no longer falls back to the instance's standard
+        /// pipe, as SNI never does.
+        #[test]
+        fn a_browser_answer_without_the_requested_protocol_leaves_no_transport() {
+            let mut context = context();
+            let chain =
+                TdsConnectionProvider::action_chain(&mut context, r"tcp:db01\INST").unwrap();
+            assert!(
+                chain
+                    .resolve_transport_contexts_with_context(&ExecutionContext::new())
+                    .is_empty()
+            );
+            let error = TdsConnectionProvider::no_transport_error(&chain).to_string();
+            assert!(
+                error.contains(
+                    "Server doesn't support requested protocol: SQL Server Browser listed no \
+                     endpoint for instance 'INST' over the protocol requested."
+                ),
+                "{error}"
+            );
+
+            #[cfg(windows)]
+            {
+                let chain =
+                    TdsConnectionProvider::action_chain(&mut context, r"np:db01\INST").unwrap();
+                let mut tcp_only = ExecutionContext::new();
+                tcp_only.store_outcome(ActionOutcome::SsrpResolved { port: 50001 });
+                assert!(
+                    chain
+                        .resolve_transport_contexts_with_context(&tcp_only)
+                        .is_empty()
+                );
+                let mut listed = ExecutionContext::new();
+                listed.store_outcome(ActionOutcome::SsrpResolvedPipe {
+                    pipe_path: r"\\db01\pipe\custom\path".to_string(),
+                });
+                let transports: Vec<TransportContext> = chain
+                    .resolve_transport_contexts_with_context(&listed)
+                    .into_iter()
+                    .map(|(transport, _)| transport)
+                    .collect();
+                assert_eq!(
+                    transports,
+                    [TransportContext::NamedPipe {
+                        pipe_name: r"\\db01\pipe\custom\path".to_string()
+                    }]
                 );
             }
         }

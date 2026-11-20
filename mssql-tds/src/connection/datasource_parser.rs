@@ -802,14 +802,13 @@ impl ParsedDataSource {
             // SSRP response — only the requested protocol's info is used.
             match self.protocol_name.as_str() {
                 "np" => {
-                    // np: prefix — attempt Named Pipe from SSRP result, then
-                    // fall back to the standard pipe path if SQL Browser didn't
-                    // return a named-pipe endpoint.
+                    // np: prefix — the pipe SQL Server Browser listed, alone.
+                    // SNI never falls back to the instance's standard pipe: an
+                    // answer that lists no pipe leaves no protocol to try
+                    // ("Server doesn't support requested protocol", open.cpp),
+                    // and a listed pipe that does not open ends the attempt.
                     #[cfg(windows)]
-                    {
-                        builder.add_connect_named_pipe_from_slot(ResultSlot::ResolvedPipePath);
-                        builder.add_connect_named_pipe(&self.default_pipe_path());
-                    }
+                    builder.add_connect_named_pipe_from_slot(ResultSlot::ResolvedPipePath);
                 }
                 "tcp" | "" => {
                     // tcp: prefix or no prefix — attempt TCP from SSRP result
@@ -1325,16 +1324,15 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn test_action_chain_np_prefix_with_instance() {
-        // np: prefix with instance name does SSRP but only tries Named Pipe.
-        // A fallback ConnectNamedPipe with the default pipe path is added in
-        // case SQL Browser doesn't return a named-pipe endpoint.
+        // np: prefix with instance name does SSRP and tries only the pipe SQL
+        // Browser listed: no fallback to the instance's standard pipe, as SNI.
         let parsed = ParsedDataSource::parse("np:localhost\\mssqlserver01", false).unwrap();
         assert!(parsed.needs_ssrp());
 
         let chain = parsed.to_connection_actions(15000);
 
-        // CheckCache -> QuerySsrp -> UpdateCache -> ConnectNamedPipeFromSlot -> ConnectNamedPipe
-        assert_eq!(chain.len(), 5);
+        // CheckCache -> QuerySsrp -> UpdateCache -> ConnectNamedPipeFromSlot
+        assert_eq!(chain.len(), 4);
         let actions = chain.actions();
 
         use crate::connection::connection_actions::ConnectionAction;
@@ -1344,10 +1342,6 @@ mod tests {
         assert!(matches!(
             actions[3],
             ConnectionAction::ConnectNamedPipeFromSlot { .. }
-        ));
-        assert!(matches!(
-            actions[4],
-            ConnectionAction::ConnectNamedPipe { .. }
         ));
 
         let metadata = chain.metadata();
@@ -1728,20 +1722,22 @@ mod tests {
     #[cfg(windows)]
     fn pipe_server_remote_returns_server_name() {
         // Exercises the else branch of pipe_server() via default_pipe_path()
-        // where the server is remote (not local).
-        let parsed = ParsedDataSource::parse("np:remoteserver\\MYINST", false).unwrap();
+        // where the server is remote (not local): a default instance's
+        // standard pipe, which np: without a pipe path opens.
+        let parsed = ParsedDataSource::parse("np:remoteserver", false).unwrap();
         let chain = parsed.to_connection_actions(15000);
 
         use crate::connection::connection_actions::ConnectionAction;
         let has_remote_pipe = chain.actions().iter().any(|a| match a {
             ConnectionAction::ConnectNamedPipe { pipe_path, .. } => {
-                pipe_path.contains("remoteserver")
+                pipe_path == r"\\remoteserver\pipe\sql\query"
             }
             _ => false,
         });
         assert!(
             has_remote_pipe,
-            "Expected fallback pipe path with remote server name"
+            "Expected the standard pipe with the remote server name: {:?}",
+            chain.actions()
         );
     }
 
