@@ -1373,18 +1373,6 @@
       ]
     },
     {
-      "id": "diagnose.finding.no_default_kerberos_ticket_cache",
-      "message": "The default file Kerberos ticket cache was not found for this user; unless krb5.conf selects another cache (KCM or KEYRING, which sqlcmd does not inspect), the integrated login had no ticket to present.",
-      "translation": "The default file Kerberos ticket cache was not found for this user; unless krb5.conf selects another cache (KCM or KEYRING, which sqlcmd does not inspect), the integrated login had no ticket to present.",
-      "placeholders": []
-    },
-    {
-      "id": "diagnose.finding.no_kerberos_ticket_cache_named",
-      "message": "The Kerberos ticket cache KRB5CCNAME names was not found, so the integrated login had no ticket to present.",
-      "translation": "The Kerberos ticket cache KRB5CCNAME names was not found, so the integrated login had no ticket to present.",
-      "placeholders": []
-    },
-    {
       "id": "diagnose.finding.no_tcp_listener",
       "message": "Nothing is listening on port {port} at those addresses.",
       "translation": "Nothing is listening on port {port} at those addresses.",
@@ -1803,35 +1791,14 @@
     },
     {
       "id": "diagnose.limitation.kerberos_cache_not_checked",
-      "message": "The Kerberos ticket cache could not be looked for within the time limit.",
-      "translation": "The Kerberos ticket cache could not be looked for within the time limit.",
-      "placeholders": []
-    },
-    {
-      "id": "diagnose.limitation.kerberos_cache_unverified",
-      "message": "The Kerberos ticket cache is a {location} cache, which sqlcmd does not inspect.",
-      "translation": "The Kerberos ticket cache is a {location} cache, which sqlcmd does not inspect.",
-      "placeholders": [
-        {
-          "id": "location",
-          "string": "%[1]s",
-          "type": "string",
-          "underlyingType": "string",
-          "argNum": 1,
-          "expr": "location"
-        }
-      ]
-    },
-    {
-      "id": "diagnose.limitation.kerberos_default_cache_only",
-      "message": "Only the default file ticket cache was looked for; a KCM or KEYRING cache set in krb5.conf is not inspected.",
-      "translation": "Only the default file ticket cache was looked for; a KCM or KEYRING cache set in krb5.conf is not inspected.",
+      "message": "The Kerberos credentials could not be read within the time limit.",
+      "translation": "The Kerberos credentials could not be read within the time limit.",
       "placeholders": []
     },
     {
       "id": "diagnose.limitation.kerberos_spn_not_proof",
-      "message": "Kerberos encryption types and delegation are not inspected; the SPN is the one the client requests, not proof that it is registered.",
-      "translation": "Kerberos encryption types and delegation are not inspected; the SPN is the one the client requests, not proof that it is registered.",
+      "message": "Kerberos delegation is not inspected, and the SPN is the one the client requests, not proof that it is registered.",
+      "translation": "Kerberos delegation is not inspected, and the SPN is the one the client requests, not proof that it is registered.",
       "placeholders": []
     },
     {
@@ -3880,6 +3847,415 @@
           "underlyingType": "string",
           "argNum": 1,
           "expr": "spn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.kerberos_named_cache_not_found",
+      "message": "The Kerberos credentials cache KRB5CCNAME names does not exist, so the integrated login had no Kerberos credentials to present.",
+      "translation": "The Kerberos credentials cache KRB5CCNAME names does not exist, so the integrated login had no Kerberos credentials to present.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.kerberos_cache_not_found",
+      "message": "This user has no Kerberos credentials cache, so the integrated login had no Kerberos credentials to present.",
+      "translation": "This user has no Kerberos credentials cache, so the integrated login had no Kerberos credentials to present.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.kerberos_no_tgt",
+      "message": "This user's Kerberos credentials cache holds no ticket-granting ticket, so the integrated login had no Kerberos credentials to present.",
+      "translation": "This user's Kerberos credentials cache holds no ticket-granting ticket, so the integrated login had no Kerberos credentials to present.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.kerberos_tgt_expired_at",
+      "message": "The ticket-granting ticket in this user's Kerberos credentials cache expired at {ends}, so the integrated login had no valid Kerberos credentials to present.",
+      "translation": "The ticket-granting ticket in this user's Kerberos credentials cache expired at {ends}, so the integrated login had no valid Kerberos credentials to present.",
+      "placeholders": [
+        {
+          "id": "ends",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "ends"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.kerberos_tgt_expired",
+      "message": "The ticket-granting ticket in this user's Kerberos credentials cache had expired, so the integrated login had no valid Kerberos credentials to present.",
+      "translation": "The ticket-granting ticket in this user's Kerberos credentials cache had expired, so the integrated login had no valid Kerberos credentials to present.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.kerberos_service_ticket_deprecated_etype",
+      "message": "The service ticket for the SPN is encrypted with {encryption}, an encryption type Kerberos has deprecated.",
+      "translation": "The service ticket for the SPN is encrypted with {encryption}, an encryption type Kerberos has deprecated.",
+      "placeholders": [
+        {
+          "id": "encryption",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "encryption"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.limitation.kerberos_credentials_unreadable",
+      "message": "The Kerberos credentials could not be read ({code}), so whether a valid ticket was available is not known.",
+      "translation": "The Kerberos credentials could not be read ({code}), so whether a valid ticket was available is not known.",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.limitation.kerberos_library_unavailable",
+      "message": "The Kerberos library could not be loaded, so the credentials cache was not read.",
+      "translation": "The Kerberos library could not be loaded, so the credentials cache was not read.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.kerberos_tickets_not_listed",
+      "message": "On this platform only the default Kerberos credentials' principal and lifetime are read, not the cache's tickets: a ticket-granting ticket is not told apart from a service ticket, and encryption types are not read.",
+      "translation": "On this platform only the default Kerberos credentials' principal and lifetime are read, not the cache's tickets: a ticket-granting ticket is not told apart from a service ticket, and encryption types are not read.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.kerberos_tickets_on_demand",
+      "message": "Windows requests Kerberos tickets when they are needed, with the logon session's credentials: a logon session without a valid ticket-granting ticket cached can still get one.",
+      "translation": "Windows requests Kerberos tickets when they are needed, with the logon session's credentials: a logon session without a valid ticket-granting ticket cached can still get one.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.kerberos_new_credentials_logon",
+      "message": "The process runs in a NewCredentials logon session (runas /netonly): the logon account shown is the local one, and network logins use the credentials given for the network.",
+      "translation": "The process runs in a NewCredentials logon session (runas /netonly): the logon account shown is the local one, and network logins use the credentials given for the network.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.kerberos_spn_host_canonicalized",
+      "message": "The cache holds a ticket for the SPN's service on another host name: the Kerberos library can canonicalize a host-based SPN's host name (dns_canonicalize_hostname and rdns in krb5.conf), so the SPN's service ticket may be that one.",
+      "translation": "The cache holds a ticket for the SPN's service on another host name: the Kerberos library can canonicalize a host-based SPN's host name (dns_canonicalize_hostname and rdns in krb5.conf), so the SPN's service ticket may be that one.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.kerberos_etypes_of_tickets",
+      "message": "The encryption types shown are those of the tickets found; they do not show every type the account, the service or the KDC allows.",
+      "translation": "The encryption types shown are those of the tickets found; they do not show every type the account, the service or the KDC allows.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.error.kerberos_credentials_unreadable",
+      "message": "The default Kerberos credentials could not be read.",
+      "translation": "The default Kerberos credentials could not be read.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.error.lsa_call_failed",
+      "message": "Windows did not complete {call}.",
+      "translation": "Windows did not complete {call}.",
+      "placeholders": [
+        {
+          "id": "call",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "call"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.kerberos_cache",
+      "message": "credentials cache {type}",
+      "translation": "credentials cache {type}",
+      "placeholders": [
+        {
+          "id": "type",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "type"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.kerberos_cache_named",
+      "message": "credentials cache {type} named by KRB5CCNAME",
+      "translation": "credentials cache {type} named by KRB5CCNAME",
+      "placeholders": [
+        {
+          "id": "type",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "type"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.logon_session",
+      "message": "{type} logon through {package} as {account}",
+      "translation": "{type} logon through {package} as {account}",
+      "placeholders": [
+        {
+          "id": "type",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "type"
+        },
+        {
+          "id": "package",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "package"
+        },
+        {
+          "id": "account",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "account"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.logon_session_no_account",
+      "message": "{type} logon through {package}",
+      "translation": "{type} logon through {package}",
+      "placeholders": [
+        {
+          "id": "type",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "type"
+        },
+        {
+          "id": "package",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "package"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.tgt_until",
+      "message": "ticket-granting ticket until {end}",
+      "translation": "ticket-granting ticket until {end}",
+      "placeholders": [
+        {
+          "id": "end",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "end"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.tgt_ended",
+      "message": "ticket-granting ticket ended {end}",
+      "translation": "ticket-granting ticket ended {end}",
+      "placeholders": [
+        {
+          "id": "end",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "end"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.service_ticket",
+      "message": "service ticket {state}",
+      "translation": "service ticket {state}",
+      "placeholders": [
+        {
+          "id": "state",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "state"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.service_ticket_encryption",
+      "message": "service ticket found, {encryption} with session key {session}",
+      "translation": "service ticket found, {encryption} with session key {session}",
+      "placeholders": [
+        {
+          "id": "encryption",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "encryption"
+        },
+        {
+          "id": "session",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "session"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.service_ticket_encryption_version",
+      "message": "service ticket found, {encryption} (key version {version}) with session key {session}",
+      "translation": "service ticket found, {encryption} (key version {version}) with session key {session}",
+      "placeholders": [
+        {
+          "id": "encryption",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "encryption"
+        },
+        {
+          "id": "version",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "version"
+        },
+        {
+          "id": "session",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "session"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.tgt_state",
+      "message": "ticket-granting ticket {state}",
+      "translation": "ticket-granting ticket {state}",
+      "placeholders": [
+        {
+          "id": "state",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "state"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.tgt_state_for",
+      "message": "ticket-granting ticket {state} for {principal}",
+      "translation": "ticket-granting ticket {state} for {principal}",
+      "placeholders": [
+        {
+          "id": "state",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "state"
+        },
+        {
+          "id": "principal",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "principal"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.tgt_until_encryption",
+      "message": "ticket-granting ticket until {end}, {encryption} with session key {session}",
+      "translation": "ticket-granting ticket until {end}, {encryption} with session key {session}",
+      "placeholders": [
+        {
+          "id": "end",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "end"
+        },
+        {
+          "id": "encryption",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "encryption"
+        },
+        {
+          "id": "session",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "session"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.tgt_ended_encryption",
+      "message": "ticket-granting ticket ended {end}, {encryption} with session key {session}",
+      "translation": "ticket-granting ticket ended {end}, {encryption} with session key {session}",
+      "placeholders": [
+        {
+          "id": "end",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "end"
+        },
+        {
+          "id": "encryption",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "encryption"
+        },
+        {
+          "id": "session",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "session"
         }
       ]
     }

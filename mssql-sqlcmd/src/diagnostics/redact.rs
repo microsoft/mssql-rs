@@ -6,18 +6,18 @@
 //!
 //! Server, instance and host names, IP addresses, named pipe paths and
 //! Kerberos SPNs identify the endpoint and are shown as they are; every report
-//! begins with a warning that it may hold them. Database and user names are
-//! pseudonymized by default: they become opaque labels such as `database-1`.
-//! A label stands for one value throughout one run, so equal values stay
-//! visibly equal, but labels mean nothing across runs. Free text (error
-//! messages) gets the same labels wherever a known database or user name
-//! appears as a whole word; anything else in it is flagged for review rather
-//! than trusted. With local detail requested, database and user names are
-//! shown as they are too.
+//! begins with a warning that it may hold them. Database and user names, and
+//! file paths (a Kerberos credentials cache's), are pseudonymized by default:
+//! they become opaque labels such as `database-1`. A label stands for one
+//! value throughout one run, so equal values stay visibly equal, but labels
+//! mean nothing across runs. Free text (error messages) gets the same labels
+//! wherever a known database or user name or path appears as a whole word;
+//! anything else in it is flagged for review rather than trusted. With local
+//! detail requested, they are shown as they are too.
 //!
-//! Certificate subject or SAN names and file paths would be pseudonymized the
-//! same way; no check reports one. (`-F`, the host name the server certificate
-//! must carry, names the endpoint and is shown as it is.)
+//! Certificate subject or SAN names would be pseudonymized the same way; no
+//! check reports one. (`-F`, the host name the server certificate must carry,
+//! names the endpoint and is shown as it is.)
 
 use std::collections::HashMap;
 
@@ -36,6 +36,8 @@ pub enum Category {
     // Pseudonymized unless local detail is requested.
     Database,
     User,
+    /// A file path.
+    Path,
 }
 
 impl Category {
@@ -50,6 +52,7 @@ impl Category {
             | Category::Pipe => None,
             Category::Database => Some("database"),
             Category::User => Some("user"),
+            Category::Path => Some("path"),
         }
     }
 }
@@ -247,6 +250,25 @@ mod tests {
         assert_eq!(
             r.text("Login failed for user 'SA'. Usage of sales_eu and sales on db01 (salesman)"),
             "Login failed for user 'user-1'. Usage of database-2 and database-1 on db01 (salesman)"
+        );
+    }
+
+    /// A Kerberos library names a cache file in its own words, after a type
+    /// prefix or a space; both get the path's label.
+    #[test]
+    fn paths_get_their_label_wherever_a_message_quotes_them() {
+        let mut r = Redactor::new(false);
+        assert_eq!(r.name(Category::Path, "/tmp/krb5cc_1000"), "path-1");
+        assert_eq!(
+            r.text(
+                "No credentials (default cache: FILE:/tmp/krb5cc_1000) (filename: /tmp/krb5cc_1000)"
+            ),
+            "No credentials (default cache: FILE:path-1) (filename: path-1)"
+        );
+        assert_eq!(
+            r.text("/tmp/krb5cc_10000"),
+            "/tmp/krb5cc_10000",
+            "another file"
         );
     }
 

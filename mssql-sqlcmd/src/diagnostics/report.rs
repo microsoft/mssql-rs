@@ -752,6 +752,109 @@ fn check_text(check: &Check, protocol: Option<Protocol>, r: &mut Redactor, local
                     &[("state", &cache)],
                 ));
             }
+            if let Some(kind) = check.field("kerberosCacheType") {
+                let id = if check.field("kerberosCredentialsSource") == Some("KRB5CCNAME") {
+                    "diagnose.detail.kerberos_cache_named"
+                } else {
+                    "diagnose.detail.kerberos_cache"
+                };
+                parts.push(tr(locale, id, &[("type", &kind)]));
+            }
+            if let (Some(kind), Some(package)) =
+                (check.field("logonType"), check.field("logonPackage"))
+            {
+                let account = named(r, "logonAccount");
+                parts.push(if account.is_empty() {
+                    tr(
+                        locale,
+                        "diagnose.detail.logon_session_no_account",
+                        &[("type", &kind), ("package", &package)],
+                    )
+                } else {
+                    tr(
+                        locale,
+                        "diagnose.detail.logon_session",
+                        &[
+                            ("type", &kind),
+                            ("package", &package),
+                            ("account", &account.join("")),
+                        ],
+                    )
+                });
+            }
+            if let Some(state) = check.field("ticketGrantingTicket") {
+                let principal = named(r, "kerberosPrincipal");
+                parts.push(if principal.is_empty() {
+                    tr(locale, "diagnose.detail.tgt_state", &[("state", &state)])
+                } else {
+                    tr(
+                        locale,
+                        "diagnose.detail.tgt_state_for",
+                        &[("state", &state), ("principal", &principal.join(""))],
+                    )
+                });
+            }
+            if let Some(end) = check.field("tgtEndTime") {
+                let expired = check.field("ticketGrantingTicket") == Some("expired");
+                parts.push(
+                    match (
+                        check.field("tgtEncryptionType"),
+                        check.field("tgtSessionKeyType"),
+                    ) {
+                        (Some(encryption), Some(session)) => tr(
+                            locale,
+                            if expired {
+                                "diagnose.detail.tgt_ended_encryption"
+                            } else {
+                                "diagnose.detail.tgt_until_encryption"
+                            },
+                            &[
+                                ("end", &end),
+                                ("encryption", &encryption),
+                                ("session", &session),
+                            ],
+                        ),
+                        _ => tr(
+                            locale,
+                            if expired {
+                                "diagnose.detail.tgt_ended"
+                            } else {
+                                "diagnose.detail.tgt_until"
+                            },
+                            &[("end", &end)],
+                        ),
+                    },
+                );
+            }
+            if let Some(state) = check.field("serviceTicket") {
+                parts.push(
+                    match (
+                        check.field("serviceTicketEncryptionType"),
+                        check.field("serviceTicketSessionKeyType"),
+                        check.field("serviceTicketKeyVersion"),
+                    ) {
+                        (Some(encryption), Some(session), Some(version)) => tr(
+                            locale,
+                            "diagnose.detail.service_ticket_encryption_version",
+                            &[
+                                ("encryption", &encryption),
+                                ("version", &version),
+                                ("session", &session),
+                            ],
+                        ),
+                        (Some(encryption), Some(session), None) => tr(
+                            locale,
+                            "diagnose.detail.service_ticket_encryption",
+                            &[("encryption", &encryption), ("session", &session)],
+                        ),
+                        _ => tr(
+                            locale,
+                            "diagnose.detail.service_ticket",
+                            &[("state", &state)],
+                        ),
+                    },
+                );
+            }
             parts.join(&tr(locale, "diagnose.list.semicolon_separator", &[]))
         }
         super::CheckId::SessionValidation => {
@@ -1203,8 +1306,9 @@ pub fn text_in(report: &Report, locale: &str) -> String {
             if let Some(code) = &error.code {
                 ids.push(code.clone());
             }
-            // A security package's status, as its documentation writes it.
-            if let (Some(status), "sspi" | "gssapi" | "kerberos") =
+            // A security package's or the LSA's status, as its documentation
+            // writes it.
+            if let (Some(status), "sspi" | "gssapi" | "kerberos" | "lsa") =
                 (error.native_error, error.source)
             {
                 ids.push(format!("0x{:08X}", status as u32));
@@ -1771,9 +1875,10 @@ enum SkipView {
 }
 
 /// A check's field: a list for `addresses`, a number for `port`,
-/// `engineEdition`, `clockOffsetMs`, `retries` and `osError` when the value is
-/// one, a boolean for `loginCompleted`, `negotiationComplete` and
-/// `retriedWithoutSpn`, otherwise text.
+/// `engineEdition`, `clockOffsetMs`, `retries`, `osError` and
+/// `serviceTicketKeyVersion` when the value is one, a boolean for
+/// `loginCompleted`, `negotiationComplete` and `retriedWithoutSpn`,
+/// otherwise text.
 #[derive(Serialize)]
 #[serde(untagged)]
 enum FieldValue {
@@ -1833,7 +1938,12 @@ impl CheckView {
             } else if let (true, Ok(number)) = (
                 matches!(
                     field.key,
-                    "port" | "engineEdition" | "clockOffsetMs" | "retries" | "osError"
+                    "port"
+                        | "engineEdition"
+                        | "clockOffsetMs"
+                        | "retries"
+                        | "osError"
+                        | "serviceTicketKeyVersion"
                 ),
                 values[0].parse::<i64>(),
             ) {
@@ -3396,7 +3506,7 @@ Limitations:
         }
         let json = json(&report, "v").unwrap();
         assert!(
-            json.contains("\"coverageMatrixVersion\": \"1.6\""),
+            json.contains("\"coverageMatrixVersion\": \"1.7\""),
             "{json}"
         );
         assert!(
@@ -3493,6 +3603,98 @@ Limitations:
         assert_eq!(attempt["spnSource"], "derived");
         assert_eq!(attempt["negotiationComplete"], false);
         assert_eq!(attempt["retriedWithoutSpn"], true);
+    }
+
+    /// The credentials read are shown as the client read them: a cache's
+    /// type, the ticket-granting ticket's state, principal (a label), end and
+    /// encryption types, and the service ticket with its key version; a
+    /// Windows logon session's type, package and account (a label).
+    #[test]
+    fn the_kerberos_credentials_read_are_shown() {
+        let mut report = passing_report();
+        for check in &mut report.checks {
+            if check.id == CheckId::ConnectionAttempt {
+                for (key, value) in [
+                    ("kerberosTicketCache", "found"),
+                    ("kerberosCredentialsSource", "KRB5CCNAME"),
+                    ("kerberosCacheType", "KCM"),
+                    ("ticketGrantingTicket", "expired"),
+                ] {
+                    check.fields.push(Field::plain(key, value));
+                }
+                check.fields.push(Field::identifier(
+                    "kerberosPrincipal",
+                    "alice@CONTOSO.COM",
+                    Category::User,
+                ));
+                for (key, value) in [
+                    ("tgtEndTime", "2026-11-20T08:15:00Z"),
+                    ("tgtEncryptionType", "aes256-cts-hmac-sha1-96"),
+                    ("tgtSessionKeyType", "aes128-cts-hmac-sha1-96"),
+                    ("serviceTicket", "found"),
+                    ("serviceTicketEncryptionType", "rc4-hmac"),
+                    ("serviceTicketSessionKeyType", "aes256-cts-hmac-sha1-96"),
+                    ("serviceTicketKeyVersion", "3"),
+                ] {
+                    check.fields.push(Field::plain(key, value));
+                }
+            }
+        }
+        let shown = text(&report);
+        for part in [
+            "; ticket cache found; credentials cache KCM named by KRB5CCNAME; ticket-granting \
+             ticket expired for user-",
+            "; ticket-granting ticket ended 2026-11-20T08:15:00Z, aes256-cts-hmac-sha1-96 with \
+             session key aes128-cts-hmac-sha1-96; service ticket found, rc4-hmac (key version 3) \
+             with session key aes256-cts-hmac-sha1-96",
+        ] {
+            assert!(shown.contains(part), "{shown}");
+        }
+        assert!(!shown.contains("alice"), "{shown}");
+        let json: serde_json::Value = serde_json::from_str(&json(&report, "v").unwrap()).unwrap();
+        let attempt = json["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["check"] == "connectionAttempt")
+            .unwrap();
+        assert!(
+            attempt["kerberosPrincipal"]
+                .as_str()
+                .is_some_and(|label| label.starts_with("user-")),
+            "{attempt}"
+        );
+        assert_eq!(attempt["serviceTicketKeyVersion"], 3);
+
+        let mut windows = passing_report();
+        for check in &mut windows.checks {
+            if check.id == CheckId::ConnectionAttempt {
+                for (key, value) in [
+                    ("kerberosTicketCache", "notApplicable"),
+                    ("kerberosCredentialsSource", "logonSession"),
+                    ("logonType", "interactive"),
+                    ("logonPackage", "Kerberos"),
+                ] {
+                    check.fields.push(Field::plain(key, value));
+                }
+                check.fields.push(Field::identifier(
+                    "logonAccount",
+                    r"CONTOSO\alice",
+                    Category::User,
+                ));
+                check
+                    .fields
+                    .push(Field::plain("ticketGrantingTicket", "absent"));
+                check.fields.push(Field::plain("serviceTicket", "notFound"));
+            }
+        }
+        let shown = text(&windows);
+        for part in [
+            "; ticket cache notApplicable; interactive logon through Kerberos as user-",
+            "; ticket-granting ticket absent; service ticket notFound",
+        ] {
+            assert!(shown.contains(part), "{shown}");
+        }
     }
 
     /// A security package's status is shown in hex, as its documentation
