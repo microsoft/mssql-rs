@@ -1,9 +1,6 @@
-# Installs the macOS docker toolchain from our own feed and boots the Colima VM.
-#
-# Used by every macOS job that needs containers. The payload is produced by
-# .pipeline/macos-docker-toolchain-pipeline.yml; see .pipeline/scripts/README.md
-# for why it exists. Shared rather than inlined so the two macOS templates
-# cannot drift apart on the version they pin.
+# Downloads the pinned macOS Docker/Colima toolchain from our own feed. The
+# payload is produced by .pipeline/macos-docker-toolchain-pipeline.yml; see the
+# scripts README for details.
 
 parameters:
 # Pinned rather than floating. The feed supports '*', but floating means an
@@ -14,14 +11,6 @@ parameters:
 - name: toolchainVersion
   type: string
   default: '0.1.0'
-- name: condition
-  type: string
-  default: succeeded()
-# False only downloads the toolchain, for callers that boot Colima themselves
-# (sql-setup-template.yml boots it in the background).
-- name: startColima
-  type: boolean
-  default: true
 
 steps:
 # Hosted macOS images are Intel today and Apple silicon eventually; reading the
@@ -32,11 +21,11 @@ steps:
     echo "agent architecture: $arch"
     echo "##vso[task.setvariable variable=toolchainPackage]macos-docker-toolchain-$arch"
   displayName: 'Select the toolchain package for this agent'
-  condition: ${{ parameters.condition }}
+  condition: succeeded()
 
 - task: UniversalPackages@0
   displayName: 'Download macOS docker toolchain ${{ parameters.toolchainVersion }}'
-  condition: ${{ parameters.condition }}
+  condition: succeeded()
   inputs:
     command: download
     downloadDirectory: '$(Agent.TempDirectory)/docker-toolchain'
@@ -44,13 +33,3 @@ steps:
     vstsFeed: 'public/mssql-rs_Public'
     vstsFeedPackage: '$(toolchainPackage)'
     vstsPackageVersion: '${{ parameters.toolchainVersion }}'
-
-# timeoutInMinutes backstops the script's own wall-clock budgets: the macOS job
-# is time-capped and SQL setup must not be what exhausts it.
-- ${{ if eq(parameters.startColima, true) }}:
-  - script: bash .pipeline/scripts/start-colima-macos.sh
-    displayName: 'Install and start Colima-based Docker'
-    condition: ${{ parameters.condition }}
-    timeoutInMinutes: 15
-    env:
-      TOOLCHAIN_DIR: '$(Agent.TempDirectory)/docker-toolchain'
