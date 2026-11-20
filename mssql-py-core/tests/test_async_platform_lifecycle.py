@@ -42,6 +42,9 @@ async def _start_waiting_nextset(client_context):
         session_id = (
             await asyncio.wait_for(cursor.fetchone(), timeout=5)
         )[0]
+        # Consume RAISERROR's no-row result before the blocking advance.
+        assert await asyncio.wait_for(cursor.nextset(), timeout=5) is True
+        assert cursor.description is None
         operation = asyncio.ensure_future(cursor.nextset())
         monitor_cursor = monitor.cursor()
         deadline = asyncio.get_running_loop().time() + 15
@@ -56,6 +59,7 @@ async def _start_waiting_nextset(client_context):
             )
             row = await asyncio.wait_for(monitor_cursor.fetchone(), timeout=5)
             if row is not None and row[0] == "WAITFOR":
+                assert not operation.done(), "Result-set advance completed before cancellation"
                 ready = True
                 return connection, monitor, cursor, operation
             await asyncio.sleep(0.05)
@@ -136,6 +140,52 @@ def test_cancelled_nextset_probe_retries_only_busy_admission(monkeypatch, busy):
             test_cancelled_nextset_during_server_wait_resynchronizes_connection({})
         assert probe.execute.await_count == 1
         probe.fetchone.assert_not_awaited()
+
+
+@pytest.mark.parametrize("pending", [True, False], ids=["waiting", "already-completed"])
+def test_waiting_nextset_skips_message_result_before_admission(monkeypatch, pending):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    import sys
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        message = loop.create_future()
+        message.set_result(True)
+        advance = loop.create_future()
+        if not pending:
+            advance.set_result(True)
+        cursor = SimpleNamespace(
+            execute=AsyncMock(),
+            fetchone=AsyncMock(return_value=(42,)),
+            nextset=Mock(side_effect=[message, advance]),
+            description=None,
+        )
+        monitor_cursor = SimpleNamespace(
+            execute=AsyncMock(),
+            fetchone=AsyncMock(return_value=("WAITFOR",)),
+        )
+        connection = SimpleNamespace(cursor=lambda: cursor, close=AsyncMock())
+        monitor = SimpleNamespace(cursor=lambda: monitor_cursor, close=AsyncMock())
+        monkeypatch.setattr(
+            sys.modules[__name__],
+            "_connect",
+            AsyncMock(side_effect=[connection, monitor]),
+        )
+        try:
+            if pending:
+                result = await _start_waiting_nextset({})
+                assert result[3] is advance
+                assert not advance.done()
+            else:
+                with pytest.raises(AssertionError, match="advance completed before cancellation"):
+                    await _start_waiting_nextset({})
+            assert cursor.nextset.call_count == 2
+        finally:
+            advance.cancel()
+            await asyncio.gather(advance, return_exceptions=True)
+
+    asyncio.run(run())
 
 
 @pytest.mark.integration

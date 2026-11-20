@@ -834,7 +834,7 @@ def test_cancelled_execute_with_large_string_closes_safely(client_context, use_p
                                         await cursor.execute(
                                             "SELECT N'after cancellation'", use_prepare=use_prepare
                                         )
-                                    except RuntimeError as error:
+                                    except mssql_py_core.InterfaceError as error:
                                         if "busy" not in str(error).lower():
                                             assert str(error) == "Connection is broken"
                                             break
@@ -855,7 +855,7 @@ def test_cancelled_execute_with_large_string_closes_safely(client_context, use_p
                             assert await independent_cursor.fetchall() == [(marker,)]
                             await conn.close()
                             assert conn.closed
-                            with pytest.raises(RuntimeError, match="Connection is closed"):
+                            with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
                                 await cursor.execute(
                                     "SELECT N'after close'", use_prepare=use_prepare
                                 )
@@ -985,7 +985,7 @@ def test_encoding_conversion_after_fetch_cancellation(client_context, use_prepar
                                         statement, value, use_prepare=use_prepare
                                     )
                                     break
-                                except RuntimeError as error:
+                                except mssql_py_core.InterfaceError as error:
                                     if "busy" not in str(error).lower():
                                         raise
                                     if asyncio.get_running_loop().time() >= deadline:
@@ -1147,7 +1147,7 @@ def test_interrupted_large_string_fetch(client_context, use_prepare, interruptio
                             assert exc_info.value.sql_errors[0]["number"] == 596
                             await reader.close()
                             assert reader.closed
-                            with pytest.raises(RuntimeError, match="Connection is closed"):
+                            with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
                                 await cursor.execute(
                                     "SELECT N'after close'", use_prepare=use_prepare
                                 )
@@ -1946,7 +1946,7 @@ def test_overlapping_string_execute_is_rejected(client_context, use_prepare, sam
                 try:
                     try:
                         await wait_for_lock_wait(control, session_id, pending)
-                        with pytest.raises(RuntimeError, match="busy with another cursor operation"):
+                        with pytest.raises(mssql_py_core.InterfaceError, match="busy with another cursor operation"):
                             await contender.execute(
                                 statement,
                                 replacement,
