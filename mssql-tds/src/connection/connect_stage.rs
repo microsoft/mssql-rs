@@ -52,12 +52,14 @@ pub const DNS: &str = "dns";
 pub const TCP: &str = "tcp";
 
 /// The SQL Server Browser lookup of a named instance. Fields: [`SERVER`],
-/// [`INSTANCE`], [`ADDRESSES`] once the server is resolved; on success
-/// [`PORT`] and/or [`PIPE`], what the Browser listed for the instance; on
-/// failure [`RESULT`], a stable code: `nameResolutionFailed`, `noAddresses`,
-/// `socketFailed`, `sendFailed`, `receiveFailed`, `noAnswer`, `timedOut`,
-/// `invalidResponse`, or [`NO_ENDPOINT`]; and [`OS_ERROR`] and [`ERROR`]
-/// when there are.
+/// [`INSTANCE`], [`ADDRESSES`] once the server is resolved; [`REQUEST`] when
+/// the Browser is asked for something other than the instance's endpoints;
+/// on success [`PORT`] and/or [`PIPE`], what the Browser listed for the
+/// instance (with [`REQUEST_DAC`], [`PORT`] is the dedicated administrator
+/// connection's); on failure [`RESULT`], a stable code:
+/// `nameResolutionFailed`, `noAddresses`, `socketFailed`, `sendFailed`,
+/// `receiveFailed`, `noAnswer`, `timedOut`, `invalidResponse`, or
+/// [`NO_ENDPOINT`]; and [`OS_ERROR`] and [`ERROR`] when there are.
 pub const INSTANCE_LOOKUP: &str = "instance_lookup";
 
 /// Opening a named pipe, the pipe shared memory uses, or a LocalDB
@@ -134,6 +136,13 @@ pub const RESOLVER_IO_KIND: &str = "resolver_io_kind";
 pub const RESOLVER_ERROR: &str = "resolver_error";
 /// The stable code of a failed instance lookup.
 pub const RESULT: &str = "result";
+/// What an [`INSTANCE_LOOKUP`] asked SQL Server Browser for, when not the
+/// instance's endpoints: [`REQUEST_DAC`].
+pub const REQUEST: &str = "request";
+
+/// [`REQUEST`] for a named instance's dedicated administrator connection
+/// port (SSRP's CLNT_UCAST_DAC).
+pub const REQUEST_DAC: &str = "dac";
 
 /// [`KIND`] of a named pipe given or found.
 pub const KIND_NAMED_PIPE: &str = "namedPipe";
