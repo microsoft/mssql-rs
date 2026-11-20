@@ -213,12 +213,14 @@ every non-Strict mode) stay on a socket with Secure Transport.
   `TrustServerCertificate` is ignored in Strict mode, as on every platform.
   `server_certificate` pinning skips the chain and name checks, so it also
   accepts X.509 v1 certificates.
-- **Shutdown.** Closing the connection sends `close_notify` once earlier writes
-  have gone out. If the server stops reading, the connection is cancelled after
-  a second, whether it was closed or dropped, and `close_connection` fails with
-  `Error::Io` (`TimedOut`). Closing also fails if earlier writes failed or were
-  still unsent when the connection ended. Closing a connection that has already
-  ended with all writes sent succeeds, as on the socket path. A peer that
+- **Shutdown.** Explicitly awaited `close_connection()` sends `close_notify` once
+  earlier writes have gone out. If the server stops reading during that close,
+  the connection is cancelled after a second, and `close_connection` fails with
+  `Error::Io` (`TimedOut`). Dropping the connection instead force-cancels it
+  immediately without draining queued writes. Closing also fails if earlier
+  writes failed or were still unsent when the connection ended. Closing a
+  connection that has already ended with all writes sent succeeds, as on the
+  socket path. A peer that
   closes the transport without `close_notify` reads as a clean end of stream,
   as with Secure Transport; TDS framing catches a truncated response. A hard
   abort after an interrupted request write instead force-cancels the connection
