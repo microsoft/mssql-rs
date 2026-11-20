@@ -164,6 +164,45 @@ stages:
           enableOdbcE2E: true
       - pwsh: |
           $ErrorActionPreference = 'Stop'
+          $venv = Join-Path $env:AGENT_TEMPDIRECTORY 'pycore-platform-venv'
+          python -m venv $venv
+          if ($LASTEXITCODE -ne 0) { throw "Python virtualenv creation failed (exit $LASTEXITCODE)" }
+          $python = Join-Path $venv 'Scripts\python.exe'
+          $scripts = Join-Path $venv 'Scripts'
+          $env:VIRTUAL_ENV = $venv
+          $env:PATH = "$scripts;$env:PATH"
+          & $python -m pip install --quiet 'maturin>=1.0,<2.0' 'pytest>=7.0' 'pytest-asyncio>=0.21.0' 'python-dotenv>=1.0.0'
+          if ($LASTEXITCODE -ne 0) { throw "Python test dependencies failed to install (exit $LASTEXITCODE)" }
+          Push-Location mssql-py-core
+          try {
+            maturin develop
+            if ($LASTEXITCODE -ne 0) { throw "mssql-py-core build failed (exit $LASTEXITCODE)" }
+            & $python tests/run_platform_lifecycle_tests.py
+            if ($LASTEXITCODE -ne 0) { throw "Cross-platform Python lifecycle tests failed (exit $LASTEXITCODE)" }
+          }
+          finally {
+            Pop-Location
+          }
+        displayName: Run Python lifecycle tests (Windows)
+        condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+        timeoutInMinutes: 20
+        env:
+          SQL_SERVER: localhost,1433
+          SQL_DATABASE: master
+          DB_USERNAME: sa
+          SQL_PASSWORD: $(SQL_PASSWORD)
+          TRUST_SERVER_CERTIFICATE: 'true'
+      - task: PublishTestResults@2
+        displayName: Publish Python lifecycle test results (Windows)
+        condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: $(Build.SourcesDirectory)/mssql-py-core/pytest-platform-lifecycle-results.xml
+          testRunTitle: $(System.PhaseName)-PythonLifecycle
+          failTaskOnFailedTests: true
+          failTaskOnMissingResultsFile: false
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
           rustup toolchain install $(miriToolchain) --profile minimal --component miri,rust-src
           if ($LASTEXITCODE -ne 0) { throw "Miri toolchain installation failed (exit $LASTEXITCODE)" }
           cargo +$(miriToolchain) miri setup --target x86_64-pc-windows-msvc
@@ -553,6 +592,12 @@ stages:
           # data, so it runs alongside the ODBC e2e suite below.
           backgroundCoverageReport: true
           beforeTestSteps:
+            - script: |
+                set -euo pipefail
+                cargo nextest run --frozen --package mssql-tds --all-features --lib \
+                  -E 'test(cancellation_preserves_a_parser_paused_mid_row) | test(attention_timeout_while_draining_after_a_partial_row_retires_the_connection)'
+              displayName: Run deterministic transport cancellation tests (macOS, pre-SQL)
+              timeoutInMinutes: 15
             # Covers Colima's 32m retry budget, SQL's 20m budget, and cleanup.
             - script: bash .pipeline/scripts/background-step.sh wait "$(Agent.TempDirectory)/macos-sql" 3300
               displayName: 'Wait for Colima and SQL Server'
@@ -571,6 +616,32 @@ stages:
               displayName: 'Verify macOS SQL Server before tests'
               env:
                 SQL_PASSWORD: $(SQL_PASSWORD)
+      - script: |
+          set -euo pipefail
+          python -m venv "$AGENT_TEMPDIRECTORY/pycore-platform-venv"
+          source "$AGENT_TEMPDIRECTORY/pycore-platform-venv/bin/activate"
+          python -m pip install --quiet 'maturin>=1.0,<2.0' 'pytest>=7.0' 'pytest-asyncio>=0.21.0' 'python-dotenv>=1.0.0'
+          cd mssql-py-core
+          maturin develop
+          python tests/run_platform_lifecycle_tests.py
+        displayName: Run Python lifecycle tests (macOS)
+        condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+        timeoutInMinutes: 20
+        env:
+          SQL_SERVER: localhost,1433
+          SQL_DATABASE: master
+          DB_USERNAME: sa
+          SQL_PASSWORD: $(SQL_PASSWORD)
+          TRUST_SERVER_CERTIFICATE: 'true'
+      - task: PublishTestResults@2
+        displayName: Publish Python lifecycle test results (macOS)
+        condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: $(Build.SourcesDirectory)/mssql-py-core/pytest-platform-lifecycle-results.xml
+          testRunTitle: $(System.PhaseName)-PythonLifecycle
+          failTaskOnFailedTests: true
+          failTaskOnMissingResultsFile: false
       - script: |
           set -euo pipefail
           if ! command -v cmake >/dev/null 2>&1; then
