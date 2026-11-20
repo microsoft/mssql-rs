@@ -943,8 +943,10 @@ trait ConnectionFactory: Send + Sync {
 ```
 
 The pool reserves capacity first and invokes `open` only for a physical open. The production
-adapter calls `TdsConnectionProvider::create_client(context, &datasource, Some(cancel))`. The
-pool owns isolation/reset/return policy, not the factory. Deterministic tests inject a Rust
+adapter calls `TdsConnectionProvider::create_client`, passing the context,
+datasource and cancellation handle explicitly. macOS Network.framework always
+force-cancels on Drop; no pool-specific disposal option is required. The pool owns
+isolation/reset/return policy, not the factory. Deterministic tests inject a Rust
 factory returning scripted clients.
 
 The factory supports SQL/trusted auth, a raw pre-acquired token, or the public async
@@ -1239,7 +1241,7 @@ verify a real login principal or implement token refresh. The separate Rust
 SQL-auth key authority is `connection_key.rs` under section 7.1; authentication
 adapters must supply verified login metadata.
 `ConnectSpec` receives already-validated effective options, including the
-pooled recovery restriction. No concrete physical factory is enabled yet.
+pooled recovery restriction. A3 adds the SQL-password physical factory below.
 
 `AcquireControl::run` drops its caller-owned future on cancellation/timeout.
 It does not cancel a TDS `CancelHandle`, supervise detached transport work, or
@@ -1255,10 +1257,9 @@ for the compiled lifecycle adapter.
 
 The core developer can build A2's manager and lifecycle behind these contracts.
 The AQE developer can work on B2/B3's logical ownership and close coordination
-on the existing direct path. There is no placeholder `PoolLease`, `ConnHandle` or Python `AsyncPool`.
-A2's compiled manager is described below; ready SQL acquisition, the full
-reset/return protocol, real SQL validation and platform matrix remain
-subsequent approved slices.
+on the existing direct path. There is no `ConnHandle` or Python `AsyncPool`.
+A2's compiled manager and A3's private SQL checkout are described below.
+Safe return, AQE integration and platform certification remain separate slices.
 
 ### 10.3 A2 compiled lifecycle
 
@@ -1342,6 +1343,50 @@ check causes the corresponding regression test to fail.
 
 These tests are lifecycle and scripted-client evidence, not live pooled SQL,
 transport-child-task settlement, Python bridge or performance certification.
+
+### 10.4 A3 private SQL checkout
+
+`pool/session.rs` implements `AsyncPoolManager::acquire` and a uniquely owned
+`PoolLease`. The current-call factory opens only after slot reservation. Fresh
+and cached clients execute and fully drain a concrete isolation SET before
+publication, including READ COMMITTED. Cached checkout arms full reset and
+requires the TDS reset acknowledgement and a quiescent, live session afterward.
+Dead, dirty or reset-invalid candidates are discarded. Retries are bounded by
+the initial cached-candidate snapshot, surrender capacity and rejoin FIFO;
+the final replacement may retain its empty reservation for one fresh open.
+Fresh login and initialization failures propagate without retry.
+
+All stages retain the original absolute acquisition deadline, cancellation
+signal and pool generation. Operation guards cancel TDS handles on interruption;
+caller-owned parallel TCP attempts drop synchronously before slot release.
+Network.framework connections always force-cancel on Drop, including interrupted
+opens and initialization, rather than draining TLS asynchronously after capacity
+has been released. This behavior applies to ordinary and pooled connections
+without changing connection configuration. Explicitly awaited close remains
+graceful.
+No application SQL is replayed.
+
+This slice enables SQL-password login only, rejects nonzero session-recovery
+counts and Always Encrypted, and checks the caller/factory authentication binding.
+It does not construct canonical keys or add token/trusted-auth pooling.
+`PoolLease` Drop discards; the quiescent-return seam remains test-only.
+There is no production check-in, Python pool API or change to AQE's direct path.
+Safe return belongs to AB#50052.
+
+The deterministic suite uses scripted TDS clients and gated reads. The native
+live-SQL harness compiles the private pool modules without exporting them from
+the cdylib and reuses `mssql-tds/tests/common` environment/SQL helpers:
+
+```powershell
+cargo nextest run --manifest-path .\mssql-py-core\Cargo.toml --frozen --lib -E 'test(pool::)' --no-fail-fast
+cargo nextest run --manifest-path .\mssql-py-core\Cargo.toml --frozen --test pool_sql -E 'test(live_)' --run-ignored only
+```
+
+Live tests require `DB_HOST`, `DB_USERNAME`, `SQL_PASSWORD` and the existing
+`DB_PORT`/TLS settings. They cover all five isolation levels on fresh and
+same-SPID cached checkout, reset of session settings/temp tables, and rejection
+of a fault-injected active transaction. They do not prove return cleanup,
+authentication parity, or support for untested platforms/server topologies.
 
 ### Upstream contracts reviewed
 

@@ -669,7 +669,7 @@ fn cancel(connection: &Handle<Nw>) {
 
 impl Drop for NwStream {
     fn drop(&mut self) {
-        self.close();
+        self.abort();
     }
 }
 
