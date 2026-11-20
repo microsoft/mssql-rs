@@ -62,6 +62,8 @@ std::string VarcharQuery(const ServerText& text, const char* type = "varchar(max
            " AS " + type + ")";
 }
 
+std::string MissingConverterMessage(unsigned code_page);
+
 bool ComparingMsodbcsql() {
     const char* target = std::getenv("ODBC_TEST_TARGET");
     return target != nullptr && std::string(target) == "msodbcsql";
@@ -182,7 +184,10 @@ protected:
         const unsigned long parsed = std::strtoul(value, &end, 10);
         ASSERT_NE(value, end);
         ASSERT_EQ('\0', *end);
-        ASSERT_TRUE(parsed == 1252 || parsed == 65001 || parsed == 932 || parsed == 1251);
+        ASSERT_TRUE(std::any_of(std::begin(kServerCollations), std::end(kServerCollations),
+                                [parsed](const ServerText& text) {
+                                    return text.code_page == parsed && text.code_page != 0;
+                                }));
         client_code_page_ = static_cast<unsigned>(parsed);
 
         // msodbcsql has no override; it is a valid reference only when the
@@ -196,6 +201,10 @@ protected:
 #else
             GTEST_SKIP() << "msodbcsql uses the process locale, not the test override";
 #endif
+        }
+
+        if (!ODBCTestUtils::HasCodePageConverter(client_code_page_)) {
+            GTEST_SKIP() << MissingConverterMessage(client_code_page_);
         }
 
         Connect();
@@ -338,18 +347,25 @@ protected:
 };
 
 const ServerText& TextForCodePage(unsigned code_page) {
-    const auto found = std::find_if(std::begin(kServerText), std::end(kServerText),
-                                    [code_page](const ServerText& text) {
-                                        return text.code_page == code_page;
-                                    });
-    if (found == std::end(kServerText)) {
+    const auto find = [code_page](const ServerText* begin, const ServerText* end) {
+        return std::find_if(begin, end, [code_page](const ServerText& text) {
+            return text.code_page == code_page;
+        });
+    };
+    const auto text = find(std::begin(kServerText), std::end(kServerText));
+    if (text != std::end(kServerText)) {
+        return *text;
+    }
+    const auto collation =
+        find(std::begin(kServerCollations), std::end(kServerCollations));
+    if (collation == std::end(kServerCollations)) {
         throw std::invalid_argument("unsupported test code page");
     }
-    return *found;
+    return *collation;
 }
 
 std::string MissingConverterMessage(unsigned code_page) {
-    return "host iconv cannot convert UTF-8 to code page " + std::to_string(code_page) +
+    return "host has no converter for code page " + std::to_string(code_page) +
            " (musl before 1.2.5 has no cp932; RHEL needs glibc-gconv-extra)";
 }
 
@@ -428,40 +444,20 @@ ODBC_TEST_F(ClientCodePageTest, NativeNarrowFetchTranscodesAcrossCollations) {
 // Benefits-from-mock-tds: synthetic UTF-8/DBCS PLP payloads could place encoded
 // characters at exact TDS chunk boundaries without relying on SQL Server casts.
 ODBC_TEST_F(ClientCodePageTest, NarrowChunksFillBufferAndReassemble) {
-    if (!ODBCTestUtils::HasCodePageConverter(client_code_page_)) {
-        GTEST_SKIP() << MissingConverterMessage(client_code_page_);
-    }
     const ServerText& text = TextForCodePage(client_code_page_);
-    std::string sql = VarcharQuery(text);
-    if (client_code_page_ == 1252) {
-        sql = "SELECT CAST(NCHAR(65) + NCHAR(8364) + NCHAR(66) COLLATE " +
-              std::string(text.collation) + " AS varchar(max))";
-    } else if (client_code_page_ == 932) {
-        sql = "SELECT CAST(NCHAR(65) + NCHAR(12354) + NCHAR(66) COLLATE " +
-              std::string(text.collation) + " AS varchar(max))";
-    } else if (client_code_page_ == 1251) {
-        sql = "SELECT CAST(NCHAR(65) + NCHAR(1046) + NCHAR(66) COLLATE " +
-              std::string(text.collation) + " AS varchar(max))";
-    } else {
-        sql = "SELECT CAST(NCHAR(65) + NCHAR(55357) + NCHAR(56832) + NCHAR(66) COLLATE " +
-              std::string(text.collation) + " AS varchar(max))";
-    }
-    const std::string utf8_value =
-        client_code_page_ == 1252 ? "A\xE2\x82\xAC" "B" :
-        client_code_page_ == 932 ? "A\xE3\x81\x82" "B" :
-        client_code_page_ == 1251 ? "A\xD0\x96" "B" :
-                                    "A\xF0\x9F\x98\x80" "B";
-    const std::string encoded =
-        ODBCTestUtils::Utf8ToCodePage(utf8_value, client_code_page_);
+    const std::string sql =
+        "SELECT CAST((NCHAR(65) + " + std::string(text.expression) + " + NCHAR(66)) COLLATE " +
+        text.collation + " AS varchar(max))";
+    const std::string encoded_character =
+        ODBCTestUtils::Utf8ToCodePage(text.utf8, client_code_page_);
+    const std::string encoded = "A" + encoded_character + "B";
     // AB#47564: SQL_C_CHAR chunks fill the byte capacity even mid-character, so
     // the multibyte character splits across the first two chunks.
-    const bool multibyte_split = client_code_page_ == 65001 || client_code_page_ == 932;
-    const std::vector<size_t> chunk_sizes =
-        client_code_page_ == 65001 ? std::vector<size_t>{4, 2} :
-        client_code_page_ == 932 ? std::vector<size_t>{2, 2} :
-                                   std::vector<size_t>{1, 1, 1};
-    const SQLLEN buffer_length =
-        client_code_page_ == 65001 ? 5 : client_code_page_ == 932 ? 3 : 2;
+    const bool multibyte_split = encoded_character.size() > 1;
+    const std::vector<size_t> chunk_sizes = multibyte_split
+                                                ? std::vector<size_t>{encoded_character.size(), 2}
+                                                : std::vector<size_t>{1, 1, 1};
+    const SQLLEN buffer_length = static_cast<SQLLEN>(encoded_character.size() + 1);
     // msodbcsql's chunk sizes for a split multibyte character are unmeasured; its
     // leg runs only when the Windows ACP matches, so that leg asserts reassembly only.
     const char* target = std::getenv("ODBC_TEST_TARGET");
