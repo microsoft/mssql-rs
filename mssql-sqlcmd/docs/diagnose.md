@@ -197,10 +197,41 @@ For the diagnostic client's own attempt it reports `securityPackage`, the
 package asked for (`Negotiate` on Windows, `Kerberos` elsewhere), and, once the
 security context reports them, `negotiatedPackage` (Negotiate's choice of
 `Kerberos` or `NTLM`), `negotiationComplete`, and `retriedWithoutSpn` when it
-retried a connection to this computer without an SPN; off Windows, whether a
-ticket cache exists. Negotiate choosing NTLM is a confirmed finding, with a
-limitation that Windows does not say why unless that retry explains it. A
-security package's failure keeps its codes in the error chain, outer first:
+retried a connection to this computer without an SPN. Negotiate choosing NTLM
+is a confirmed finding, with a limitation that Windows does not say why unless
+that retry explains it.
+After the attempt, diagnose reads the client's own Kerberos credentials, where
+its Kerberos library or Windows keeps them, without asking a KDC for anything
+or reading a key: `kerberosCredentialsSource` says where (`KRB5CCNAME`,
+`defaultCache`, or Windows' `logonSession`). Off Windows, MIT krb5's own
+library (`libkrb5.so.3`, loaded at run time) gives the cache's
+`kerberosCacheType` (`FILE`, `DIR`, `KCM`, `KEYRING`...), its file
+(`kerberosCache`, a label) and its tickets; on macOS, whose library is another
+implementation, and wherever MIT's cannot be loaded, GSSAPI gives the default
+credentials' principal and lifetime only, and a limitation says so. On Windows,
+the LSA gives the logon session's `logonType`, `logonPackage` and
+`logonAccount` (a label) and lists its tickets as `klist` does, without a
+privilege. `ticketGrantingTicket` is `valid`, `expired`, `absent`, `unreadable`
+(its read's own code follows the attempt's errors in the error chain),
+`unavailable` (no Kerberos library) or `notChecked` (no time left), with
+`kerberosPrincipal` (a label), `tgtEndTime` and the ticket's encryption types;
+`serviceTicket` is `found` or `notFound` for the SPN, with its encryption types
+and key version (`serviceTicketKeyVersion`, off Windows). `kerberosTicketCache`
+keeps its meaning: `found`, `notFound`, `unverified` when the cache could not
+be read, `notChecked`, and `notApplicable` on Windows. When the client's own
+security package failed at the login without a code that explains it, and the
+cache held no valid ticket-granting ticket and no valid service ticket for the
+SPN, the login had no Kerberos credentials to present: a confirmed finding
+(suspected where tickets are not listed). A code says more, and a server that
+answered the login was presented credentials, so neither gets it. sqlcmd's own
+driver runs in the same process with the same credentials: its failed login
+gets the finding when the server answered none of it and the diagnostic
+client's evidence login failed at its own login.
+Windows gets tickets when it needs them, so a logon session without one is
+evidence only. A service ticket with DES, triple DES or RC4 is an informational
+finding. The encryption types are those of the tickets found, not every type
+the account allows, and a limitation says so.
+A security package's failure keeps its codes in the error chain, outer first:
 SSPI's `SECURITY_STATUS` (`"source": "sspi"`), or GSSAPI's major status
 (`gssapi`) and the Kerberos library's code beneath it (`kerberos`), each with
 its symbolic name as `code` and its value as `nativeError` (in hex in text).
@@ -298,14 +329,16 @@ English:
 addresses. Review the output before sharing it." Server, instance and host
 names (the `-F` certificate name included), IP addresses, named pipe paths and
 Kerberos SPNs identify the endpoint and are shown as they are. Database and
-user names are replaced with labels (`database-1`, `user-1`) that are stable
-within one run only, in the text and JSON report alike, and in error text
-where they appear as whole words. `--local-detail` shows them as they are
-(JSON `localDetail: true`). Text sqlcmd cannot classify, such as error
-messages, is flagged for review before sharing (`errors[].message` and
-`errors[].text` in `reviewBeforeSharing`), with or without local detail. No
-check reports certificate subject or SAN names or file paths; they would be
-labelled the same way. The password is never part of the report.
+user names, Kerberos principals and logon accounts, and file paths (a Kerberos
+credentials cache's) are replaced with labels (`database-1`, `user-1`,
+`path-1`) that are stable within one run only, in the text and JSON report
+alike, and in error text where they appear as whole words. `--local-detail`
+shows them as they are (JSON `localDetail: true`). Text sqlcmd cannot
+classify, such as error messages, is flagged for review before sharing
+(`errors[].message` and `errors[].text` in `reviewBeforeSharing`), with or
+without local detail. No check reports certificate subject or SAN names; they
+would be labelled the same way. The password is never part of the report, and
+neither is a Kerberos key or ticket.
 
 For transport evidence, `mssql-tds` makes one diagnostic connection attempt,
 through its diagnostic entry point (`TdsConnectionProvider::diagnose_client`):
