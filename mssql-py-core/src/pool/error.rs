@@ -55,6 +55,10 @@ pub(crate) enum PoolError {
     IdentityMismatch,
     #[error("known token expiry does not permit reuse")]
     TokenExpired,
+    #[error("connection initialization failed")]
+    Initialize(#[source] Box<TdsError>),
+    #[error("connection is not quiescent after initialization")]
+    InvalidSession,
     #[error("connection cleanup failed")]
     Cleanup(#[source] Box<TdsError>),
     #[error("connection cleanup timed out")]

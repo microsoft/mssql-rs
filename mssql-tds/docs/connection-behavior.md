@@ -21,7 +21,8 @@ MSF off attempts the complete address list sequentially, respecting
 `IPAddressPreference`. Parallel mode does not prioritize an address family.
 Parallel attempts share the TCP-connect budget, including DNS; sequential
 attempts retain their per-address budgets. Both remain inside the existing
-login deadline. Cancelling a parallel race aborts its remaining socket tasks.
+login deadline. Cancelling a parallel race synchronously drops its remaining
+caller-owned connection attempts before releasing the caller's resources.
 
 Precedence is **explicit connection > application startup default > deployment
 environment > built-in true**. Set `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT` to
@@ -212,12 +213,14 @@ every non-Strict mode) stay on a socket with Secure Transport.
   `TrustServerCertificate` is ignored in Strict mode, as on every platform.
   `server_certificate` pinning skips the chain and name checks, so it also
   accepts X.509 v1 certificates.
-- **Shutdown.** Closing the connection sends `close_notify` once earlier writes
-  have gone out. If the server stops reading, the connection is cancelled after
-  a second, whether it was closed or dropped, and `close_connection` fails with
-  `Error::Io` (`TimedOut`). Closing also fails if earlier writes failed or were
-  still unsent when the connection ended. Closing a connection that has already
-  ended with all writes sent succeeds, as on the socket path. A peer that
+- **Shutdown.** Explicitly awaited `close_connection()` sends `close_notify` once
+  earlier writes have gone out. If the server stops reading during that close,
+  the connection is cancelled after a second, and `close_connection` fails with
+  `Error::Io` (`TimedOut`). Dropping the connection instead force-cancels it
+  immediately without draining queued writes. Closing also fails if earlier
+  writes failed or were still unsent when the connection ended. Closing a
+  connection that has already ended with all writes sent succeeds, as on the
+  socket path. A peer that
   closes the transport without `close_notify` reads as a clean end of stream,
   as with Secure Transport; TDS framing catches a truncated response. A hard
   abort after an interrupted request write instead force-cancels the connection
@@ -230,6 +233,19 @@ every non-Strict mode) stay on a socket with Secure Transport.
 `default-features = false` removes the Network.framework path and its `block2`
 dependency, which hands Objective-C blocks to Network.framework, so Strict
 connections use a socket and Secure Transport (TLS 1.2 maximum).
+
+## Abandoned connection teardown
+
+On macOS Network.framework, dropping a connection force-cancels it before Drop
+returns instead of scheduling a graceful drain of queued TLS writes. This applies
+to both ordinary and pooled connections, including interrupted handshakes,
+redirected login and recovered transports. No disposal option is required.
+Other backends' disposal behavior is unchanged.
+
+Explicitly awaited `close_connection()` remains graceful: it drains queued writes
+before negotiating the TLS close. Drop abandons the connection instead and does
+not guarantee delivery of pending writes.
+Local cancellation does not guarantee immediate removal of a server-side session.
 
 ## Execution stack usage
 
