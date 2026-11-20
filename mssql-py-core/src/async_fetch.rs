@@ -439,7 +439,7 @@ async fn materialize_rows(output: FetchOutput, rows: Vec<PyRowWriter>) -> PyResu
     match output {
         FetchOutput::One => tokio::task::spawn_blocking(move || {
             Python::attach(|py| match rows.into_iter().next() {
-                Some(writer) => Ok(writer.to_async_py_tuple(py)?.into_any().unbind()),
+                Some(writer) => Ok(writer.to_py_tuple(py)?.into_any().unbind()),
                 None => Ok(py.None()),
             })
         })
@@ -464,7 +464,7 @@ async fn materialize_list_rows(rows: Vec<PyRowWriter>) -> PyResult<Py<PyAny>> {
                 Python::attach(|py| {
                     let converted = chunk
                         .into_iter()
-                        .map(|writer| writer.to_async_py_tuple(py).map(Bound::unbind))
+                        .map(|writer| writer.to_py_tuple(py).map(Bound::unbind))
                         .collect::<PyResult<Vec<_>>>()?;
                     let chunk = PyList::new(py, converted)?;
                     let list = match list {
@@ -1207,6 +1207,7 @@ mod tests {
     use mssql_tds::datatypes::row_writer::RowWriter;
     use mssql_tds::datatypes::sql_string::EncodingType;
     use mssql_tds::error::Error;
+    use mssql_tds::token::tokens::SqlCollation;
     use pyo3::Python;
     use pyo3::types::PyAnyMethods;
 
@@ -1225,31 +1226,48 @@ mod tests {
     use crate::row_writer::PyRowWriter;
 
     #[tokio::test]
-    async fn malformed_utf8_is_rejected_only_by_async_materialization() {
+    async fn malformed_utf8_uses_replacement_in_sync_and_async_materialization() {
         for output in [FetchOutput::One, FetchOutput::Many, FetchOutput::All] {
-            for (bytes, expected) in [
-                (&b"\x80"[..], "\u{fffd}"),
-                (&b"\xc0\xaf"[..], "\u{fffd}\u{fffd}"),
-                (&b"\xe2\x82"[..], "\u{fffd}"),
-                (&b"\xf0\x28\x8c\xbc"[..], "\u{fffd}(\u{fffd}\u{fffd}"),
+            for encoding in [
+                EncodingType::Utf8,
+                EncodingType::LcidBased(SqlCollation {
+                    info: 0x0409,
+                    lcid_language_id: 0x0409,
+                    col_flags: 0x40,
+                    sort_id: 0,
+                }),
             ] {
-                let mut writer = PyRowWriter::new(1);
-                writer.write_string(0, Cow::Borrowed(bytes), EncodingType::Utf8);
+                for (bytes, expected) in [
+                    (&b"\x80"[..], "\u{fffd}"),
+                    (&b"\xc0\xaf"[..], "\u{fffd}\u{fffd}"),
+                    (&b"\xe2\x82"[..], "\u{fffd}"),
+                    (&b"\xf0\x28\x8c\xbc"[..], "\u{fffd}(\u{fffd}\u{fffd}"),
+                ] {
+                    let mut writer = PyRowWriter::new(1);
+                    writer.write_string(0, Cow::Borrowed(bytes), encoding);
 
-                Python::attach(|py| {
-                    let row = writer
-                        .to_py_tuple(py)
-                        .unwrap()
-                        .extract::<(String,)>()
-                        .unwrap();
-                    assert_eq!(row.0, expected);
-                });
+                    Python::attach(|py| {
+                        let row = writer
+                            .to_py_tuple(py)
+                            .unwrap()
+                            .extract::<(String,)>()
+                            .unwrap();
+                        assert_eq!(row.0, expected);
+                    });
 
-                let error = materialize_rows(output, vec![writer]).await.unwrap_err();
-                Python::attach(|py| {
-                    assert!(error.is_instance_of::<crate::async_errors::DataError>(py));
-                });
-                assert!(error.to_string().contains("Invalid UTF-8"));
+                    let result = materialize_rows(output, vec![writer]).await.unwrap();
+                    Python::attach(|py| match output {
+                        FetchOutput::One => {
+                            assert_eq!(result.extract::<(String,)>(py).unwrap().0, expected);
+                        }
+                        FetchOutput::Many | FetchOutput::All => {
+                            assert_eq!(
+                                result.extract::<Vec<(String,)>>(py).unwrap(),
+                                vec![(expected.to_owned(),)]
+                            );
+                        }
+                    });
+                }
             }
         }
     }

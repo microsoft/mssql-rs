@@ -224,7 +224,7 @@ def test_fetchone_takes_no_arguments_and_distinguishes_null_from_exhaustion(
 @pytest.mark.integration
 @pytest.mark.parametrize("use_prepare", [True, False], ids=["prepared", "direct"])
 @pytest.mark.parametrize("operation", ["fetchone", "fetchmany", "fetchall"])
-def test_malformed_utf8_returns_data_error_and_keeps_session_reusable(
+def test_malformed_utf8_uses_replacement_and_keeps_session_reusable(
     client_context, use_prepare, operation
 ):
     async def run():
@@ -248,7 +248,12 @@ def test_malformed_utf8_returns_data_error_and_keeps_session_reusable(
                 "fetchmany": lambda: cursor.fetchmany(1),
                 "fetchall": cursor.fetchall,
             }[operation]
-            for payload in (b"\x80", b"\xc0\xaf", b"\xe2\x82", b"\xf0\x28\x8c\xbc"):
+            for payload, expected in (
+                (b"\x80", "\ufffd"),
+                (b"\xc0\xaf", "\ufffd\ufffd"),
+                (b"\xe2\x82", "\ufffd"),
+                (b"\xf0\x28\x8c\xbc", "\ufffd(\ufffd\ufffd"),
+            ):
                 await cursor.execute(
                     "SELECT CONVERT(varbinary(max), CONVERT(varchar(max), ?))",
                     payload,
@@ -259,8 +264,9 @@ def test_malformed_utf8_returns_data_error_and_keeps_session_reusable(
                 await cursor.execute(
                     "SELECT CONVERT(varchar(max), ?)", payload, use_prepare=use_prepare
                 )
-                with pytest.raises(mssql_py_core.DataError, match="Invalid UTF-8"):
-                    await fetch()
+                result = await fetch()
+                row = (expected,)
+                assert result == (row if operation == "fetchone" else [row])
 
                 value = "valid:\u6f22\U0001f600\x00e\u0301"
                 await cursor.execute(
