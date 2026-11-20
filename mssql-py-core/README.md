@@ -62,6 +62,10 @@ For SDK authors integrating the native runtime:
   transaction outcome, without retrying commit.
 - A broken connection still needs `await connection.close()`. The `closed`
   property indicates teardown, not whether the connection is healthy.
+- Explicit `commit()` and `rollback()` also recheck interruption after draining
+  and before reporting completion. Interruption before authorization prevents
+  finalization; interruption during finalization reports an unknown outcome
+  without retrying the transaction request.
 - If creating a `commit()` or `rollback()` awaitable fails before native work
   starts, pending transactions and unread cursor results remain available.
 - [Connection settings](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md#connection-policy-and-migration)

@@ -117,7 +117,7 @@ fn map_claim_error(error: ClaimError) -> PyErr {
 
 /// Owns the session claim for an in-flight commit or rollback.
 ///
-/// `complete()` releases the claim after success or a handled TDS error. Dropping
+/// `complete()` checks interruption when releasing the claim. Dropping
 /// before completion indicates cancellation or an interrupted protocol exchange,
 /// so the connection is marked broken before the claim is released.
 struct ConnectionOperationGuard {
@@ -136,10 +136,13 @@ impl ConnectionOperationGuard {
         }
     }
 
-    /// Releases the claim and prevents drop-time connection poisoning.
-    fn complete(&mut self) {
-        self.session_state.release_operation(self.operation_id);
+    /// Releases the claim while checking for interruption during finalization.
+    fn complete(&mut self) -> PyResult<()> {
+        let result = self
+            .session_state
+            .complete_connection_operation(self.operation_id);
         self.completed = true;
+        result
     }
 }
 
@@ -464,6 +467,19 @@ impl PyAsyncConnection {
                 .map_err(map_claim_error)?;
             let result = async {
                 client.close_query().await?;
+                if guard.session_state.is_broken() {
+                    return Err(TdsError::OperationCancelledError(
+                        match mode {
+                            CloseMode::Commit => {
+                                "Cannot commit a broken connection; connection discarded"
+                            }
+                            CloseMode::Rollback => {
+                                "Cannot roll back a broken connection; connection discarded"
+                            }
+                        }
+                        .into(),
+                    ));
+                }
                 if client.has_active_transaction() {
                     match mode {
                         CloseMode::Commit => client.commit_transaction(None, None).await?,
@@ -482,7 +498,7 @@ impl PyAsyncConnection {
             });
             drop(client);
             if result.is_ok() {
-                guard.complete();
+                guard.complete()?;
             }
             result?;
             Python::attach(|py| Ok(py.None()))
@@ -617,6 +633,168 @@ asyncio.run(run())",
         runtime.block_on(result).unwrap();
         assert_eq!(std::sync::Arc::strong_count(&transport), 1);
         assert!(transport.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn late_waiter_cancellation_cannot_commit_or_report_transaction_success() {
+        use std::pin::Pin;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+        use std::task::{Context, Waker};
+
+        use crate::async_session::SessionOperationGuard;
+        use mssql_tds::connection::tds_client::ExecuteOptions;
+        use mssql_tds::test_client_support::{
+            col_metadata_empty, done_no_more, env_change_begin_transaction,
+            env_change_commit_transaction, env_change_rollback_transaction,
+            tds_client_from_tokens_capturing,
+        };
+        use pyo3::types::PyDict;
+        use tracing::{Subscriber, span::Attributes};
+        use tracing_subscriber::{Layer, layer::Context as LayerContext, prelude::*};
+
+        type Waiter = Pin<Box<dyn std::future::Future<Output = PyResult<()>> + Send>>;
+        struct CancelAtPhase {
+            phase: &'static str,
+            waiter: Arc<Mutex<Option<Waiter>>>,
+        }
+        impl<S: Subscriber> Layer<S> for CancelAtPhase {
+            fn on_new_span(
+                &self,
+                attributes: &Attributes<'_>,
+                _id: &tracing::span::Id,
+                _context: LayerContext<'_, S>,
+            ) {
+                if attributes.metadata().name() == self.phase {
+                    drop(self.waiter.lock().unwrap().take().unwrap());
+                }
+            }
+        }
+
+        let runtime = pyo3_async_runtimes::tokio::get_runtime();
+        for (phase, mode) in [
+            ("close_query", CloseMode::Commit),
+            ("commit_transaction", CloseMode::Commit),
+            ("close_query", CloseMode::Rollback),
+            ("rollback_transaction", CloseMode::Rollback),
+            ("no_cancellation", CloseMode::Commit),
+            ("no_cancellation", CloseMode::Rollback),
+        ] {
+            let (mut client, transport) = tds_client_from_tokens_capturing(vec![
+                env_change_begin_transaction(7),
+                col_metadata_empty(),
+                done_no_more(),
+                match mode {
+                    CloseMode::Commit => env_change_commit_transaction(),
+                    CloseMode::Rollback => env_change_rollback_transaction(),
+                },
+                done_no_more(),
+            ]);
+            runtime
+                .block_on(client.execute("SELECT 1".into(), ExecuteOptions::default()))
+                .unwrap();
+            let initial_bytes = transport.lock().unwrap().len();
+            let connection = Arc::new(LogicalConnection::new(client));
+            let state = connection.state.clone();
+            let future_state = state.clone();
+            let (release, wait) = tokio::sync::oneshot::channel();
+            let (completed, completion) = tokio::sync::oneshot::channel();
+            let mut waiter: Waiter = Box::pin(state.clone().run_tracked_preflight(
+                move |preflight| async move {
+                    wait.await.unwrap();
+                    let claim = preflight.claim_execute(1).unwrap();
+                    let mut guard = SessionOperationGuard::new(future_state, claim.operation_id);
+                    guard.finish_execute(true);
+                    completed.send(()).unwrap();
+                    Ok(())
+                },
+            ));
+            assert!(
+                waiter
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            release.send(()).unwrap();
+            runtime.block_on(completion).unwrap();
+            let waiter = Arc::new(Mutex::new(Some(waiter)));
+            let subscriber = tracing_subscriber::registry().with(CancelAtPhase {
+                phase,
+                waiter: waiter.clone(),
+            });
+            let wrapper = PyAsyncConnection {
+                tds_client: Some(connection),
+                tracing_dispatch: Some(tracing::Dispatch::new(subscriber)),
+                autocommit: Arc::new(AtomicBool::new(false)),
+                session_state: state.clone(),
+                default_query_timeout: 0,
+            };
+            Python::attach(|py| {
+                let globals = PyDict::new(py);
+                globals
+                    .set_item("conn", Py::new(py, wrapper).unwrap())
+                    .unwrap();
+                globals
+                    .set_item("OperationalError", py.get_type::<OperationalError>())
+                    .unwrap();
+                globals
+                    .set_item(
+                        "method",
+                        match mode {
+                            CloseMode::Commit => "commit",
+                            CloseMode::Rollback => "rollback",
+                        },
+                    )
+                    .unwrap();
+                globals
+                    .set_item(
+                        "expected",
+                        if phase == "no_cancellation" {
+                            None
+                        } else if phase == "close_query" {
+                            Some(match mode {
+                                CloseMode::Commit => "Cannot commit a broken connection",
+                                CloseMode::Rollback => "Cannot roll back a broken connection",
+                            })
+                        } else {
+                            Some("outcome may be unknown")
+                        },
+                    )
+                    .unwrap();
+                py.run(
+                    cr"import asyncio
+async def run():
+    if expected is None:
+        assert await getattr(conn, method)() is None
+    else:
+        try:
+            await getattr(conn, method)()
+        except OperationalError as error:
+            assert expected in str(error), error
+        else:
+            raise AssertionError('interrupted transaction reported success')
+    await conn.close()
+asyncio.run(run())",
+                    Some(&globals),
+                    None,
+                )
+                .unwrap();
+            });
+            if phase == "no_cancellation" {
+                let waiting = waiter.lock().unwrap().take().unwrap();
+                runtime.block_on(waiting).unwrap();
+                assert!(!state.is_broken());
+            } else {
+                assert!(waiter.lock().unwrap().is_none());
+                assert!(state.is_broken());
+            }
+            if phase == "close_query" {
+                assert_eq!(transport.lock().unwrap().len(), initial_bytes);
+            } else {
+                assert!(transport.lock().unwrap().len() > initial_bytes);
+            }
+            assert_eq!(Arc::strong_count(&transport), 1);
+        }
     }
 
     #[test]

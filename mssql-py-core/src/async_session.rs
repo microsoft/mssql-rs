@@ -607,6 +607,23 @@ impl AsyncConnectionState {
         }
     }
 
+    pub(crate) fn complete_connection_operation(&self, operation_id: OperationId) -> PyResult<()> {
+        let mut state = self.lock();
+        let owns_operation = state
+            .active_operation
+            .as_ref()
+            .is_some_and(|active| active.operation_id == operation_id);
+        if owns_operation {
+            state.active_operation = None;
+        }
+        if state.broken {
+            return Err(OperationalError::new_err(
+                "Transaction completion was interrupted; outcome may be unknown; connection discarded",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn abandon_cursor(&self, cursor_id: CursorId) {
         let mut state = self.lock();
         if state

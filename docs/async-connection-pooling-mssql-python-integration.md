@@ -55,6 +55,10 @@ Cancellation before that authorization prevents commit. Cancellation afterward
 but before atomic close-outcome publication reports failure with a potentially
 unknown transaction outcome; commit is never retried. Publication and cancellation
 are ordered by the same session mutex, without holding it during network I/O.
+Explicit commit/rollback also recheck broken state after draining. Transaction
+claim release and the completion interruption check share the session mutex.
+Interruption after authorization but before that completion check reports a
+potentially unknown outcome without replaying the request.
 Pool leases, production clean return and Python pool APIs remain
 separate implementation slices.
 
