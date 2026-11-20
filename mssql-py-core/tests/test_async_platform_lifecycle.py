@@ -9,6 +9,8 @@ import warnings
 import mssql_py_core
 import pytest
 
+from .test_async_fetch import execute_after_cancellation_settles
+
 
 async def _connect(client_context):
     with warnings.catch_warnings():
@@ -80,7 +82,10 @@ def test_cancelled_nextset_during_server_wait_resynchronizes_connection(client_c
                 await asyncio.wait_for(operation, timeout=10)
 
             probe = connection.cursor()
-            await asyncio.wait_for(probe.execute("SELECT 1", use_prepare=False), timeout=10)
+            await asyncio.wait_for(
+                execute_after_cancellation_settles(probe, "SELECT 1"),
+                timeout=10,
+            )
             assert await asyncio.wait_for(probe.fetchone(), timeout=10) == (1,)
         finally:
             if not operation.done():
@@ -93,6 +98,42 @@ def test_cancelled_nextset_during_server_wait_resynchronizes_connection(client_c
             await asyncio.wait_for(monitor.close(), timeout=10)
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("busy", [True, False])
+def test_cancelled_nextset_probe_retries_only_busy_admission(monkeypatch, busy):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import sys
+
+    error = mssql_py_core.InterfaceError(
+        "Connection is busy with another cursor operation" if busy else "Connection is broken"
+    )
+    probe = SimpleNamespace(
+        execute=AsyncMock(side_effect=[error, None]),
+        fetchone=AsyncMock(return_value=(1,)),
+    )
+    connection = SimpleNamespace(cursor=lambda: probe, close=AsyncMock())
+    monitor = SimpleNamespace(close=AsyncMock())
+
+    async def start_waiting(_context):
+        operation = asyncio.get_running_loop().create_future()
+        return connection, monitor, None, operation
+
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_start_waiting_nextset",
+        start_waiting,
+    )
+    if busy:
+        test_cancelled_nextset_during_server_wait_resynchronizes_connection({})
+        assert probe.execute.await_count == 2
+        probe.fetchone.assert_awaited_once()
+    else:
+        with pytest.raises(mssql_py_core.InterfaceError, match="Connection is broken"):
+            test_cancelled_nextset_during_server_wait_resynchronizes_connection({})
+        assert probe.execute.await_count == 1
+        probe.fetchone.assert_not_awaited()
 
 
 @pytest.mark.integration
