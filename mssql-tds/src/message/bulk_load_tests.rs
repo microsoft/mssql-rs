@@ -176,6 +176,40 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_bulk_declares_vector_bulk_input() {
+        use crate::connection::bulk_copy::BulkCopyOptions;
+        use crate::datatypes::bulk_copy_metadata::VectorBulkInput;
+        use crate::datatypes::sqldatatypes::{VECTOR_HEADER_SIZE, VectorBaseType};
+        use crate::message::bulk_load::build_insert_bulk_command;
+
+        let length = (VECTOR_HEADER_SIZE + 3 * 2) as i32;
+        let destination = BulkCopyColumnMetadata::new("v", SqlDbType::Vector, 0xF5)
+            .with_length(length, TypeLength::Variable(length))
+            .with_scale(VectorBaseType::Float16 as u8);
+        let options = BulkCopyOptions::default();
+        let native = destination
+            .with_vector_bulk_input(VectorBulkInput::Native(VectorBaseType::Float32))
+            .unwrap();
+        let text = destination
+            .with_vector_bulk_input(VectorBulkInput::Utf8Json)
+            .unwrap();
+
+        assert_eq!(
+            build_insert_bulk_command("dbo.t", std::slice::from_ref(&destination), &options)
+                .unwrap(),
+            "INSERT BULK [dbo].[t] ([v] vector(3, float16))"
+        );
+        assert_eq!(
+            build_insert_bulk_command("dbo.t", &[native], &options).unwrap(),
+            "INSERT BULK [dbo].[t] ([v] vector(3))"
+        );
+        assert_eq!(
+            build_insert_bulk_command("dbo.t", &[text], &options).unwrap(),
+            "INSERT BULK [dbo].[t] ([v] varchar(max) COLLATE Latin1_General_100_BIN2_UTF8)"
+        );
+    }
+
+    #[test]
     fn test_insert_bulk_with_collation() {
         use crate::connection::bulk_copy::BulkCopyOptions;
         use crate::message::bulk_load::build_insert_bulk_command;

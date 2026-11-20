@@ -332,8 +332,9 @@ impl<'a> StreamingBulkLoadWriter<'a> {
             let actual_base_type = vector.base_type();
             if actual_base_type != base_type {
                 return Err(Error::TypeConversionError(format!(
-                    "Vector base type mismatch: declared {:?}, but vector has {:?}",
-                    base_type, actual_base_type
+                    "Vector base type mismatch for column '{}': declared {:?}, but vector has {:?}; \
+                     all vectors in a bulk-copy column must use the same base type",
+                    col_meta.column_name, base_type, actual_base_type
                 )));
             }
             let dimensions = col_meta.vector_dimensions()?;
@@ -1266,7 +1267,7 @@ mod vector_tests {
         assert!(matches!(
             result,
             Err(Error::TypeConversionError(message))
-                if message == "Vector base type mismatch: declared Float16, but vector has Float32"
+                if message.starts_with("Vector base type mismatch for column 'v': declared Float16, but vector has Float32;")
         ));
         assert!(bytes.is_empty());
     }
@@ -1279,7 +1280,7 @@ mod vector_tests {
         assert!(matches!(
             result,
             Err(Error::TypeConversionError(message))
-                if message == "Vector base type mismatch: declared Float32, but vector has Float16"
+                if message.starts_with("Vector base type mismatch for column 'v': declared Float32, but vector has Float16;")
         ));
         assert!(bytes.is_empty());
     }
@@ -1307,7 +1308,7 @@ mod vector_tests {
             assert!(matches!(
                 result,
                 Err(Error::TypeConversionError(message))
-                    if message.starts_with("Vector base type mismatch:")
+                    if message.starts_with("Vector base type mismatch for column 'v':")
             ));
             assert!(bytes.is_empty());
         }
