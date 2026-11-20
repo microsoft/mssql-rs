@@ -262,6 +262,12 @@ type GssDisplayNameFn = unsafe extern "C" fn(
     output_name_type: *mut GssOid,
 ) -> GssOmUint32;
 
+type GssOidToStrFn = unsafe extern "C" fn(
+    minor_status: *mut GssOmUint32,
+    oid: GssOid,
+    oid_str: GssBufferT,
+) -> GssOmUint32;
+
 /// SPNEGO mechanism OID 1.3.6.1.5.5.2 (RFC 4178), the mechanism HTTP
 /// `Negotiate` (RFC 4559) requires.
 static GSS_SPNEGO_MECHANISM_BYTES: [u8; 6] = [0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
@@ -335,6 +341,8 @@ struct GssapiLibrary {
     /// without it still serves TDS integrated authentication.
     gss_inquire_cred: Option<GssInquireCredFn>,
     gss_display_name: Option<GssDisplayNameFn>,
+    /// Optional: only needed to name the mechanism a context used.
+    gss_oid_to_str: Option<GssOidToStrFn>,
     /// GSS_C_NT_HOSTBASED_SERVICE OID pointer (from library or fallback)
     gss_c_nt_hostbased_service: GssOid,
 }
@@ -411,6 +419,7 @@ impl GssapiLibrary {
         let gss_release_cred = load_sym("gss_release_cred");
         let gss_inquire_cred = load_sym("gss_inquire_cred");
         let gss_display_name = load_sym("gss_display_name");
+        let gss_oid_to_str = load_sym("gss_oid_to_str");
 
         // Check all required symbols were loaded
         if gss_init_sec_context.is_null()
@@ -474,6 +483,8 @@ impl GssapiLibrary {
                 .then(|| unsafe { std::mem::transmute(gss_inquire_cred) }),
             gss_display_name: (!gss_display_name.is_null())
                 .then(|| unsafe { std::mem::transmute(gss_display_name) }),
+            gss_oid_to_str: (!gss_oid_to_str.is_null())
+                .then(|| unsafe { std::mem::transmute(gss_oid_to_str) }),
             gss_c_nt_hostbased_service,
         })
     }
@@ -727,6 +738,30 @@ pub fn get_gssapi_error(major: GssOmUint32, minor: GssOmUint32) -> String {
     } else {
         messages.join("; ")
     }
+}
+
+/// `oid`, an OID the library returned, as the library writes it (MIT:
+/// `{ 1 2 840 113554 1 2 2 }`), or `None` when it cannot say. The library
+/// reads its own descriptor: Apple's headers pack `gss_OID_desc`, so its
+/// fields are never read here.
+pub(super) fn oid_to_string(oid: GssOid) -> Option<String> {
+    let lib = get_gssapi_lib()?;
+    let oid_to_str = lib.gss_oid_to_str?;
+    if oid.is_null() {
+        return None;
+    }
+    let mut minor: GssOmUint32 = 0;
+    let mut text = GssBufferDesc::default();
+    // SAFETY: `oid` came from the library, and `text` receives a buffer it
+    // allocates.
+    let major = unsafe { oid_to_str(&mut minor, oid, &mut text) };
+    if major != GSS_S_COMPLETE {
+        return None;
+    }
+    // SAFETY: on success the buffer holds `length` bytes, released once read.
+    let bytes = unsafe { text.to_vec() };
+    unsafe { (lib.gss_release_buffer)(&mut minor, &mut text) };
+    String::from_utf8(bytes).ok()
 }
 
 /// Gets a single status message from GSSAPI.

@@ -52,7 +52,7 @@ use super::gssapi_ffi::{
     gss_release_name, spnego_mechanism,
 };
 use crate::security::{
-    IntegratedAuthConfig, SecurityContext, SecurityError, SspiAuthToken,
+    IntegratedAuthConfig, Negotiation, SecurityContext, SecurityError, SspiAuthToken,
     spn::make_spn_canonicalized,
 };
 use std::ptr;
@@ -122,6 +122,9 @@ pub struct GssapiContext {
 
     /// Mechanism and request flags passed to gss_init_sec_context.
     purpose: ContextPurpose,
+
+    /// The mechanism gss_init_sec_context reported using, once it did.
+    mechanism: Option<String>,
 }
 
 /// What a [GssapiContext] authenticates to, which fixes its mechanism and
@@ -205,6 +208,7 @@ impl GssapiContext {
             is_complete: false,
             channel_bindings: config.channel_bindings.clone(),
             purpose: ContextPurpose::TdsLogin,
+            mechanism: None,
         })
     }
 
@@ -226,6 +230,7 @@ impl GssapiContext {
             is_complete: false,
             channel_bindings: None,
             purpose: ContextPurpose::HttpNegotiate,
+            mechanism: None,
         })
     }
 
@@ -290,6 +295,7 @@ impl SecurityContext for GssapiContext {
         };
 
         let req_flags = self.purpose.req_flags();
+        let mut actual_mech: GssOid = ptr::null_mut();
 
         // Call gss_init_sec_context
         let major_status = unsafe {
@@ -303,7 +309,7 @@ impl SecurityContext for GssapiContext {
                 0,                         // No time limit
                 GSS_C_NO_CHANNEL_BINDINGS, // Channel bindings not supported on non-Windows
                 input_token,
-                ptr::null_mut(), // actual_mech_type
+                &mut actual_mech,
                 &mut output_token,
                 &mut ret_flags,
                 &mut time_rec,
@@ -318,23 +324,25 @@ impl SecurityContext for GssapiContext {
             // Authentication failed - get error message
             let error_msg = get_gssapi_error(major_status, minor_status);
 
-            // Check for specific error conditions
-            if major_status & 0xFFFF0000 == gssapi_ffi::GSS_S_NO_CRED {
-                // Use GssapiError which has more details
-                return Err(SecurityError::GssapiError {
-                    major: major_status,
-                    minor: minor_status,
-                    message: format!(
-                        "No Kerberos credentials available. Run 'kinit' to obtain a ticket. {}",
-                        error_msg
-                    ),
-                });
-            }
-
-            return Err(SecurityError::InitContextFailed {
-                message: error_msg,
-                code: major_status,
+            // Both codes are kept: the minor one is the mechanism's (Kerberos's)
+            // own, which says what failed.
+            let message = if major_status & 0xFFFF0000 == gssapi_ffi::GSS_S_NO_CRED {
+                format!(
+                    "No Kerberos credentials available. Run 'kinit' to obtain a ticket. {}",
+                    error_msg
+                )
+            } else {
+                error_msg
+            };
+            return Err(SecurityError::GssapiError {
+                major: major_status,
+                minor: minor_status,
+                message,
             });
+        }
+
+        if let Some(oid) = gssapi_ffi::oid_to_string(actual_mech) {
+            self.mechanism = mechanism_name(&oid);
         }
 
         // Copy output token to Vec<u8>
@@ -369,6 +377,32 @@ impl SecurityContext for GssapiContext {
     fn imported_name(&self) -> &str {
         &self.imported_name
     }
+
+    fn negotiation(&self) -> Negotiation {
+        Negotiation {
+            package: self.mechanism.clone(),
+            complete: self.is_complete && self.mechanism.is_some(),
+            retried_without_spn: false,
+        }
+    }
+}
+
+/// The name of the GSSAPI mechanism whose OID the library wrote as `oid`:
+/// `Kerberos`, `NTLM` (gss-ntlmssp) or `Negotiate` (SPNEGO), otherwise the
+/// OID in dotted form; `None` for text with no OID in it.
+fn mechanism_name(oid: &str) -> Option<String> {
+    let dotted = oid
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|arc| !arc.is_empty())
+        .collect::<Vec<_>>()
+        .join(".");
+    Some(match dotted.as_str() {
+        "" => return None,
+        "1.2.840.113554.1.2.2" => "Kerberos".to_string(),
+        "1.3.6.1.4.1.311.2.2.10" => "NTLM".to_string(),
+        "1.3.6.1.5.5.2" => "Negotiate".to_string(),
+        _ => dotted,
+    })
 }
 
 /// # Login Flow
@@ -572,6 +606,40 @@ mod tests {
                     println!("Got error: {:?}", e);
                 }
             }
+        }
+    }
+
+    /// The mechanism gss_init_sec_context reports is named from the OID as
+    /// the library writes it, MIT's braced form or a dotted one; one without
+    /// a name is shown dotted.
+    #[test]
+    fn mechanisms_are_named_by_their_oid() {
+        let name = |oid: &str| mechanism_name(oid);
+        assert_eq!(
+            name("{ 1 2 840 113554 1 2 2 }").as_deref(),
+            Some("Kerberos")
+        );
+        // MIT's length counts the terminating NUL.
+        assert_eq!(
+            name("{ 1 2 840 113554 1 2 2 }\0").as_deref(),
+            Some("Kerberos")
+        );
+        assert_eq!(name("1.2.840.113554.1.2.2").as_deref(), Some("Kerberos"));
+        assert_eq!(name("{ 1 3 6 1 4 1 311 2 2 10 }").as_deref(), Some("NTLM"));
+        assert_eq!(name("{ 1 3 6 1 5 5 2 }").as_deref(), Some("Negotiate"));
+        // The pre-RFC 1964 Kerberos OID.
+        assert_eq!(name("{ 1 3 5 1 5 2 }").as_deref(), Some("1.3.5.1.5.2"));
+        assert_eq!(name(""), None);
+        assert_eq!(name("{ }"), None);
+    }
+
+    /// A context reports a negotiated mechanism only once the library said
+    /// which one it used.
+    #[test]
+    fn a_context_reports_no_mechanism_before_the_library_names_one() {
+        let config = IntegratedAuthConfig::new();
+        if let Ok(ctx) = GssapiContext::new(&config, "server.contoso.com", 1433) {
+            assert_eq!(ctx.negotiation(), Negotiation::default());
         }
     }
 

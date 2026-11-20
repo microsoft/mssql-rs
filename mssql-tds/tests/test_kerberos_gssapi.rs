@@ -180,9 +180,11 @@ fn test_has_valid_credentials() {
 mod e2e {
     use super::*;
     use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
+    use mssql_tds::connection::connect_stage;
     use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
+    use mssql_tds::security::SecurityError;
 
     /// Creates a ClientContext configured for Kerberos/SSPI authentication.
     fn create_kerberos_context() -> ClientContext {
@@ -503,5 +505,138 @@ mod e2e {
 
         println!("=== Kerberos IP Address Connection Test PASSED ===");
         println!("✓ Reverse DNS lookup correctly resolved IP to FQDN for SPN construction!");
+    }
+
+    /// The fields of every `login` connect stage a connection opened.
+    #[derive(Clone, Default)]
+    struct LoginStages(
+        std::sync::Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<&'static str, String>>>>,
+    );
+
+    struct Fields<'a>(&'a mut std::collections::BTreeMap<&'static str, String>);
+
+    impl tracing::field::Visit for Fields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name(), value.to_string());
+        }
+    }
+
+    impl tracing::Subscriber for LoginStages {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.is_span() && metadata.target() == connect_stage::TARGET
+        }
+        fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let mut stages = self.0.lock().unwrap();
+            let mut fields = std::collections::BTreeMap::new();
+            fields.insert("name", attrs.metadata().name().to_string());
+            attrs.record(&mut Fields(&mut fields));
+            stages.push(fields);
+            tracing::span::Id::from_u64(stages.len() as u64)
+        }
+        fn record(&self, span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+            let mut stages = self.0.lock().unwrap();
+            let index = usize::try_from(span.into_u64()).unwrap() - 1;
+            values.record(&mut Fields(&mut stages[index]));
+        }
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    impl LoginStages {
+        fn login(&self) -> std::collections::BTreeMap<&'static str, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .rfind(|stage| stage.get("name").map(String::as_str) == Some(connect_stage::LOGIN))
+                .cloned()
+                .expect("a login stage")
+        }
+    }
+
+    /// The login stage records the package asked for and the mechanism
+    /// GSSAPI used, and the server confirms the scheme.
+    #[tokio::test]
+    #[ignore = "Requires Kerberos environment - set KERBEROS_TEST=1 to run"]
+    async fn test_kerberos_login_records_its_negotiation() {
+        if env::var("KERBEROS_TEST").is_err() {
+            return;
+        }
+        assert!(has_valid_credentials(), "No valid Kerberos credentials.");
+
+        let stages = LoginStages::default();
+        let _guard = tracing::subscriber::set_default(stages.clone());
+        let mut client: TdsClient = TdsConnectionProvider {}
+            .create_client(create_kerberos_context(), "sql.example.local,1433", None)
+            .await
+            .expect("Failed to connect with Kerberos");
+        let login = stages.login();
+        assert_eq!(
+            login.get(connect_stage::PACKAGE).map(String::as_str),
+            Some("Kerberos")
+        );
+        assert_eq!(
+            login
+                .get(connect_stage::NEGOTIATED_PACKAGE)
+                .map(String::as_str),
+            Some("Kerberos")
+        );
+        assert_eq!(
+            login
+                .get(connect_stage::NEGOTIATION_COMPLETE)
+                .map(String::as_str),
+            Some("true")
+        );
+
+        client
+            .execute(
+                "SELECT CONVERT(nvarchar(40), CONNECTIONPROPERTY('auth_scheme'))".to_string(),
+                (),
+            )
+            .await
+            .expect("Query failed");
+        assert!(client.on_rows());
+        let row = client
+            .next_row()
+            .await
+            .expect("Failed to get row")
+            .expect("a row");
+        assert!(format!("{:?}", row[0]).contains("KERBEROS"), "{:?}", row[0]);
+        while client.advance_to_rows().await.expect("Failed") {}
+    }
+
+    /// An SPN the KDC does not know fails with GSSAPI's major status and the
+    /// Kerberos library's own code under it, both kept.
+    #[tokio::test]
+    #[ignore = "Requires Kerberos environment - set KERBEROS_TEST=1 to run"]
+    async fn test_kerberos_unknown_spn_keeps_the_kerberos_code() {
+        if env::var("KERBEROS_TEST").is_err() {
+            return;
+        }
+        assert!(has_valid_credentials(), "No valid Kerberos credentials.");
+
+        let mut context = create_kerberos_context();
+        context.server_spn = Some("MSSQLSvc@no-such-host.example.local".to_string());
+        let provider = TdsConnectionProvider {};
+        let error = match provider
+            .create_client(context, "sql.example.local,1433", None)
+            .await
+        {
+            Ok(_) => panic!("an SPN the KDC does not know logged in"),
+            Err(error) => error,
+        };
+        // KRB5KDC_ERR_S_PRINCIPAL_UNKNOWN
+        let principal_unknown = (-1_765_328_377_i32) as u32;
+        match error {
+            mssql_tds::error::Error::Security(SecurityError::GssapiError { minor, .. }) => {
+                assert_eq!(minor, principal_unknown, "minor 0x{minor:08X}");
+            }
+            other => panic!("expected a GSSAPI error, got {other:?}"),
+        }
     }
 }

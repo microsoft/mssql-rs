@@ -136,6 +136,14 @@ struct SecPkgInfoW {
     Comment: LPWSTR,
 }
 
+/// The package Negotiate chose for a context, and how far its negotiation got
+/// (`SECPKG_ATTR_NEGOTIATION_INFO`).
+#[repr(C)]
+struct SecPkgContext_NegotiationInfoW {
+    PackageInfo: *mut SecPkgInfoW,
+    NegotiationState: ULONG,
+}
+
 // =============================================================================
 // Constants - SECURITY_STATUS values
 // =============================================================================
@@ -277,6 +285,16 @@ const SECBUFFER_TARGET_HOST: ULONG = 16;
 pub(super) const SECBUFFER_VERSION: ULONG = 0;
 
 // =============================================================================
+// Constants - Context attributes
+// =============================================================================
+
+/// QueryContextAttributesW: the package Negotiate chose, and its state.
+const SECPKG_ATTR_NEGOTIATION_INFO: ULONG = 12;
+
+/// Negotiation state: the negotiation is complete.
+const SECPKG_NEGOTIATION_COMPLETE: ULONG = 0;
+
+// =============================================================================
 // Constants - Auth identity flags
 // =============================================================================
 
@@ -355,6 +373,15 @@ unsafe extern "system" {
         phContext: *const CtxtHandle,
         pToken: *const SecBufferDesc,
     ) -> SECURITY_STATUS;
+
+    /// Queries an attribute of a security context.
+    ///
+    /// <https://learn.microsoft.com/en-us/windows/win32/api/sspi/nf-sspi-querycontextattributesw>
+    fn QueryContextAttributesW(
+        phContext: *const CtxtHandle,
+        ulAttribute: ULONG,
+        pBuffer: PVOID,
+    ) -> SECURITY_STATUS;
 }
 
 // =============================================================================
@@ -401,6 +428,40 @@ pub(super) fn needs_continue(status: SECURITY_STATUS) -> bool {
 /// Checks if CompleteAuthToken needs to be called.
 pub(super) fn needs_complete(status: SECURITY_STATUS) -> bool {
     status == SEC_I_COMPLETE_NEEDED || status == SEC_I_COMPLETE_AND_CONTINUE
+}
+
+/// The package Negotiate chose for `ctx` (`Kerberos`, `NTLM`) and whether
+/// the negotiation is complete; `None` when the context does not say.
+pub(super) fn negotiation_info(ctx: &CtxtHandle) -> Option<(String, bool)> {
+    let mut info = SecPkgContext_NegotiationInfoW {
+        PackageInfo: ptr::null_mut(),
+        NegotiationState: 0,
+    };
+    // SAFETY: `ctx` is a handle InitializeSecurityContextW returned, and
+    // `info` is the structure this attribute fills in.
+    let status = unsafe {
+        QueryContextAttributesW(
+            ctx,
+            SECPKG_ATTR_NEGOTIATION_INFO,
+            (&mut info as *mut SecPkgContext_NegotiationInfoW).cast(),
+        )
+    };
+    if status != SEC_E_OK || info.PackageInfo.is_null() {
+        return None;
+    }
+    // SAFETY: the package allocated PackageInfo, which is read once here and
+    // then freed with FreeContextBuffer, as QueryContextAttributesW requires.
+    let name = unsafe {
+        let name = (*info.PackageInfo).Name;
+        let text = (!name.is_null()).then(|| {
+            let len = (0..).take_while(|&i| *name.add(i) != 0).count();
+            String::from_utf16_lossy(std::slice::from_raw_parts(name, len))
+        });
+        FreeContextBuffer(info.PackageInfo.cast());
+        text
+    };
+    name.filter(|name| !name.is_empty())
+        .map(|name| (name, info.NegotiationState == SECPKG_NEGOTIATION_COMPLETE))
 }
 
 /// Gets the maximum token size for a security package.

@@ -349,6 +349,10 @@ impl<'a, 'b> SessionHandler<'a, 'b> {
             target: connect_stage::TARGET,
             connect_stage::LOGIN,
             spn = tracing::field::Empty,
+            package = tracing::field::Empty,
+            negotiated_package = tracing::field::Empty,
+            negotiation_complete = tracing::field::Empty,
+            spn_retry = tracing::field::Empty,
             os_error = tracing::field::Empty,
             io_kind = tracing::field::Empty,
             error = tracing::field::Empty,
@@ -802,12 +806,17 @@ impl LoginHandler<'_> {
             );
 
             let provider = context.security_context_provider.clone();
+            // The handler records what its security context negotiates on the
+            // login's stage itself: a failed round consumes it.
+            let stage = self.login_stage.clone();
             let handler = off_runtime_thread(move || {
-                SspiAuthHandler::new(&config, &server, port, provider.as_deref())
+                SspiAuthHandler::new(&config, &server, port, provider.as_deref(), stage)
             })
             .await?;
             self.login_stage
                 .record(connect_stage::SPN, handler.target_spn());
+            self.login_stage
+                .record(connect_stage::PACKAGE, handler.package_name());
             let (handler, initial_token) = off_runtime_thread(move || {
                 let mut handler = handler;
                 let token = handler.get_initial_token()?;

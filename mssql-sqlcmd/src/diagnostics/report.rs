@@ -717,7 +717,33 @@ fn check_text(check: &Check, protocol: Option<Protocol>, r: &mut Redactor, local
             }
             let spn = named(r, "spn");
             if !spn.is_empty() {
-                parts.push(tr(locale, "diagnose.detail.spn", &[("spn", &spn.join(""))]));
+                let id = match check.field("spnSource") {
+                    Some(super::SPN_DERIVED) => "diagnose.detail.spn_derived",
+                    Some(super::SPN_DIAGNOSTIC_CLIENT) => "diagnose.detail.spn_diagnostic_client",
+                    _ => "diagnose.detail.spn",
+                };
+                parts.push(tr(locale, id, &[("spn", &spn.join(""))]));
+            }
+            if let Some(package) = check.field("securityPackage") {
+                parts.push(tr(
+                    locale,
+                    "diagnose.detail.security_package",
+                    &[("package", &package)],
+                ));
+            }
+            if let Some(negotiated) = check.field("negotiatedPackage") {
+                parts.push(tr(
+                    locale,
+                    if check.field("negotiationComplete") == Some("true") {
+                        "diagnose.detail.negotiated_package"
+                    } else {
+                        "diagnose.detail.negotiated_package_incomplete"
+                    },
+                    &[("package", &negotiated)],
+                ));
+            }
+            if check.field("retriedWithoutSpn") == Some("true") {
+                parts.push(tr(locale, "diagnose.detail.retried_without_spn", &[]));
             }
             if let Some(cache) = check.field("kerberosTicketCache") {
                 parts.push(tr(
@@ -769,6 +795,13 @@ fn check_text(check: &Check, protocol: Option<Protocol>, r: &mut Redactor, local
                         ("target", &target),
                         ("edition", &check.field("engineEdition").unwrap_or("?")),
                     ],
+                ));
+            }
+            if let Some(scheme) = check.field("authScheme") {
+                parts.push(tr(
+                    locale,
+                    "diagnose.detail.auth_scheme",
+                    &[("scheme", &scheme)],
                 ));
             }
             if let Some(offset) = check.field("clockOffsetMs") {
@@ -1169,6 +1202,12 @@ pub fn text_in(report: &Report, locale: &str) -> String {
             }
             if let Some(code) = &error.code {
                 ids.push(code.clone());
+            }
+            // A security package's status, as its documentation writes it.
+            if let (Some(status), "sspi" | "gssapi" | "kerberos") =
+                (error.native_error, error.source)
+            {
+                ids.push(format!("0x{:08X}", status as u32));
             }
             let ids = if ids.is_empty() {
                 String::new()
@@ -1733,7 +1772,8 @@ enum SkipView {
 
 /// A check's field: a list for `addresses`, a number for `port`,
 /// `engineEdition`, `clockOffsetMs`, `retries` and `osError` when the value is
-/// one, a boolean for `loginCompleted`, otherwise text.
+/// one, a boolean for `loginCompleted`, `negotiationComplete` and
+/// `retriedWithoutSpn`, otherwise text.
 #[derive(Serialize)]
 #[serde(untagged)]
 enum FieldValue {
@@ -1782,9 +1822,13 @@ impl CheckView {
                 .collect();
             let value = if field.key == "addresses" {
                 FieldValue::List(values)
-            } else if let (true, Ok(flag)) =
-                (field.key == "loginCompleted", values[0].parse::<bool>())
-            {
+            } else if let (true, Ok(flag)) = (
+                matches!(
+                    field.key,
+                    "loginCompleted" | "negotiationComplete" | "retriedWithoutSpn"
+                ),
+                values[0].parse::<bool>(),
+            ) {
                 FieldValue::Flag(flag)
             } else if let (true, Ok(number)) = (
                 matches!(
@@ -3352,7 +3396,7 @@ Limitations:
         }
         let json = json(&report, "v").unwrap();
         assert!(
-            json.contains("\"coverageMatrixVersion\": \"1.5\""),
+            json.contains("\"coverageMatrixVersion\": \"1.6\""),
             "{json}"
         );
         assert!(
@@ -3397,6 +3441,76 @@ Limitations:
                 "\"spn\": \"MSSQLSvc/db01.contoso.com:1433\", \"kerberosTicketCache\": \"notFound\""
             ),
             "{json}"
+        );
+    }
+
+    /// The SPN's source, the package asked for and the one negotiated are
+    /// shown; whether the negotiation completed and the retry without an SPN
+    /// are booleans in JSON; the server's scheme is the session's.
+    #[test]
+    fn the_security_context_evidence_is_shown() {
+        let mut report = passing_report();
+        for check in &mut report.checks {
+            match check.id {
+                CheckId::ConnectionAttempt => {
+                    check.fields.push(Field::identifier(
+                        "spn",
+                        "MSSQLSvc/db01.contoso.com:1433",
+                        Category::Spn,
+                    ));
+                    for (key, value) in [
+                        ("spnSource", "derived"),
+                        ("securityPackage", "Negotiate"),
+                        ("negotiatedPackage", "NTLM"),
+                        ("negotiationComplete", "false"),
+                        ("retriedWithoutSpn", "true"),
+                    ] {
+                        check.fields.push(Field::plain(key, value));
+                    }
+                }
+                CheckId::SessionValidation => {
+                    check.fields.push(Field::plain("authScheme", "NTLM"));
+                }
+                _ => {}
+            }
+        }
+        let text = text(&report);
+        assert!(
+            text.contains(
+                "; SPN MSSQLSvc/db01.contoso.com:1433 (derived); security package Negotiate; \
+                 negotiated NTLM (incomplete); retried without an SPN"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("authentication scheme NTLM"), "{text}");
+        let json: serde_json::Value = serde_json::from_str(&json(&report, "v").unwrap()).unwrap();
+        let attempt = json["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["check"] == "connectionAttempt")
+            .unwrap();
+        assert_eq!(attempt["spnSource"], "derived");
+        assert_eq!(attempt["negotiationComplete"], false);
+        assert_eq!(attempt["retriedWithoutSpn"], true);
+    }
+
+    /// A security package's status is shown in hex, as its documentation
+    /// writes it, next to its name.
+    #[test]
+    fn a_security_status_is_shown_in_hex() {
+        let mut report = failing_report();
+        let mut error =
+            ErrorRecord::new("kerberos", CheckId::ConnectionAttempt, "Server not found");
+        error.code = Some("KRB5KDC_ERR_S_PRINCIPAL_UNKNOWN".to_string());
+        error.native_error = Some(-1_765_328_377);
+        report.errors = vec![error];
+        let text = text(&report);
+        assert!(
+            text.contains(
+                "kerberos [KRB5KDC_ERR_S_PRINCIPAL_UNKNOWN; 0x96C73A07]: Server not found"
+            ),
+            "{text}"
         );
     }
 
