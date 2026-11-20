@@ -5,7 +5,7 @@
 # Returns 124 when the limit was hit, otherwise the command's own exit status.
 
 run_bounded() {
-  local limit=$1 pid='' waited=0 result='' previous_term previous_job last_job cleanup_attempt
+  local limit=$1 pid='' deadline result='' previous_term previous_job last_job cleanup_attempt
   shift
   previous_term=$(trap -p TERM)
   # Bash 3.2 treats an unset $! as an error under nounset, even with :-.
@@ -43,12 +43,13 @@ run_bounded() {
   # Job control gives the child its own process group. Signalling only the direct
   # child leaves grandchildren (limactl, qemu, docker) alive holding the task's
   # stdout, which hangs the pipeline step even after the timeout fires.
+  deadline=$(($(date +%s) + limit))
   set -m
   "$@" &
   pid=$!
   set +m
   while kill -0 "$pid" 2>/dev/null; do
-    if [ "$waited" -ge "$limit" ]; then
+    if [ "$(date +%s)" -ge "$deadline" ]; then
       echo "##[warning]'$1' exceeded ${limit}s — terminating"
       kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
       sleep 5
@@ -58,7 +59,6 @@ run_bounded() {
       break
     fi
     sleep 2
-    waited=$((waited + 2))
   done
   if [ -z "$result" ]; then
     if wait "$pid"; then result=0; else result=$?; fi
