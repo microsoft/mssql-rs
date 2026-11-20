@@ -418,9 +418,10 @@ mod tests {
     use pyo3::types::{PyCFunction, PyDict};
     use tokio::sync::oneshot;
     use tracing::Subscriber;
-    use tracing::span::{Attributes, Id};
+    use tracing::span::Id;
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::registry::LookupSpan;
 
     use super::{FinalizerCompletionGuard, PyAsyncCursor, clear_result_state, map_claim_error};
     use crate::async_description::DescriptionState;
@@ -431,17 +432,12 @@ mod tests {
     use crate::async_tracing::CURSOR_OPERATION_SPAN_NAME;
     use crate::row_writer::PyRowWriter;
 
-    struct ClaimInstalled(std::sync::Mutex<Option<oneshot::Sender<()>>>);
+    struct OperationStarted(std::sync::Mutex<Option<oneshot::Sender<()>>>);
 
-    impl<S: Subscriber> Layer<S> for ClaimInstalled {
-        fn on_new_span(
-            &self,
-            attributes: &Attributes<'_>,
-            _id: &Id,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            // Cursor-operation spans are created after admission, before physical access.
-            if attributes.metadata().name() == CURSOR_OPERATION_SPAN_NAME
+    impl<S: Subscriber + for<'lookup> LookupSpan<'lookup>> Layer<S> for OperationStarted {
+        fn on_enter(&self, id: &Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+            // Entry proves native work started; span creation alone can precede registration.
+            if ctx.span(id).unwrap().metadata().name() == CURSOR_OPERATION_SPAN_NAME
                 && let Some(sender) = self.0.lock().unwrap().take()
             {
                 sender.send(()).unwrap();
@@ -463,12 +459,12 @@ mod tests {
         (cursor, transport)
     }
 
-    fn assert_queued_operation_rejected(operation: &str, closed: bool) {
+    fn assert_queued_operation_after_revocation(operation: &str, closed: bool) {
         let (mut cursor, transport) = cursor();
         let (claimed_tx, claimed_rx) = oneshot::channel();
         cursor.tracing_dispatch = Some(tracing::Dispatch::new(
             tracing_subscriber::Registry::default()
-                .with(ClaimInstalled(std::sync::Mutex::new(Some(claimed_tx)))),
+                .with(OperationStarted(std::sync::Mutex::new(Some(claimed_tx)))),
         ));
         let connection = cursor.tds_client.clone();
         let state = cursor.session_state.clone();
@@ -534,23 +530,34 @@ mod tests {
                 _ => format!("cursor.{operation}()"),
             };
             let expected = if closed { "closed" } else { "closing" };
-            let await_claim = if matches!(operation, "execute" | "executemany") {
-                "    await asyncio.wait_for(wait_for_claim(), 5)\n"
-            } else {
-                ""
-            };
-            let code = CString::new(format!(
-                r#"import asyncio
-async def run():
-    pending = {call}
-{await_claim}    revoke()
+            let assert_result = if operation == "close" {
+                r#"    assert await asyncio.wait_for(pending, 5) is None
     try:
+        cursor.fetchone()
+    except RuntimeError as error:
+        assert str(error) == 'Cursor is closed', str(error)
+    else:
+        raise AssertionError('revoked cursor still exposes results')
+"#
+                .to_string()
+            } else {
+                format!(
+                    r#"    try:
         await asyncio.wait_for(pending, 5)
     except InterfaceError as error:
         assert str(error) == 'Connection is {expected}', str(error)
     else:
         raise AssertionError('queued {operation} reached the client')
-    assert await cursor.close() is None
+"#
+                )
+            };
+            let code = CString::new(format!(
+                r#"import asyncio
+async def run():
+    pending = {call}
+    await asyncio.wait_for(wait_for_claim(), 5)
+    revoke()
+{assert_result}    assert await cursor.close() is None
 asyncio.run(run())
 "#
             ))
@@ -573,14 +580,14 @@ asyncio.run(run())
     #[test]
     fn queued_execute_rejects_revoked_parent() {
         for closed in [false, true] {
-            assert_queued_operation_rejected("execute", closed);
+            assert_queued_operation_after_revocation("execute", closed);
         }
     }
 
     #[test]
     fn queued_executemany_rejects_revoked_parent() {
         for closed in [false, true] {
-            assert_queued_operation_rejected("executemany", closed);
+            assert_queued_operation_after_revocation("executemany", closed);
         }
     }
 
@@ -588,7 +595,7 @@ asyncio.run(run())
     fn queued_fetch_variants_and_nextset_reject_revoked_parent() {
         for operation in ["fetchone", "fetchmany", "fetchall", "nextset"] {
             for closed in [false, true] {
-                assert_queued_operation_rejected(operation, closed);
+                assert_queued_operation_after_revocation(operation, closed);
             }
         }
     }
@@ -596,7 +603,7 @@ asyncio.run(run())
     #[test]
     fn queued_cursor_close_cleans_local_results_after_parent_revocation() {
         for closed in [false, true] {
-            assert_queued_operation_rejected("close", closed);
+            assert_queued_operation_after_revocation("close", closed);
         }
     }
 

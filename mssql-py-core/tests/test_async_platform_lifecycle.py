@@ -32,7 +32,9 @@ async def _start_waiting_nextset(client_context):
         cursor = connection.cursor()
         await asyncio.wait_for(
             cursor.execute(
-                "SELECT @@SPID; WAITFOR DELAY '00:01:00'; SELECT 2",
+                "SELECT @@SPID; "
+                "RAISERROR('lifecycle ready', 10, 1) WITH NOWAIT; "
+                "WAITFOR DELAY '00:01:00'; SELECT 2",
                 use_prepare=False,
             ),
             timeout=15,
