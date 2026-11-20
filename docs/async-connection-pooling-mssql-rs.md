@@ -1420,14 +1420,19 @@ PR validation runs the pool contracts and live harness on native Windows/macOS,
 and the live harness alongside Python-core Rust tests in the Linux build
 container. The `pool-sql` nextest profile keeps live JUnit results separate from
 the `ci` unit-test results. Only the explicitly selected live tests are unignored;
-unrelated ignored compatibility tests remain excluded.
+unrelated ignored compatibility tests remain excluded. Native pool validation
+fetches Python-core dependencies before frozen runs, independently of optional
+formatting and Clippy steps.
 
 Local Windows evidence (SQL Server 2019 Developer, 15.0.2210.4, TCP/TLS with
 certificate trust enabled, SQL-password authentication): all four live harness
 tests passed, including pre-reset rollback observation and delayed-error discard.
-The run used a temporary low-privilege login, removed afterward. Linux/macOS
-execution of this slice remains unverified until validation runs on those hosts;
-pipeline wiring is not cross-platform execution evidence.
+The run used a temporary low-privilege login, removed afterward.
+[PR validation build 193984](https://dev.azure.com/SqlClientDrivers/904996cc-6198-4d39-8540-eca72bdf0b7b/_build/results?buildId=193984)
+verified this Rust slice on Linux, macOS and Windows: each executed and published
+all four live tests. Linux also passed 530 Python-core Rust tests; native macOS
+and Windows each passed 133 pool contracts. This does not verify the deferred
+Python/AQE integration or other authentication/topology combinations.
 
 ### Upstream contracts reviewed
 

@@ -213,6 +213,7 @@ def test_native_pool_validation_runs_after_sql_ready_and_reports_both_runs():
     )
     assert steps.index(run) > steps.index("${{ parameters.beforeTestSteps }}")
     command = run["script"]
+    assert command.startswith("cargo fetch && cargo nextest run --frozen ")
     assert '--lib -E "test(pool::)" --profile ci' in command
     assert " && cargo nextest run " in command
     assert '--test pool_sql -E "test(live_)" --run-ignored only --profile pool-sql' in command
