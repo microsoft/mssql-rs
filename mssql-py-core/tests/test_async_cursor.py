@@ -84,7 +84,7 @@ def test_retained_cursor_rejects_work_after_connection_close(
             "execute": ("SELECT 1",),
             "executemany": ("SELECT ?", [(1,)]),
         }
-        with pytest.raises(RuntimeError, match="Connection is closed"):
+        with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
             await getattr(cursor, operation)(*arguments.get(operation, ()))
         assert await cursor.close() is None
 
@@ -107,7 +107,7 @@ def test_buffered_cursor_rejects_work_after_connection_close(
         finally:
             await conn.close()
 
-        with pytest.raises(RuntimeError, match="Connection is closed"):
+        with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
             await getattr(cursor, operation)()
         assert await cursor.close() is None
 
@@ -172,7 +172,7 @@ def test_cursor_close_can_retry_after_another_cursor_releases_results(
             blocked = conn.cursor()
             await owner.execute("SELECT 1", use_prepare=False)
 
-            with pytest.raises(RuntimeError, match="busy with another cursor"):
+            with pytest.raises(mssql_py_core.InterfaceError, match="busy with another cursor"):
                 blocked.close()
 
             await owner.close()
@@ -201,7 +201,7 @@ def test_dropped_cursor_with_unread_rows_does_not_leave_connection_busy(
                 probe = conn.cursor()
                 try:
                     await probe.execute("SET NOCOUNT ON", use_prepare=False)
-                except RuntimeError as error:
+                except mssql_py_core.InterfaceError as error:
                     if "busy" in str(error).lower():
                         continue
                     assert "broken" in str(error).lower()
@@ -242,7 +242,7 @@ def test_dropped_idle_cursor_does_not_break_another_cursor(mock_client_context):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("transaction_method", ["commit", "rollback"])
-def test_transaction_operation_rejects_pending_cursor_results(
+def test_transaction_operation_drains_pending_cursor_results(
     client_context, transaction_method
 ):
     async def run():
@@ -250,8 +250,7 @@ def test_transaction_operation_rejects_pending_cursor_results(
         try:
             cursor = conn.cursor()
             await cursor.execute("SELECT 1", use_prepare=False)
-            with pytest.raises(RuntimeError, match="busy with another operation"):
-                await getattr(conn, transaction_method)()
+            assert await getattr(conn, transaction_method)() is None
             await cursor.close()
             assert await getattr(conn, transaction_method)() is None
         finally:
@@ -277,12 +276,35 @@ def test_async_api_exposes_user_facing_docstrings():
     cursor_doc = " ".join(mssql_py_core.PyAsyncCursor.__doc__.split())
     assert "only one cursor may own an active batch" in cursor_doc
     assert "row-producing execute retains ownership" in cursor_doc
-    assert "`commit()` or `rollback()` report busy" in cursor_doc
+    assert "transaction completion drains dormant results" in cursor_doc
     assert "Positional parameters use `?` markers" in mssql_py_core.PyAsyncCursor.execute.__doc__
     assert "consumed only after" in mssql_py_core.PyAsyncCursor.setinputsizes.__doc__
     close_doc = " ".join(mssql_py_core.PyAsyncCursor.close.__doc__.split())
     assert "Closing an already closed cursor is a no-op" in close_doc
     assert "table-valued parameter" in mssql_py_core.TableValuedParameter.__doc__
+
+
+@pytest.mark.integration
+def test_cursor_close_preserves_buffered_server_diagnostics(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "SELECT 1; PRINT 'b3 cleanup details';"
+                "RAISERROR ('b3 cleanup failure', 16, 1)",
+                use_prepare=False,
+            )
+            with pytest.raises(mssql_py_core.DatabaseError, match="b3 cleanup failure") as error:
+                await cursor.close()
+            assert any(
+                message["message"] == "b3 cleanup details"
+                for message in error.value.info_messages
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
 
 
 def test_two_cursors_can_be_created(mock_client_context):
@@ -329,7 +351,7 @@ def test_conn_cursor_after_close_raises_connection_closed(mock_client_context):
             warnings.simplefilter("ignore", FutureWarning)
             conn = await mssql_py_core.PyAsyncConnection.connect(mock_client_context)
             await conn.close()
-            with pytest.raises(RuntimeError, match="Connection is closed"):
+            with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
                 conn.cursor()
 
     asyncio.run(run())
