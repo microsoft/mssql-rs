@@ -455,7 +455,7 @@ impl Request {
 /// The version of the diagnostic coverage matrix this implementation follows
 /// (`docs/diagnose-coverage.md`): which phases are checked, with which signals,
 /// and which coverage states each can report.
-pub const COVERAGE_MATRIX_VERSION: &str = "1.5";
+pub const COVERAGE_MATRIX_VERSION: &str = "1.6";
 
 /// The link to driver-tracing guidance for `sqlcmd diagnose`, given when the
 /// client's own evidence cannot explain a failure. It is a Microsoft FWLink so
@@ -846,6 +846,11 @@ pub(crate) const REQUIRES: &str = "requires";
 /// [REQUIRES] on instance resolution when SQL Server Browser gave a named
 /// instance no usable port: an explicit `host,port`.
 pub(crate) const REQUIRES_EXPLICIT_PORT: &str = "explicitPort";
+/// The field of instance resolution that names the request SQL Server Browser
+/// was sent when it was not the instance request: `dac`, for a dedicated
+/// administrator connection's port. Without an `instance` field it is a
+/// default instance's, asked once port 1434 did not connect.
+pub(crate) const BROWSER_REQUEST: &str = "browserRequest";
 
 impl Skip {
     fn not_applicable(
@@ -1930,8 +1935,7 @@ impl Diagnosis {
 
     /// Reads the checks from the stages the client recorded before a cancel,
     /// when the connection attempt had started and no check past the
-    /// connection input was made from it yet. A named instance's DAC keeps
-    /// the name resolution the lookup finished; its port stays unchecked.
+    /// connection input was made from it yet.
     async fn observe_so_far(&mut self, steps: Vec<Step>) {
         let Some(target) = self.target.clone() else {
             return;
@@ -1942,10 +1946,6 @@ impl Diagnosis {
             return;
         }
         if steps.is_empty() {
-            return;
-        }
-        if target.protocol == Protocol::Admin && target.instance.is_some() {
-            self.dac_lookup(&target, &steps);
             return;
         }
         Box::pin(self.observe(&target, steps, &Ended::Canceled, 0, None, None)).await;
@@ -2025,9 +2025,6 @@ impl Diagnosis {
         if !self.wants(Depth::EndpointResolution) {
             return;
         }
-        // A named instance's DAC port comes from SQL Server Browser's DAC
-        // request, which the client does not make: only the name is checked.
-        let dac_lookup = target.protocol == Protocol::Admin && target.instance.is_some();
         // sqlcmd's own driver connection, which decides the connection attempt.
         let driver = self
             .request
@@ -2035,7 +2032,6 @@ impl Diagnosis {
             .clone()
             .filter(|_| self.wants(Depth::ConnectionAttempt));
         let stop_after = match self.request.depth {
-            _ if dac_lookup => Some(DiagnosticStop::Resolution),
             Depth::ConnectionInput | Depth::EndpointResolution => Some(DiagnosticStop::Resolution),
             Depth::NetworkReachability => Some(DiagnosticStop::Transport),
             // sqlcmd's own driver makes the connection attempt: the
@@ -2065,17 +2061,6 @@ impl Diagnosis {
         let attempt_ms = millis(started);
         let (client, ended) = self.attempt_ended(attempt);
         let steps = self.recorder.steps();
-        if dac_lookup {
-            self.dac_lookup(&target, &steps);
-            if let Some(mut client) = client {
-                let _ = client.close_connection().await;
-            }
-            if let Some(driver) = driver {
-                self.prepare_driver_checks();
-                Box::pin(self.driver_attempt(driver, &target, None)).await;
-            }
-            return;
-        }
         Box::pin(self.observe(&target, steps, &ended, attempt_ms, client.as_ref(), driver)).await;
         match client {
             Some(mut client) => {
@@ -2089,50 +2074,6 @@ impl Diagnosis {
                 &Skip::BlockedBy(CheckId::ConnectionAttempt),
             ),
         }
-    }
-
-    /// `admin:host\instance`: the name is checked; the DAC port, which only
-    /// SQL Server Browser's DAC request gives, is not guessed.
-    fn dac_lookup(&mut self, target: &Target, steps: &[Step]) {
-        let mut ordered: Vec<&Step> = steps.iter().collect();
-        ordered.sort_by_key(|s| s.started);
-        let groups = transports(&ordered);
-        let lookup = ordered
-            .iter()
-            .copied()
-            .find(|s| s.stage == Stage::InstanceLookup);
-        self.name_resolution(target, groups.first(), lookup, None, false, false);
-        let mut check = Check::new(CheckId::InstanceResolution, Coverage::Inconclusive);
-        check.fields.push(Field::identifier(
-            "host",
-            target.resolvable_host().to_string(),
-            Category::Host,
-        ));
-        check.fields.push(Field::identifier(
-            "instance",
-            target.instance.clone().unwrap_or_default(),
-            Category::Instance,
-        ));
-        check
-            .fields
-            .push(Field::plain("result", "dacLookupUnsupported"));
-        check.domain = Some(Domain::undetermined(&[
-            "connectivity.instanceResolution",
-            "client.driver",
-        ]));
-        self.checks.push(check);
-        self.limitation_text(LocalizedText::new(
-            "diagnose.limitation.admin_named_instance_dac_unsupported",
-            "The dedicated administrator connection to a named instance gets its port from \
-             SQL Server Browser's DAC request, which the diagnostic client does not make. \
-             Its endpoint evidence is unavailable; sqlcmd's own driver, when supplied, \
-             still checks the connection.",
-            vec![],
-        ));
-        self.skip_rest(
-            CheckId::InstanceResolution,
-            &Skip::BlockedBy(CheckId::InstanceResolution),
-        );
     }
 
     /// Reads the checks from the stages the attempt went through (`steps`)
@@ -2188,14 +2129,37 @@ impl Diagnosis {
             return;
         }
 
-        // Transports tried before SQL Server Browser was asked (shared
-        // memory first, without a prefix) were moved past.
-        let looked_up_after = lookup.map_or(0, |l| {
+        // Transports tried before SQL Server Browser was asked were moved
+        // past: shared memory first, without a prefix, or a default
+        // instance's dedicated administrator connection on port 1434, after
+        // which the client asks for its DAC port. When nothing was tried
+        // after that DAC lookup, port 1434 is the TCP path, unless the
+        // Browser gave another port, which the attempt then ended before.
+        let before_lookup = lookup.map_or(0, |l| {
             groups
                 .iter()
                 .take_while(|g| g.started().is_some_and(|s| s < l.started))
                 .count()
         });
+        let other_dac_port = lookup.is_some_and(|l| {
+            l.ok == Some(true)
+                && l.detail(connect_stage::PORT)
+                    .and_then(|p| p.parse::<u16>().ok())
+                    != Some(DAC_PORT)
+        });
+        let looked_up_after = if target.protocol == Protocol::Admin
+            && before_lookup == groups.len()
+            && !other_dac_port
+        {
+            0
+        } else {
+            before_lookup
+        };
+        // A default instance's DAC lookup that failed: the client reports
+        // that failure (SNI's error 43), not port 1434's.
+        let dac_replaced = target.protocol == Protocol::Admin
+            && target.instance.is_none()
+            && lookup.is_some_and(|l| l.ok != Some(true));
         // The transport the attempt ended on, and the TCP path it tried (the
         // last one), which a later transport may have replaced.
         let primary_at = (groups.len() > looked_up_after).then(|| groups.len() - 1);
@@ -2323,7 +2287,7 @@ impl Diagnosis {
                     tcp,
                     blocked,
                     not_tcp,
-                    tcp_superseded,
+                    tcp_superseded || dac_replaced,
                     ended.canceled(),
                 ),
             }
@@ -2802,17 +2766,29 @@ impl Diagnosis {
             .map(str::to_string)
             .or_else(|| target.instance.clone())
             .unwrap_or_default();
+        // The Browser's DAC request, for a dedicated administrator
+        // connection's port. A default instance's asks for `MSSQLServer`,
+        // once port 1434 did not connect: the check names no instance.
+        let dac = step.detail(connect_stage::REQUEST) == Some(connect_stage::REQUEST_DAC);
+        let default_dac = dac && target.instance.is_none();
         let mut check = Check::new(id, Coverage::Passed);
         check.deadline_ms = Some(BROWSER_TIMEOUT_MS);
         check.duration_ms = Some(step.duration_ms);
         check
             .fields
             .push(Field::identifier("host", host.clone(), Category::Host));
-        check.fields.push(Field::identifier(
-            "instance",
-            instance.clone(),
-            Category::Instance,
-        ));
+        if !default_dac {
+            check.fields.push(Field::identifier(
+                "instance",
+                instance.clone(),
+                Category::Instance,
+            ));
+        }
+        if dac {
+            check
+                .fields
+                .push(Field::plain(BROWSER_REQUEST, connect_stage::REQUEST_DAC));
+        }
         // An explicit TCP target needs a TCP port: an answer that lists only
         // a pipe gives it none.
         let no_tcp_port = step.ok == Some(true)
@@ -2843,6 +2819,29 @@ impl Diagnosis {
                 check.fields.push(Field::plain("pipeSource", source));
             }
             self.checks.push(check);
+            // The port that did not connect, again: the client does not try
+            // it twice and fails with SNI's error 42, the wording of the TCP
+            // connect's errors then.
+            if default_dac
+                && step
+                    .detail(connect_stage::PORT)
+                    .and_then(|p| p.parse::<u16>().ok())
+                    == Some(DAC_PORT)
+            {
+                self.finding(
+                    Certainty::Confirmed,
+                    id,
+                    LocalizedText::new(
+                        "diagnose.finding.dac_port_1434_again",
+                        format!(
+                            "Port 1434 did not connect, and SQL Server Browser on {host} gave \
+                             1434 as the default instance's dedicated administrator connection \
+                             (DAC) port: as the client does, sqlcmd does not try it again."
+                        ),
+                        vec![("host", host.clone())],
+                    ),
+                );
+            }
             return None;
         }
         if step.abandoned() && !timed_out {
@@ -2850,15 +2849,26 @@ impl Diagnosis {
             self.checks.push(Check::skipped(id, Skip::Canceled));
             return Some(Skip::Canceled);
         }
-        if lookup_unresolved(step, timed_out) {
-            // Name resolution reports it.
+        // Name resolution, checked first, reports a lookup that could not
+        // resolve the name, unless it passed on an earlier transport's
+        // resolving (a default instance's port 1434, before its DAC lookup):
+        // the lookup's own resolving failed then, which it reports itself.
+        let unresolved = lookup_unresolved(step, timed_out);
+        let name_resolved = self
+            .checks
+            .iter()
+            .rev()
+            .find(|c| c.id == CheckId::NameResolution)
+            .is_some_and(|c| c.coverage == Coverage::Passed);
+        if unresolved && !name_resolved {
             self.checks
                 .push(Check::skipped(id, Skip::BlockedBy(CheckId::NameResolution)));
             return Some(Skip::BlockedBy(CheckId::NameResolution));
         }
         // What is blocked without the endpoint: a port, which only the user
-        // can then give, or a pipe.
-        let needs_port = target.protocol.uses_tcp();
+        // can then give, or a pipe. A dedicated administrator connection
+        // takes no port: only the Browser can give it.
+        let needs_port = target.protocol.uses_tcp() && !dac;
         let blocks = if needs_port {
             Skip::PortRequired
         } else {
@@ -2872,7 +2882,17 @@ impl Diagnosis {
             None => "failed",
         };
         let os_error = step.os_error();
-        let problem = ssrp_problem_text(code, step.detail(connect_stage::ERROR));
+        // A lookup whose own resolving ran out of time never asked SQL
+        // Server Browser: no answer of the Browser's was missed.
+        let problem = if unresolved && code == "timedOut" {
+            LocalizedText::new(
+                "diagnose.error.ssrp_resolve_timed_out",
+                "the server name did not resolve in the time limit",
+                vec![],
+            )
+        } else {
+            ssrp_problem_text(code, step.detail(connect_stage::ERROR))
+        };
         let mut record = ErrorRecord::new("sqlBrowser", id, "");
         record.message = problem.clone();
         record.code = Some(code.to_string());
@@ -2914,43 +2934,68 @@ impl Diagnosis {
         };
         check.domain = Some(if check.coverage == Coverage::Diagnosed {
             Domain::specific("connectivity.instanceResolution")
+        } else if unresolved {
+            Domain::undetermined(&["connectivity.nameResolution", "connectivity.network"])
         } else {
             Domain::undetermined(&["connectivity.instanceResolution", "connectivity.network"])
         });
         self.checks.push(check);
-        self.quoting_finding(
-            Certainty::Confirmed,
-            id,
-            if target.protocol.uses_tcp() {
-                LocalizedText::new_with_args(
-                    "diagnose.finding.browser_no_usable_port",
-                    format!(
-                        "SQL Server Browser on {host} gave no usable port for instance \
-                         {instance}: {}.",
-                        problem.render("en-US")
-                    ),
-                    vec![
-                        LocalizedArg::text("host", host.clone()),
-                        LocalizedArg::text("instance", instance),
-                        LocalizedArg::localized_text("problem", &problem),
-                    ],
-                )
-            } else {
-                LocalizedText::new_with_args(
-                    "diagnose.finding.browser_no_usable_pipe",
-                    format!(
-                        "SQL Server Browser on {host} gave no usable pipe for instance \
-                         {instance}: {}.",
-                        problem.render("en-US")
-                    ),
-                    vec![
-                        LocalizedArg::text("host", host.clone()),
-                        LocalizedArg::text("instance", instance),
-                        LocalizedArg::localized_text("problem", &problem),
-                    ],
-                )
-            },
-        );
+        let problem_arg = LocalizedArg::localized_text("problem", &problem);
+        let finding = if default_dac {
+            LocalizedText::new_with_args(
+                "diagnose.finding.browser_no_default_dac_port",
+                format!(
+                    "Port 1434 did not connect, and SQL Server Browser on {host} gave no other \
+                     dedicated administrator connection (DAC) port for the default instance: \
+                     {}.",
+                    problem.render("en-US")
+                ),
+                vec![LocalizedArg::text("host", host.clone()), problem_arg],
+            )
+        } else if dac {
+            LocalizedText::new_with_args(
+                "diagnose.finding.browser_no_dac_port",
+                format!(
+                    "SQL Server Browser on {host} gave no dedicated administrator connection \
+                     (DAC) port for instance {instance}: {}.",
+                    problem.render("en-US")
+                ),
+                vec![
+                    LocalizedArg::text("host", host.clone()),
+                    LocalizedArg::text("instance", instance),
+                    problem_arg,
+                ],
+            )
+        } else if target.protocol.uses_tcp() {
+            LocalizedText::new_with_args(
+                "diagnose.finding.browser_no_usable_port",
+                format!(
+                    "SQL Server Browser on {host} gave no usable port for instance \
+                     {instance}: {}.",
+                    problem.render("en-US")
+                ),
+                vec![
+                    LocalizedArg::text("host", host.clone()),
+                    LocalizedArg::text("instance", instance),
+                    problem_arg,
+                ],
+            )
+        } else {
+            LocalizedText::new_with_args(
+                "diagnose.finding.browser_no_usable_pipe",
+                format!(
+                    "SQL Server Browser on {host} gave no usable pipe for instance \
+                     {instance}: {}.",
+                    problem.render("en-US")
+                ),
+                vec![
+                    LocalizedArg::text("host", host.clone()),
+                    LocalizedArg::text("instance", instance),
+                    problem_arg,
+                ],
+            )
+        };
+        self.quoting_finding(Certainty::Confirmed, id, finding);
         if needs_port {
             self.explicit_port_request(&host);
         }
@@ -3294,6 +3339,15 @@ impl Diagnosis {
             .iter()
             .map(|a| format!("{} {}", a.address, a.result.name()))
             .collect();
+        // Refused away from the loopback address: the DAC listens there
+        // alone unless the server allows remote admin connections.
+        let dac_remote_refused = target.protocol == Protocol::Admin
+            && all(TcpResult::Refused)
+            && !check.attempts.iter().any(|a| {
+                a.address
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+            });
         self.checks.push(check);
         self.finding(
             Certainty::Confirmed,
@@ -3318,6 +3372,19 @@ impl Diagnosis {
                     "diagnose.finding.no_tcp_listener",
                     format!("Nothing is listening on port {port} at those addresses."),
                     vec![("port", port.to_string())],
+                ),
+            );
+        }
+        if dac_remote_refused {
+            self.finding(
+                Certainty::Suspected,
+                id,
+                LocalizedText::new(
+                    "diagnose.finding.dac_remote_admin_connections",
+                    "Unless its 'remote admin connections' option is on, SQL Server accepts a \
+                     dedicated administrator connection (DAC) only from its own computer, on \
+                     the loopback address.",
+                    vec![],
                 ),
             );
         }
@@ -3536,11 +3603,55 @@ impl Diagnosis {
         self.findings.retain(|f| !set_aside.contains(&f.check));
     }
 
+    /// A default instance's dedicated administrator connection did not
+    /// connect on port 1434 (`group`); as the client does, sqlcmd then asked
+    /// SQL Server Browser for its DAC port and connected there, checked
+    /// below. Its connects' errors are kept, superseded: the driver reports
+    /// none of them.
+    fn dac_default_port_moved_past(&mut self, group: &Transport) {
+        let mut reason = None;
+        for step in group.tcp.iter().filter(|s| s.ok != Some(true)) {
+            let address = step.detail(connect_stage::ADDRESS).unwrap_or_default();
+            let message = match step.detail(connect_stage::ERROR) {
+                Some(error) => LocalizedText::literal(error),
+                None => {
+                    LocalizedText::new("diagnose.error.not_connected", "it did not connect", vec![])
+                }
+            };
+            let mut record = ErrorRecord::new("os", CheckId::TcpConnect, "");
+            record.message = address_message(address, DAC_PORT, &message);
+            record.os_error = step.os_error();
+            record.superseded = true;
+            self.errors.push(record);
+            reason.get_or_insert(message);
+        }
+        let reason = reason.unwrap_or_else(|| {
+            LocalizedText::new("diagnose.error.not_connected", "it did not connect", vec![])
+        });
+        let reason_english = reason.render("en-US");
+        self.finding_quoting(
+            Certainty::Informational,
+            CheckId::TcpConnect,
+            LocalizedText::new_with_args(
+                "diagnose.finding.dac_default_port_not_connected",
+                format!(
+                    "Port 1434, a default instance's dedicated administrator connection (DAC) \
+                     port, did not connect ({reason_english}); as the client does, sqlcmd then \
+                     asked SQL Server Browser for the DAC port, checked below."
+                ),
+                vec![LocalizedArg::localized_text("reason", &reason)],
+            ),
+            &reason,
+        );
+    }
+
     /// The transports the client moved past (shared memory that did not
     /// open, a TCP path that failed, without a prefix; for `np:host\instance`
-    /// the pipe SQL Server Browser listed, before the standard pipe): an
-    /// informational finding each, and their errors kept as evidence, marked
-    /// superseded, as a normal run reports only the last transport's.
+    /// the pipe SQL Server Browser listed, before the standard pipe; for a
+    /// default instance's dedicated administrator connection, port 1434
+    /// before its DAC port): an informational finding each, and their errors
+    /// kept as evidence, marked superseded, as a normal run reports only the
+    /// last transport's.
     fn moved_past(
         &mut self,
         target: &Target,
@@ -3550,6 +3661,12 @@ impl Diagnosis {
     ) {
         for (index, group) in groups.iter().enumerate() {
             if Some(index) == current {
+                continue;
+            }
+            // A default instance's dedicated administrator connection on
+            // port 1434, after which the client asked for its DAC port.
+            if target.protocol == Protocol::Admin && group.is_tcp() {
+                self.dac_default_port_moved_past(group);
                 continue;
             }
             // Without a next transport, SQL Server Browser was asked next,
@@ -8739,8 +8856,11 @@ pub(crate) mod tests {
         }
     }
 
+    /// sqlcmd's own driver decides the connection even when the diagnostic
+    /// connection's DAC lookup fails (no SQL Server Browser answers here):
+    /// once it connects, the failed lookup is set aside.
     #[test]
-    fn the_driver_is_called_even_when_diagnostic_dac_resolution_is_unavailable() {
+    fn the_driver_is_called_even_when_the_diagnostic_dac_lookup_fails() {
         let (hook, calls) = fake_driver(driver::DriverOutcome {
             connected: true,
             ..driver::DriverOutcome::default()
@@ -8749,6 +8869,11 @@ pub(crate) mod tests {
         request.driver = Some(hook);
         let report = run(request);
         assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            checked(&report, CheckId::InstanceResolution).coverage,
+            Coverage::NotApplicable,
+            "{report:#?}"
+        );
         assert_eq!(
             checked(&report, CheckId::ConnectionAttempt).coverage,
             Coverage::Passed,
@@ -9607,19 +9732,25 @@ pub(crate) mod tests {
         );
     }
     /// The dedicated administrator connection goes over TCP to port 1434, so
-    /// its name resolution and TCP connect run against that port.
+    /// its name resolution and TCP connect run against that port. Where port
+    /// 1434 does not connect (no DAC listening here), the client then asks
+    /// SQL Server Browser for the default instance's DAC port, which no
+    /// Browser here gives: port 1434 stays the TCP path.
     #[test]
     fn the_admin_connection_is_checked_on_port_1434() {
         let report = run(request("admin:127.0.0.1", Depth::NetworkReachability));
         let check = |id: CheckId| report.checks.iter().find(|c| c.id == id).unwrap();
         assert_eq!(check(CheckId::NameResolution).coverage, Coverage::Passed);
-        assert_eq!(
-            check(CheckId::InstanceResolution).coverage,
-            Coverage::NotApplicable
-        );
         let tcp = check(CheckId::TcpConnect);
         assert_eq!(tcp.field("port"), Some("1434"), "{report:#?}");
         assert!(tcp.attempts.iter().all(|a| a.port == 1434));
+        let lookup = check(CheckId::InstanceResolution);
+        if tcp.coverage == Coverage::Passed {
+            assert_eq!(lookup.coverage, Coverage::NotApplicable, "{report:#?}");
+        } else {
+            assert_eq!(lookup.field(BROWSER_REQUEST), Some("dac"), "{report:#?}");
+            assert_eq!(lookup.field("instance"), None);
+        }
     }
     /// A named instance whose port SQL Server Browser does not give: nothing
     /// that needs a port is tried, and the findings state evidence only, no
@@ -9655,15 +9786,19 @@ pub(crate) mod tests {
             }
         }
     }
-    /// A named instance's DAC port comes from a Browser request the client
-    /// does not make: no port is guessed, and nothing past it is checked.
+    /// A named instance's DAC port comes from SQL Server Browser's DAC
+    /// request: without an answer no port is guessed, none is asked for
+    /// (`admin:` takes none), and nothing past it is checked.
     #[test]
     fn a_named_instance_admin_connection_is_not_guessed() {
         let report = run(request("admin:127.0.0.1\\INST", Depth::SessionValidation));
         let check = |id: CheckId| report.checks.iter().find(|c| c.id == id).unwrap();
         let lookup = check(CheckId::InstanceResolution);
-        assert_eq!(lookup.coverage, Coverage::Inconclusive);
-        assert_eq!(lookup.field("result"), Some("dacLookupUnsupported"));
+        assert_ne!(lookup.coverage, Coverage::Passed, "{report:#?}");
+        assert!(lookup.field("result").is_some(), "{lookup:#?}");
+        assert_eq!(lookup.field(BROWSER_REQUEST), Some("dac"));
+        assert_eq!(lookup.field("instance"), Some("INST"));
+        assert_eq!(lookup.field(REQUIRES), None);
         for id in [
             CheckId::TcpConnect,
             CheckId::ConnectionAttempt,
@@ -9675,8 +9810,648 @@ pub(crate) mod tests {
                 "{id:?}"
             );
         }
-        assert!(report.limitations.iter().any(|l| l.contains("DAC request")));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.text.render("en-US").starts_with(
+                    "SQL Server Browser on 127.0.0.1 gave no dedicated administrator"
+                )),
+            "{:#?}",
+            report.findings
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| !f.text.contains("port explicitly")),
+            "{:#?}",
+            report.findings
+        );
+        assert!(report.limitations.is_empty(), "{:#?}", report.limitations);
         assert_eq!(report.exit_code(), 2, "{report:#?}");
+    }
+
+    /// A default instance's dedicated administrator connection to db01: port
+    /// 1434 refused, then SQL Server Browser's DAC lookup for `MSSQLServer`,
+    /// ended (`ok`) with `lookup`'s details. A lookup that resolved the name
+    /// lists its addresses there (see [`RESOLVED`]).
+    fn default_dac_stages(ok: Option<bool>, lookup: &[(&'static str, &'static str)]) -> Stages {
+        let mut details = vec![
+            (cs::SERVER, "db01"),
+            (cs::INSTANCE, "MSSQLServer"),
+            (cs::REQUEST, cs::REQUEST_DAC),
+        ];
+        details.extend_from_slice(lookup);
+        Stages::new()
+            .add(
+                Stage::Dns,
+                Some(true),
+                0,
+                1,
+                &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+            )
+            .add(
+                Stage::Tcp,
+                Some(false),
+                1,
+                2,
+                &[
+                    (cs::ADDRESS, "10.0.0.1"),
+                    (cs::PORT, "1434"),
+                    (cs::OS_ERROR, "10061"),
+                    (cs::IO_KIND, "ConnectionRefused"),
+                    (cs::ERROR, "refused"),
+                ],
+            )
+            .add(Stage::InstanceLookup, ok, 2, 5, &details)
+    }
+
+    /// The addresses a lookup that resolved db01 records.
+    const RESOLVED: (&str, &str) = (cs::ADDRESSES, "10.0.0.1");
+
+    fn error_lines(text: &str) -> Vec<&str> {
+        text.lines()
+            .filter(|l| l.trim_start().starts_with("Sqlcmd: Error:"))
+            .collect()
+    }
+
+    /// A named instance's DAC port, from SQL Server Browser's DAC request, is
+    /// the TCP path's port.
+    #[test]
+    fn a_named_instance_admin_connection_connects_to_its_dac_port() {
+        let stages = Stages::new()
+            .add(
+                Stage::InstanceLookup,
+                Some(true),
+                0,
+                3,
+                &[
+                    (cs::SERVER, "db01"),
+                    (cs::INSTANCE, "INST"),
+                    (cs::REQUEST, cs::REQUEST_DAC),
+                    (cs::ADDRESSES, "10.0.0.1"),
+                    (cs::PORT, "1500"),
+                ],
+            )
+            .add(
+                Stage::Dns,
+                Some(true),
+                3,
+                4,
+                &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+            )
+            .add(
+                Stage::Tcp,
+                Some(true),
+                4,
+                5,
+                &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1500")],
+            );
+        let report = observed(
+            request(r"admin:db01\INST", Depth::NetworkReachability),
+            stages,
+            Ended::Stopped,
+        );
+        let lookup = checked(&report, CheckId::InstanceResolution);
+        assert_eq!(lookup.coverage, Coverage::Passed, "{report:#?}");
+        assert_eq!(lookup.field(BROWSER_REQUEST), Some("dac"));
+        assert_eq!(lookup.field("port"), Some("1500"));
+        let tcp = checked(&report, CheckId::TcpConnect);
+        assert_eq!(tcp.coverage, Coverage::Passed, "{report:#?}");
+        assert_eq!(tcp.field("port"), Some("1500"));
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        let text = report::text(&report);
+        assert!(text.contains(r"db01\INST: DAC port 1500"), "{text}");
+    }
+
+    /// An answer to the DAC request that is not a DAC port: evidence about
+    /// the Browser, reported as SNI reports it (error 43), with no port asked
+    /// for and no timeout line.
+    #[test]
+    fn a_named_instance_dac_answer_that_is_not_a_port_is_sni_error_43() {
+        let stages = Stages::new().add(
+            Stage::InstanceLookup,
+            Some(false),
+            0,
+            3,
+            &[
+                (cs::SERVER, "db01"),
+                (cs::INSTANCE, "INST"),
+                (cs::REQUEST, cs::REQUEST_DAC),
+                (cs::ADDRESSES, "10.0.0.1"),
+                (cs::RESULT, "invalidResponse"),
+                (
+                    cs::ERROR,
+                    "SQL Server Browser's DAC answer is 5 bytes, not 6",
+                ),
+            ],
+        );
+        let report = observed(
+            request(r"admin:db01\INST", Depth::SessionValidation),
+            stages,
+            Ended::Failed(Error::ConnectionError("no DAC port".to_string())),
+        );
+        let lookup = checked(&report, CheckId::InstanceResolution);
+        assert_eq!(lookup.coverage, Coverage::Diagnosed, "{report:#?}");
+        assert_eq!(lookup.field("result"), Some("invalidResponse"));
+        assert_eq!(lookup.field(REQUIRES), None);
+        assert_eq!(
+            checked(&report, CheckId::TcpConnect).skip,
+            Some(Skip::BlockedBy(CheckId::InstanceResolution))
+        );
+        let text = report::text(&report);
+        assert!(text.contains(r"db01\INST: no DAC port"), "{text}");
+        let errors = error_lines(&text);
+        assert_eq!(errors.len(), 2, "{text}");
+        assert!(
+            errors[0].contains(
+                "An error occurred while obtaining the dedicated administrator connection (DAC) \
+                 port. Make sure that SQL Browser is running, or check the error log for the \
+                 port number [xFFFFFFFF]."
+            ),
+            "{text}"
+        );
+        assert!(errors[1].contains("A network-related"), "{text}");
+    }
+
+    /// The DAC lookup's failures keep their classes: no answer, and a time
+    /// limit spent on it, are inconclusive, with the timeout line; a request
+    /// this computer would not send makes the run partial; a name that does
+    /// not resolve is name resolution's. None asks for a port, and each
+    /// reads as SNI's error 43.
+    #[test]
+    fn a_named_instance_dac_lookup_keeps_its_failure_classes() {
+        const NOT_OBTAINED: &str = "SQL Server Network Interfaces: An error occurred while \
+             obtaining the dedicated administrator connection (DAC) port.";
+        let lookup = |ok: Option<bool>, details: &[(&'static str, &'static str)]| {
+            let mut all = vec![
+                (cs::SERVER, "db01"),
+                (cs::INSTANCE, "INST"),
+                (cs::REQUEST, cs::REQUEST_DAC),
+            ];
+            all.extend_from_slice(details);
+            Stages::new().add(Stage::InstanceLookup, ok, 0, 2000, &all)
+        };
+        let failed = || Ended::Failed(Error::ConnectionError("no DAC port".to_string()));
+        let dac = || request(r"admin:db01\INST", Depth::SessionValidation);
+        let no_port_asked = |report: &Report| {
+            assert_eq!(
+                checked(report, CheckId::InstanceResolution).field(REQUIRES),
+                None
+            );
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .all(|f| !f.text.contains("port explicitly")),
+                "{:#?}",
+                report.findings
+            );
+        };
+
+        for (stages, ended, result) in [
+            (
+                lookup(
+                    Some(false),
+                    &[(cs::ADDRESSES, "10.0.0.1"), (cs::RESULT, "noAnswer")],
+                ),
+                failed(),
+                "noAnswer",
+            ),
+            (
+                lookup(None, &[(cs::ADDRESSES, "10.0.0.1")]),
+                timed_out(),
+                "timedOut",
+            ),
+        ] {
+            let report = observed(dac(), stages, ended);
+            let check = checked(&report, CheckId::InstanceResolution);
+            assert_eq!(check.coverage, Coverage::Inconclusive, "{report:#?}");
+            assert_eq!(check.field("result"), Some(result));
+            assert_eq!(
+                checked(&report, CheckId::TcpConnect).skip,
+                Some(Skip::BlockedBy(CheckId::InstanceResolution)),
+                "{result}"
+            );
+            no_port_asked(&report);
+            let text = report::text(&report);
+            assert!(text.contains(NOT_OBTAINED), "{text}");
+            assert!(text.contains("Login timeout expired"), "{text}");
+        }
+
+        let report = observed(
+            dac(),
+            lookup(
+                Some(false),
+                &[(cs::RESULT, "socketFailed"), (cs::OS_ERROR, "10055")],
+            ),
+            failed(),
+        );
+        assert_eq!(report.execution_status, ExecutionStatus::Partial);
+        assert!(
+            report
+                .limitations
+                .iter()
+                .any(|l| l.contains("did not let sqlcmd ask SQL Server Browser")),
+            "{:#?}",
+            report.limitations
+        );
+        assert_eq!(
+            checked(&report, CheckId::TcpConnect).skip,
+            Some(Skip::BlockedBy(CheckId::InstanceResolution))
+        );
+        no_port_asked(&report);
+        assert!(report::text(&report).contains(NOT_OBTAINED));
+
+        let report = observed(
+            dac(),
+            lookup(
+                Some(false),
+                &[
+                    (cs::RESULT, "nameResolutionFailed"),
+                    (cs::OS_ERROR, "11001"),
+                    (cs::ERROR, "No such host is known."),
+                ],
+            ),
+            failed(),
+        );
+        assert_eq!(
+            checked(&report, CheckId::NameResolution).field("result"),
+            Some("notFound")
+        );
+        assert_eq!(
+            checked(&report, CheckId::InstanceResolution).skip,
+            Some(Skip::BlockedBy(CheckId::NameResolution))
+        );
+        let text = report::text(&report);
+        let errors = error_lines(&text);
+        assert!(errors[0].contains(NOT_OBTAINED), "{text}");
+        assert!(!text.contains("Error Locating Server"), "{text}");
+    }
+
+    /// Port 1434 refused and SQL Server Browser gave no DAC port: SNI
+    /// reports the lookup's failure (error 43), not port 1434's, whose
+    /// error is kept, superseded. Refused away from the loopback address,
+    /// the DAC may be accepted only on it.
+    #[test]
+    fn a_default_dac_lookup_that_fails_is_reported_instead_of_port_1434() {
+        let report = observed(
+            request("admin:db01", Depth::SessionValidation),
+            default_dac_stages(Some(false), &[RESOLVED, (cs::RESULT, "noAnswer")]),
+            Ended::Failed(Error::ConnectionError("no answer".to_string())),
+        );
+        let lookup = checked(&report, CheckId::InstanceResolution);
+        assert_eq!(lookup.coverage, Coverage::Inconclusive, "{report:#?}");
+        assert_eq!(lookup.field(BROWSER_REQUEST), Some("dac"));
+        assert_eq!(lookup.field("instance"), None);
+        assert_eq!(lookup.field("result"), Some("noAnswer"));
+        assert_eq!(lookup.field(REQUIRES), None);
+        let tcp = checked(&report, CheckId::TcpConnect);
+        assert_eq!(tcp.coverage, Coverage::Diagnosed, "{report:#?}");
+        assert_eq!(tcp.field("port"), Some("1434"));
+        let port_1434: Vec<&ErrorRecord> = report
+            .errors
+            .iter()
+            .filter(|e| e.check == CheckId::TcpConnect)
+            .collect();
+        assert!(
+            !port_1434.is_empty() && port_1434.iter().all(|e| e.superseded),
+            "{:#?}",
+            report.errors
+        );
+        let rendered: Vec<String> = report
+            .findings
+            .iter()
+            .map(|f| f.text.render("en-US"))
+            .collect();
+        assert!(
+            rendered.iter().any(|f| f.starts_with(
+                "Port 1434 did not connect, and SQL Server Browser on db01 gave no other \
+                 dedicated administrator connection (DAC) port for the default instance: "
+            )),
+            "{rendered:#?}"
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.certainty == Certainty::Suspected
+                    && f.text.contains("'remote admin connections'")),
+            "{rendered:#?}"
+        );
+        let text = report::text(&report);
+        assert!(text.contains("db01: no DAC port"), "{text}");
+        let errors = error_lines(&text);
+        assert_eq!(errors.len(), 3, "{text}");
+        assert!(
+            errors.iter().any(|l| l.contains(
+                "An error occurred while obtaining the dedicated administrator connection (DAC) \
+                 port."
+            )),
+            "{text}"
+        );
+        assert!(
+            errors.iter().any(|l| l.contains("Login timeout expired")),
+            "{text}"
+        );
+        assert!(errors[2].contains("A network-related"), "{text}");
+        assert!(!text.contains("TCP Provider"), "{text}");
+    }
+
+    /// Port 1434 refused after its name resolved, and then the DAC lookup's
+    /// own resolving failed (another resolution of the same name, within the
+    /// Browser's time limit): name resolution passed, so the lookup reports
+    /// its failure itself, worded as SNI's error 43, rather than deferring
+    /// to name resolution and leaving no error current.
+    #[test]
+    fn a_default_dac_lookup_that_cannot_resolve_the_name_again_reports_it() {
+        const NOT_OBTAINED: &str = "SQL Server Network Interfaces: An error occurred while \
+             obtaining the dedicated administrator connection (DAC) port.";
+        let not_found = || {
+            default_dac_stages(
+                Some(false),
+                &[
+                    (cs::RESULT, "nameResolutionFailed"),
+                    (cs::OS_ERROR, "11001"),
+                    (cs::ERROR, "No such host is known. (os error 11001)"),
+                ],
+            )
+        };
+        let failed = || Ended::Failed(Error::ConnectionError("no DAC port".to_string()));
+        for (stages, ended, result, problem, timeout_line) in [
+            (
+                not_found(),
+                failed(),
+                "nameResolutionFailed",
+                "the server name did not resolve: No such host is known. (os error 11001)",
+                false,
+            ),
+            (
+                default_dac_stages(Some(false), &[(cs::RESULT, "timedOut")]),
+                failed(),
+                "timedOut",
+                "the server name did not resolve in the time limit",
+                true,
+            ),
+            (
+                default_dac_stages(None, &[]),
+                timed_out(),
+                "timedOut",
+                "the server name did not resolve in the time limit",
+                true,
+            ),
+        ] {
+            let report = observed(
+                request("admin:db01", Depth::SessionValidation),
+                stages,
+                ended,
+            );
+            assert_eq!(
+                checked(&report, CheckId::NameResolution).coverage,
+                Coverage::Passed,
+                "{result}: {report:#?}"
+            );
+            let lookup = checked(&report, CheckId::InstanceResolution);
+            assert_eq!(lookup.skip, None, "{result}: {report:#?}");
+            assert_eq!(lookup.coverage, Coverage::Inconclusive, "{result}");
+            assert_eq!(lookup.field("result"), Some(result));
+            assert_eq!(lookup.field(BROWSER_REQUEST), Some("dac"));
+            assert_eq!(
+                lookup.domain,
+                Some(Domain::undetermined(&[
+                    "connectivity.nameResolution",
+                    "connectivity.network"
+                ])),
+                "{result}"
+            );
+            assert!(
+                report.findings.iter().any(|f| f.text.render("en-US")
+                    == format!(
+                        "Port 1434 did not connect, and SQL Server Browser on db01 gave no \
+                         other dedicated administrator connection (DAC) port for the default \
+                         instance: {problem}."
+                    )),
+                "{result}: {:#?}",
+                report.findings
+            );
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .filter(|e| e.check == CheckId::TcpConnect)
+                    .all(|e| e.superseded),
+                "{result}: {:#?}",
+                report.errors
+            );
+            let text = report::text(&report);
+            let errors = error_lines(&text);
+            // `Login timeout expired` comes first outside Windows.
+            assert!(
+                errors.iter().any(|l| l.contains(NOT_OBTAINED)),
+                "{result}: {text}"
+            );
+            assert_eq!(
+                errors.iter().any(|l| l.contains("Login timeout expired")),
+                timeout_line,
+                "{result}: {text}"
+            );
+            assert!(
+                errors
+                    .last()
+                    .is_some_and(|l| l.contains("A network-related")),
+                "{result}: {text}"
+            );
+        }
+
+        // Port 1434's own resolving failed too: name resolution reports it,
+        // in SNI's words for the DAC lookup, as before.
+        let stages = Stages::new()
+            .add(
+                Stage::Dns,
+                Some(false),
+                0,
+                1,
+                &[
+                    (cs::HOST, "db01"),
+                    (cs::OS_ERROR, "11001"),
+                    (cs::ERROR, "No such host is known. (os error 11001)"),
+                ],
+            )
+            .add(
+                Stage::InstanceLookup,
+                Some(false),
+                1,
+                2,
+                &[
+                    (cs::SERVER, "db01"),
+                    (cs::INSTANCE, "MSSQLServer"),
+                    (cs::REQUEST, cs::REQUEST_DAC),
+                    (cs::RESULT, "nameResolutionFailed"),
+                    (cs::OS_ERROR, "11001"),
+                    (cs::ERROR, "No such host is known. (os error 11001)"),
+                ],
+            );
+        let report = observed(
+            request("admin:db01", Depth::SessionValidation),
+            stages,
+            failed(),
+        );
+        assert_eq!(
+            checked(&report, CheckId::NameResolution).field("result"),
+            Some("notFound")
+        );
+        assert_eq!(
+            checked(&report, CheckId::InstanceResolution).skip,
+            Some(Skip::BlockedBy(CheckId::NameResolution))
+        );
+        let text = report::text(&report);
+        assert!(error_lines(&text)[0].contains(NOT_OBTAINED), "{text}");
+    }
+
+    /// Port 1434 refused and SQL Server Browser gave 1434 again: the client
+    /// stops there, and reports port 1434's failure as SNI's error 42.
+    #[test]
+    fn a_default_dac_port_given_again_is_port_1434s_failure() {
+        let report = observed(
+            request("admin:db01", Depth::SessionValidation),
+            default_dac_stages(Some(true), &[RESOLVED, (cs::PORT, "1434")]),
+            Ended::Failed(Error::ConnectionError(
+                "Could not establish dedicated administrator connection (DAC) on default port."
+                    .to_string(),
+            )),
+        );
+        let lookup = checked(&report, CheckId::InstanceResolution);
+        assert_eq!(lookup.coverage, Coverage::Passed, "{report:#?}");
+        assert_eq!(lookup.field("port"), Some("1434"));
+        assert_eq!(lookup.field("instance"), None);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.certainty == Certainty::Confirmed
+                    && f.check == CheckId::InstanceResolution
+                    && f.text.render("en-US")
+                        == "Port 1434 did not connect, and SQL Server Browser on db01 gave 1434 as \
+                        the default instance's dedicated administrator connection (DAC) port: \
+                        as the client does, sqlcmd does not try it again."),
+            "{:#?}",
+            report.findings
+        );
+        let tcp = checked(&report, CheckId::TcpConnect);
+        assert_eq!(tcp.coverage, Coverage::Diagnosed, "{report:#?}");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.check == CheckId::TcpConnect && !e.superseded),
+            "{:#?}",
+            report.errors
+        );
+        assert_eq!(
+            checked(&report, CheckId::ConnectionAttempt).skip,
+            Some(Skip::BlockedBy(CheckId::TcpConnect))
+        );
+        let text = report::text(&report);
+        assert!(text.contains("db01: DAC port 1434"), "{text}");
+        let errors = error_lines(&text);
+        assert_eq!(errors.len(), 2, "{text}");
+        assert!(
+            errors[0].contains(
+                "SQL Server Network Interfaces: Could not establish dedicated administrator \
+                 connection (DAC) on default port. Make sure that DAC is enabled [10061]."
+            ),
+            "{text}"
+        );
+        assert!(errors[1].contains("A network-related"), "{text}");
+    }
+
+    /// Port 1434 refused and SQL Server Browser gave another DAC port, which
+    /// connected: port 1434 was moved past, its error kept, superseded.
+    #[test]
+    fn a_default_dac_moves_past_port_1434_to_the_port_the_browser_gave() {
+        let stages = default_dac_stages(Some(true), &[RESOLVED, (cs::PORT, "1500")])
+            .add(
+                Stage::Dns,
+                Some(true),
+                5,
+                6,
+                &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+            )
+            .add(
+                Stage::Tcp,
+                Some(true),
+                6,
+                7,
+                &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1500")],
+            );
+        let report = observed(
+            request("admin:db01", Depth::NetworkReachability),
+            stages,
+            Ended::Stopped,
+        );
+        assert_eq!(
+            checked(&report, CheckId::InstanceResolution).field("port"),
+            Some("1500")
+        );
+        let tcp = checked(&report, CheckId::TcpConnect);
+        assert_eq!(tcp.coverage, Coverage::Passed, "{report:#?}");
+        assert_eq!(tcp.field("port"), Some("1500"));
+        assert!(tcp.attempts.iter().all(|a| a.port == 1500), "{tcp:#?}");
+        assert!(
+            report.checks.iter().all(|c| !c.coverage.failed()),
+            "{report:#?}"
+        );
+        assert!(
+            report.findings.iter().any(|f| f.certainty == Certainty::Informational
+                && f.text.render("en-US")
+                    == "Port 1434, a default instance's dedicated administrator connection (DAC) \
+                        port, did not connect (refused); as the client does, sqlcmd then asked \
+                        SQL Server Browser for the DAC port, checked below."),
+            "{:#?}",
+            report.findings
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .all(|e| e.superseded && e.text.is_none()),
+            "{:#?}",
+            report.errors
+        );
+    }
+
+    /// The time limit ran out after SQL Server Browser gave another DAC port,
+    /// before the client tried it: port 1434 was moved past, and the port
+    /// the Browser gave is not attempted.
+    #[test]
+    fn a_default_dac_port_the_time_limit_left_untried_is_not_attempted() {
+        let report = observed(
+            request("admin:db01", Depth::SessionValidation),
+            default_dac_stages(Some(true), &[RESOLVED, (cs::PORT, "1500")]),
+            timed_out(),
+        );
+        let tcp = checked(&report, CheckId::TcpConnect);
+        assert_eq!(tcp.coverage, Coverage::Inconclusive, "{report:#?}");
+        assert_eq!(tcp.field("result"), Some("notAttempted"));
+        assert_eq!(tcp.field("port"), Some("1500"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .filter(|e| e.code.as_deref() == Some("refused"))
+                .all(|e| e.superseded),
+            "{:#?}",
+            report.errors
+        );
+        assert!(
+            report.findings.iter().any(|f| f
+                .text
+                .render("en-US")
+                .starts_with("Port 1434, a default instance's")),
+            "{:#?}",
+            report.findings
+        );
     }
     /// Work that blocks (a slow DNS server, say) does not block the runtime:
     /// a cancel racing it is seen at once, and the work gets only its budget.
@@ -9739,12 +10514,16 @@ pub(crate) mod tests {
 
     /// A cancel while SQL Server Browser is asked for a named instance's DAC:
     /// the addresses the lookup already resolved still pass name resolution,
-    /// and the DAC port stays unchecked. Without them, name resolution was
+    /// and the DAC lookup was canceled. Without them, name resolution was
     /// canceled.
     #[test]
     fn a_canceled_named_admin_connection_keeps_its_name_resolution() {
         let pending = |addresses: Option<&'static str>| {
-            let mut details = vec![(cs::SERVER, "db01"), (cs::INSTANCE, "INST")];
+            let mut details = vec![
+                (cs::SERVER, "db01"),
+                (cs::INSTANCE, "INST"),
+                (cs::REQUEST, cs::REQUEST_DAC),
+            ];
             details.extend(addresses.map(|a| (cs::ADDRESSES, a)));
             Stages::new().add(Stage::InstanceLookup, None, 0, 900, &details)
         };
@@ -9765,7 +10544,7 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(addresses, ["10.0.0.1", "10.0.0.2"]);
         let lookup = checked(&report, CheckId::InstanceResolution);
-        assert_eq!(lookup.field("result"), Some("dacLookupUnsupported"));
+        assert_eq!(lookup.skip, Some(Skip::Canceled), "{report:#?}");
         for id in [
             CheckId::TcpConnect,
             CheckId::ConnectionAttempt,
