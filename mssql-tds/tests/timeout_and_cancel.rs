@@ -25,12 +25,23 @@ mod timeout_and_cancel_tests {
 
     #[tokio::test]
     pub async fn query_timeout_e2e() {
+        let resource = format!("query_timeout_{}", uuid::Uuid::new_v4().simple());
+        let acquire_lock = format!(
+            "DECLARE @result int;
+             EXEC @result = sys.sp_getapplock @Resource = N'{resource}',
+                 @LockMode = 'Exclusive', @LockOwner = 'Session', @LockTimeout = -1;
+             IF @result < 0 THROW 50000, 'Could not acquire timeout test lock', 1;"
+        );
+        let mut blocker = begin_connection(&build_tcp_datasource()).await;
+        blocker.execute(acquire_lock.clone(), ()).await.unwrap();
+        blocker.close_query().await.unwrap();
         let mut connection = begin_connection(&build_tcp_datasource()).await;
 
+        // Unlike WAITFOR, the conflicting session lock cannot finish early under server load.
         let start_time = Instant::now();
         let execute_result = connection
             .execute(
-                "WAITFOR DELAY '00:00:05'".to_string(),
+                acquire_lock,
                 mssql_tds::connection::tds_client::ExecuteOptions {
                     timeout: Some(2),
                     ..Default::default()
@@ -44,6 +55,7 @@ mod timeout_and_cancel_tests {
         // Re-use the connection just to make sure it still works.
         let expected = [ExpectedQueryResultType::Result(1)];
         run_query_and_check_results(&mut connection, "SELECT 1".to_string(), &expected).await;
+        blocker.close_connection().await.unwrap();
     }
 
     #[tokio::test]

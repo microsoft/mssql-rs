@@ -9,9 +9,8 @@
 # dropping the Intel docker bottle at 29.8.0 turned `brew install docker` into
 # an 8-minute Go build, and colima's image download has failed on DNS.
 #
-# Colima's VM boot is flaky on hosted macOS (~3% of runs): the lima hostagent
-# either misses its 5s startup window or never emits the `running` event. Both
-# are transient, so retry from a clean slate instead of failing the job.
+# Colima's VM boot can fail or overrun its allowance on hosted macOS. Retry
+# from a clean slate instead of failing the job after a single timeout.
 set -euo pipefail
 
 # shellcheck source=.pipeline/scripts/run-bounded.sh
@@ -25,14 +24,12 @@ COLIMA_DISK=${COLIMA_DISK:-50}
 # slows boot.
 COLIMA_MEMORY=${COLIMA_MEMORY:-4}
 COLIMA_START_ATTEMPTS=${COLIMA_START_ATTEMPTS:-3}
-# Catches a genuinely wedged `colima start` so it still reaches the delete and
-# retry path instead of running until the pipeline step timeout. Sized above the
-# slowest healthy boot seen over 113 runs (509s; p95 366s) — the observed
-# failures give up within seconds, so anything past this is stuck, not slow.
-COLIMA_START_TIMEOUT_SECONDS=${COLIMA_START_TIMEOUT_SECONDS:-540}
-# The macOS job only gets 60 minutes, so cap the retries by wall clock rather
-# than letting three boots of an unhealthy agent eat the test budget.
-COLIMA_BUDGET_SECONDS=${COLIMA_BUDGET_SECONDS:-480}
+# Healthy boots reached 565s in November 2026; macOS 26 failures commonly reach
+# the second VM boot before the old 540s limit. Leave room for slower agents.
+COLIMA_START_TIMEOUT_SECONDS=${COLIMA_START_TIMEOUT_SECONDS:-900}
+# Allow two full attempts plus cleanup without exhausting the 120-minute job.
+# A retry budget shorter than one attempt prevents recovery after a timeout.
+COLIMA_BUDGET_SECONDS=${COLIMA_BUDGET_SECONDS:-1920}
 # The payload to run from. Required: there is no second way to get a docker CLI
 # onto the agent, and a run that quietly found one some other way would not be
 # the run we tested.

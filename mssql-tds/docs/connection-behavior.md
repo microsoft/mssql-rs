@@ -21,7 +21,8 @@ MSF off attempts the complete address list sequentially, respecting
 `IPAddressPreference`. Parallel mode does not prioritize an address family.
 Parallel attempts share the TCP-connect budget, including DNS; sequential
 attempts retain their per-address budgets. Both remain inside the existing
-login deadline. Cancelling a parallel race aborts its remaining socket tasks.
+login deadline. Cancelling a parallel race synchronously drops its remaining
+caller-owned connection attempts before releasing the caller's resources.
 
 Precedence is **explicit connection > application startup default > deployment
 environment > built-in true**. Set `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT` to
