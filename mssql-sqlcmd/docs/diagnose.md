@@ -82,7 +82,8 @@ The diagnostic client applies them as sqlcmd's driver does: `-K ReadOnly` and
 `-H` go in its login, `-a` sets its packet size (512 to 32767 bytes, as `-a`
 takes it; another value is an invalid argument), and `-A` puts `admin:` before
 the server, as sqlcmd does, so the connection is checked as `admin:` is (port
-1434); with `-D`, whose data source names the server, sqlcmd does not add it.
+1434, or a named instance's DAC port from SQL Server Browser); with `-D`,
+whose data source names the server, sqlcmd does not add it.
 `-M` connects over TCP only, so a server without a prefix is checked over TCP
 (connection input reports `tcp`, not `auto`); the diagnostic client still
 connects to the addresses one at a time rather than all at once, which a
@@ -143,6 +144,21 @@ the port but the time limit was spent before the client tried it, `tcpConnect`
 is `inconclusive`, with `"result": "notAttempted"` and the time-limit error;
 likewise for the pipe the Browser's answer pointed to (`np:`, or without a
 prefix an answer with only a pipe), named by `transport` and `pipe`.
+
+A dedicated administrator connection (`admin:` or `-A`) to a named instance
+gets its port from SQL Server Browser's DAC request, as the client does:
+`instanceResolution` carries `"browserRequest": "dac"`, and the instance's
+own port is never used. `admin:` takes no port, so none is asked for when the
+Browser gives none (no answer, or an answer that is not a DAC port,
+`invalidResponse`); the checks after it are `blockedByPrerequisite`. A
+default instance's connects to port 1434 and, when that does not connect,
+asks the DAC request for `MSSQLServer` (reported without an `instance`):
+another port is the TCP path, with port 1434's errors kept, superseded; port
+1434 again ends the attempt, with a confirmed finding. Their errors read as
+the driver words them: a DAC request that gave no port as SNI's error 43, port
+1434 refused again as its error 42. A DAC refused away from the loopback
+address adds a suspected finding: unless the server's `remote admin
+connections` option is on, it accepts the DAC on the loopback address alone.
 
 A pipe given directly (`np:`, `lpc:`, LocalDB) that does not open is
 reported at `networkReachability` by `tcpConnect`, the reachability check,

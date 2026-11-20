@@ -559,6 +559,29 @@ fn check_text(check: &Check, protocol: Option<Protocol>, r: &mut Redactor, local
                 )
             }
         }
+        // The Browser's DAC request: a dedicated administrator connection's
+        // port, for a named instance or (without one) the default instance.
+        super::CheckId::InstanceResolution if check.field(super::BROWSER_REQUEST).is_some() => {
+            let host = named(r, "host").join("");
+            let instance = named(r, "instance").join("");
+            let server = if instance.is_empty() {
+                host
+            } else {
+                format!("{host}\\{instance}")
+            };
+            match check.field("port") {
+                Some(port) => tr(
+                    locale,
+                    "diagnose.detail.dac_port",
+                    &[("server", &server), ("port", &port)],
+                ),
+                None => tr(
+                    locale,
+                    "diagnose.detail.no_dac_port",
+                    &[("server", &server)],
+                ),
+            }
+        }
         super::CheckId::InstanceResolution => {
             let pipe_text = |r: &mut Redactor| {
                 tr(
@@ -3352,7 +3375,7 @@ Limitations:
         }
         let json = json(&report, "v").unwrap();
         assert!(
-            json.contains("\"coverageMatrixVersion\": \"1.5\""),
+            json.contains("\"coverageMatrixVersion\": \"1.6\""),
             "{json}"
         );
         assert!(

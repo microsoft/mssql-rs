@@ -5,13 +5,20 @@
 //!
 //! Queries the SQL Server Browser service (UDP port 1434) to resolve
 //! named instances to their actual connection endpoints (TCP port,
-//! Named Pipe path, etc.).
+//! Named Pipe path, etc.), and a named instance's dedicated administrator
+//! connection (DAC) to its TCP port.
 //!
 //! ## Protocol
 //! - Send [`CLNT_UCAST_INST`] (0x04) + null-terminated ASCII instance name
 //! - Receive [`SVR_RESP`] (0x05) + 2-byte LE payload size + semicolon-delimited metadata/protocols
 //!
-//! Reference: `SSRP::SsrpGetInfo()` in msodbcsql `/Sql/Common/DK/sni/src/ssrp.cpp`
+//! For the DAC port:
+//! - Send [`CLNT_UCAST_DAC`] (0x0F) + version (0x01) + null-terminated instance name
+//! - Receive exactly 6 bytes: [`SVR_RESP`] + 2-byte LE size (6) + version
+//!   (0x01) + 2-byte LE TCP port
+//!
+//! Reference: `SSRP::SsrpGetInfo()` and `SSRP::GetAdminPort()` in msodbcsql
+//! `/Sql/Common/DK/sni/src/ssrp.cpp`
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -34,6 +41,17 @@ pub(crate) const SSRP_PORT: u16 = 1434;
 
 /// Request type: unicast query for a specific named instance.
 const CLNT_UCAST_INST: u8 = 0x04;
+
+/// Request type: unicast query for a named instance's dedicated
+/// administrator connection (DAC) port.
+const CLNT_UCAST_DAC: u8 = 0x0F;
+
+/// The DAC request's protocol version, which its answer repeats.
+const DAC_PROTOCOL_VERSION: u8 = 0x01;
+
+/// The DAC answer's whole size: [`SVR_RESP`], the size itself (2 bytes), the
+/// version and the port (2 bytes).
+const DAC_RESPONSE_SIZE: usize = 6;
 
 /// Response marker byte from SQL Browser.
 const SVR_RESP: u8 = 0x05;
@@ -114,6 +132,48 @@ pub(crate) async fn query_instance(
     query_browser(server, instance, resolve, timeout_ms, deadline, on_resolved)
         .await
         .map(|response| response.protocols)
+}
+
+/// Asks SQL Server Browser on `server` (at `ssrp_port`) for the TCP port of
+/// the named `instance`'s dedicated administrator connection, as
+/// [`query_instance`] asks for its endpoints: within the same time limit,
+/// with the same failures, `on_resolved` given the addresses asked.
+pub(crate) async fn query_dac_port(
+    server: &str,
+    instance: &str,
+    ssrp_port: u16,
+    timeout_ms: u64,
+    bound_resolution: bool,
+    on_resolved: impl FnOnce(&[SocketAddr]),
+) -> Result<u16, SsrpLookupError> {
+    let resolve = tokio::net::lookup_host((server, ssrp_port));
+    let deadline =
+        bound_resolution.then(|| tokio::time::Instant::now() + Duration::from_millis(timeout_ms));
+    debug!(
+        server,
+        instance, timeout_ms, "Asking SQL Server Browser for the DAC port"
+    );
+    let raw = ask_browser(
+        server,
+        &build_dac_request(instance),
+        resolve,
+        timeout_ms,
+        deadline,
+        on_resolved,
+    )
+    .await?;
+    parse_dac_response(&raw).map_err(SsrpLookupError::InvalidResponse)
+}
+
+/// [`query_dac_port`] against a Browser on `ssrp_port`, for tests.
+#[cfg(test)]
+pub(crate) async fn get_dac_port_ext(
+    server: &str,
+    instance: &str,
+    ssrp_port: u16,
+    timeout_ms: u64,
+) -> Result<u16, SsrpLookupError> {
+    query_dac_port(server, instance, ssrp_port, timeout_ms, false, |_| {}).await
 }
 
 /// Why a SQL Server Browser lookup failed, with the operating system's error
@@ -320,6 +380,58 @@ pub(crate) fn build_instance_request(instance: &str) -> Vec<u8> {
     buf
 }
 
+/// Build a CLNT_UCAST_DAC request packet.
+///
+/// Format: `[0x0F][0x01][instance name][0x00]`, the name encoded as
+/// [`build_instance_request`] encodes it.
+pub(crate) fn build_dac_request(instance: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(instance.len() + 3);
+    buf.push(CLNT_UCAST_DAC);
+    buf.push(DAC_PROTOCOL_VERSION);
+    buf.extend_from_slice(instance.as_bytes());
+    buf.push(0x00); // null terminator
+    buf
+}
+
+/// The port in SQL Server Browser's answer to a CLNT_UCAST_DAC request,
+/// which is exactly `[0x05][0x06 0x00][0x01][port, 2 bytes LE]` with a port
+/// other than 0, as SNI accepts it (`SSRP::GetAdminPort`).
+pub(crate) fn parse_dac_response(buf: &[u8]) -> TdsResult<u16> {
+    let invalid = |what: String| {
+        Err(Error::ProtocolError(format!(
+            "SQL Server Browser's DAC answer {what}"
+        )))
+    };
+    if buf.len() != DAC_RESPONSE_SIZE {
+        return invalid(format!(
+            "is {} bytes (expected {DAC_RESPONSE_SIZE})",
+            buf.len()
+        ));
+    }
+    if buf[0] != SVR_RESP {
+        return invalid(format!(
+            "starts with 0x{:02X} (expected 0x{SVR_RESP:02X})",
+            buf[0]
+        ));
+    }
+    let size = u16::from_le_bytes([buf[1], buf[2]]);
+    if usize::from(size) != DAC_RESPONSE_SIZE {
+        return invalid(format!(
+            "gives its size as {size} (expected {DAC_RESPONSE_SIZE})"
+        ));
+    }
+    if buf[3] != DAC_PROTOCOL_VERSION {
+        return invalid(format!(
+            "has version {} (expected {DAC_PROTOCOL_VERSION})",
+            buf[3]
+        ));
+    }
+    match u16::from_le_bytes([buf[4], buf[5]]) {
+        0 => invalid("gives port 0".to_string()),
+        port => Ok(port),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Response parsing
 // ---------------------------------------------------------------------------
@@ -472,8 +584,37 @@ where
 {
     debug!(server, instance, timeout_ms, "Querying SQL Server Browser");
 
-    let request = build_instance_request(instance);
+    let raw = ask_browser(
+        server,
+        &build_instance_request(instance),
+        resolve,
+        timeout_ms,
+        deadline,
+        on_resolved,
+    )
+    .await?;
 
+    trace!(len = raw.len(), "Received SSRP response");
+
+    parse_ssrp_response(&raw).map_err(SsrpLookupError::InvalidResponse)
+}
+
+/// Sends `request` to SQL Server Browser on `server` (resolved by `resolve`,
+/// the Browser port included) at all its addresses, and gives the first
+/// answer from one of them. Without a `deadline`, resolving is not bounded
+/// and the answer is waited for `timeout_ms` after it; with one, both share
+/// it. `on_resolved` is given the addresses asked, once resolved.
+async fn ask_browser<A>(
+    server: &str,
+    request: &[u8],
+    resolve: impl std::future::Future<Output = std::io::Result<A>>,
+    timeout_ms: u64,
+    deadline: Option<tokio::time::Instant>,
+    on_resolved: impl FnOnce(&[SocketAddr]),
+) -> Result<Vec<u8>, SsrpLookupError>
+where
+    A: Iterator<Item = SocketAddr>,
+{
     // Resolve server to all IP addresses
     let resolved = match deadline {
         Some(deadline) => tokio::time::timeout_at(deadline, resolve)
@@ -506,28 +647,18 @@ where
     // The deadline covers opening the sockets and sending too, not only
     // waiting for the answer: a send that stalls is no answer in time.
     let asked = tokio::time::Instant::now();
-    let raw =
-        match tokio::time::timeout_at(deadline, send_and_receive_first(&request, &addrs, deadline))
-            .await
-        {
-            Ok(result) => result?,
-            Err(_) => {
-                return Err(SsrpLookupError::NoAnswer {
-                    timeout_ms: u64::try_from(
-                        deadline.saturating_duration_since(asked).as_millis(),
-                    )
-                    .unwrap_or(u64::MAX),
-                    address: addrs
-                        .first()
-                        .map(|a| a.ip().to_string())
-                        .unwrap_or_default(),
-                });
-            }
-        };
-
-    trace!(len = raw.len(), "Received SSRP response");
-
-    parse_ssrp_response(&raw).map_err(SsrpLookupError::InvalidResponse)
+    match tokio::time::timeout_at(deadline, send_and_receive_first(request, &addrs, deadline)).await
+    {
+        Ok(result) => result,
+        Err(_) => Err(SsrpLookupError::NoAnswer {
+            timeout_ms: u64::try_from(deadline.saturating_duration_since(asked).as_millis())
+                .unwrap_or(u64::MAX),
+            address: addrs
+                .first()
+                .map(|a| a.ip().to_string())
+                .unwrap_or_default(),
+        }),
+    }
 }
 
 /// Send `request` to every address in `addrs` (one UDP socket per address family)
@@ -654,6 +785,91 @@ mod tests {
         assert_eq!(pkt[0], CLNT_UCAST_INST);
         assert_eq!(&pkt[1..pkt.len() - 1], b"SQLEXPRESS");
         assert_eq!(*pkt.last().unwrap(), 0x00);
+    }
+
+    #[test]
+    fn a_dac_request_carries_its_version_and_the_instance() {
+        assert_eq!(build_dac_request("SQLEXPRESS"), b"\x0F\x01SQLEXPRESS\x00");
+        assert_eq!(build_dac_request("MSSQLServer"), b"\x0F\x01MSSQLServer\x00");
+    }
+
+    fn dac_answer(port: u16) -> Vec<u8> {
+        let mut answer = vec![SVR_RESP, 6, 0, DAC_PROTOCOL_VERSION];
+        answer.extend_from_slice(&port.to_le_bytes());
+        answer
+    }
+
+    /// A DAC answer is taken only as SNI takes it: exactly six bytes, its
+    /// marker, size and version right, and a port.
+    #[test]
+    fn only_a_well_formed_dac_answer_gives_a_port() {
+        assert_eq!(parse_dac_response(&dac_answer(53110)).unwrap(), 53110);
+        let mut longer = dac_answer(53110);
+        longer.push(0);
+        let mut marker = dac_answer(53110);
+        marker[0] = CLNT_UCAST_INST;
+        let mut size = dac_answer(53110);
+        size[1] = 7;
+        let mut version = dac_answer(53110);
+        version[3] = 2;
+        for (answer, says) in [
+            (Vec::new(), "is 0 bytes"),
+            (dac_answer(53110)[..5].to_vec(), "is 5 bytes"),
+            (longer, "is 7 bytes"),
+            (marker, "starts with 0x04"),
+            (size, "gives its size as 7"),
+            (version, "has version 2"),
+            (dac_answer(0), "gives port 0"),
+        ] {
+            let error = parse_dac_response(&answer).unwrap_err().to_string();
+            assert!(error.contains(says), "{answer:?}: {error}");
+        }
+    }
+
+    /// A mock SQL Server Browser on this computer that answers the first
+    /// request it gets with `answer`; its port, and the request it got.
+    async fn answering_browser(answer: Vec<u8>) -> (u16, tokio::task::JoinHandle<Vec<u8>>) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let asked = tokio::spawn(async move {
+            let mut buf = vec![0u8; 512];
+            let (n, addr) = socket.recv_from(&mut buf).await.unwrap();
+            socket.send_to(&answer, addr).await.unwrap();
+            buf.truncate(n);
+            buf
+        });
+        (port, asked)
+    }
+
+    #[tokio::test]
+    async fn the_dac_port_is_asked_for_with_the_dac_request() {
+        let (port, asked) = answering_browser(dac_answer(53110)).await;
+        let dac = get_dac_port_ext("127.0.0.1", "INST", port, 2000)
+            .await
+            .unwrap();
+        assert_eq!(dac, 53110);
+        assert_eq!(asked.await.unwrap(), build_dac_request("INST"));
+
+        // An answer with the instance's endpoints is not a DAC answer.
+        let endpoints = make_response(
+            "ServerName;MOCK;InstanceName;INST;IsClustered;No;Version;16.0.1000.6;tcp;55555;;",
+        );
+        let (port, _) = answering_browser(endpoints).await;
+        let error = get_dac_port_ext("127.0.0.1", "INST", port, 2000)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "invalidResponse", "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_dac_port_lookup_without_an_answer_is_no_answer() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let error = get_dac_port_ext("127.0.0.1", "INST", port, 200)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "noAnswer", "{error}");
+        drop(socket);
     }
 
     // -- Response parsing --------------------------------------------------
