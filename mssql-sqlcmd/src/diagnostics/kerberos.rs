@@ -18,15 +18,38 @@ use mssql_tds::security::SecurityError;
 use super::stages::Step;
 use super::{CheckId, Coverage, Domain, ErrorRecord, LocalizedText};
 
+#[cfg_attr(not(unix), allow(dead_code))]
+mod ber;
 #[cfg(unix)]
 mod ccache;
 mod credentials;
+#[cfg(unix)]
+mod ldap;
 #[cfg(windows)]
 mod lsa;
+mod spn_lookup;
+#[cfg(windows)]
+mod wldap;
 
 pub(super) use credentials::{Credentials, not_checked_fields, not_checked_limitation};
 #[cfg(test)]
 pub(super) use credentials::{Failure, State, Store, Ticket};
+#[cfg(test)]
+pub(super) use spn_lookup::{Account, AccountKind, Failure as SpnFailure, Scope};
+pub(super) use spn_lookup::{
+    Lookup as SpnLookup, Query as SpnQuery, Reported as SpnReported, directory_form,
+    report as spn_report,
+};
+
+/// How the SPN is looked up in the directory on this platform.
+pub(super) fn spn_directory() -> Option<fn(SpnQuery) -> SpnLookup> {
+    #[cfg(windows)]
+    return Some(wldap::lookup);
+    #[cfg(unix)]
+    return Some(ldap::lookup);
+    #[cfg(not(any(windows, unix)))]
+    None
+}
 
 /// How the caller's own Kerberos credentials are read; tests read their own.
 #[derive(Clone, Copy)]
@@ -449,6 +472,19 @@ impl SecuritySignal {
             }
             _ => (Coverage::Diagnosed, Domain::specific(KERBEROS_DOMAIN)),
         }
+    }
+
+    /// Whether how the SPN is registered can explain the failure, so that
+    /// looking it up in the directory says something about it.
+    pub(super) fn spn_related(self) -> bool {
+        matches!(
+            self,
+            Self::ServicePrincipalUnknown
+                | Self::ServicePrincipalNotUnique
+                | Self::TargetUnknown
+                | Self::KeyMismatch
+                | Self::NoCommonEncryptionType
+        )
     }
 
     /// The finding: what the signal establishes, with `code`, the code that

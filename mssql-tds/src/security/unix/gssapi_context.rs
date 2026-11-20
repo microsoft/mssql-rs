@@ -45,11 +45,11 @@
 //! - Client must be able to reach the KDC (Key Distribution Center)
 
 use super::gssapi_ffi::{
-    self, GSS_C_DELEG_FLAG, GSS_C_MUTUAL_FLAG, GSS_C_NO_CHANNEL_BINDINGS, GSS_C_NO_CONTEXT,
-    GSS_C_NO_CREDENTIAL, GSS_C_NO_OID, GSS_S_COMPLETE, GSS_S_CONTINUE_NEEDED, GssBufferDesc,
-    GssCtxIdT, GssNameT, GssOid, GssOmUint32, get_gss_nt_service_name, get_gssapi_error,
-    gss_delete_sec_context, gss_import_name, gss_init_sec_context, gss_release_buffer,
-    gss_release_name, spnego_mechanism,
+    self, GSS_C_CONF_FLAG, GSS_C_DELEG_FLAG, GSS_C_INTEG_FLAG, GSS_C_MUTUAL_FLAG,
+    GSS_C_NO_CHANNEL_BINDINGS, GSS_C_NO_CONTEXT, GSS_C_NO_CREDENTIAL, GSS_C_NO_OID,
+    GSS_C_SEQUENCE_FLAG, GSS_S_COMPLETE, GSS_S_CONTINUE_NEEDED, GssBufferDesc, GssCtxIdT, GssNameT,
+    GssOid, GssOmUint32, get_gss_nt_service_name, get_gssapi_error, gss_delete_sec_context,
+    gss_import_name, gss_init_sec_context, gss_release_buffer, gss_release_name, spnego_mechanism,
 };
 use crate::security::{
     IntegratedAuthConfig, Negotiation, SecurityContext, SecurityError, SspiAuthToken,
@@ -137,12 +137,16 @@ enum ContextPurpose {
     /// HTTP Negotiate (RFC 4559): SPNEGO with mutual authentication and no
     /// delegation, so the TGT is never forwarded to the web server.
     HttpNegotiate,
+    /// A SASL GSSAPI bind to an LDAP server (RFC 4752): Kerberos with mutual
+    /// authentication, sequencing, integrity and confidentiality for the
+    /// security layer, and no delegation.
+    Directory,
 }
 
 impl ContextPurpose {
     fn mechanism(self) -> GssOid {
         match self {
-            Self::TdsLogin => GSS_C_NO_OID,
+            Self::TdsLogin | Self::Directory => GSS_C_NO_OID,
             Self::HttpNegotiate => spnego_mechanism(),
         }
     }
@@ -151,6 +155,9 @@ impl ContextPurpose {
         match self {
             Self::TdsLogin => GSS_C_MUTUAL_FLAG | GSS_C_DELEG_FLAG,
             Self::HttpNegotiate => GSS_C_MUTUAL_FLAG,
+            Self::Directory => {
+                GSS_C_MUTUAL_FLAG | GSS_C_SEQUENCE_FLAG | GSS_C_INTEG_FLAG | GSS_C_CONF_FLAG
+            }
         }
     }
 }
@@ -234,6 +241,56 @@ impl GssapiContext {
         })
     }
 
+    /// Creates a context for a SASL GSSAPI bind (RFC 4752) to the LDAP
+    /// service on `host` (`ldap@host`), such as a directory lookup: the
+    /// user's Kerberos credentials are never delegated to it.
+    pub fn for_ldap(host: &str) -> Result<Self, SecurityError> {
+        Self::check_availability()?;
+        let spn = format!("ldap@{host}");
+        let target_name = import_name(&spn, true)?;
+        Ok(Self {
+            imported_name: spn.clone(),
+            spn,
+            ctx_handle: GssCtxHandle::default(),
+            target_name: GssNameHandle(target_name),
+            is_complete: false,
+            channel_bindings: None,
+            purpose: ContextPurpose::Directory,
+            mechanism: None,
+        })
+    }
+
+    /// `message` protected for the peer once the context is established:
+    /// signed, and sealed when `seal`. The token, and whether it was sealed.
+    /// Exclusive, as GSSAPI does not let two threads use one context at once:
+    /// wrapping advances its sequence state.
+    pub fn wrap(&mut self, seal: bool, message: &[u8]) -> Result<(Vec<u8>, bool), SecurityError> {
+        let context = self.established()?;
+        // SAFETY: an established context of this library, used by this
+        // thread alone.
+        unsafe { gssapi_ffi::wrap(context, seal, message) }
+    }
+
+    /// The message in a token from the peer, verified (and unsealed) once
+    /// the context is established, and whether it was sealed. Exclusive, as
+    /// [`wrap`](Self::wrap) is.
+    pub fn unwrap(&mut self, token: &[u8]) -> Result<(Vec<u8>, bool), SecurityError> {
+        let context = self.established()?;
+        // SAFETY: an established context of this library, used by this
+        // thread alone.
+        unsafe { gssapi_ffi::unwrap(context, token) }
+    }
+
+    fn established(&self) -> Result<GssCtxIdT, SecurityError> {
+        if self.is_complete && self.ctx_handle.0 != GSS_C_NO_CONTEXT {
+            Ok(self.ctx_handle.0)
+        } else {
+            Err(SecurityError::InternalError(
+                "the security context is not established".to_string(),
+            ))
+        }
+    }
+
     /// Checks if GSSAPI is available on this system.
     ///
     /// # Login Flow
@@ -254,7 +311,7 @@ impl GssapiContext {
 impl SecurityContext for GssapiContext {
     fn package_name(&self) -> &str {
         match self.purpose {
-            ContextPurpose::TdsLogin => "Kerberos",
+            ContextPurpose::TdsLogin | ContextPurpose::Directory => "Kerberos",
             ContextPurpose::HttpNegotiate => "Negotiate",
         }
     }
@@ -666,6 +723,36 @@ mod tests {
         if let Ok(ctx) = GssapiContext::for_http_negotiate("adfs.contoso.com") {
             assert_eq!(ctx.spn(), "HTTP@adfs.contoso.com");
             assert_eq!(ctx.package_name(), "Negotiate");
+        }
+    }
+
+    #[test]
+    fn a_directory_bind_protects_its_messages_without_delegation() {
+        // A directory lookup has no reason to forward the user's TGT.
+        let flags = ContextPurpose::Directory.req_flags();
+        assert_eq!(flags & GSS_C_DELEG_FLAG, 0);
+        for wanted in [
+            GSS_C_MUTUAL_FLAG,
+            GSS_C_SEQUENCE_FLAG,
+            GSS_C_INTEG_FLAG,
+            GSS_C_CONF_FLAG,
+        ] {
+            assert_ne!(flags & wanted, 0, "{wanted}");
+        }
+        // RFC 4752's GSSAPI mechanism is Kerberos itself, not SPNEGO.
+        assert!(ContextPurpose::Directory.mechanism().is_null());
+        if let Ok(mut ctx) = GssapiContext::for_ldap("dc.example.local") {
+            assert_eq!(ctx.spn(), "ldap@dc.example.local");
+            assert_eq!(ctx.package_name(), "Kerberos");
+            // Nothing is protected before the context is established.
+            assert!(matches!(
+                ctx.wrap(true, b"message"),
+                Err(SecurityError::InternalError(_))
+            ));
+            assert!(matches!(
+                ctx.unwrap(b"token"),
+                Err(SecurityError::InternalError(_))
+            ));
         }
     }
 
