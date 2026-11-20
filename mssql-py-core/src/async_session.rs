@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use mssql_tds::core::CancelHandle;
@@ -105,17 +105,44 @@ pub(crate) struct AsyncConnectionState {
 struct TaskCancellation {
     state: Arc<AsyncConnectionState>,
     abort: AbortHandle,
-    poison_on_cancel: bool,
+    preflight: Option<Arc<PreflightTask>>,
     completed: bool,
 }
 
 impl Drop for TaskCancellation {
     fn drop(&mut self) {
         if !self.completed {
-            if self.poison_on_cancel {
+            if let Some(preflight) = &self.preflight {
+                preflight.cancel();
+            } else {
                 self.state.mark_broken();
             }
             self.abort.abort();
+        }
+    }
+}
+
+pub(crate) struct PreflightTask {
+    state: Arc<AsyncConnectionState>,
+    flags: AtomicU8,
+}
+
+impl PreflightTask {
+    const CLAIMED: u8 = 1;
+    const CANCELLED: u8 = 2;
+
+    pub(crate) fn claim_execute(&self, cursor_id: CursorId) -> Result<ExecuteClaim, ClaimError> {
+        let claim = self.state.claim_execute(cursor_id)?;
+        // Either side of a claim/cancel race must observe the other before delivery.
+        if self.flags.fetch_or(Self::CLAIMED, Ordering::AcqRel) & Self::CANCELLED != 0 {
+            self.state.mark_broken();
+        }
+        Ok(claim)
+    }
+
+    fn cancel(&self) {
+        if self.flags.fetch_or(Self::CANCELLED, Ordering::AcqRel) & Self::CLAIMED != 0 {
+            self.state.mark_broken();
         }
     }
 }
@@ -226,22 +253,28 @@ impl AsyncConnectionState {
         F: Future<Output = PyResult<T>> + Send + 'static,
         T: Send + 'static,
     {
-        self.run_tracked_inner(future, true).await
+        self.run_tracked_inner(future, None).await
     }
 
-    /// Preflight has no session claim; its operation guard owns later interruption.
-    pub(crate) async fn run_tracked_preflight<F, T>(self: Arc<Self>, future: F) -> PyResult<T>
+    /// The preflight exemption ends at this task's claim, not native completion.
+    pub(crate) async fn run_tracked_preflight<G, F, T>(self: Arc<Self>, future: G) -> PyResult<T>
     where
+        G: FnOnce(Arc<PreflightTask>) -> F + Send,
         F: Future<Output = PyResult<T>> + Send + 'static,
         T: Send + 'static,
     {
-        self.run_tracked_inner(future, false).await
+        let preflight = Arc::new(PreflightTask {
+            state: self.clone(),
+            flags: AtomicU8::new(0),
+        });
+        self.run_tracked_inner(future(preflight.clone()), Some(preflight))
+            .await
     }
 
     async fn run_tracked_inner<F, T>(
         self: Arc<Self>,
         future: F,
-        poison_on_cancel: bool,
+        preflight: Option<Arc<PreflightTask>>,
     ) -> PyResult<T>
     where
         F: Future<Output = PyResult<T>> + Send + 'static,
@@ -253,7 +286,7 @@ impl AsyncConnectionState {
         let mut cancellation = TaskCancellation {
             state: self,
             abort,
-            poison_on_cancel,
+            preflight,
             completed: false,
         };
         let result = receiver.await.map_err(|_| {
@@ -640,15 +673,16 @@ impl AsyncConnectionState {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
     use tracing::{Event, Subscriber};
     use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
     use super::{
         AsyncConnectionState, ClaimError, ConnectionLifecycle, FetchCompletion, OperationPhase,
-        SessionOperationGuard,
+        PreflightTask, SessionOperationGuard,
     };
 
     #[test]
@@ -704,16 +738,18 @@ mod tests {
             let previous = unrelated_operation.then(|| state.claim_execute(2).unwrap());
             let (started, ready) = tokio::sync::oneshot::channel();
             let task_state = state.clone();
-            let task = tokio::spawn(state.clone().run_tracked_preflight(async move {
-                let guard = claim_before_cancel.then(|| {
-                    let claim = task_state.claim_execute(1).unwrap();
-                    SessionOperationGuard::new(task_state, claim.operation_id)
-                });
-                started.send(()).unwrap();
-                std::future::pending::<()>().await;
-                drop(guard);
-                Ok(())
-            }));
+            let task = tokio::spawn(state.clone().run_tracked_preflight(
+                move |preflight| async move {
+                    let guard = claim_before_cancel.then(|| {
+                        let claim = preflight.claim_execute(1).unwrap();
+                        SessionOperationGuard::new(task_state, claim.operation_id)
+                    });
+                    started.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                    drop(guard);
+                    Ok(())
+                },
+            ));
             ready.await.unwrap();
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
@@ -728,6 +764,65 @@ mod tests {
                 assert_eq!(state.validate_operation(previous.operation_id), Ok(()));
             } else if !claim_before_cancel {
                 assert!(state.claim_execute(1).is_ok());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_waiter_cancellation_after_execution_prevents_commit() {
+        for (has_open_batch, delivered) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let state = Arc::new(AsyncConnectionState::new());
+            let (release, wait) = tokio::sync::oneshot::channel();
+            let task_state = state.clone();
+            let mut waiter = Box::pin(state.clone().run_tracked_preflight(
+                move |preflight| async move {
+                    wait.await.unwrap();
+                    let claim = preflight.claim_execute(1).unwrap();
+                    let mut guard = SessionOperationGuard::new(task_state, claim.operation_id);
+                    guard.finish_execute(has_open_batch);
+                    Ok(())
+                },
+            ));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(waiter.as_mut().poll(&mut context).is_pending());
+            release.send(()).unwrap();
+            let mut tasks = std::mem::take(&mut state.lock().tasks);
+            assert!(tasks.join_next().await.unwrap().is_ok());
+            assert!(!state.is_broken());
+
+            if delivered {
+                waiter.await.unwrap();
+            } else {
+                drop(waiter);
+            }
+
+            assert_eq!(state.is_broken(), !delivered);
+            assert_eq!(state.must_discard(), !delivered);
+        }
+    }
+
+    #[test]
+    fn preflight_claim_cancel_race_only_breaks_successfully_claimed_tasks() {
+        for (cancel_first, busy) in [(false, false), (true, false), (false, true), (true, true)] {
+            let state = Arc::new(AsyncConnectionState::new());
+            let previous = busy.then(|| state.claim_execute(2).unwrap());
+            let preflight = PreflightTask {
+                state: state.clone(),
+                flags: AtomicU8::new(0),
+            };
+            if cancel_first {
+                preflight.cancel();
+            }
+            assert_eq!(preflight.claim_execute(1).is_ok(), !busy);
+            if !cancel_first {
+                preflight.cancel();
+            }
+            assert_eq!(state.is_broken(), !busy);
+            assert_eq!(state.must_discard(), !busy);
+            if let Some(previous) = previous {
+                assert_eq!(state.validate_operation(previous.operation_id), Ok(()));
             }
         }
     }

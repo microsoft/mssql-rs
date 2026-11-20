@@ -462,10 +462,12 @@ mod tests {
     async fn cancelled_preflight_does_not_break_clean_close() {
         let (connection, transport) = connection();
         let (started, ready) = tokio::sync::oneshot::channel();
-        let pending = tokio::spawn(connection.state.clone().run_tracked_preflight(async move {
-            started.send(()).unwrap();
-            std::future::pending::<PyResult<()>>().await
-        }));
+        let pending = tokio::spawn(connection.state.clone().run_tracked_preflight(
+            move |_| async move {
+                started.send(()).unwrap();
+                std::future::pending::<PyResult<()>>().await
+            },
+        ));
         ready.await.unwrap();
         pending.abort();
         assert!(pending.await.unwrap_err().is_cancelled());
@@ -480,6 +482,75 @@ mod tests {
         assert!(!connection.state.is_broken());
         assert!(connection.handle.lock().await.is_none());
         assert_eq!(Arc::strong_count(&transport), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_completed_execution_never_commits_on_clean_exit() {
+        use crate::async_session::SessionOperationGuard;
+        use mssql_tds::connection::tds_client::ExecuteOptions;
+        use mssql_tds::test_client_support::{
+            done_no_more, env_change_begin_transaction, env_change_commit_transaction,
+        };
+
+        let (client, transport) = tds_client_from_tokens_capturing(vec![
+            env_change_begin_transaction(7),
+            done_no_more(),
+            env_change_commit_transaction(),
+            done_no_more(),
+        ]);
+        let connection = Arc::new(LogicalConnection::new(client));
+        let worker = connection.clone();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let (completed, completion) = tokio::sync::oneshot::channel();
+        let mut waiter = Box::pin(connection.state.clone().run_tracked_preflight(
+            move |preflight| async move {
+                wait.await.unwrap();
+                let claim = preflight.claim_execute(1).unwrap();
+                let mut guard =
+                    SessionOperationGuard::new(worker.state.clone(), claim.operation_id);
+                {
+                    let mut client = worker.lock_operation(claim.operation_id).await.unwrap();
+                    client
+                        .execute(
+                            "INSERT INTO test VALUES (1)".into(),
+                            ExecuteOptions::default(),
+                        )
+                        .await
+                        .unwrap();
+                    client.close_query().await.unwrap();
+                    assert!(client.has_active_transaction());
+                }
+                guard.finish_execute(false);
+                completed.send(()).unwrap();
+                Ok(())
+            },
+        ));
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        release.send(()).unwrap();
+        completion.await.unwrap();
+        let execution_bytes = transport.lock().unwrap().len();
+        drop(waiter);
+
+        let error = LogicalConnection::wait_closed(connection.start_close(
+            CloseMode::Commit,
+            CLOSE_TIMEOUT,
+            None,
+        ))
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot commit a broken connection")
+        );
+        assert_eq!(transport.lock().unwrap().len(), execution_bytes);
+        assert_eq!(Arc::strong_count(&transport), 1);
+        assert!(connection.handle.lock().await.is_none());
     }
 
     #[tokio::test]

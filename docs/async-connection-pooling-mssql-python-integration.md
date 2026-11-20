@@ -47,6 +47,9 @@ existing block exception stays primary. Interrupted/indeterminate work prevents
 commit on close and reports failure if clean exit required commit. Successfully
 settled cooperative fetch cancellation preserves direct-session recovery and
 transaction intent, but keeps sticky discard eligibility for future pool reuse.
+`executemany` preflight cancellation preserves the session only before that task
+claims execution. Cancellation after its claim and before result delivery breaks
+the session and prevents clean-exit commit, even after native execution finishes.
 Pool leases, production clean return and Python pool APIs remain
 separate implementation slices.
 

@@ -54,7 +54,9 @@ For SDK authors integrating the native runtime:
   finalization racing close preserves the same transaction intent. This does not
   enable connection pooling.
 - Cancelling `executemany` during parameter binding leaves the connection and
-  existing transaction usable.
+  existing transaction usable. After execution claims the session, cancellation
+  before result delivery breaks the connection and prevents clean-exit commit,
+  even if native execution has finished.
 - A broken connection still needs `await connection.close()`. The `closed`
   property indicates teardown, not whether the connection is healthy.
 - If creating a `commit()` or `rollback()` awaitable fails before native work
