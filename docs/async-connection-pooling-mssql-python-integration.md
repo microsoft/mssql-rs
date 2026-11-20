@@ -49,7 +49,12 @@ settled cooperative fetch cancellation preserves direct-session recovery and
 transaction intent, but keeps sticky discard eligibility for future pool reuse.
 `executemany` preflight cancellation preserves the session only before that task
 claims execution. Cancellation after its claim and before result delivery breaks
-the session and prevents clean-exit commit, even after native execution finishes.
+the session, even after native execution finishes. Close rechecks broken state
+after draining, authorizing transaction finalization under the session mutex.
+Cancellation before that authorization prevents commit. Cancellation afterward
+but before atomic close-outcome publication reports failure with a potentially
+unknown transaction outcome; commit is never retried. Publication and cancellation
+are ordered by the same session mutex, without holding it during network I/O.
 Pool leases, production clean return and Python pool APIs remain
 separate implementation slices.
 

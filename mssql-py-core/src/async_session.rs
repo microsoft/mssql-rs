@@ -7,10 +7,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use mssql_tds::core::CancelHandle;
 use pyo3::prelude::*;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::{AbortHandle, JoinSet};
+use tokio::time::Instant;
 
-use crate::async_errors::{OperationalError, map_connection_claim};
+use crate::async_errors::{OperationalError, map_connection_claim, map_tds_error};
+use crate::async_handle::{CloseMode, CloseResult, check_cleanup_deadline};
 
 pub(crate) type CursorId = u64;
 pub(crate) type FetchId = u64;
@@ -650,6 +652,34 @@ impl AsyncConnectionState {
         let mut state = self.lock();
         state.lifecycle = ConnectionLifecycle::Closed;
         state.active_operation = None;
+    }
+
+    pub(crate) fn complete_close(
+        &self,
+        mode: CloseMode,
+        deadline: Instant,
+        result: PyResult<()>,
+        sender: &watch::Sender<Option<CloseResult>>,
+    ) {
+        let mut state = self.lock();
+        let result = result.and_then(|()| {
+            check_cleanup_deadline(deadline)
+                .map_err(|error| map_tds_error("Connection cleanup failed", error, Vec::new()))?;
+            if matches!(mode, CloseMode::Commit) && state.broken {
+                return Err(OperationalError::new_err(
+                    "Connection was interrupted during commit cleanup; outcome may be unknown; connection discarded",
+                ));
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            self.mark_for_discard();
+            state.broken = true;
+        }
+        state.lifecycle = ConnectionLifecycle::Closed;
+        state.active_operation = None;
+        // Publish under the cancellation lock so late poisoning cannot race success.
+        sender.send_replace(Some(result.map_err(Arc::new)));
     }
 
     pub(crate) fn mark_broken(&self) {

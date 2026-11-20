@@ -55,8 +55,11 @@ For SDK authors integrating the native runtime:
   enable connection pooling.
 - Cancelling `executemany` during parameter binding leaves the connection and
   existing transaction usable. After execution claims the session, cancellation
-  before result delivery breaks the connection and prevents clean-exit commit,
-  even if native execution has finished.
+  before result delivery breaks the connection, even if native execution has
+  finished. Close rechecks this after draining and publishes its outcome
+  atomically with cancellation. Cancellation before commit authorization prevents
+  the request; cancellation afterward reports failure with a potentially unknown
+  transaction outcome, without retrying commit.
 - A broken connection still needs `await connection.close()`. The `closed`
   property indicates teardown, not whether the connection is healthy.
 - If creating a `commit()` or `rollback()` awaitable fails before native work

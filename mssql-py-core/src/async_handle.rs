@@ -25,8 +25,17 @@ pub(crate) enum CloseMode {
     Commit,
 }
 
-type CloseResult = Result<(), Arc<PyErr>>;
+pub(crate) type CloseResult = Result<(), Arc<PyErr>>;
 type CloseReceiver = watch::Receiver<Option<CloseResult>>;
+
+pub(crate) fn check_cleanup_deadline(deadline: Instant) -> TdsResult<()> {
+    if Instant::now() >= deadline {
+        return Err(Error::TimeoutError(TimeoutErrorType::String(
+            "Connection cleanup timed out; connection discarded".to_owned(),
+        )));
+    }
+    Ok(())
+}
 
 struct CloseCompletion {
     state: Arc<AsyncConnectionState>,
@@ -137,8 +146,11 @@ impl LogicalConnection {
                         }
                     }
                     Some(handle) => {
-                        match timeout_at(deadline, Self::finalize_handle(handle, mode, deadline))
-                            .await
+                        match timeout_at(
+                            deadline,
+                            Self::finalize_handle(handle, &connection.state, mode, deadline),
+                        )
+                        .await
                         {
                             Ok(result) => result,
                             Err(_) => Err(OperationalError::new_err(
@@ -147,18 +159,10 @@ impl LogicalConnection {
                         }
                     }
                 }
-            }
-            .and_then(|()| {
-                Self::check_cleanup_deadline(deadline)
-                    .map_err(|error| map_tds_error("Connection cleanup failed", error, Vec::new()))
-            });
-            if result.is_err() {
-                connection.state.mark_broken();
-            }
-            connection.state.mark_closed();
-            completion
-                .sender
-                .send_replace(Some(result.map_err(Arc::new)));
+            };
+            connection
+                .state
+                .complete_close(mode, deadline, result, &completion.sender);
             completion.completed = true;
             tracing::info!(
                 discard = connection.state.must_discard(),
@@ -211,34 +215,45 @@ impl LogicalConnection {
         Ok(client)
     }
 
-    fn check_cleanup_deadline(deadline: Instant) -> TdsResult<()> {
-        if Instant::now() >= deadline {
-            return Err(Error::TimeoutError(TimeoutErrorType::String(
-                "Connection cleanup timed out; connection discarded".to_owned(),
-            )));
-        }
-        Ok(())
-    }
-
     async fn finalize_handle(
         mut handle: ConnHandle,
+        state: &AsyncConnectionState,
         mode: CloseMode,
         deadline: Instant,
     ) -> PyResult<()> {
         let client = handle.client_mut();
         let result = async {
-            Self::check_cleanup_deadline(deadline)?;
+            check_cleanup_deadline(deadline)?;
             client.close_query().await?;
-            Self::check_cleanup_deadline(deadline)?;
+            check_cleanup_deadline(deadline)
+        }
+        .await;
+        result.map_err(|error| {
+            map_tds_error(
+                "Connection cleanup failed",
+                error,
+                client.take_info_messages(),
+            )
+        })?;
+        // This mutex-protected check authorizes finalization after draining.
+        if state.is_broken() {
+            return match mode {
+                CloseMode::Commit => Err(OperationalError::new_err(
+                    "Cannot commit a broken connection; connection discarded",
+                )),
+                CloseMode::Rollback => Ok(()),
+            };
+        }
+        let result = async {
             if client.has_active_transaction() {
                 match mode {
                     CloseMode::Commit => client.commit_transaction(None, None).await?,
                     CloseMode::Rollback => client.rollback_transaction(None, None).await?,
                 }
             }
-            Self::check_cleanup_deadline(deadline)?;
+            check_cleanup_deadline(deadline)?;
             client.close_connection().await?;
-            Self::check_cleanup_deadline(deadline)
+            check_cleanup_deadline(deadline)
         }
         .await;
         result.map_err(|error| {
@@ -554,6 +569,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_waiter_cancellation_cannot_commit_or_publish_success() {
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use crate::async_session::SessionOperationGuard;
+        use mssql_tds::connection::tds_client::ExecuteOptions;
+        use mssql_tds::test_client_support::{
+            col_metadata_empty, done_no_more, env_change_begin_transaction,
+            env_change_commit_transaction,
+        };
+        use tracing::{Subscriber, span::Attributes};
+        use tracing_subscriber::{Layer, layer::Context as LayerContext, prelude::*};
+
+        type Waiter = Pin<Box<dyn Future<Output = PyResult<()>> + Send>>;
+        struct CancelAtPhase {
+            phase: &'static str,
+            waiter: Arc<StdMutex<Option<Waiter>>>,
+            cancelled: Arc<AtomicBool>,
+        }
+        impl<S: Subscriber> Layer<S> for CancelAtPhase {
+            fn on_new_span(
+                &self,
+                attributes: &Attributes<'_>,
+                _id: &tracing::span::Id,
+                _context: LayerContext<'_, S>,
+            ) {
+                if attributes.metadata().name() == self.phase {
+                    let waiter = self.waiter.lock().unwrap().take().unwrap();
+                    drop(waiter);
+                    self.cancelled.store(true, Ordering::Release);
+                }
+            }
+        }
+
+        for (phase, mode) in [
+            ("close_query", CloseMode::Commit),
+            ("commit_transaction", CloseMode::Commit),
+            ("close_connection", CloseMode::Commit),
+            ("close_query", CloseMode::Rollback),
+        ] {
+            let (mut client, transport) = tds_client_from_tokens_capturing(vec![
+                env_change_begin_transaction(7),
+                col_metadata_empty(),
+                done_no_more(),
+                env_change_commit_transaction(),
+                done_no_more(),
+            ]);
+            client
+                .execute("SELECT 1".into(), ExecuteOptions::default())
+                .await
+                .unwrap();
+            assert!(client.has_active_transaction());
+            assert!(client.has_open_batch());
+            let initial_bytes = transport.lock().unwrap().len();
+            let connection = Arc::new(LogicalConnection::new(client));
+            let state = connection.state.clone();
+            let (release, wait) = tokio::sync::oneshot::channel();
+            let (completed, completion) = tokio::sync::oneshot::channel();
+            let mut waiter: Waiter = Box::pin(state.clone().run_tracked_preflight(
+                move |preflight| async move {
+                    wait.await.unwrap();
+                    let claim = preflight.claim_execute(1).unwrap();
+                    let mut guard = SessionOperationGuard::new(state, claim.operation_id);
+                    guard.finish_execute(true);
+                    completed.send(()).unwrap();
+                    Ok(())
+                },
+            ));
+            assert!(
+                waiter
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            release.send(()).unwrap();
+            completion.await.unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let subscriber = tracing_subscriber::Registry::default().with(CancelAtPhase {
+                phase,
+                waiter: Arc::new(StdMutex::new(Some(waiter))),
+                cancelled: cancelled.clone(),
+            });
+            let result = LogicalConnection::wait_closed(connection.start_close(
+                mode,
+                CLOSE_TIMEOUT,
+                Some(tracing::Dispatch::new(subscriber)),
+            ))
+            .await;
+            assert!(cancelled.load(Ordering::Acquire), "{phase}");
+            match mode {
+                CloseMode::Commit => {
+                    let error = result.unwrap_err();
+                    let expected = if phase == "close_query" {
+                        "Cannot commit a broken connection"
+                    } else {
+                        "outcome may be unknown"
+                    };
+                    assert!(error.to_string().contains(expected), "{phase}: {error}");
+                    Python::attach(|py| assert!(error.is_instance_of::<OperationalError>(py)));
+                    let repeated = LogicalConnection::wait_closed(connection.start_close(
+                        CloseMode::Rollback,
+                        Duration::ZERO,
+                        None,
+                    ))
+                    .await
+                    .unwrap_err();
+                    assert_eq!(repeated.to_string(), error.to_string());
+                }
+                CloseMode::Rollback => result.unwrap(),
+            }
+            assert!(connection.state.is_broken());
+            if phase == "close_query" {
+                assert_eq!(transport.lock().unwrap().len(), initial_bytes);
+            } else {
+                assert!(transport.lock().unwrap().len() > initial_bytes);
+            }
+            assert_eq!(Arc::strong_count(&transport), 1);
+            assert!(connection.handle.lock().await.is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_publication_rechecks_cancellation_and_original_deadline() {
+        use crate::async_session::ConnectionLifecycle;
+
+        for (mode, cancelled, expired, failed) in [
+            (CloseMode::Commit, true, false, false),
+            (CloseMode::Rollback, true, false, false),
+            (CloseMode::Commit, false, true, false),
+            (CloseMode::Commit, false, false, false),
+            (CloseMode::Commit, true, true, true),
+        ] {
+            let state = AsyncConnectionState::new();
+            state.begin_close();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            if cancelled {
+                state.mark_broken();
+            }
+            if expired {
+                tokio::time::advance(Duration::from_secs(1)).await;
+            }
+            let result = if failed {
+                Err(OperationalError::new_err("original cleanup failure"))
+            } else {
+                Ok(())
+            };
+            let (sender, receiver) = watch::channel(None);
+            state.complete_close(mode, deadline, result, &sender);
+            assert_eq!(state.lifecycle(), ConnectionLifecycle::Closed);
+            let outcome = receiver.borrow().clone().unwrap();
+            if failed || expired || cancelled && matches!(mode, CloseMode::Commit) {
+                let error = outcome.unwrap_err();
+                let expected = if failed {
+                    "original cleanup failure"
+                } else if expired {
+                    "timed out"
+                } else {
+                    "outcome may be unknown"
+                };
+                assert!(error.to_string().contains(expected));
+                assert!(state.is_broken());
+                assert!(state.must_discard());
+            } else {
+                outcome.unwrap();
+                state.mark_broken();
+                assert!(receiver.borrow().as_ref().unwrap().is_ok());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn close_timeout_joins_task_destruction_before_reporting_outcome() {
         let (connection, transport) = connection();
         let (operation, _) = connection.state.claim_connection_operation().unwrap();
@@ -641,6 +827,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(2)).await;
         let error = LogicalConnection::finalize_handle(
             ConnHandle::Direct(client),
+            &AsyncConnectionState::new(),
             CloseMode::Commit,
             deadline,
         )
