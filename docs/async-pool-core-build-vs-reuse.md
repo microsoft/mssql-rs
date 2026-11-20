@@ -35,6 +35,16 @@ the authoritative integration contract; the
 [AQE integration design](./async-connection-pooling-mssql-python-integration.md)
 retains responsibility for logical ownership, Python credentials and DB-API behavior.
 
+**Key ownership revision (2026-11-17):** Rust owns effective-option validation,
+default resolution and the sole canonical pool-key builder under Doc 1 section
+7.1. Python retains existing connection-string parsing/adaptation and forwards
+supported options/authentication inputs. Rust constructs a versioned,
+unambiguous descriptor and process-private randomly keyed HMAC fingerprint from
+the same immutable effective spec used for physical opening. No competing Python
+key builder or customer-supplied key is introduced. This responsibility belongs
+to the driver, not Deadpool, and does not change the library comparison or claim
+that keying is already implemented.
+
 The work is split into seven tasks. Only the first two are affected by the answer.
 
 | Task | Area | Affected by this question |
@@ -45,7 +55,7 @@ The work is split into seven tasks. Only the first two are affected by the answe
 | Revoke stale cursor access | Async connection ownership | No |
 | Safe close and transaction handling | Async connection close | No |
 | Connect and close through the pool | Native binding | No |
-| AsyncPool API, pool key, tests and benchmark | `mssql-python` | No |
+| AsyncPool API, canonical pool key, tests and benchmark | `mssql-python` API/parsing and Rust effective-option/key preparation | No |
 
 ## 2. Requirements
 
@@ -129,7 +139,7 @@ can add dependencies. Enable only the needed features.
 | Ordinary Object Drop returns without awaited cleanup | Driver guard destroys the client, then returns an empty slot; explicit release is the only reuse path |
 | No per-call create/recycle arguments | Pool slots, then explicitly call the current factory/reset/isolation code while owning a slot |
 | Recycle errors are candidate rejection, not fatal caller errors | Keep identity/provider errors and bounded TDS candidate retry in the outer acquisition path |
-| Separate phase timeouts | One outer absolute deadline and cancellation policy, including Python pre-key work |
+| Separate phase timeouts | One outer absolute deadline and cancellation policy, including Python credential preparation and Rust option/key preparation |
 | No exact queued-only `max_waiting` API | Prototype admission bookkeeping against actual queue transitions; a counter around get/status is not sufficient |
 | Close is irreversible and does not await graceful TDS shutdown | Reversible driver gate retains the same slot pool; permanent shutdown joins driver-tracked work |
 | Retain/take/resize can release accounting before removed clients are destroyed | Do not remove live client-bearing slots during active admission; maintenance barrier and off-lock destruction required |
@@ -145,6 +155,7 @@ reuse rather than quietly weakening the design.
 
 ```text
 async_query / PyO3 logical connection
+  -> Rust preparation: validated effective spec/auth binding and canonical HMAC key
   -> AsyncPoolManager: key, lifecycle, generation, deadline and queue policy
   -> per-key Deadpool managed slot pool: bounded checkout and returned storage
   -> driver acquisition/lease guard: slot plus zero or one unique TdsClient
@@ -183,7 +194,8 @@ needs extra machinery for per-call context, fatal recycle errors and retirement.
 | Generic async manager hooks | TDS factory, liveness/reset/ACK/drain/isolation and auth metadata |
 | Generic close/retain/status primitives | Reversible generations, atomic return/publication and graceful shutdown |
 | Generic library cancellation handling | End-to-end Rust/Python cancellation and one total deadline |
-| No Python-specific behavior | Complete keying, logical lease cells, close barrier, credentials and DB-API errors |
+| No connection-option or identity policy | Rust effective-option resolution and sole canonical key builder; same immutable spec for keying and physical opening |
+| No Python-specific behavior | Parser/adaptation parity, logical lease cells, close barrier, credentials and DB-API errors |
 
 ## 6. Effort and Risk
 
@@ -239,6 +251,10 @@ needs extra machinery for per-call context, fatal recycle errors and retirement.
   open/reset/release cancellation, pruning and disable/re-enable with old leases.
 - Test repeated asyncio loops, current-call credential context, no stale finalizer
   access, and auth cancellation/late results.
+- Test Rust key/spec consistency and every accepted option's
+  partition/equivalence/rejection behavior, including resolved defaults,
+  credential changes, serialization ambiguity, process-key isolation and
+  diagnostic redaction; preserve Python parser/adaptation parity.
 - Use live SQL for SPID/reset/isolation/transaction effects, not only mock success.
 - Record unverified OS/topology cases and measure eager carrier/cleanup cost.
 

@@ -200,6 +200,72 @@ def test_rust_coverage_publishes_only_cobertura():
         assert "--cobertura" in content, path
 
 
+def test_native_pool_validation_runs_after_sql_ready_and_reports_both_runs():
+    steps = next(
+        step["${{ if eq(parameters.enableTests, true) }}"]
+        for step in load_template("build-template.yml")["steps"]
+        if "${{ if eq(parameters.enableTests, true) }}" in step
+    )
+    run = next(
+        step for step in steps
+        if isinstance(step, dict)
+        and step.get("displayName") == "Run pool contracts and live SQL tests (mssql-py-core)"
+    )
+    assert steps.index(run) > steps.index("${{ parameters.beforeTestSteps }}")
+    command = run["script"]
+    assert '--lib -E "test(pool::)" --profile ci' in command
+    assert " && cargo nextest run " in command
+    assert '--test pool_sql -E "test(live_)" --run-ignored only --profile pool-sql' in command
+    assert run["workingDirectory"] == "$(Build.SourcesDirectory)/mssql-py-core"
+    assert run["condition"] == _PR
+    assert run["env"] == {
+        "SQL_PASSWORD": "$(SQL_PASSWORD)",
+        "DB_HOST": "localhost",
+        "DB_PORT": "1433",
+        "DB_USERNAME": "sa",
+        "TRUST_SERVER_CERTIFICATE": "true",
+    }
+    publish = next(
+        step for step in steps
+        if isinstance(step, dict)
+        and step.get("displayName") == "Publish pool test results (mssql-py-core)"
+    )
+    assert publish["condition"] == _PR.replace("succeeded()", "succeededOrFailed()")
+    assert publish["inputs"]["failTaskOnFailedTests"] is True
+    for profile in ("ci", "pool-sql"):
+        assert f"/target/nextest/{profile}/junit.xml" in publish["inputs"]["testResultsFiles"]
+
+
+def test_container_pool_validation_receives_sql_and_preserves_unit_results():
+    steps = load_template("build-template-container.yml")["steps"]
+    run = next(
+        step for step in steps if step.get("displayName") == "Run Rust unit tests (mssql-py-core)"
+    )
+    assert "--network testnet" in run["script"]
+    for setting in (
+        "-e SQL_PASSWORD",
+        '-e DB_HOST="sql1"',
+        '-e DB_USERNAME="sa"',
+        '-e TRUST_SERVER_CERTIFICATE="true"',
+    ):
+        assert setting in run["script"]
+    assert run["env"]["SQL_PASSWORD"] == "$(SQL_PASSWORD)"
+    script = (_ROOT / ".pipeline" / "scripts" / "containerized-pycore-rust-test.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "set -e\n" in script
+    assert "--test pool_sql -E 'test(live_)'" in script
+    assert "--run-ignored only --profile pool-sql" in script
+    assert script.index("--profile ci") < script.index("--profile pool-sql")
+    assert script.index("--profile pool-sql") < script.index("cargo llvm-cov report")
+    publish = next(
+        step for step in steps
+        if step.get("displayName") == "Publish mssql-py-core Rust test results"
+    )
+    for profile in ("ci", "pool-sql"):
+        assert f"/target/nextest/{profile}/junit.xml" in publish["inputs"]["testResultsFiles"]
+
+
 def test_kerberos_archive_flag_matches_bash_comparison():
     template = (_TEMPLATES / "kerberos-test-template.yml").read_text(encoding="utf-8")
     # Template expressions render booleans as True/False.

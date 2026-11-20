@@ -4,12 +4,13 @@
 use mssql_tds::connection::tds_client::{ExecuteOptions, TdsClient};
 use mssql_tds::core::CancelHandle;
 use mssql_tds::message::transaction_management::TransactionIsolationLevel;
+use tokio::time::Instant;
 
 use super::connection::{ConnectSpec, ConnectionFactory, OpenedConnection, PoolKey};
 use super::control::AcquireControl;
 use super::error::{AcquireStage, PoolError, PoolResult};
 use super::lifecycle::SlotGuard;
-use super::manager::AsyncPoolManager;
+use super::manager::{AsyncPoolManager, check_runtime};
 
 /// A concrete isolation level; the protocol's NoChange is not valid at checkout.
 pub(crate) struct Isolation(&'static str);
@@ -50,9 +51,10 @@ impl Drop for OperationCancel {
     }
 }
 
-/// Drop always discards. Safe, awaited return is a separate implementation slice.
+/// Only successful awaited release permits reuse; Drop always discards.
 pub(crate) struct PoolLease {
     slot: SlotGuard<OpenedConnection>,
+    discard: bool,
 }
 
 impl PoolLease {
@@ -61,6 +63,65 @@ impl PoolLease {
             .value_mut()
             .expect("published client")
             .client_mut()
+    }
+
+    pub(crate) fn mark_discard(&mut self) {
+        self.discard = true;
+    }
+
+    pub(crate) async fn release(self) -> PoolResult<()> {
+        let deadline = self.slot.cleanup_deadline()?;
+        self.release_with_deadline(deadline).await
+    }
+
+    pub(crate) async fn release_with_deadline(mut self, deadline: Instant) -> PoolResult<()> {
+        let deadline = deadline.min(self.slot.cleanup_deadline()?);
+        if Instant::now() >= deadline {
+            return Err(PoolError::CleanupTimeout);
+        }
+        if self.discard {
+            return Ok(());
+        }
+        let runtime = tokio::runtime::Handle::current().id();
+        {
+            // The slot owns the client throughout cleanup, including future drop.
+            let cleanup = tokio::time::timeout_at(deadline, async {
+                let client = self.client_mut();
+                client
+                    .close_query()
+                    .await
+                    .map_err(|error| PoolError::Cleanup(Box::new(error)))?;
+                if client.has_active_transaction() {
+                    let cancel = OperationCancel(CancelHandle::new());
+                    client
+                        .rollback_transaction_with_options(
+                            None,
+                            None,
+                            ExecuteOptions::new().cancel(&cancel.0),
+                        )
+                        .await
+                        .map_err(|error| PoolError::Cleanup(Box::new(error)))?;
+                }
+                if !quiescent(client) {
+                    return Err(PoolError::Cleanup(Box::new(
+                        mssql_tds::error::Error::ProtocolError(
+                            "connection is not quiescent after cleanup".into(),
+                        ),
+                    )));
+                }
+                Ok(())
+            });
+            tokio::pin!(cleanup);
+            std::future::poll_fn(|cx| {
+                if let Err(error) = check_runtime(runtime) {
+                    return std::task::Poll::Ready(Err(error));
+                }
+                std::future::Future::poll(cleanup.as_mut(), cx)
+                    .map(|result| result.map_err(|_| PoolError::CleanupTimeout)?)
+            })
+            .await?;
+        }
+        self.slot.return_before(deadline)
     }
 
     #[cfg(test)]
@@ -134,7 +195,10 @@ impl AsyncPoolManager {
                 Ok(connection) => {
                     slot.install(connection)?;
                     slot.publish()?;
-                    return Ok(Some(PoolLease { slot }));
+                    return Ok(Some(PoolLease {
+                        slot,
+                        discard: false,
+                    }));
                 }
                 Err(error @ (PoolError::Initialize(_) | PoolError::InvalidSession)) => {
                     tracing::debug!(%error, "discarding invalid pool candidate");
@@ -161,7 +225,10 @@ impl AsyncPoolManager {
             .await?;
         slot.install(connection)?;
         slot.publish()?;
-        Ok(Some(PoolLease { slot }))
+        Ok(Some(PoolLease {
+            slot,
+            discard: false,
+        }))
     }
 }
 

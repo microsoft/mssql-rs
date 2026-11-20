@@ -25,6 +25,7 @@ use mssql_tds::message::transaction_management::TransactionIsolationLevel;
 use pool::config::PoolConfig;
 use pool::connection::{AuthBinding, ConnectSpec, PoolKey, SqlConnectionFactory};
 use pool::control::AcquireControl;
+use pool::error::PoolError;
 use pool::manager::AsyncPoolManager;
 use pool::session::{Isolation, PoolLease};
 use tokio::time::Instant;
@@ -110,7 +111,7 @@ async fn live_fresh_and_reused_sessions_apply_every_isolation_level() {
             "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
         )
         .await;
-        fresh.return_quiescent().unwrap();
+        fresh.release().await.unwrap();
         let mut reused = acquire(&manager, &spec, level.try_into().unwrap()).await;
         assert_eq!(scalar(reused.client_mut(), "SELECT @@SPID").await, spid);
         assert_eq!(scalar(reused.client_mut(), query).await, expected);
@@ -139,7 +140,7 @@ async fn live_checkout_resets_session_state_and_discards_dirty_candidates() {
         "SET LOCK_TIMEOUT 1234; CREATE TABLE #pool_probe (n int)",
     )
     .await;
-    first.return_quiescent().unwrap();
+    first.release().await.unwrap();
     let mut reused = acquire(
         &manager,
         &spec,
@@ -189,4 +190,107 @@ async fn live_checkout_resets_session_state_and_discards_dirty_candidates() {
     );
     drop(replacement);
     manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires live SQL Server and DB_HOST/DB_USERNAME/SQL_PASSWORD"]
+async fn live_release_drains_and_rolls_back_before_same_spid_checkout() {
+    let owner = manager();
+    let observer_pool = manager();
+    let spec = spec();
+    let mut first = acquire(
+        &owner,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    let spid = scalar(first.client_mut(), "SELECT @@SPID").await;
+    let resource = format!("pool_return_{}", uuid::Uuid::new_v4().simple());
+    first
+        .client_mut()
+        .execute(
+            format!(
+                "BEGIN TRANSACTION; \
+                 EXEC sys.sp_getapplock @Resource='{resource}', @LockMode='Exclusive', \
+                 @LockOwner='Transaction', @LockTimeout=0; SELECT 1; SELECT 2"
+            ),
+            (),
+        )
+        .await
+        .unwrap();
+    assert!(first.client_mut().has_open_batch());
+    assert!(first.client_mut().has_active_transaction());
+    let mut observer = acquire(
+        &observer_pool,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    let try_lock = format!(
+        "DECLARE @result int; \
+         EXEC @result = sys.sp_getapplock @Resource='{resource}', @LockMode='Exclusive', \
+         @LockOwner='Session', @LockTimeout=0; SELECT @result"
+    );
+    assert_eq!(scalar(observer.client_mut(), &try_lock).await, -1);
+    first.release().await.unwrap();
+    // Observe rollback before any checkout RESETCONNECTION can mask a dirty return.
+    assert!(scalar(observer.client_mut(), &try_lock).await >= 0);
+    exec(
+        observer.client_mut(),
+        &format!("EXEC sys.sp_releaseapplock @Resource='{resource}', @LockOwner='Session'"),
+    )
+    .await;
+    let mut reused = acquire(
+        &owner,
+        &spec,
+        TransactionIsolationLevel::Serializable.try_into().unwrap(),
+    )
+    .await;
+    assert_eq!(scalar(reused.client_mut(), "SELECT @@SPID").await, spid);
+    assert_eq!(scalar(reused.client_mut(), "SELECT @@TRANCOUNT").await, 0);
+    assert_eq!(
+        scalar(
+            reused.client_mut(),
+            "SELECT CAST(transaction_isolation_level AS int) \
+             FROM sys.dm_exec_sessions WHERE session_id = @@SPID",
+        )
+        .await,
+        4
+    );
+    reused.release().await.unwrap();
+    observer.release().await.unwrap();
+    owner.shutdown().await.unwrap();
+    observer_pool.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires live SQL Server and DB_HOST/DB_USERNAME/SQL_PASSWORD"]
+async fn live_release_delayed_error_discards_instead_of_caching() {
+    let owner = manager();
+    let spec = spec();
+    let mut first = acquire(
+        &owner,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    let id = first.client_mut().client_connection_id();
+    first
+        .client_mut()
+        .execute(
+            "SELECT 1; RAISERROR('safe return delayed error', 16, 1)".into(),
+            (),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(first.release().await, Err(PoolError::Cleanup(_))));
+    let mut replacement = acquire(
+        &owner,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    assert_ne!(replacement.client_mut().client_connection_id(), id);
+    replacement.release().await.unwrap();
+    owner.shutdown().await.unwrap();
 }
