@@ -1057,6 +1057,16 @@ def test_cancelled_large_string_insert_rolls_back_on_close(client_context, use_p
                         await control.execute(
                             "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION", use_prepare=False
                         )
+                    for _ in range(500):
+                        await control.execute(
+                            f"SELECT COUNT(*) FROM {table} WITH (NOLOCK) WHERE id = 1",
+                            use_prepare=False,
+                        )
+                        if await control.fetchall() == [(1,)]:
+                            break
+                        await asyncio.sleep(0.01)
+                    else:
+                        pytest.fail("Cancelled INSERT never executed server-side")
                     await writer.close()
 
                 await control.execute(
