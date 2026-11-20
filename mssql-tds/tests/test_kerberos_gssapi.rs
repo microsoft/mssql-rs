@@ -15,7 +15,10 @@
 
 #![cfg(unix)]
 
-use mssql_tds::security::unix::{GssapiContext, has_valid_credentials, is_gssapi_available};
+use mssql_tds::security::unix::{
+    GssapiContext, default_credential, default_principal_name, has_valid_credentials,
+    is_gssapi_available,
+};
 use mssql_tds::security::{IntegratedAuthConfig, SecurityContext, SecurityPackage};
 use std::env;
 
@@ -171,6 +174,27 @@ fn test_has_valid_credentials() {
     // With dlopen, this returns false if GSSAPI library is not available.
     let has_creds = has_valid_credentials();
     println!("Has valid Kerberos credentials: {}", has_creds);
+}
+
+/// The default credential names whoever `kinit` authenticated and says how
+/// long it stays valid, without asking the KDC for anything.
+///
+/// Set KERBEROS_TEST=1 to enable this test.
+#[test]
+#[ignore = "Requires Kerberos environment - set KERBEROS_TEST=1 to run"]
+fn test_kerberos_default_credential_has_its_principal_and_lifetime() {
+    if env::var("KERBEROS_TEST").is_err() {
+        println!("Skipping Kerberos test - set KERBEROS_TEST=1 to enable");
+        return;
+    }
+    let credential = default_credential().expect("kinit testuser@EXAMPLE.LOCAL first");
+    assert_eq!(credential.principal, "testuser@EXAMPLE.LOCAL");
+    assert!(credential.lifetime_seconds > 0, "{credential:?}");
+    assert_eq!(
+        default_principal_name().unwrap(),
+        credential.principal,
+        "the principal name is the default credential's"
+    );
 }
 
 // =============================================================================

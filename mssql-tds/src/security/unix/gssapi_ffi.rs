@@ -853,6 +853,16 @@ pub fn has_valid_credentials() -> bool {
     major == GSS_S_COMPLETE
 }
 
+/// The default initiator credential as GSSAPI finds it, in whichever cache
+/// holds it (FILE, DIR, KCM, KEYRING, macOS's API).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DefaultCredential {
+    /// Its principal, `user@REALM`.
+    pub principal: String,
+    /// The seconds it stays valid: 0 once expired, `u32::MAX` for no limit.
+    pub lifetime_seconds: u32,
+}
+
 /// Returns the display name of the default initiator credential's principal
 /// (e.g. `user@REALM`), i.e. whoever `kinit` last authenticated.
 ///
@@ -860,6 +870,12 @@ pub fn has_valid_credentials() -> bool {
 /// `gss_display_name` sequence (`AzureADAuth.cpp` `CheckFederated`), which
 /// derives the Entra user realm lookup from the Kerberos identity.
 pub fn default_principal_name() -> Result<String, crate::security::SecurityError> {
+    default_credential().map(|credential| credential.principal)
+}
+
+/// The default initiator credential: its principal and remaining lifetime,
+/// read without contacting the KDC.
+pub fn default_credential() -> Result<DefaultCredential, crate::security::SecurityError> {
     use crate::security::SecurityError;
 
     let lib = get_gssapi_lib().ok_or_else(|| {
@@ -902,12 +918,13 @@ pub fn default_principal_name() -> Result<String, crate::security::SecurityError
     }
 
     let mut name: GssNameT = ptr::null_mut();
+    let mut lifetime: GssOmUint32 = 0;
     let major = unsafe {
         inquire_cred(
             &mut minor,
             cred,
             &mut name,
-            ptr::null_mut(),
+            &mut lifetime,
             ptr::null_mut(),
             ptr::null_mut(),
         )
@@ -933,7 +950,10 @@ pub fn default_principal_name() -> Result<String, crate::security::SecurityError
         .trim_end_matches('\0')
         .to_string();
     unsafe { (lib.gss_release_buffer)(&mut release_minor, &mut buffer) };
-    Ok(principal)
+    Ok(DefaultCredential {
+        principal,
+        lifetime_seconds: lifetime,
+    })
 }
 
 // =============================================================================
