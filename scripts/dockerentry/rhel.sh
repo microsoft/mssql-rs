@@ -31,4 +31,5 @@ update-ca-trust extract
 
 openssl verify -CAfile /etc/pki/tls/certs/ca-bundle.trust.crt mssql.crt
 
-cargo nextest run -E 'not (test(connectivity))' --workspace-remap /workspace --archive-file "$ARCHIVE_NAME" --no-fail-fast --profile ci --success-output immediate
+# Compile fixtures run in the build container.
+cargo nextest run -E 'not (test(connectivity) | (package(mssql-rs) & binary(data_api_compile)))' --workspace-remap /workspace --archive-file "$ARCHIVE_NAME" --no-fail-fast --profile ci --success-output immediate
