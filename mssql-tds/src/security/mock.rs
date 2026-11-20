@@ -7,7 +7,7 @@
 //! used to test the TDS protocol integration without requiring actual SSPI or
 //! GSSAPI infrastructure.
 
-use crate::security::{SecurityContext, SecurityError, SspiAuthToken};
+use crate::security::{Negotiation, SecurityContext, SecurityError, SspiAuthToken};
 
 /// Mock security context for testing SSPI authentication flow.
 ///
@@ -60,6 +60,9 @@ pub struct MockSecurityContext {
 
     /// Optional error to return on a specific round
     error_on_round: Option<(usize, SecurityError)>,
+
+    /// What the context reports it negotiated.
+    negotiation: Negotiation,
 }
 
 impl MockSecurityContext {
@@ -76,6 +79,7 @@ impl MockSecurityContext {
             spn: "MSSQLSvc/mock:1433".to_string(),
             package_name: "Mock".to_string(),
             error_on_round: None,
+            negotiation: Negotiation::default(),
         }
     }
 
@@ -92,6 +96,7 @@ impl MockSecurityContext {
             spn: "MSSQLSvc/mock:1433".to_string(),
             package_name: "Mock".to_string(),
             error_on_round: None,
+            negotiation: Negotiation::default(),
         }
     }
 
@@ -110,6 +115,7 @@ impl MockSecurityContext {
             spn: "MSSQLSvc/mock:1433".to_string(),
             package_name: "Mock".to_string(),
             error_on_round: None,
+            negotiation: Negotiation::default(),
         }
     }
 
@@ -136,6 +142,12 @@ impl MockSecurityContext {
     /// Configures the mock to return an error on a specific round.
     pub fn with_error_on_round(mut self, round: usize, error: SecurityError) -> Self {
         self.error_on_round = Some((round, error));
+        self
+    }
+
+    /// Sets what the mock reports it negotiated.
+    pub fn with_negotiation(mut self, negotiation: Negotiation) -> Self {
+        self.negotiation = negotiation;
         self
     }
 
@@ -202,6 +214,10 @@ impl SecurityContext for MockSecurityContext {
 
     fn spn(&self) -> &str {
         &self.spn
+    }
+
+    fn negotiation(&self) -> Negotiation {
+        self.negotiation.clone()
     }
 }
 
