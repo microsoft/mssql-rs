@@ -456,7 +456,7 @@ impl Request {
 /// The version of the diagnostic coverage matrix this implementation follows
 /// (`docs/diagnose-coverage.md`): which phases are checked, with which signals,
 /// and which coverage states each can report.
-pub const COVERAGE_MATRIX_VERSION: &str = "1.7";
+pub const COVERAGE_MATRIX_VERSION: &str = "1.8";
 
 /// The link to driver-tracing guidance for `sqlcmd diagnose`, given when the
 /// client's own evidence cannot explain a failure. It is a Microsoft FWLink so
@@ -1156,7 +1156,9 @@ pub struct Finding {
 /// One error of the ordered error chain, with the identifiers it came with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ErrorRecord {
-    /// `sqlcmd`, `os`, `sqlBrowser`, `tls`, `sqlServer` or `client`.
+    /// `sqlcmd`, `os`, `sqlBrowser`, `tls`, `sqlServer` or `client`; a
+    /// security library's (`sspi`, `gssapi`, `kerberos`, `lsa`); or `ldap`,
+    /// a directory's.
     pub source: &'static str,
     pub check: CheckId,
     /// SQL Server's error number.
@@ -1667,6 +1669,12 @@ struct Diagnosis {
     credentials_lookup: Option<kerberos::CredentialsLookup>,
     /// The credentials as the connection attempt's evidence last read them.
     kerberos_credentials: Option<kerberos::Credentials>,
+    /// How the SPN is looked up in the directory: the platform's LDAP
+    /// client; tests look it up their own way, or not at all.
+    spn_directory: Option<fn(kerberos::SpnQuery) -> kerberos::SpnLookup>,
+    /// Whether the evidence login the diagnostic client made after sqlcmd's
+    /// own driver failed ended in a way that calls for looking its SPN up.
+    evidence_wants_spn_lookup: bool,
     recorder: StageRecorder,
     target: Option<Target>,
     checks: Vec<Check>,
@@ -1854,6 +1862,13 @@ impl Diagnosis {
             windows: cfg!(windows),
             credentials_lookup: kerberos::CredentialsLookup::platform(),
             kerberos_credentials: None,
+            // A test never searches this computer's directory.
+            spn_directory: if cfg!(test) {
+                None
+            } else {
+                kerberos::spn_directory()
+            },
+            evidence_wants_spn_lookup: false,
             recorder: StageRecorder::new(),
             target: None,
             checks: Vec::new(),
@@ -3927,7 +3942,9 @@ impl Diagnosis {
         });
         let refused_login = any_error(&LOGIN_ERRORS);
         let refused_database = any_error(&DATABASE_ERRORS);
-        if self.request.authentication == Authentication::Integrated && any_error(&[18452]) {
+        let untrusted_login =
+            self.request.authentication == Authentication::Integrated && any_error(&[18452]);
+        if untrusted_login {
             self.limitation_text(kerberos::login_18452_limitation());
         }
         let (coverage, domain, auth) = if refused_login {
@@ -4006,6 +4023,7 @@ impl Diagnosis {
         check = self.checks[driver_check].clone();
 
         let evidence = transport_opened && !(refused_login || refused_database || missing_driver);
+        self.evidence_wants_spn_lookup = false;
         if evidence && !cancel_requested() {
             let (checks, errors) = (self.checks.len(), self.errors.len());
             // The driver's check keeps its own transport. Its SPN is the one
@@ -4099,6 +4117,16 @@ impl Diagnosis {
             }
         }
         self.note_driver_credentials(&check, server_refused || refused_login || refused_database);
+        // sqlcmd's own driver requests the same SPN: a login SQL Server
+        // refused with 18452, or an evidence login that failed in a way the
+        // SPN's registration can explain, calls for looking it up.
+        if untrusted_login || self.evidence_wants_spn_lookup {
+            let deadline = Instant::now() + self.request.timeout();
+            if let Some(reported) = self.look_up_spn(deadline).await {
+                check.fields.extend(reported.fields.iter().cloned());
+                self.spn_lookup_reported(reported);
+            }
+        }
         self.checks[driver_check] = check;
     }
 
@@ -4133,7 +4161,9 @@ impl Diagnosis {
             self.spn = Some(platform_spn(&spn));
             self.spn_source = SPN_DERIVED;
         }
-        let records = self.kerberos_evidence(&mut check, budget).await;
+        let records = self
+            .kerberos_evidence(&mut check, Instant::now() + budget)
+            .await;
         self.errors.extend(records);
         self.checks[index] = check;
     }
@@ -4986,20 +5016,37 @@ impl Diagnosis {
                 vec![],
             ));
         }
-        // The credentials are read within what is left of the attempt's time
-        // limit, not a fresh one, and the time it takes is the check's.
-        let credential_records = if self.request.authentication == Authentication::Integrated {
-            let budget = self
-                .request
-                .timeout()
-                .saturating_sub(Duration::from_millis(attempt_ms));
-            let looking = Instant::now();
-            let records = self.kerberos_evidence(&mut check, budget).await;
-            check.duration_ms = Some(attempt_ms.saturating_add(millis(looking)));
-            records
-        } else {
-            Vec::new()
-        };
+        // The credentials are read, and the SPN looked up, within what is
+        // left of the attempt's time limit, not a fresh one, and the time it
+        // takes is the check's.
+        let (credential_records, spn_lookup) =
+            if self.request.authentication == Authentication::Integrated {
+                let deadline = Instant::now()
+                    + self
+                        .request
+                        .timeout()
+                        .saturating_sub(Duration::from_millis(attempt_ms));
+                let looking = Instant::now();
+                let records = self.kerberos_evidence(&mut check, deadline).await;
+                let wanted = self.spn_lookup_wanted(&check, ended);
+                // sqlcmd's own driver made the attempt: its check gets the
+                // lookup, once its evidence login is over.
+                let spn_lookup = if self.request.driver.is_some() {
+                    self.evidence_wants_spn_lookup = wanted;
+                    None
+                } else if wanted {
+                    self.look_up_spn(deadline).await
+                } else {
+                    None
+                };
+                if let Some(reported) = &spn_lookup {
+                    check.fields.extend(reported.fields.iter().cloned());
+                }
+                check.duration_ms = Some(attempt_ms.saturating_add(millis(looking)));
+                (records, spn_lookup)
+            } else {
+                (Vec::new(), None)
+            };
 
         match (ended, client) {
             // The server asked for a Microsoft Entra token, which diagnose
@@ -5116,6 +5163,9 @@ impl Diagnosis {
         }
         // After the attempt's own errors: reading the credentials came after it.
         self.errors.extend(credential_records);
+        if let Some(reported) = spn_lookup {
+            self.spn_lookup_reported(reported);
+        }
         if self.request.authentication == Authentication::Integrated {
             self.note_negotiation();
         }
@@ -5149,6 +5199,96 @@ impl Diagnosis {
                 kerberos::retried_without_spn_finding(),
             );
         }
+    }
+
+    /// Whether the attempt's outcome calls for looking its SPN up in the
+    /// directory: a login that failed in a way the SPN's registration can
+    /// explain (a security code that points at the SPN or names no cause, or
+    /// SQL Server's 18452), or Negotiate choosing NTLM.
+    fn spn_lookup_wanted(&self, check: &Check, ended: &Ended) -> bool {
+        match ended {
+            Ended::Failed(error) => {
+                failed_stage(&check.subphases, ended.timed_out()) == Some(Stage::Login)
+                    && match error {
+                        Error::Security(security) => kerberos::SecuritySignal::of(security)
+                            .is_none_or(kerberos::SecuritySignal::spn_related),
+                        Error::SqlServerError { diagnostics } => {
+                            diagnostics.errors.iter().any(|e| e.number == 18452)
+                        }
+                        _ => false,
+                    }
+            }
+            _ => self.login_security.as_ref().is_some_and(|security| {
+                security.negotiate_chose_ntlm() && !security.retried_without_spn
+            }),
+        }
+    }
+
+    /// Looks the SPN the attempt requested up in the directory by
+    /// `deadline`, unless it names this computer; what it came to, as the
+    /// connection attempt reports it.
+    async fn look_up_spn(&mut self, deadline: Instant) -> Option<kerberos::SpnReported> {
+        let directory = self.spn_directory?;
+        let requested = self.spn.clone()?;
+        if cancel_requested() {
+            return None;
+        }
+        let searched = kerberos::directory_form(&requested);
+        let host = searched.split_once('/').map_or("", |(_, rest)| {
+            rest.rsplit_once(':').map_or(rest, |(host, _)| host)
+        });
+        if mssql_tds::security::is_loopback_address(host) {
+            return None;
+        }
+        // Off Windows, the client's own realm says where its directory is,
+        // and only valid credentials bind to it.
+        let realm = self
+            .kerberos_credentials
+            .as_ref()
+            .and_then(kerberos::Credentials::bindable_realm)
+            .map(str::to_string);
+        let query = kerberos::SpnQuery {
+            spn: searched.clone(),
+            realm,
+            deadline,
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        let lookup = if left.is_zero() {
+            None
+        } else {
+            within(left, move || directory(query)).await
+        };
+        Some(kerberos::spn_report(
+            lookup.as_ref(),
+            &requested,
+            &searched,
+            CheckId::ConnectionAttempt,
+        ))
+    }
+
+    /// What an SPN lookup came to: its findings, its limitations, and the
+    /// error-chain records of one that failed, after the attempt's own.
+    fn spn_lookup_reported(&mut self, reported: kerberos::SpnReported) {
+        if reported.completed {
+            // The search says whether the SPN is registered: only
+            // delegation is left uninspected.
+            for limitation in &mut self.limitations {
+                if limitation.id == Some("diagnose.limitation.kerberos_spn_not_proof") {
+                    *limitation = LocalizedText::new(
+                        "diagnose.limitation.kerberos_delegation_not_inspected",
+                        "Kerberos delegation is not inspected.",
+                        vec![],
+                    );
+                }
+            }
+        }
+        for (certainty, text) in reported.findings {
+            self.finding_once(certainty, CheckId::ConnectionAttempt, text);
+        }
+        for limitation in reported.limitations {
+            self.limitation_text(limitation);
+        }
+        self.errors.extend(reported.records);
     }
 
     /// The connection attempt with a Microsoft Entra method that needs a
@@ -5198,10 +5338,14 @@ impl Diagnosis {
     /// the client's own Kerberos credentials, read where its Kerberos library
     /// or Windows keeps them. A cache may be on a slow (network) path or a
     /// daemon that does not answer, so the credentials are read on a thread
-    /// of their own within `budget`, what is left of the attempt's time
-    /// limit. The error-chain records of a read that failed, for the caller
-    /// to add after the attempt's own.
-    async fn kerberos_evidence(&mut self, check: &mut Check, budget: Duration) -> Vec<ErrorRecord> {
+    /// of their own by `deadline`, the end of the attempt's time limit. The
+    /// error-chain records of a read that failed, for the caller to add after
+    /// the attempt's own.
+    async fn kerberos_evidence(
+        &mut self,
+        check: &mut Check,
+        deadline: Instant,
+    ) -> Vec<ErrorRecord> {
         if let Some(spn) = self.spn.clone() {
             check
                 .fields
@@ -5246,6 +5390,7 @@ impl Diagnosis {
                 .push(Field::plain("kerberosTicketCache", "notApplicable")),
             Some(lookup) => {
                 let spn = self.spn.clone();
+                let budget = deadline.saturating_duration_since(Instant::now());
                 match within(budget, move || (lookup.read)(spn)).await {
                     Some(credentials) => {
                         check.fields.extend(credentials.fields());
@@ -12164,6 +12309,446 @@ pub(crate) mod tests {
         );
     }
 
+    /// Valid credentials of `testuser@CONTOSO.COM`, as a cache holds them.
+    fn realm_credentials(_: Option<String>) -> kerberos::Credentials {
+        let mut credentials = cache_credentials(kerberos::State::Valid, false);
+        credentials.principal = Some("testuser@CONTOSO.COM".to_string());
+        credentials
+    }
+
+    /// A directory with one account that has the SPN, named after the query
+    /// it was given: `spn|realm`.
+    fn echoing_directory(query: kerberos::SpnQuery) -> kerberos::SpnLookup {
+        kerberos::SpnLookup::Searched {
+            scope: kerberos::Scope::Forest,
+            accounts: vec![kerberos::Account {
+                name: format!("{}|{}", query.spn, query.realm.unwrap_or_default()),
+                kind: kerberos::AccountKind::User,
+                encryption_types: None,
+            }],
+        }
+    }
+
+    /// [`integrated_login_with_cache`], with valid credentials and the SPN
+    /// looked up in `directory`.
+    fn integrated_login_looked_up(
+        details: &[(&'static str, &str)],
+        ended: Ended,
+        directory: fn(kerberos::SpnQuery) -> kerberos::SpnLookup,
+    ) -> Report {
+        let mut integrated = request("tcp:db01,1433", Depth::ConnectionAttempt);
+        integrated.authentication = Authentication::Integrated;
+        let ok = matches!(ended, Ended::Connected);
+        let stages = Stages::new()
+            .add(
+                Stage::Dns,
+                Some(true),
+                0,
+                1,
+                &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+            )
+            .add(
+                Stage::Tcp,
+                Some(true),
+                1,
+                2,
+                &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1433")],
+            )
+            .add(Stage::Prelogin, Some(true), 2, 3, &[])
+            .add(Stage::Login, Some(ok), 3, 4, details);
+        observed_with(integrated, stages, ended, |diagnosis| {
+            diagnosis.credentials_lookup = Some(cache_lookup(realm_credentials));
+            diagnosis.spn_directory = Some(directory);
+        })
+    }
+
+    const CONTOSO_SPN: (&str, &str) = (cs::SPN, "MSSQLSvc/db01.contoso.com:1433");
+
+    /// A login that failed in a way the SPN's registration can explain has
+    /// its SPN looked up, as the directory holds it, in the client's own
+    /// realm: no account, or more than one, is a confirmed finding within
+    /// the scope searched; one account is shown.
+    #[test]
+    fn an_spn_the_login_failed_on_is_looked_up_in_the_directory() {
+        let report = integrated_login_looked_up(
+            &[CONTOSO_SPN],
+            Ended::Failed(spn_unknown_failure()),
+            echoing_directory,
+        );
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.field("spnLookup"), Some("found"), "{attempt:#?}");
+        assert_eq!(attempt.field("spnSearched"), None);
+        assert_eq!(
+            attempt.field("spnAccounts"),
+            Some("MSSQLSvc/db01.contoso.com:1433|CONTOSO.COM")
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.certainty == Certainty::Informational
+                    && f.text.id == Some("diagnose.finding.spn_registered_once")),
+            "{:#?}",
+            report.findings
+        );
+
+        let missing: fn(kerberos::SpnQuery) -> kerberos::SpnLookup =
+            |_| kerberos::SpnLookup::Searched {
+                scope: kerberos::Scope::Forest,
+                accounts: Vec::new(),
+            };
+        let report = integrated_login_looked_up(
+            &[CONTOSO_SPN],
+            Ended::Failed(spn_unknown_failure()),
+            missing,
+        );
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.field("spnLookup"), Some("notFound"));
+        assert_eq!(attempt.field("spnLookupScope"), Some("forest"));
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.text.id == Some("diagnose.finding.spn_not_registered_forest"))
+            .expect("no account is a finding");
+        assert_eq!(finding.certainty, Certainty::Confirmed);
+        assert!(
+            finding.text.contains("MSSQLSvc/db01.contoso.com:1433"),
+            "{finding:#?}"
+        );
+        assert!(
+            report
+                .limitations
+                .iter()
+                .any(|l| l.id == Some("diagnose.limitation.spn_lookup_forest")),
+            "{:#?}",
+            report.limitations
+        );
+        // The search said whether the SPN is registered.
+        let ids: Vec<_> = report.limitations.iter().filter_map(|l| l.id).collect();
+        assert!(
+            ids.contains(&"diagnose.limitation.kerberos_delegation_not_inspected"),
+            "{ids:#?}"
+        );
+        assert!(
+            !ids.contains(&"diagnose.limitation.kerberos_spn_not_proof"),
+            "{ids:#?}"
+        );
+
+        let duplicated: fn(kerberos::SpnQuery) -> kerberos::SpnLookup = |_| {
+            let account = |name: &str, kind| kerberos::Account {
+                name: name.to_string(),
+                kind,
+                encryption_types: None,
+            };
+            kerberos::SpnLookup::Searched {
+                scope: kerberos::Scope::Domain,
+                accounts: vec![
+                    account("DB01$", kerberos::AccountKind::Computer),
+                    account("svc_sql", kerberos::AccountKind::User),
+                ],
+            }
+        };
+        let report = integrated_login_looked_up(
+            &[CONTOSO_SPN],
+            Ended::Failed(spn_unknown_failure()),
+            duplicated,
+        );
+        assert_eq!(
+            checked(&report, CheckId::ConnectionAttempt).field("spnLookup"),
+            Some("multiple")
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.certainty == Certainty::Confirmed
+                    && f.text.id == Some("diagnose.finding.spn_registered_more_than_once_domain")),
+            "{:#?}",
+            report.findings
+        );
+        // Both accounts are a JSON list, each pseudonymized.
+        let value: serde_json::Value =
+            serde_json::from_str(&report::json(&report, "dev").unwrap()).unwrap();
+        let attempt = value["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["check"] == "connectionAttempt")
+            .unwrap();
+        let accounts = attempt["spnAccounts"].as_array().expect("a list");
+        assert_eq!(accounts.len(), 2, "{attempt:#?}");
+        assert!(
+            accounts
+                .iter()
+                .all(|a| a.as_str().is_some_and(|a| a.starts_with("user-"))),
+            "{attempt:#?}"
+        );
+        assert_ne!(accounts[0], accounts[1]);
+
+        // A host-based SPN, as the Kerberos library asks for it, is searched
+        // as the directory holds it.
+        let report = integrated_login_looked_up(
+            &[(cs::SPN, "MSSQLSvc@db01.contoso.com")],
+            Ended::Failed(spn_unknown_failure()),
+            echoing_directory,
+        );
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(
+            attempt.field("spnSearched"),
+            Some("MSSQLSvc/db01.contoso.com")
+        );
+        assert_eq!(
+            attempt.field("spnAccounts"),
+            Some("MSSQLSvc/db01.contoso.com|CONTOSO.COM")
+        );
+
+        // The account is a user name: a label wherever the report shows it.
+        let named: fn(kerberos::SpnQuery) -> kerberos::SpnLookup =
+            |_| kerberos::SpnLookup::Searched {
+                scope: kerberos::Scope::Domain,
+                accounts: vec![kerberos::Account {
+                    name: "svc_sql".to_string(),
+                    kind: kerberos::AccountKind::User,
+                    encryption_types: Some(0x18),
+                }],
+            };
+        let report =
+            integrated_login_looked_up(&[CONTOSO_SPN], Ended::Failed(spn_unknown_failure()), named);
+        let text = report::text(&report);
+        let json = report::json(&report, "dev").unwrap();
+        for shown in [&text, &json] {
+            assert!(!shown.contains("svc_sql"), "{shown}");
+        }
+        assert!(
+            text.contains(
+                "SPN registered in the domain on user-2 (user), which allows \
+                 aes128-cts-hmac-sha1-96, aes256-cts-hmac-sha1-96"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("is registered on one account, user-2."),
+            "{text}"
+        );
+    }
+
+    /// The SPN is looked up only when its registration can explain the
+    /// login's outcome: a failure at the login with a code that points at the
+    /// SPN or names no cause, SQL Server's 18452, or Negotiate choosing NTLM;
+    /// never for this computer's own name.
+    #[test]
+    fn an_spn_is_looked_up_only_when_its_registration_can_explain_the_login() {
+        let looked_up = |details: &[(&'static str, &str)], ended: Ended| {
+            let report = integrated_login_looked_up(details, ended, echoing_directory);
+            checked(&report, CheckId::ConnectionAttempt)
+                .field("spnLookup")
+                .map(str::to_string)
+        };
+        let generic = || {
+            Ended::Failed(Error::Security(
+                mssql_tds::security::SecurityError::InternalError("unexpected".to_string()),
+            ))
+        };
+        let untrusted = || Ended::Failed(server_error(18452, "Login failed."));
+        let ntlm = [
+            CONTOSO_SPN,
+            (cs::PACKAGE, "Negotiate"),
+            (cs::NEGOTIATED_PACKAGE, "NTLM"),
+            (cs::NEGOTIATION_COMPLETE, "true"),
+        ];
+        assert_eq!(
+            looked_up(&[CONTOSO_SPN], generic()).as_deref(),
+            Some("found")
+        );
+        assert_eq!(
+            looked_up(&[CONTOSO_SPN], untrusted()).as_deref(),
+            Some("found")
+        );
+        assert_eq!(looked_up(&ntlm, Ended::Connected).as_deref(), Some("found"));
+
+        // Another cause, or nothing to explain.
+        #[cfg(windows)]
+        let skew = mssql_tds::security::SecurityError::InitContextFailed {
+            code: 0x8009_0324,
+            message: "clock skew".to_string(),
+        };
+        #[cfg(unix)]
+        let skew = mssql_tds::security::SecurityError::GssapiError {
+            major: 13 << 16,
+            minor: (-1_765_328_347_i32) as u32,
+            message: "Clock skew too great".to_string(),
+        };
+        assert_eq!(
+            looked_up(&[CONTOSO_SPN], Ended::Failed(Error::Security(skew))),
+            None
+        );
+        assert_eq!(
+            looked_up(
+                &[CONTOSO_SPN],
+                Ended::Failed(server_error(18456, "Login failed."))
+            ),
+            None
+        );
+        assert_eq!(looked_up(&[CONTOSO_SPN], Ended::Connected), None);
+        assert_eq!(looked_up(&[CONTOSO_SPN], timed_out()), None);
+        // This computer's own name: the client retries without an SPN.
+        assert_eq!(
+            looked_up(&[(cs::SPN, "MSSQLSvc/localhost:1433")], generic()),
+            None
+        );
+        assert_eq!(
+            looked_up(&[(cs::SPN, "MSSQLSvc/127.0.0.1:1433")], untrusted()),
+            None
+        );
+
+        // A SQL login.
+        let stages = Stages::new()
+            .add(
+                Stage::Dns,
+                Some(true),
+                0,
+                1,
+                &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+            )
+            .add(
+                Stage::Tcp,
+                Some(true),
+                1,
+                2,
+                &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1433")],
+            )
+            .add(Stage::Prelogin, Some(true), 2, 3, &[])
+            .add(Stage::Login, Some(false), 3, 4, &[]);
+        let report = observed_with(
+            request("tcp:db01,1433", Depth::ConnectionAttempt),
+            stages,
+            Ended::Failed(server_error(18452, "Login failed.")),
+            |diagnosis| diagnosis.spn_directory = Some(echoing_directory),
+        );
+        assert_eq!(
+            checked(&report, CheckId::ConnectionAttempt).field("spnLookup"),
+            None
+        );
+    }
+
+    /// A lookup that could not search, was refused, failed or ran out of
+    /// time claims nothing about the SPN: a limitation says so, and a
+    /// directory's own error follows the attempt's in the error chain.
+    #[test]
+    fn an_spn_lookup_that_said_nothing_claims_nothing() {
+        let refused: fn(kerberos::SpnQuery) -> kerberos::SpnLookup = |_| {
+            kerberos::SpnLookup::Refused(kerberos::SpnFailure::Ldap {
+                code: 49,
+                message: Some("80090308: LdapErr: DSID-0C09056B, data 52e".to_string()),
+            })
+        };
+        let report = integrated_login_looked_up(
+            &[CONTOSO_SPN],
+            Ended::Failed(spn_unknown_failure()),
+            refused,
+        );
+        assert_eq!(
+            checked(&report, CheckId::ConnectionAttempt).field("spnLookup"),
+            Some("refused")
+        );
+        assert!(
+            !report.findings.iter().any(|f| f
+                .text
+                .id
+                .is_some_and(|id| id.starts_with("diagnose.finding.spn_"))),
+            "{:#?}",
+            report.findings
+        );
+        assert!(
+            report
+                .limitations
+                .iter()
+                .any(|l| l.contains("refused the SPN lookup (invalidCredentials)")),
+            "{:#?}",
+            report.limitations
+        );
+        let last = report.errors.last().unwrap();
+        assert_eq!(
+            (last.source, last.code.as_deref(), last.native_error),
+            ("ldap", Some("invalidCredentials"), Some(49))
+        );
+        assert!(!last.superseded);
+        assert!(
+            report
+                .limitations
+                .iter()
+                .any(|l| l.id == Some("diagnose.limitation.kerberos_spn_not_proof")),
+            "{:#?}",
+            report.limitations
+        );
+
+        // Out of time: the lookup shares what is left of the attempt's limit.
+        let slow: fn(kerberos::SpnQuery) -> kerberos::SpnLookup = |query| {
+            std::thread::sleep(Duration::from_millis(1500));
+            echoing_directory(query)
+        };
+        let mut integrated = request("tcp:db01,1433", Depth::ConnectionAttempt);
+        integrated.authentication = Authentication::Integrated;
+        integrated.login_timeout_seconds = 1;
+        let stages = Stages::new()
+            .add(
+                Stage::Dns,
+                Some(true),
+                0,
+                1,
+                &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+            )
+            .add(
+                Stage::Tcp,
+                Some(true),
+                1,
+                2,
+                &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1433")],
+            )
+            .add(Stage::Prelogin, Some(true), 2, 3, &[])
+            .add(Stage::Login, Some(false), 3, 4, &[CONTOSO_SPN]);
+        let started = Instant::now();
+        let report = observed_lasting_with(
+            integrated,
+            stages,
+            Ended::Failed(spn_unknown_failure()),
+            600,
+            |diagnosis| {
+                diagnosis.credentials_lookup = Some(cache_lookup(realm_credentials));
+                diagnosis.spn_directory = Some(slow);
+            },
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1400),
+            "{:?}",
+            started.elapsed()
+        );
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.field("spnLookup"), Some("notChecked"));
+        assert!(attempt.duration_ms.unwrap() <= 1100, "{attempt:#?}");
+        assert!(
+            report
+                .limitations
+                .iter()
+                .any(|l| l.id == Some("diagnose.limitation.spn_lookup_not_checked")),
+            "{:#?}",
+            report.limitations
+        );
+    }
+
+    /// Off Windows, the directory searched is the client's realm's, which
+    /// only credentials with a valid ticket-granting ticket can bind to.
+    #[test]
+    fn only_valid_credentials_give_the_realm_to_search() {
+        let mut credentials = realm_credentials(None);
+        assert_eq!(credentials.bindable_realm(), Some("CONTOSO.COM"));
+        credentials.state = kerberos::State::Expired;
+        assert_eq!(credentials.bindable_realm(), None);
+        credentials.state = kerberos::State::Valid;
+        credentials.principal = Some("testuser".to_string());
+        assert_eq!(credentials.bindable_realm(), None);
+    }
+
     /// What the security context negotiated is reported: the package asked
     /// for, the one negotiated and whether it completed. Negotiate's choice
     /// of NTLM is a finding; why it chose NTLM is a limitation, unless the
@@ -14801,6 +15386,101 @@ pub(crate) mod tests {
                 .findings
                 .iter()
                 .any(|f| f.text.id == Some("diagnose.finding.kerberos_no_tgt")),
+            "{:#?}",
+            report.findings
+        );
+    }
+
+    /// sqlcmd's own driver requests the same SPN: its evidence login only
+    /// says whether the SPN is looked up, and the driver's check reports the
+    /// lookup, of the SPN made for the endpoint when SQL Server refused the
+    /// driver's login with 18452.
+    #[test]
+    fn a_driver_login_has_its_spn_looked_up_after_its_evidence() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let untrusted = || {
+            fake_driver(driver_failure(
+                "28000",
+                18452,
+                "Login failed. The login is from an untrusted domain and cannot be used with \
+                 Integrated authentication.",
+            ))
+            .0
+        };
+
+        let mut integrated = request("tcp:db01,1433", Depth::ConnectionAttempt);
+        integrated.authentication = Authentication::Integrated;
+        integrated.driver = Some(untrusted());
+        let mut diagnosis = Diagnosis::new(integrated);
+        diagnosis.credentials_lookup = Some(cache_lookup(realm_credentials));
+        diagnosis.spn_directory = Some(echoing_directory);
+        let target = input(&mut diagnosis).unwrap();
+        let stages = Stages::new()
+            .add(
+                Stage::Dns,
+                Some(true),
+                0,
+                1,
+                &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+            )
+            .add(
+                Stage::Tcp,
+                Some(true),
+                1,
+                2,
+                &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1433")],
+            )
+            .add(Stage::Prelogin, Some(true), 2, 3, &[])
+            .add(Stage::Login, Some(false), 3, 4, &[CONTOSO_SPN]);
+        runtime.block_on(diagnosis.observe(
+            &target,
+            stages.list,
+            &Ended::Failed(spn_unknown_failure()),
+            10,
+            None,
+            None,
+        ));
+        assert!(diagnosis.evidence_wants_spn_lookup);
+        let evidence = diagnosis
+            .checks
+            .iter()
+            .find(|c| c.id == CheckId::ConnectionAttempt)
+            .unwrap();
+        assert_eq!(evidence.field("spnLookup"), None, "{evidence:#?}");
+
+        let mut integrated = request("tcp:db01.contoso.com,1433", Depth::ConnectionAttempt);
+        integrated.authentication = Authentication::Integrated;
+        let hook = untrusted();
+        integrated.driver = Some(hook.clone());
+        let mut diagnosis = Diagnosis::new(integrated);
+        diagnosis.credentials_lookup = Some(cache_lookup(realm_credentials));
+        diagnosis.spn_directory = Some(echoing_directory);
+        let target = input(&mut diagnosis).unwrap();
+        runtime.block_on(diagnosis.driver_attempt(
+            hook,
+            &target,
+            Some(("db01.contoso.com".to_string(), 1433)),
+        ));
+        let report = diagnosis.finish(0, 0);
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.field("spnLookup"), Some("found"), "{attempt:#?}");
+        let searched = if cfg!(windows) {
+            "MSSQLSvc/db01.contoso.com:1433"
+        } else {
+            "MSSQLSvc/db01.contoso.com"
+        };
+        assert_eq!(
+            attempt.field("spnAccounts"),
+            Some(format!("{searched}|CONTOSO.COM").as_str())
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.text.id == Some("diagnose.finding.spn_registered_once")),
             "{:#?}",
             report.findings
         );

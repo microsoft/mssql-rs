@@ -173,7 +173,13 @@ pub(super) const GSS_C_DELEG_FLAG: GssOmUint32 = 1;
 const GSS_C_REPLAY_FLAG: GssOmUint32 = 4;
 
 /// Request sequence detection
-const GSS_C_SEQUENCE_FLAG: GssOmUint32 = 8;
+pub(super) const GSS_C_SEQUENCE_FLAG: GssOmUint32 = 8;
+
+/// Request confidentiality (sealing) for wrapped messages
+pub(super) const GSS_C_CONF_FLAG: GssOmUint32 = 16;
+
+/// Request integrity (signing) for wrapped messages
+pub(super) const GSS_C_INTEG_FLAG: GssOmUint32 = 32;
 
 // Status type constants for gss_display_status
 /// Major status (calling/routine error)
@@ -268,6 +274,25 @@ type GssOidToStrFn = unsafe extern "C" fn(
     oid_str: GssBufferT,
 ) -> GssOmUint32;
 
+type GssWrapFn = unsafe extern "C" fn(
+    minor_status: *mut GssOmUint32,
+    context_handle: GssCtxIdT,
+    conf_req_flag: i32,
+    qop_req: GssOmUint32,
+    input_message_buffer: GssBufferT,
+    conf_state: *mut i32,
+    output_message_buffer: GssBufferT,
+) -> GssOmUint32;
+
+type GssUnwrapFn = unsafe extern "C" fn(
+    minor_status: *mut GssOmUint32,
+    context_handle: GssCtxIdT,
+    input_message_buffer: GssBufferT,
+    output_message_buffer: GssBufferT,
+    conf_state: *mut i32,
+    qop_state: *mut GssOmUint32,
+) -> GssOmUint32;
+
 /// SPNEGO mechanism OID 1.3.6.1.5.5.2 (RFC 4178), the mechanism HTTP
 /// `Negotiate` (RFC 4559) requires.
 static GSS_SPNEGO_MECHANISM_BYTES: [u8; 6] = [0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
@@ -343,6 +368,10 @@ struct GssapiLibrary {
     gss_display_name: Option<GssDisplayNameFn>,
     /// Optional: only needed to name the mechanism a context used.
     gss_oid_to_str: Option<GssOidToStrFn>,
+    /// Optional: only needed to protect messages after a context is
+    /// established (a SASL security layer).
+    gss_wrap: Option<GssWrapFn>,
+    gss_unwrap: Option<GssUnwrapFn>,
     /// GSS_C_NT_HOSTBASED_SERVICE OID pointer (from library or fallback)
     gss_c_nt_hostbased_service: GssOid,
 }
@@ -420,6 +449,8 @@ impl GssapiLibrary {
         let gss_inquire_cred = load_sym("gss_inquire_cred");
         let gss_display_name = load_sym("gss_display_name");
         let gss_oid_to_str = load_sym("gss_oid_to_str");
+        let gss_wrap = load_sym("gss_wrap");
+        let gss_unwrap = load_sym("gss_unwrap");
 
         // Check all required symbols were loaded
         if gss_init_sec_context.is_null()
@@ -485,6 +516,8 @@ impl GssapiLibrary {
                 .then(|| unsafe { std::mem::transmute(gss_display_name) }),
             gss_oid_to_str: (!gss_oid_to_str.is_null())
                 .then(|| unsafe { std::mem::transmute(gss_oid_to_str) }),
+            gss_wrap: (!gss_wrap.is_null()).then(|| unsafe { std::mem::transmute(gss_wrap) }),
+            gss_unwrap: (!gss_unwrap.is_null()).then(|| unsafe { std::mem::transmute(gss_unwrap) }),
             gss_c_nt_hostbased_service,
         })
     }
@@ -762,6 +795,106 @@ pub(super) fn oid_to_string(oid: GssOid) -> Option<String> {
     let bytes = unsafe { text.to_vec() };
     unsafe { (lib.gss_release_buffer)(&mut minor, &mut text) };
     String::from_utf8(bytes).ok()
+}
+
+/// `message` protected for the peer of `context` with `gss_wrap`: signed,
+/// and sealed when `seal`. The token, and whether it was sealed.
+///
+/// # Safety
+///
+/// `context` is a context this library established.
+pub(super) unsafe fn wrap(
+    context: GssCtxIdT,
+    seal: bool,
+    message: &[u8],
+) -> Result<(Vec<u8>, bool), crate::security::SecurityError> {
+    let lib = get_gssapi_lib().ok_or_else(library_missing)?;
+    let wrap = lib.gss_wrap.ok_or_else(|| unsupported("gss_wrap"))?;
+    let mut minor: GssOmUint32 = 0;
+    let mut input = GssBufferDesc::from_slice(message);
+    let mut output = GssBufferDesc::default();
+    let mut sealed: i32 = 0;
+    // SAFETY: the caller's context; `input` borrows `message`, which the
+    // library only reads, and `output` receives a buffer it allocates.
+    let major = unsafe {
+        wrap(
+            &mut minor,
+            context,
+            i32::from(seal),
+            0, // GSS_C_QOP_DEFAULT
+            &mut input,
+            &mut sealed,
+            &mut output,
+        )
+    };
+    // SAFETY: as in `oid_to_string`.
+    unsafe { take_buffer(lib, major, minor, &mut output) }.map(|token| (token, sealed != 0))
+}
+
+/// The message in `token` from the peer of `context`, verified (and
+/// unsealed) with `gss_unwrap`, and whether it was sealed.
+///
+/// # Safety
+///
+/// `context` is a context this library established.
+pub(super) unsafe fn unwrap(
+    context: GssCtxIdT,
+    token: &[u8],
+) -> Result<(Vec<u8>, bool), crate::security::SecurityError> {
+    let lib = get_gssapi_lib().ok_or_else(library_missing)?;
+    let unwrap = lib.gss_unwrap.ok_or_else(|| unsupported("gss_unwrap"))?;
+    let mut minor: GssOmUint32 = 0;
+    let mut input = GssBufferDesc::from_slice(token);
+    let mut output = GssBufferDesc::default();
+    let mut sealed: i32 = 0;
+    let mut qop: GssOmUint32 = 0;
+    // SAFETY: as in `wrap`.
+    let major = unsafe {
+        unwrap(
+            &mut minor,
+            context,
+            &mut input,
+            &mut output,
+            &mut sealed,
+            &mut qop,
+        )
+    };
+    // SAFETY: as in `oid_to_string`.
+    unsafe { take_buffer(lib, major, minor, &mut output) }.map(|message| (message, sealed != 0))
+}
+
+/// The bytes of `buffer`, which the library filled when `major` is
+/// complete, released once read; otherwise the call's error.
+///
+/// # Safety
+///
+/// `buffer` is empty or was allocated by `lib`.
+unsafe fn take_buffer(
+    lib: &GssapiLibrary,
+    major: GssOmUint32,
+    minor: GssOmUint32,
+    buffer: &mut GssBufferDesc,
+) -> Result<Vec<u8>, crate::security::SecurityError> {
+    let bytes = (major == GSS_S_COMPLETE).then(|| unsafe { buffer.to_vec() });
+    if !buffer.value.is_null() {
+        let mut release_minor: GssOmUint32 = 0;
+        unsafe { (lib.gss_release_buffer)(&mut release_minor, buffer) };
+    }
+    bytes.ok_or_else(|| crate::security::SecurityError::GssapiError {
+        major,
+        minor,
+        message: get_gssapi_error(major, minor),
+    })
+}
+
+fn library_missing() -> crate::security::SecurityError {
+    crate::security::SecurityError::LoadLibraryFailed(
+        "libgssapi_krb5: GSSAPI library not available".to_string(),
+    )
+}
+
+fn unsupported(symbol: &str) -> crate::security::SecurityError {
+    crate::security::SecurityError::NotSupported(format!("libgssapi_krb5 does not export {symbol}"))
 }
 
 /// Gets a single status message from GSSAPI.

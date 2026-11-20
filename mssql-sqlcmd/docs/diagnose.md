@@ -244,6 +244,34 @@ network) or a realm with no KDC are `diagnosed`; a key mismatch, whose causes
 the client cannot tell apart, and a failure without a specific code are
 `inconclusive`. SQL Server's 18452 is reported with a limitation that it alone
 does not establish one cause.
+When the login failed in a way the SPN's registration can explain (a code that
+points at the SPN, such as a principal the KDC has no single account for, a
+target unknown, a key mismatch or no common encryption type, or no specific
+code), SQL Server answered 18452, or Negotiate chose NTLM, diagnose looks the
+SPN up in the directory: one read-only search for exactly that SPN, with the
+user's own credentials, within what is left of the attempt's time limit, and
+never for this computer's own name. A host-based SPN (`MSSQLSvc@host`) is
+searched as the directory holds it (`MSSQLSvc/host`, shown as `spnSearched`).
+On Windows, Windows LDAP (`wldap32.dll`, loaded at run time) binds to the
+forest's global catalog as Windows finds it, signed and sealed; elsewhere, a
+global catalog of the client's realm, else one of its domain controllers, is
+found through Active Directory's DNS records (`_gc._tcp`, then
+`_ldap._tcp.dc._msdcs`), which no other directory has, and bound to with the
+user's Kerberos ticket (SASL GSSAPI), which needs a valid ticket-granting
+ticket. The bind must authenticate the server and agree a sealed (else signed)
+layer before its answer is used: a server that ends the bind sooner, or offers
+neither, is a failed lookup. `spnLookup` is `found`, `notFound` or
+`multiple` within `spnLookupScope` (`forest` or `domain`): no account, or more
+than one, is a confirmed finding, and one account is shown (`spnAccounts`, a
+label) with its `spnAccountType` and, from a domain controller, the
+`spnAccountEncryptionTypes` it allows (`notSet` for none); a global catalog
+does not hold them, and a limitation says so. `noDirectory`, `noCredentials`,
+`refused`, `failed` and `notChecked` (no time left) claim nothing about the
+SPN: a limitation says so, and a directory's own error follows the attempt's
+in the error chain (`"source": "ldap"`). The search does not reach a trusted
+forest and, through a domain controller, only that domain. sqlcmd's own driver
+requests the same SPN: its check gets the lookup when the server refused its
+login with 18452 or the diagnostic client's evidence login failed that way.
 Session validation of an integrated login reads `authScheme`, the scheme SQL
 Server authenticated the login with (`CONNECTIONPROPERTY('auth_scheme')`:
 `KERBEROS`, `NTLM`), in the same query, so it costs no round trip; NTLM is a
