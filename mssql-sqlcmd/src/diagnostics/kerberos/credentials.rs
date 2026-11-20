@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::super::redact::Category;
 use super::super::{Certainty, CheckId, ErrorRecord, Field, LocalizedText};
+use super::ber::{element, field, integer};
 use super::{gss_major_name, hex, krb5_error_name};
 
 /// Where the credentials are kept.
@@ -202,6 +203,19 @@ impl Credentials {
             service_ticket_for_another_host: false,
             failure: None,
         }
+    }
+
+    /// The realm of credentials a Kerberos bind can use: a valid
+    /// ticket-granting ticket's principal's.
+    pub(crate) fn bindable_realm(&self) -> Option<&str> {
+        if self.state != State::Valid {
+            return None;
+        }
+        self.principal
+            .as_deref()?
+            .rsplit_once('@')
+            .map(|(_, realm)| realm)
+            .filter(|realm| !realm.is_empty())
     }
 
     /// From the tickets listed: the ticket-granting ticket for the client's
@@ -752,84 +766,14 @@ pub(crate) fn ticket_encryption(der: &[u8]) -> Option<(i32, Option<u32>)> {
     Some((etype, key_version))
 }
 
-/// The content of the DER element at the start of `input` when its tag is
-/// `tag`, and what follows the element.
-fn element(input: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
-    let (&found, rest) = input.split_first()?;
-    if found != tag {
-        return None;
-    }
-    let (&first, rest) = rest.split_first()?;
-    let (length, rest) = if first < 0x80 {
-        (usize::from(first), rest)
-    } else {
-        let count = usize::from(first & 0x7F);
-        if count == 0 || count > 4 || rest.len() < count {
-            return None;
-        }
-        let (bytes, rest) = rest.split_at(count);
-        let length = bytes
-            .iter()
-            .fold(0usize, |length, byte| (length << 8) | usize::from(*byte));
-        (length, rest)
-    };
-    (rest.len() >= length).then(|| rest.split_at(length))
-}
-
-/// The content of the context-specific field `tag` among a SEQUENCE's.
-fn field(mut fields: &[u8], tag: u8) -> Option<&[u8]> {
-    while let Some(&found) = fields.first() {
-        let (content, rest) = element(fields, found)?;
-        if found == tag {
-            return Some(content);
-        }
-        fields = rest;
-    }
-    None
-}
-
-/// The DER INTEGER at the start of `input`, when it fits 64 bits.
-fn integer(input: &[u8]) -> Option<i64> {
-    let (bytes, _) = element(input, 0x02)?;
-    if bytes.is_empty() || bytes.len() > 8 {
-        return None;
-    }
-    let sign = if bytes[0] & 0x80 == 0 { 0 } else { -1 };
-    Some(
-        bytes
-            .iter()
-            .fold(sign, |value: i64, byte| (value << 8) | i64::from(*byte)),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn der(tag: u8, content: &[u8]) -> Vec<u8> {
-        let mut out = vec![tag];
-        if content.len() < 0x80 {
-            out.push(content.len() as u8);
-        } else {
-            let length = (content.len() as u32).to_be_bytes();
-            let skip = length.iter().take_while(|b| **b == 0).count();
-            out.push(0x80 | (4 - skip) as u8);
-            out.extend_from_slice(&length[skip..]);
-        }
-        out.extend_from_slice(content);
-        out
-    }
+    use super::super::ber::{number, tlv as der};
 
     fn int(value: i64) -> Vec<u8> {
-        let bytes = value.to_be_bytes();
-        let mut start = 0;
-        while start < 7
-            && ((bytes[start] == 0 && bytes[start + 1] & 0x80 == 0)
-                || (bytes[start] == 0xFF && bytes[start + 1] & 0x80 != 0))
-        {
-            start += 1;
-        }
-        der(0x02, &bytes[start..])
+        number(0x02, value)
     }
 
     /// A ticket as a KDC encodes it, with a cipher of `cipher_len` bytes.

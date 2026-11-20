@@ -4258,6 +4258,363 @@
           "expr": "session"
         }
       ]
+    },
+    {
+      "id": "diagnose.error.ldap_result",
+      "message": "LDAP error {code}",
+      "translation": "LDAP error {code}",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.error.spn_lookup_bind_failed",
+      "message": "The Kerberos bind to the directory failed.",
+      "translation": "The Kerberos bind to the directory failed.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.spn_lookup_not_checked",
+      "message": "The SPN could not be looked up in the directory within the time limit; this is not evidence that it is missing or registered more than once.",
+      "translation": "The SPN could not be looked up in the directory within the time limit; this is not evidence that it is missing or registered more than once.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.spn_lookup_no_directory",
+      "message": "No directory was found to look the SPN up in: this computer is in no domain, or no domain controller of the client's realm could be found or reached.",
+      "translation": "No directory was found to look the SPN up in: this computer is in no domain, or no domain controller of the client's realm could be found or reached.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.spn_lookup_no_credentials",
+      "message": "The SPN was not looked up: the client has no valid Kerberos credentials to search the directory with.",
+      "translation": "The SPN was not looked up: the client has no valid Kerberos credentials to search the directory with.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.spn_lookup_refused",
+      "message": "The directory refused the SPN lookup ({code}); this is not evidence that the SPN is missing or registered more than once.",
+      "translation": "The directory refused the SPN lookup ({code}); this is not evidence that the SPN is missing or registered more than once.",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.limitation.spn_lookup_failed",
+      "message": "The SPN lookup did not complete ({code}); this is not evidence that the SPN is missing or registered more than once.",
+      "translation": "The SPN lookup did not complete ({code}); this is not evidence that the SPN is missing or registered more than once.",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.limitation.spn_lookup_forest",
+      "message": "The SPN was searched in the global catalog of the client's forest: an account in a trusted forest is not searched.",
+      "translation": "The SPN was searched in the global catalog of the client's forest: an account in a trusted forest is not searched.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.spn_lookup_domain",
+      "message": "The SPN was searched in the client's domain only: other domains of its forest are not searched.",
+      "translation": "The SPN was searched in the client's domain only: other domains of its forest are not searched.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.spn_lookup_host_canonicalized",
+      "message": "The Kerberos library can canonicalize the host name of a host-based SPN before asking the KDC for it (dns_canonicalize_hostname and rdns in krb5.conf), so the KDC may have been asked for another name than the one searched.",
+      "translation": "The Kerberos library can canonicalize the host name of a host-based SPN before asking the KDC for it (dns_canonicalize_hostname and rdns in krb5.conf), so the KDC may have been asked for another name than the one searched.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.spn_account_etypes_not_in_global_catalog",
+      "message": "A global catalog does not hold an account's supported encryption types (msDS-SupportedEncryptionTypes), so the account's are not shown.",
+      "translation": "A global catalog does not hold an account's supported encryption types (msDS-SupportedEncryptionTypes), so the account's are not shown.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.spn_account_etypes_not_returned",
+      "message": "The directory did not return the account's supported encryption types (msDS-SupportedEncryptionTypes): they are not set, and the KDC uses its defaults for the account, or the client cannot read them.",
+      "translation": "The directory did not return the account's supported encryption types (msDS-SupportedEncryptionTypes): they are not set, and the KDC uses its defaults for the account, or the client cannot read them.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.spn_not_registered_forest",
+      "message": "No account in the client's forest has the SPN {spn}.",
+      "translation": "No account in the client's forest has the SPN {spn}.",
+      "placeholders": [
+        {
+          "id": "spn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "spn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.spn_not_registered_domain",
+      "message": "No account in the client's domain has the SPN {spn}.",
+      "translation": "No account in the client's domain has the SPN {spn}.",
+      "placeholders": [
+        {
+          "id": "spn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "spn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.spn_registered_once",
+      "message": "The SPN {spn} is registered on one account, {account}.",
+      "translation": "The SPN {spn} is registered on one account, {account}.",
+      "placeholders": [
+        {
+          "id": "spn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "spn"
+        },
+        {
+          "id": "account",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "account"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.spn_registered_more_than_once_forest",
+      "message": "The SPN {spn} is registered on more than one account in the client's forest, so the KDC cannot tell which account's key to issue its ticket with.",
+      "translation": "The SPN {spn} is registered on more than one account in the client's forest, so the KDC cannot tell which account's key to issue its ticket with.",
+      "placeholders": [
+        {
+          "id": "spn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "spn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.spn_registered_more_than_once_domain",
+      "message": "The SPN {spn} is registered on more than one account in the client's domain, so the KDC cannot tell which account's key to issue its ticket with.",
+      "translation": "The SPN {spn} is registered on more than one account in the client's domain, so the KDC cannot tell which account's key to issue its ticket with.",
+      "placeholders": [
+        {
+          "id": "spn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "spn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.spn_lookup",
+      "message": "SPN lookup {state}",
+      "translation": "SPN lookup {state}",
+      "placeholders": [
+        {
+          "id": "state",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "state"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.spn_lookup_not_found",
+      "message": "SPN not found in the {scope}",
+      "translation": "SPN not found in the {scope}",
+      "placeholders": [
+        {
+          "id": "scope",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "scope"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.spn_lookup_found",
+      "message": "SPN registered in the {scope} on {account} ({type})",
+      "translation": "SPN registered in the {scope} on {account} ({type})",
+      "placeholders": [
+        {
+          "id": "scope",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "scope"
+        },
+        {
+          "id": "account",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "account"
+        },
+        {
+          "id": "type",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "type"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.spn_lookup_found_encryption",
+      "message": "SPN registered in the {scope} on {account} ({type}), which allows {types}",
+      "translation": "SPN registered in the {scope} on {account} ({type}), which allows {types}",
+      "placeholders": [
+        {
+          "id": "scope",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "scope"
+        },
+        {
+          "id": "account",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "account"
+        },
+        {
+          "id": "type",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "type"
+        },
+        {
+          "id": "types",
+          "string": "%[4]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 4,
+          "expr": "types"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.spn_lookup_found_unset",
+      "message": "SPN registered in the {scope} on {account} ({type}), with no encryption types set",
+      "translation": "SPN registered in the {scope} on {account} ({type}), with no encryption types set",
+      "placeholders": [
+        {
+          "id": "scope",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "scope"
+        },
+        {
+          "id": "account",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "account"
+        },
+        {
+          "id": "type",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "type"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.spn_lookup_multiple",
+      "message": "SPN registered in the {scope} on more than one account: {accounts}",
+      "translation": "SPN registered in the {scope} on more than one account: {accounts}",
+      "placeholders": [
+        {
+          "id": "scope",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "scope"
+        },
+        {
+          "id": "accounts",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "accounts"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.spn_searched",
+      "message": "searched as {spn}",
+      "translation": "searched as {spn}",
+      "placeholders": [
+        {
+          "id": "spn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "spn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.limitation.kerberos_delegation_not_inspected",
+      "message": "Kerberos delegation is not inspected.",
+      "translation": "Kerberos delegation is not inspected.",
+      "placeholders": []
     }
   ]
 }

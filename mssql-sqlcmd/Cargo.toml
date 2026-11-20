@@ -50,7 +50,8 @@ mssql-mock-tds = { path = "../mssql-mock-tds" }
 [target.'cfg(all(target_pointer_width = "64", unix))'.dependencies]
 libc = "0.2"
 
-# diagnostics: the client's operating-system version and its logon session's
-# Kerberos tickets (LSA).
+# diagnostics: the client's operating-system version, its logon session's
+# Kerberos tickets (LSA), and the directory its SPN is looked up in (Windows
+# LDAP, loaded at run time).
 [target.'cfg(all(target_pointer_width = "64", windows))'.dependencies]
-windows-sys = { version = "0.59", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Security_Authentication_Identity", "Win32_System_SystemInformation"] }
+windows-sys = { version = "0.59", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Security_Authentication_Identity", "Win32_System_LibraryLoader", "Win32_System_SystemInformation"] }
