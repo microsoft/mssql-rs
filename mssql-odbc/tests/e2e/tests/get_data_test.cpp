@@ -3790,7 +3790,9 @@ ODBC_TEST_F_MODES(GetDataLiveTest, PlpSubMinimalBufferDrainsWithoutLossAndProbeI
 
 ODBC_TEST_F_MODES(GetDataLiveTest, WcharOddByteBuffersPreserveWholeUnits,
                   odbc_concurrency::kAllModes) {
-    const std::string expected = WorkerToken("odd");
+    std::string expected = WorkerToken("odd");
+    // Leave a short final chunk for the 2- and 3-unit payload capacities.
+    while (expected.size() % 6 != 5) expected.push_back('x');
     for (const std::string type : {"varchar(64)", "nvarchar(64)", "varchar(max)", "nvarchar(max)"}) {
         SCOPED_TRACE(type);
         for (SQLLEN buffer_bytes : {SQLLEN{5}, SQLLEN{7}, SQLLEN{9}}) {
@@ -3799,32 +3801,53 @@ ODBC_TEST_F_MODES(GetDataLiveTest, WcharOddByteBuffersPreserveWholeUnits,
                           SQL_HANDLE_STMT, stmt_);
             ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
-            SQLWCHAR buffer[5];
-            std::memset(buffer, 0x5A, sizeof(buffer));
-            SQLLEN indicator = -1;
-            ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
-                      SQLGetData(stmt_, 1, SQL_C_WCHAR, buffer, buffer_bytes, &indicator))
-                << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
-            EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
-            SQLINTEGER diagnostic_count = -1;
-            ASSERT_SQL_OK(SQLGetDiagField(SQL_HANDLE_STMT, stmt_, 0, SQL_DIAG_NUMBER,
-                                          &diagnostic_count, 0, nullptr),
-                          SQL_HANDLE_STMT, stmt_);
-            EXPECT_EQ(1, diagnostic_count);
+            const size_t payload_capacity =
+                static_cast<size_t>(buffer_bytes) / sizeof(SQLWCHAR) - 1;
+            size_t consumed = 0;
+            for (int call = 0; consumed < expected.size(); ++call) {
+                ASSERT_LT(call, 1000) << "stream did not terminate";
+                SCOPED_TRACE("call " + std::to_string(call) + " at unit " +
+                             std::to_string(consumed));
+                unsigned char buffer[10];
+                std::memset(buffer, 0x5A, sizeof(buffer));
+                SQLLEN indicator = -1;
+                const SQLRETURN rc =
+                    SQLGetData(stmt_, 1, SQL_C_WCHAR, buffer, buffer_bytes, &indicator);
+                const size_t remaining = expected.size() - consumed;
+                const size_t expected_payload = (std::min)(remaining, payload_capacity);
+                if (remaining > payload_capacity) {
+                    ASSERT_EQ(SQL_SUCCESS_WITH_INFO, rc)
+                        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+                    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+                } else {
+                    ASSERT_EQ(SQL_SUCCESS, rc)
+                        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+                }
 
-            const size_t payload_units = static_cast<size_t>(buffer_bytes) / sizeof(SQLWCHAR) - 1;
-            for (size_t i = 0; i < payload_units; ++i) {
-                EXPECT_EQ(static_cast<SQLWCHAR>(expected[i]), buffer[i]);
+                SQLINTEGER diagnostic_count = -1;
+                ASSERT_SQL_OK(SQLGetDiagField(SQL_HANDLE_STMT, stmt_, 0, SQL_DIAG_NUMBER,
+                                              &diagnostic_count, 0, nullptr),
+                              SQL_HANDLE_STMT, stmt_);
+                EXPECT_EQ(remaining > payload_capacity ? 1 : 0, diagnostic_count);
+                if (indicator != SQL_NO_TOTAL) {
+                    EXPECT_EQ(static_cast<SQLLEN>(remaining * sizeof(SQLWCHAR)), indicator);
+                }
+
+                for (size_t i = 0; i < expected_payload; ++i) {
+                    SQLWCHAR unit = 0;
+                    std::memcpy(&unit, buffer + i * sizeof(unit), sizeof(unit));
+                    EXPECT_EQ(static_cast<SQLWCHAR>(expected[consumed + i]), unit);
+                }
+                SQLWCHAR terminator = 0x5A5A;
+                std::memcpy(&terminator, buffer + expected_payload * sizeof(terminator),
+                            sizeof(terminator));
+                EXPECT_EQ(0, terminator);
+                for (size_t i = (expected_payload + 1) * sizeof(SQLWCHAR); i < sizeof(buffer);
+                     ++i) {
+                    EXPECT_EQ(0x5A, buffer[i]) << "byte " << i;
+                }
+                consumed += expected_payload;
             }
-            EXPECT_EQ(0, buffer[payload_units]);
-            const auto* bytes = reinterpret_cast<const unsigned char*>(buffer);
-            for (size_t i = (payload_units + 1) * sizeof(SQLWCHAR); i < sizeof(buffer); ++i) {
-                EXPECT_EQ(0x5A, bytes[i]) << "byte " << i;
-            }
-            if (indicator != SQL_NO_TOTAL) {
-                EXPECT_EQ(static_cast<SQLLEN>(expected.size() * sizeof(SQLWCHAR)), indicator);
-            }
-            EXPECT_EQ(expected.substr(payload_units), ReadWCharDataInChunksAsUtf8(stmt_, 1, 8192));
             SQLCloseCursor(stmt_);
         }
     }
