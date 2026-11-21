@@ -88,6 +88,8 @@ logical connection/cursor ownership and result-delivery responsibilities.
   indeterminate client I/O; later successful draining cannot undo it.
   Marked leases discard locally without protocol cleanup. No release path commits
   or requires graceful logout; errors and timeouts discard synchronously.
+  Unfinished streamed parameter writes are not quiescent: release reports a
+  cleanup error and discards before rollback or capacity return.
 - The Rust preparation layer constructs canonical keys and expected authentication
   bindings from the effective connection settings; Python does not build keys.
   Native checkout owns pooled-context validation, including the zero-recovery

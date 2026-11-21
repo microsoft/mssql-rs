@@ -260,7 +260,7 @@ mod reset_ack_fault {
     /// reset verification; the observer outlives it to prove local retirement.
     pub fn inject_missing_reset_ack(client: &mut TdsClient) -> TdsResult<ResetAckInjection> {
         if !matches!(client.transport, AnyTransport::Network(_))
-            || client.has_open_batch()
+            || client.command_is_busy()
             || client.has_active_transaction()
             || client.reset_pending()
             || client.is_connection_dead()

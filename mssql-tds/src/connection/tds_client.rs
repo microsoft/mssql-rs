@@ -6550,7 +6550,7 @@ impl TdsClient {
     }
 
     /// Returns `true` when an open result batch or streamed write blocks a new command.
-    pub(in crate::connection) fn command_is_busy(&self) -> bool {
+    pub fn command_is_busy(&self) -> bool {
         self.execution_context.has_open_batch()
             || !matches!(self.streamed_write_state, StreamedWriteState::Idle)
     }
@@ -25573,6 +25573,27 @@ mod tests {
     }
 
     // ── ResetConnection ENVCHANGE: full client-side state transition (A1/A3) ──
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn reset_ack_injection_rejects_unfinished_streamed_write() {
+        let mut client = TdsClient::new(
+            AnyTransport::network(create_network_transport_with_data(&[])),
+            crate::handler::handler_factory::create_test_negotiated_settings_internal(),
+            ExecutionContext::new(),
+            ClientContext::with_data_source("tcp:localhost,1433"),
+            Vec::new(),
+        );
+        client
+            .begin_sp_executesql("SELECT @v".into(), vec![streamed_varbinary("@v")], ())
+            .await
+            .unwrap();
+        assert!(!client.has_open_batch());
+        assert!(matches!(
+            crate::test_client_support::inject_missing_reset_ack(&mut client),
+            Err(UsageError(_))
+        ));
+    }
 
     #[cfg(feature = "test-util")]
     #[tokio::test]

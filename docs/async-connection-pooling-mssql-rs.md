@@ -1411,6 +1411,9 @@ results must be verified separately.
 AB#50052 adds `PoolLease::release`, `release_with_deadline` and irreversible
 `mark_discard`. Explicit release drains unread results, then rolls back any
 remaining transaction, and requires a live, quiescent client before check-in.
+An unfinished streamed parameter write is busy even without an open result batch;
+release reports a cleanup error and discards before rollback, rather than
+completing the application's RPC or caching the client.
 One deadline covers drain, rollback and return: the earlier of the caller's
 original close deadline and now plus configured `cleanup_timeout`.
 Acquisition deadlines and cancellation tokens do not become cleanup budgets.

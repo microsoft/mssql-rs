@@ -91,6 +91,13 @@ impl PoolLease {
                     .close_query()
                     .await
                     .map_err(|error| PoolError::Cleanup(Box::new(error)))?;
+                if client.command_is_busy() {
+                    return Err(PoolError::Cleanup(Box::new(
+                        mssql_tds::error::Error::ProtocolError(
+                            "connection has an unfinished command after result drain".into(),
+                        ),
+                    )));
+                }
                 if client.has_active_transaction() {
                     let cancel = OperationCancel(CancelHandle::new());
                     client
@@ -133,7 +140,7 @@ impl PoolLease {
 fn quiescent(client: &TdsClient) -> bool {
     !client.is_connection_dead()
         && !client.reset_pending()
-        && !client.has_open_batch()
+        && !client.command_is_busy()
         && !client.has_active_transaction()
         && !client.is_session_recovery_enabled()
 }

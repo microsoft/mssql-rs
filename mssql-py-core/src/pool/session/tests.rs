@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use mssql_tds::connection::client_context::ClientContext;
+use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags, StreamedSqlType};
 use mssql_tds::test_client_support::*;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
@@ -649,6 +650,60 @@ async fn release_drains_all_results_before_discovering_and_rolling_back_raw_tran
     assert_eq!(reused.client_mut().client_connection_id(), id);
     assert!(quiescent(reused.client_mut()));
     assert_eq!(factory.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn release_rejects_unfinished_streamed_write_before_capacity_handoff() {
+    for in_transaction in [false, true] {
+        let manager = manager(1);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let tokens = if in_transaction {
+            vec![env_change_begin_transaction(42), done_no_more()]
+        } else {
+            vec![]
+        };
+        let client =
+            tds_client_from_tokens_gated(tokens, Arc::new(Semaphore::new(2)), dropped.clone());
+        let mut first = lease(&manager, client).await;
+        if in_transaction {
+            first
+                .client_mut()
+                .execute("BEGIN TRANSACTION".into(), ())
+                .await
+                .unwrap();
+        }
+        first
+            .client_mut()
+            .begin_sp_executesql(
+                "SELECT @v".into(),
+                vec![RpcParameter::data_at_exec(
+                    Some("@v".into()),
+                    StatusFlags::NONE,
+                    StreamedSqlType::VarBinaryMax,
+                )],
+                (),
+            )
+            .await
+            .unwrap();
+        first
+            .client_mut()
+            .write_streamed_chunk(&[1; 8192])
+            .await
+            .unwrap();
+        assert!(!first.client_mut().has_open_batch());
+        assert!(first.client_mut().command_is_busy());
+        let mut waiting = Box::pin(manager.reserve(key(), control(CancellationToken::new())));
+        assert!(poll(waiting.as_mut()).is_pending());
+
+        assert!(
+            matches!(first.release().await, Err(PoolError::Cleanup(ref cause))
+            if matches!(cause.as_ref(), mssql_tds::error::Error::ProtocolError(_)))
+        );
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        let slot = waiting.await.unwrap().unwrap();
+        drop(slot);
+        manager.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]
