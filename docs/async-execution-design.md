@@ -182,7 +182,7 @@ These hold for both native Rust and the Python bridge:
 
 1. **Tasks, not threads, carry queries.** At every `.await` on the network, the thread is released and reused.
 2. **The reactor (epoll/IOCP) wakes the right task** when the server's bytes arrive; any free worker thread resumes it.
-3. **Parallelism scales with connections, not cursors.** One cursor per connection = zero lock contention. Multiple cursors on one connection are serialized until MARS is implemented.
+3. **Parallelism scales with connections, not cursors.** Python async cursors sharing a connection require caller-managed sequencing. Execution raises `RuntimeError` if another cursor owns the active operation or batch; it does not automatically wait.
 4. **Logical ownership and operation claims guard access to the client's mutex.** The mutex serializes one connection's I/O; it does not couple different connections. A mutex alone is not a pooled close/settlement barrier.
 5. **The statement handle is a plain server-side `i32`.** Keep it pinned to its originating connection; no synchronization concern.
 6. **For the existing Python async API:** one shared Tokio runtime + `future_into_py`, with the GIL held at Python-object boundaries. The synchronous API retains `block_on`.
@@ -925,17 +925,19 @@ async fn run_two_queries(
 
 ### 11.2 Concurrency model: connections vs. cursors
 
-There is very little locking, and that is by design.
+Each Python async connection has operation claims guarding its client mutex.
+Independent connections can overlap; cursors sharing a connection must be
+sequenced by the caller.
 
 ```mermaid
 flowchart TB
     subgraph ConnA["Connection A"]
-        MA["Arc-Mutex-TdsClient A"]
+        MA["Logical connection A<br/>operation claims + client mutex"]
         CA["Cursor A1"]
         CA --> MA
     end
     subgraph ConnB["Connection B"]
-        MB["Arc-Mutex-TdsClient B"]
+        MB["Logical connection B<br/>operation claims + client mutex"]
         CB["Cursor B1"]
         CB --> MB
     end
@@ -943,14 +945,15 @@ flowchart TB
     MB -. socket B .-> NET
 ```
 
-- The `Mutex` only serializes access **within a single connection**, because one TCP socket can carry **one request at a time** (MARS — Multiple Active Result Sets — is parsed at login but **not yet implemented**).
+- Operation claims reject a second cursor's execution **before client-mutex access** while another cursor owns an active operation or batch. The Python async API raises `RuntimeError` rather than queueing it. Callers must finish active work and exhaust its batch or close its cursor before another cursor executes.
+- The client mutex protects admitted I/O within one connection; it is not an automatic cursor queue. MARS (Multiple Active Result Sets) is parsed at login but **not yet implemented**.
 - **Across connections there is NO shared lock.** A and B never wait on each other.
 - **Parallelism scales with the number of connections, NOT the number of cursors.**
 
 | Scenario                                           | Result                                                                                                          |
 | -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | **One cursor per connection** (2 conns, 2 cursors) | ✅ Zero contention — fully parallel                                                                              |
-| **Two cursors on one connection**                  | ⚠️ Serialized — the 2nd cursor waits on that connection's `Mutex` until the 1st finishes (they share one socket) |
+| **Two cursors on one connection**                  | ⚠️ Caller-managed sequencing — execution raises `RuntimeError` while another cursor owns the active operation or batch; no automatic waiting |
 | **N independent connections**                      | ✅ N-way parallelism                                                                                             |
 
 > **Rule of thumb:** Want *N* parallel queries → use *N* connections (a connection pool).

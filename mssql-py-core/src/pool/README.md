@@ -23,7 +23,7 @@ For native SQL initialization and reuse, see
 | `PoolConfig` in [config.rs](config.rs) | Validated per-key capacity and queue limits, idle policy and separate acquisition/cleanup/shutdown budgets. Builders return updated settings; they do not reconfigure a running manager. |
 | `AcquireControl` in [control.rs](control.rs) | One caller-owned absolute deadline and cancellation token shared across acquisition stages. It drops interrupted work, but does not supervise detached work or cancel TDS/Python operations for their owners. |
 | `AcquireStage` in [error.rs](error.rs) | Identifies where acquisition timed out; changing stages does not start a new budget. |
-| `PoolKey` in [connection.rs](connection.rs) | Opaque fingerprint that partitions reuse. The caller adapter must supply a fingerprint, never a raw connection string or token; this type only rejects empty input, not noncanonical keys. |
+| `PoolKey` in [connection.rs](connection.rs) | Opaque fingerprint that partitions reuse. The Rust preparation adapter must supply a fingerprint, never a raw connection string or token; this type only rejects empty input, not noncanonical keys. |
 | `AuthBinding` in [connection.rs](connection.rs) | Separate opaque identity/credential-version fingerprint expected for a physical open. Equality is not proof of a real login principal. |
 | `TokenExpiry` and `AuthMetadata` in [connection.rs](connection.rs) | Distinguish non-token authentication, known UTC expiry and unknown raw-token expiry. Metadata carries the binding to compare with the expected one; it does not implement credential refresh or reuse policy. |
 | `ConnectSpec` in [connection.rs](connection.rs) | Immutable per-call effective options and expected authentication binding. Native checkout calls `validate_pool()` before reservation to validate the context and reject nonzero recovery counts, unsupported authentication and Always Encrypted. |
@@ -64,8 +64,13 @@ being installed as shared "current request" state on the factory or scheduler.
 Failed cached candidates are discarded. Retries are bounded by the initial
 candidate count and rejoin FIFO with the original deadline and cancellation
 token; the final replacement can retain its empty reservation for one fresh open.
+The [key contract](../../../docs/async-connection-pooling-mssql-rs.md#71-key-contract)
+assigns canonical key construction to the Rust preparation layer, using the same
+immutable effective settings and authentication binding as physical opening.
+This is an integration responsibility, not part of Deadpool slot scheduling.
 The [Python integration design](../../../docs/async-connection-pooling-mssql-python-integration.md)
-owns key construction, logical connection/cursor ownership and result delivery.
+retains Python's connection-string parsing, authentication integration,
+logical connection/cursor ownership and result-delivery responsibilities.
 
 ## Ownership and cancellation rules
 
@@ -83,7 +88,8 @@ owns key construction, logical connection/cursor ownership and result delivery.
   indeterminate client I/O; later successful draining cannot undo it.
   Marked leases discard locally without protocol cleanup. No release path commits
   or requires graceful logout; errors and timeouts discard synchronously.
-- The caller constructs canonical keys and expected authentication bindings.
+- The Rust preparation layer constructs canonical keys and expected authentication
+  bindings from the effective connection settings; Python does not build keys.
   Native checkout owns pooled-context validation, including the zero-recovery
   restriction; it also checks returned metadata for binding equality and
   non-token authentication before using a client.
