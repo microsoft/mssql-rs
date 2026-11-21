@@ -79,43 +79,54 @@ def test_plans_released_crates(tmp_path, released, expected):
         assert bump.planned_bumps(tmp_path, published) == expected
 
 
-def test_mock_bump_waits_for_published_core(tmp_path, capsys):
+@pytest.mark.parametrize("dependent", bump.TDS_DEPENDENTS)
+def test_dependent_bump_waits_for_published_core(tmp_path, capsys, dependent):
     current = dict.fromkeys(bump.CRATES, "0.1.7")
-    published = {"mssql-tds": set(), "mssql-mock-tds": {"0.1.7"}}
+    published = {crate: set() for crate in bump.CRATES}
+    published[dependent].add("0.1.7")
     with patch.object(bump, "cargo_versions", return_value=current):
         assert bump.planned_bumps(tmp_path, published) == {}
     assert "waiting for its mssql-tds dependency" in capsys.readouterr().out
 
 
-def test_mock_target_follows_core_target(tmp_path):
-    current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.2.0"}
-    published = {"mssql-tds": {"0.2.0"}, "mssql-mock-tds": set()}
+def test_dependent_targets_follow_core_target(tmp_path):
+    current = dict.fromkeys(bump.CRATES, "0.2.0")
+    published = {crate: set() for crate in bump.CRATES}
+    published["mssql-tds"].add("0.2.0")
     with patch.object(bump, "cargo_versions", return_value=current):
-        assert bump.planned_bumps(tmp_path, published) == {
-            "mssql-tds": ("0.2.0", "0.3.0"),
-            "mssql-mock-tds": ("0.2.0", "0.3.0"),
-        }
+        assert bump.planned_bumps(tmp_path, published) == dict.fromkeys(
+            bump.CRATES, ("0.2.0", "0.3.0")
+        )
 
 
-def test_drifted_core_and_mock_versions_fail(tmp_path):
-    current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.1.0"}
-    published = {"mssql-tds": {"0.2.0"}, "mssql-mock-tds": set()}
+@pytest.mark.parametrize("dependent", bump.TDS_DEPENDENTS)
+def test_drifted_core_and_dependent_versions_fail(tmp_path, dependent):
+    current = dict.fromkeys(bump.CRATES, "0.2.0")
+    current[dependent] = "0.1.0"
+    published = {crate: set() for crate in bump.CRATES}
+    published["mssql-tds"].add("0.2.0")
     with patch.object(bump, "cargo_versions", return_value=current):
         with pytest.raises(ValueError, match="must match for a release"):
             bump.planned_bumps(tmp_path, published)
 
 
-def test_aligned_mock_target_already_published_fails(tmp_path):
-    current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.2.0"}
-    published = {"mssql-tds": {"0.2.0"}, "mssql-mock-tds": {"0.3.0"}}
+@pytest.mark.parametrize("dependent", bump.TDS_DEPENDENTS)
+def test_aligned_dependent_target_already_published_fails(tmp_path, dependent):
+    current = dict.fromkeys(bump.CRATES, "0.2.0")
+    published = {crate: set() for crate in bump.CRATES}
+    published["mssql-tds"].add("0.2.0")
+    published[dependent].add("0.3.0")
     with patch.object(bump, "cargo_versions", return_value=current):
-        with pytest.raises(ValueError, match=r"mssql-mock-tds 0\.3\.0 is already published"):
+        with pytest.raises(ValueError, match=rf"{dependent} 0\.3\.0 is already published"):
             bump.planned_bumps(tmp_path, published)
 
 
-def test_mock_ahead_of_core_target_fails(tmp_path):
-    current = {"mssql-tds": "0.2.0", "mssql-mock-tds": "0.4.0"}
-    published = {"mssql-tds": {"0.2.0"}, "mssql-mock-tds": set()}
+@pytest.mark.parametrize("dependent", bump.TDS_DEPENDENTS)
+def test_dependent_ahead_of_core_target_fails(tmp_path, dependent):
+    current = dict.fromkeys(bump.CRATES, "0.2.0")
+    current[dependent] = "0.4.0"
+    published = {crate: set() for crate in bump.CRATES}
+    published["mssql-tds"].add("0.2.0")
     with patch.object(bump, "cargo_versions", return_value=current):
         with pytest.raises(ValueError, match="must match for a release"):
             bump.planned_bumps(tmp_path, published)
@@ -155,7 +166,7 @@ def test_missing_crate_in_cargo_metadata_fails(tmp_path):
     with patch.object(bump.subprocess, "run", return_value=subprocess.CompletedProcess(
         "cargo", 0, stdout=json.dumps({"packages": packages})
     )):
-        with pytest.raises(ValueError, match="mssql-mock-tds not found"):
+        with pytest.raises(ValueError, match="mssql-mock-tds, mssql-rs not found"):
             bump.cargo_versions(tmp_path)
 
 
@@ -320,6 +331,16 @@ def manifests(tmp_path):
         'bytes = "1.11.0"\n',
         encoding="utf-8",
     )
+    (tmp_path / "mssql-rs").mkdir()
+    (tmp_path / "mssql-rs" / "Cargo.toml").write_text(
+        '[package]\nname = "mssql-rs"\nversion = "0.2.0"\nedition = "2024"\n\n'
+        '[dependencies]\n'
+        'mssql-tds = { path = "../mssql-tds", version = "0.2.0", default-features = false }\n\n'
+        '[dev-dependencies]\n'
+        'mssql-tds = { path = "../mssql-tds", version = "0.2.0", '
+        'default-features = false, features = ["test-util"] }\n',
+        encoding="utf-8",
+    )
     (tmp_path / bump.PYPROJECT).parent.mkdir()
     (tmp_path / bump.PYPROJECT).write_text(
         '[build-system]\nrequires = ["maturin"]\n\n'
@@ -338,10 +359,11 @@ def test_reads_versions_from_the_right_table(manifests):
 def test_crate_bump_rewrites_manifests_and_dependency(manifests):
     changes = dict.fromkeys(bump.CRATES, ("0.2.0", "0.3.0"))
     assert bump.apply_crate_bumps(manifests, changes) == [
-        "mssql-mock-tds/Cargo.toml", "mssql-tds/Cargo.toml"
+        "mssql-mock-tds/Cargo.toml", "mssql-rs/Cargo.toml", "mssql-tds/Cargo.toml"
     ]
     core = (manifests / "mssql-tds" / "Cargo.toml").read_text(encoding="utf-8")
     mock = (manifests / "mssql-mock-tds" / "Cargo.toml").read_text(encoding="utf-8")
+    driver = (manifests / "mssql-rs" / "Cargo.toml").read_text(encoding="utf-8")
     assert '[package]\nname = "mssql-tds"\nversion = "0.3.0"' in core
     # A version requirement in [dependencies] must not be mistaken for the package version.
     assert 'tokio = { version = "1.48.0" }' in core
@@ -350,14 +372,20 @@ def test_crate_bump_rewrites_manifests_and_dependency(manifests):
         'mssql-tds = { path = "../mssql-tds", version = "0.3.0", default-features = false }'
         in mock
     )
+    assert '[package]\nname = "mssql-rs"\nversion = "0.3.0"' in driver
+    assert driver.count('mssql-tds = { path = "../mssql-tds", version = "0.3.0"') == 2
 
 
-def test_core_only_bump_still_touches_the_mock_manifest(manifests):
+def test_core_only_bump_still_updates_both_dependent_manifests(manifests):
     paths = bump.apply_crate_bumps(manifests, {"mssql-tds": ("0.2.0", "0.3.0")})
     mock = (manifests / "mssql-mock-tds" / "Cargo.toml").read_text(encoding="utf-8")
+    driver = (manifests / "mssql-rs" / "Cargo.toml").read_text(encoding="utf-8")
     assert "mssql-mock-tds/Cargo.toml" in paths
+    assert "mssql-rs/Cargo.toml" in paths
     assert '[package]\nname = "mssql-mock-tds"\nversion = "0.2.0"' in mock
     assert 'version = "0.3.0", default-features = false' in mock
+    assert '[package]\nname = "mssql-rs"\nversion = "0.2.0"' in driver
+    assert driver.count('mssql-tds = { path = "../mssql-tds", version = "0.3.0"') == 2
 
 
 def test_python_bump_rewrites_pyproject_only(manifests):
@@ -375,11 +403,21 @@ def test_missing_version_field_fails(tmp_path):
         bump.write_table_version(manifest, "package", "0.3.0")
 
 
-def test_missing_mock_dependency_fails(tmp_path):
+@pytest.mark.parametrize("expected_count", [1, 2])
+def test_missing_tds_dependency_fails(tmp_path, expected_count):
     manifest = tmp_path / "Cargo.toml"
     manifest.write_text('[dependencies]\nbytes = "1.11.0"\n', encoding="utf-8")
-    with pytest.raises(ValueError, match="no versioned mssql-tds path dependency"):
-        bump.write_mock_tds_dependency(manifest, "0.3.0")
+    with pytest.raises(ValueError, match="versioned mssql-tds path dependencies, found 0"):
+        bump.write_tds_dependency(manifest, "0.3.0", expected_count)
+
+
+def test_missing_driver_dev_dependency_is_not_partially_rewritten(manifests):
+    manifest = manifests / "mssql-rs" / "Cargo.toml"
+    original = manifest.read_text().split("[dev-dependencies]", 1)[0]
+    manifest.write_text(original)
+    with pytest.raises(ValueError, match="expected 2 versioned mssql-tds"):
+        bump.write_tds_dependency(manifest, "0.3.0", expected_count=2)
+    assert manifest.read_text() == original
 
 
 # --- python track planning --------------------------------------------------

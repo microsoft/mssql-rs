@@ -14,7 +14,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$crateNames = @('mssql-tds', 'mssql-mock-tds')
+$crateNames = @('mssql-tds', 'mssql-mock-tds', 'mssql-rs')
 
 if (Test-Path $OutputDirectory) {
     $existing = @(Get-ChildItem $OutputDirectory -Force)
@@ -39,7 +39,7 @@ try {
             '--exclude-lockfile'
             '--target-dir', $TargetDirectory
         )
-        if ($crateName -eq 'mssql-mock-tds') {
+        if ($crateName -ne 'mssql-tds') {
             # Verification requires its mssql-tds version to exist on crates.io.
             $arguments += '--no-verify'
         }
@@ -79,37 +79,43 @@ try {
     }
 
     $tdsPackageDirectory = Join-Path $verificationDirectory "mssql-tds-$Version"
-    $mockPackageDirectory = Join-Path $verificationDirectory "mssql-mock-tds-$Version"
-    $mockManifestPath = Join-Path $mockPackageDirectory 'Cargo.toml'
-    $mockManifest = Get-Content $mockManifestPath -Raw
-    $dependency = [regex]::Match(
-        $mockManifest,
-        '(?ms)^\[dependencies\.mssql-tds\]\s*$(?<body>.*?)(?=^\[|\z)'
-    )
-    if (-not $dependency.Success) {
-        throw 'Packaged mssql-mock-tds has no mssql-tds dependency'
-    }
-    if ($dependency.Groups['body'].Value -match '(?m)^\s*path\s*=') {
-        throw 'Packaged mssql-mock-tds unexpectedly contains an mssql-tds path dependency'
-    }
+    foreach ($crateName in $crateNames | Where-Object { $_ -ne 'mssql-tds' }) {
+        $packageDirectory = Join-Path $verificationDirectory "$crateName-$Version"
+        $manifestPath = Join-Path $packageDirectory 'Cargo.toml'
+        $manifest = Get-Content $manifestPath -Raw
+        $dependencyKinds = @('dependencies')
+        if ($crateName -eq 'mssql-rs') {
+            $dependencyKinds += 'dev-dependencies'
+        }
+        $relativeTdsPath = [System.IO.Path]::GetRelativePath(
+            $packageDirectory,
+            $tdsPackageDirectory
+        ).Replace('\', '/')
 
-    $relativeTdsPath = [System.IO.Path]::GetRelativePath(
-        $mockPackageDirectory,
-        $tdsPackageDirectory
-    ).Replace('\', '/')
-    $patchedDependency = $dependency.Value.TrimEnd() + "`npath = `"$relativeTdsPath`"`n`n"
-    $mockManifest = $mockManifest.Substring(0, $dependency.Index) +
-        $patchedDependency +
-        $mockManifest.Substring($dependency.Index + $dependency.Length)
-    Set-Content $mockManifestPath $mockManifest -NoNewline
+        foreach ($kind in $dependencyKinds) {
+            $pattern = '(?ms)^\[{0}\.mssql-tds\]\s*$(?<body>.*?)(?=^\[|\z)' -f $kind
+            $dependency = [regex]::Match($manifest, $pattern)
+            if (-not $dependency.Success) {
+                throw "Packaged $crateName has no mssql-tds $kind entry"
+            }
+            if ($dependency.Groups['body'].Value -match '(?m)^\s*path\s*=') {
+                throw "Packaged $crateName unexpectedly contains an mssql-tds path dependency"
+            }
+            $patchedDependency = $dependency.Value.TrimEnd() + "`npath = `"$relativeTdsPath`"`n`n"
+            $manifest = $manifest.Substring(0, $dependency.Index) +
+                $patchedDependency +
+                $manifest.Substring($dependency.Index + $dependency.Length)
+        }
+        Set-Content $manifestPath $manifest -NoNewline
 
-    & cargo check `
-        --manifest-path $mockManifestPath `
-        --target-dir (Join-Path $TargetDirectory 'package-verification-target')
-    if ($LASTEXITCODE -ne 0) {
-        throw "Packaged mssql-mock-tds failed cargo check with exit code $LASTEXITCODE"
+        & cargo check `
+            --manifest-path $manifestPath `
+            --target-dir (Join-Path $TargetDirectory 'package-verification-target')
+        if ($LASTEXITCODE -ne 0) {
+            throw "Packaged $crateName failed cargo check with exit code $LASTEXITCODE"
+        }
+        Write-Host "Verified packaged $crateName against packaged mssql-tds."
     }
-    Write-Host 'Verified packaged mssql-mock-tds against packaged mssql-tds.'
 }
 finally {
     Pop-Location

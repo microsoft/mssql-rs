@@ -96,6 +96,11 @@ pub struct StreamingBulkLoadWriter<'a> {
 }
 
 impl<'a> StreamingBulkLoadWriter<'a> {
+    /// Metadata for a destination column in the current bulk stream.
+    pub fn column_metadata(&self, column_index: usize) -> Option<&BulkCopyColumnMetadata> {
+        self.column_metadata.get(column_index)
+    }
+
     /// Create a new streaming bulk load writer.
     ///
     /// # Arguments
