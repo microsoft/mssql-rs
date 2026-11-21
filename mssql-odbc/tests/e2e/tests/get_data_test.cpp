@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -84,21 +85,27 @@ std::vector<Unit> RepeatUnits(std::initializer_list<Unit> pattern, size_t total)
 // 'expected' is the whole value in target units; the indicator must count down
 // the bytes still available before each call, or be SQL_NO_TOTAL. Binary chunk
 // lengths come from 'expected', never from scanning, since zero is valid data.
+// A byte limit exposes only part of the aligned storage to SQLGetData and
+// checks that all bytes after the terminator retain their sentinel value.
 template <typename Unit>
 void ExpectEveryTruncatedChunkFull(SQLHSTMT stmt, SQLUSMALLINT column, SQLSMALLINT c_type,
                                    const std::vector<Unit>& expected, size_t buffer_units,
-                                   bool terminated = true) {
-    const size_t payload_units = terminated ? buffer_units - 1 : buffer_units;
+                                   bool terminated = true, std::optional<size_t> byte_limit = {}) {
+    const size_t storage_bytes = buffer_units * sizeof(Unit);
+    const size_t read_bytes = byte_limit.value_or(storage_bytes);
+    ASSERT_LE(read_bytes, storage_bytes);
+    ASSERT_GT(read_bytes / sizeof(Unit), terminated ? 1u : 0u);
+    const size_t payload_units = read_bytes / sizeof(Unit) - (terminated ? 1 : 0);
     std::vector<Unit> buffer(buffer_units);
     size_t consumed = 0;
     for (int call = 0; consumed < expected.size(); ++call) {
         ASSERT_LT(call, 1000) << "stream did not terminate";
         SCOPED_TRACE("call " + std::to_string(call) + " at unit " + std::to_string(consumed));
-        std::fill(buffer.begin(), buffer.end(), static_cast<Unit>(0x5A));
+        std::memset(buffer.data(), 0x5A, storage_bytes);
         SQLLEN indicator = -1;
         const SQLRETURN rc =
             SQLGetData(stmt, column, c_type, buffer.data(),
-                       static_cast<SQLLEN>(buffer.size() * sizeof(Unit)), &indicator);
+                       static_cast<SQLLEN>(read_bytes), &indicator);
         const size_t remaining = expected.size() - consumed;
         const size_t expected_payload = (std::min)(remaining, payload_units);
         if (remaining > payload_units) {
@@ -108,6 +115,11 @@ void ExpectEveryTruncatedChunkFull(SQLHSTMT stmt, SQLUSMALLINT column, SQLSMALLI
         } else {
             ASSERT_EQ(SQL_SUCCESS, rc) << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt);
         }
+        SQLINTEGER diagnostic_count = -1;
+        ASSERT_SQL_OK(SQLGetDiagField(SQL_HANDLE_STMT, stmt, 0, SQL_DIAG_NUMBER,
+                                      &diagnostic_count, 0, nullptr),
+                      SQL_HANDLE_STMT, stmt);
+        EXPECT_EQ(remaining > payload_units ? 1 : 0, diagnostic_count);
         // SQLGetData allows SQL_NO_TOTAL when a converting driver cannot
         // cheaply know the converted length; msodbcsql reports it for
         // CP1252 -> SQL_C_WCHAR. Any other value must count down exactly.
@@ -127,12 +139,18 @@ void ExpectEveryTruncatedChunkFull(SQLHSTMT stmt, SQLUSMALLINT column, SQLSMALLI
         EXPECT_TRUE(std::equal(buffer.begin(), buffer.begin() + length,
                                expected.begin() + static_cast<std::ptrdiff_t>(consumed)))
             << "chunk content";
+        if (byte_limit) {
+            const auto* bytes = reinterpret_cast<const unsigned char*>(buffer.data());
+            for (size_t i = (length + 1) * sizeof(Unit); i < storage_bytes; ++i) {
+                EXPECT_EQ(0x5A, bytes[i]) << "byte " << i;
+            }
+        }
         consumed += length;
     }
     SQLLEN indicator = -1;
     EXPECT_EQ(SQL_NO_DATA,
               SQLGetData(stmt, column, c_type, buffer.data(),
-                         static_cast<SQLLEN>(buffer.size() * sizeof(Unit)), &indicator));
+                         static_cast<SQLLEN>(read_bytes), &indicator));
 }
 
 // Streams one SQL_C_CHAR column across as many SQLGetData calls as it takes,
@@ -3781,6 +3799,27 @@ ODBC_TEST_F_MODES(GetDataLiveTest, PlpSubMinimalBufferDrainsWithoutLossAndProbeI
     EXPECT_EQ(RepeatToken("abc", 200), ReadCharDataInChunks(stmt_, 1, 8192));
 
     SQLCloseCursor(stmt_);
+}
+
+ODBC_TEST_F_MODES(GetDataLiveTest, WcharOddByteBuffersPreserveWholeUnits,
+                  odbc_concurrency::kAllModes) {
+    std::string expected = WorkerToken("odd");
+    // Leave a short final chunk for the 2- and 3-unit payload capacities.
+    while (expected.size() % 6 != 5) expected.push_back('x');
+    const std::vector<SQLWCHAR> expected_units(expected.begin(), expected.end());
+    for (const std::string type : {"varchar(64)", "nvarchar(64)", "varchar(max)", "nvarchar(max)"}) {
+        SCOPED_TRACE(type);
+        for (size_t buffer_bytes : {5u, 7u, 9u}) {
+            SCOPED_TRACE(buffer_bytes);
+            ASSERT_SQL_OK(ExecDirect("SELECT CAST('" + expected + "' AS " + type + ")"),
+                          SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+            ExpectEveryTruncatedChunkFull(stmt_, 1, SQL_C_WCHAR, expected_units,
+                                          /*buffer_units=*/5, /*terminated=*/true, buffer_bytes);
+            SQLCloseCursor(stmt_);
+        }
+    }
 }
 
 // The same boundary on the widening path (varchar(max) -> SQL_C_WCHAR), where
