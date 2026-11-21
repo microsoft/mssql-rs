@@ -1384,6 +1384,14 @@ of a fault-injected active transaction. Additional A4 live tests are described
 below; test implementation alone does not establish live execution,
 authentication parity, or support for untested platforms/server topologies.
 
+The dead-idle-socket test uses a second connection to `KILL` the successfully
+returned session, guarded by a unique `CONTEXT_INFO` marker. It requires
+permission to view other sessions and kill the test session (CI uses `sa`).
+Checkout must replace that connection, restore isolation and permit subsequent
+reuse of the replacement. Missing-reset-ACK rejection remains a scripted
+protocol-fault test; a live socket failure is not evidence of a successful
+carrier response with a deliberately omitted acknowledgement.
+
 ### 10.5 A4 private safe return
 
 AB#50052 adds `PoolLease::release`, `release_with_deadline` and irreversible

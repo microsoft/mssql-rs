@@ -294,3 +294,77 @@ async fn live_release_delayed_error_discards_instead_of_caching() {
     replacement.release().await.unwrap();
     owner.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires live SQL Server, DB_HOST/DB_USERNAME/SQL_PASSWORD and permission to KILL/view sessions"]
+async fn live_dead_idle_socket_is_replaced_and_replacement_is_reusable() {
+    let owner = manager();
+    let observer_pool = manager();
+    let spec = spec();
+    let mut first = acquire(
+        &owner,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    let spid = scalar(first.client_mut(), "SELECT @@SPID").await;
+    let rejected_id = first.client_mut().client_connection_id();
+    let marker = uuid::Uuid::new_v4().simple().to_string();
+    exec(first.client_mut(), &format!("SET CONTEXT_INFO 0x{marker}")).await;
+    first.release().await.unwrap();
+
+    let mut observer = acquire(
+        &observer_pool,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    // Guard against killing an unrelated session if SQL Server recycles the SPID.
+    exec(
+        observer.client_mut(),
+        &format!(
+            "IF EXISTS (SELECT 1 FROM sys.dm_exec_sessions \
+             WHERE session_id = {spid} AND context_info = 0x{marker}) \
+             KILL {spid}; \
+             ELSE THROW 50005, 'pool socket test session is no longer present', 1"
+        ),
+    )
+    .await;
+
+    let mut replacement = acquire(
+        &owner,
+        &spec,
+        TransactionIsolationLevel::Serializable.try_into().unwrap(),
+    )
+    .await;
+    let replacement_id = replacement.client_mut().client_connection_id();
+    assert_ne!(replacement_id, rejected_id);
+    assert!(!replacement.client_mut().reset_pending());
+    assert!(!replacement.client_mut().has_open_batch());
+    assert_eq!(
+        scalar(replacement.client_mut(), "SELECT @@TRANCOUNT").await,
+        0
+    );
+    assert_eq!(
+        scalar(
+            replacement.client_mut(),
+            "SELECT CAST(transaction_isolation_level AS int) \
+             FROM sys.dm_exec_sessions WHERE session_id = @@SPID",
+        )
+        .await,
+        4
+    );
+    replacement.release().await.unwrap();
+    let mut reused = acquire(
+        &owner,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    assert_eq!(reused.client_mut().client_connection_id(), replacement_id);
+    assert_eq!(scalar(reused.client_mut(), "SELECT 1").await, 1);
+    reused.release().await.unwrap();
+    observer.release().await.unwrap();
+    owner.shutdown().await.unwrap();
+    observer_pool.shutdown().await.unwrap();
+}

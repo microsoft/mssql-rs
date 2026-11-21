@@ -201,7 +201,10 @@ async fn missing_ack_and_delayed_errors_discard_candidates_before_one_fresh_open
         vec![env_change_reset_connection(), done_more_with_count(0)],
     ] {
         let manager = manager(1);
-        cache(&manager, opened(tds_client_from_tokens(tokens))).await;
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let client =
+            tds_client_from_tokens_gated(tokens, Arc::new(Semaphore::new(20)), dropped.clone());
+        cache(&manager, opened(client)).await;
         let factory = Factory::new(vec![opened(tds_client_from_tokens(vec![done_no_more()]))]);
         let mut lease = manager
             .acquire(
@@ -214,9 +217,33 @@ async fn missing_ack_and_delayed_errors_discard_candidates_before_one_fresh_open
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
         assert!(quiescent(lease.client_mut()));
         assert_eq!(factory.calls.load(Ordering::SeqCst), 1);
     }
+}
+
+#[tokio::test]
+async fn known_dead_candidate_is_replaced_without_sending_a_reset() {
+    let manager = manager(1);
+    let (mut client, sent) = tds_client_from_tokens_capturing(vec![]);
+    client.mark_connection_dead();
+    cache(&manager, opened(client)).await;
+    let factory = Factory::new(vec![opened(tds_client_from_tokens(vec![done_no_more()]))]);
+    let mut lease = manager
+        .acquire(
+            key(),
+            &spec(),
+            &factory,
+            isolation(),
+            control(CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(sent.lock().unwrap().is_empty());
+    assert!(quiescent(lease.client_mut()));
+    assert_eq!(factory.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
