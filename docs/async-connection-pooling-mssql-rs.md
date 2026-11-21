@@ -1388,9 +1388,23 @@ The dead-idle-socket test uses a second connection to `KILL` the successfully
 returned session, guarded by a unique `CONTEXT_INFO` marker. It requires
 permission to view other sessions and kill the test session (CI uses `sa`).
 Checkout must replace that connection, restore isolation and permit subsequent
-reuse of the replacement. Missing-reset-ACK rejection remains a scripted
-protocol-fault test; a live socket failure is not evidence of a successful
+reuse of the replacement. A live socket failure is not evidence of a successful
 carrier response with a deliberately omitted acknowledgement.
+
+The live missing-reset-ACK tests use a `test-util`-only, per-client injector.
+After real network/TLS parsing, it withholds exactly one reset ENVCHANGE from
+the batch response reader, before normal reset verification. Other tokens and
+the remaining request budget are preserved. The tests require evidence that a
+real ACK was intercepted, the normal `ConnectionResetNotAcknowledged` error,
+and destruction of the failed client before one replacement login. A healthy
+control reuses its session, and the replacement must itself remain reusable.
+The injection cannot be installed on a scripted transport or an active client,
+and is absent from production builds.
+
+This is live SQL-backed fault injection, not evidence that SQL Server naturally
+omits the acknowledgement. The existing Windows/macOS native and Linux container
+CI selectors include these `live_` tests; their platform-specific execution
+results must be verified separately.
 
 ### 10.5 A4 private safe return
 

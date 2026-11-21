@@ -1,13 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Test-only helpers for driving a [`TdsClient`] against a scripted sequence of
-//! TDS tokens, without a live server. Gated behind the `test-util` feature so
+//! Test-only helpers for scripted TDS clients and faults in live network clients.
+//! Scripted constructors need no live server. Gated behind the `test-util` feature so
 //! downstream crates (e.g. `mssqlodbc`) can unit-test the code paths that
 //! require a positioned client — statement-wise navigation, no-row results,
 //! end-of-batch — which otherwise are only reachable through end-to-end tests.
 //!
-//! The transport replays the queued tokens for both `receive_token` (result
+//! The scripted transport replays the queued tokens for both `receive_token` (result
 //! boundaries) and `receive_row_into` (row draining, where every queued token
 //! is surfaced as a control token, so a `DONE` terminates the current result
 //! set exactly as it does on the wire). It has no row bytes, so it cannot yield
@@ -191,6 +191,94 @@ use crate::token::tokens::{
     ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, EnvChangeContainer, EnvChangeToken,
     EnvChangeTokenSubType, ErrorToken, InfoToken, Tokens,
 };
+
+#[cfg(feature = "test-util")]
+pub(crate) use reset_ack_fault::ResetAckFilter;
+#[cfg(feature = "test-util")]
+pub use reset_ack_fault::{ResetAckInjection, inject_missing_reset_ack};
+
+#[cfg(feature = "test-util")]
+mod reset_ack_fault {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::*;
+
+    #[derive(Debug, Default)]
+    struct Evidence {
+        suppressed: AtomicUsize,
+        clients_dropped: AtomicUsize,
+    }
+
+    /// Evidence from withholding one decoded ACK from a real network client.
+    #[derive(Debug)]
+    pub struct ResetAckInjection(Arc<Evidence>);
+
+    impl ResetAckInjection {
+        /// Number of real parsed ACKs withheld; at most one per installation.
+        pub fn suppressed(&self) -> usize {
+            self.0.suppressed.load(Ordering::SeqCst)
+        }
+
+        /// Number of owning clients destroyed, recorded after their other fields.
+        pub fn clients_dropped(&self) -> usize {
+            self.0.clients_dropped.load(Ordering::SeqCst)
+        }
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct ResetAckFilter {
+        evidence: Arc<Evidence>,
+        armed: bool,
+    }
+
+    impl ResetAckFilter {
+        pub(crate) fn suppress(&mut self, token: &Tokens) -> bool {
+            if self.armed
+                && matches!(token, Tokens::EnvChange(change)
+                    if change.sub_type == EnvChangeTokenSubType::ResetConnection)
+            {
+                self.armed = false;
+                self.evidence.suppressed.fetch_add(1, Ordering::SeqCst);
+                return true;
+            }
+            false
+        }
+    }
+
+    impl Drop for ResetAckFilter {
+        fn drop(&mut self) {
+            self.evidence.clients_dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Arms one omission at the batch token boundary, after real parsing/TLS.
+    ///
+    /// The server response is otherwise unchanged. The client keeps its normal
+    /// reset verification; the observer outlives it to prove local retirement.
+    pub fn inject_missing_reset_ack(client: &mut TdsClient) -> TdsResult<ResetAckInjection> {
+        if !matches!(client.transport, AnyTransport::Network(_))
+            || client.has_open_batch()
+            || client.has_active_transaction()
+            || client.reset_pending()
+            || client.is_connection_dead()
+            || client.reset_ack_filter.is_some()
+        {
+            return Err(crate::error::Error::UsageError(
+                "reset ACK injection requires a quiet network client without an existing injector"
+                    .into(),
+            ));
+        }
+        let evidence = Arc::new(Evidence::default());
+        client.reset_ack_filter = Some(Box::new(ResetAckFilter {
+            evidence: evidence.clone(),
+            armed: true,
+        }));
+        Ok(ResetAckInjection(evidence))
+    }
+}
 
 /// An opaque, scripted TDS token produced by the constructor helpers in this
 /// module and consumed by [`tds_client_from_tokens`]. It wraps the crate's
