@@ -825,6 +825,10 @@ pub struct TdsClient {
     // Active incremental (streamed) PLP parameter-write state, if a streamed
     // RPC is mid-flight. Idle for the normal atomic send path.
     streamed_write_state: StreamedWriteState,
+
+    // Last field: its Drop records retirement after the transport and client state.
+    #[cfg(feature = "test-util")]
+    pub(crate) reset_ack_filter: Option<Box<crate::test_client_support::ResetAckFilter>>,
 }
 
 /// Runs `fut` bounded by `remaining`, converting an elapsed timeout into
@@ -916,6 +920,8 @@ impl TdsClient {
             #[cfg(test)]
             reconnect_elapsed_for_test: None,
             streamed_write_state: StreamedWriteState::Idle,
+            #[cfg(feature = "test-util")]
+            reset_ack_filter: None,
         }
     }
 
@@ -6284,6 +6290,12 @@ impl TdsClient {
         if let Some(token) = self.parked_token.take() {
             return Ok(*token);
         }
+        #[cfg(feature = "test-util")]
+        if self.reset_ack_filter.is_some() {
+            return self
+                .next_response_token_with_ack_filter(parser_context)
+                .await;
+        }
         let start = self.request_timeout_start();
         let result = self
             .transport
@@ -6294,6 +6306,38 @@ impl TdsClient {
             )
             .await;
         self.accept_response_token(start, result)
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn next_response_token_with_ack_filter(
+        &mut self,
+        parser_context: &ParserContext,
+    ) -> TdsResult<Tokens> {
+        loop {
+            let start = self.request_timeout_start();
+            let result = self
+                .transport
+                .receive_token(
+                    parser_context,
+                    self.remaining_request_timeout,
+                    self.cancel_handle.as_ref(),
+                )
+                .await;
+            if self.reset_pending()
+                && let Ok(token) = &result
+                && self
+                    .reset_ack_filter
+                    .as_mut()
+                    .expect("installed ACK filter")
+                    .suppress(token)
+            {
+                if let Some(start) = start {
+                    self.update_remaining_timeout(start);
+                }
+                continue;
+            }
+            return self.accept_response_token(start, result);
+        }
     }
 
     /// [`next_response_token`](Self::next_response_token) for a procedure-tail
@@ -6556,7 +6600,7 @@ impl TdsClient {
     }
 
     /// Returns `true` when an open result batch or streamed write blocks a new command.
-    pub(in crate::connection) fn command_is_busy(&self) -> bool {
+    pub fn command_is_busy(&self) -> bool {
         self.execution_context.has_open_batch()
             || !matches!(self.streamed_write_state, StreamedWriteState::Idle)
     }
@@ -25579,6 +25623,67 @@ mod tests {
     }
 
     // ── ResetConnection ENVCHANGE: full client-side state transition (A1/A3) ──
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn reset_ack_injection_rejects_unfinished_streamed_write() {
+        let mut client = TdsClient::new(
+            AnyTransport::network(create_network_transport_with_data(&[])),
+            crate::handler::handler_factory::create_test_negotiated_settings_internal(),
+            ExecutionContext::new(),
+            ClientContext::with_data_source("tcp:localhost,1433"),
+            Vec::new(),
+        );
+        client
+            .begin_sp_executesql("SELECT @v".into(), vec![streamed_varbinary("@v")], ())
+            .await
+            .unwrap();
+        assert!(!client.has_open_batch());
+        assert!(matches!(
+            crate::test_client_support::inject_missing_reset_ack(&mut client),
+            Err(UsageError(_))
+        ));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn reset_ack_injection_suppresses_only_one_ack_and_preserves_other_envchanges() {
+        use crate::test_client_support::inject_missing_reset_ack;
+
+        let packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_bytes(&[
+                0xe3, 3, 0, 18, 0, 0, // Reset ACK.
+                0xe3, 3, 0, 1, 0, 0, // Database ENVCHANGE.
+                0xe3, 3, 0, 18, 0, 0, // A second ACK must pass through.
+            ])
+            .build();
+        let mut client = TdsClient::new(
+            AnyTransport::network(create_network_transport_with_data(&packet)),
+            crate::handler::handler_factory::create_test_negotiated_settings_internal(),
+            ExecutionContext::new(),
+            ClientContext::with_data_source("tcp:localhost,1433"),
+            Vec::new(),
+        );
+        let injection = inject_missing_reset_ack(&mut client).unwrap();
+        client.prepare_reset_connection(false);
+        client.transport.as_writer().note_reset_dispatched();
+        let token = client
+            .next_response_token(&ParserContext::None(()))
+            .await
+            .unwrap();
+        assert!(matches!(token, Tokens::EnvChange(change)
+            if change.sub_type == EnvChangeTokenSubType::Database));
+        assert_eq!(injection.suppressed(), 1);
+        let token = client
+            .next_response_token(&ParserContext::None(()))
+            .await
+            .unwrap();
+        assert!(matches!(token, Tokens::EnvChange(change)
+            if change.sub_type == EnvChangeTokenSubType::ResetConnection));
+        assert_eq!(injection.suppressed(), 1);
+        drop(client);
+        assert_eq!(injection.clients_dropped(), 1);
+    }
 
     fn error_token_with_severity(severity: u8) -> crate::token::tokens::ErrorToken {
         crate::token::tokens::ErrorToken {

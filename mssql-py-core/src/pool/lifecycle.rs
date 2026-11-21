@@ -765,13 +765,30 @@ impl<C: Send + 'static> SlotGuard<C> {
         Ok(())
     }
 
-    // A4 will call this only after its awaited quiescence proof; there is no
-    // production clean-return entry point in A2.
+    pub(super) fn cleanup_deadline(&self) -> PoolResult<Instant> {
+        self.pool.check_runtime()?;
+        Instant::now()
+            .checked_add(self.pool.config.cleanup_timeout())
+            .ok_or(PoolError::CleanupTimeout)
+    }
+
     #[cfg(test)]
-    pub(super) fn return_quiescent(mut self) -> PoolResult<()> {
+    pub(super) fn return_quiescent(self) -> PoolResult<()> {
+        let deadline = self.cleanup_deadline()?;
+        self.return_before(deadline)
+    }
+
+    pub(super) fn return_before(mut self, deadline: Instant) -> PoolResult<()> {
+        self.pool.check_runtime()?;
         let mut state = lock(&self.pool.state)?;
+        if Instant::now() >= deadline {
+            return Err(PoolError::CleanupTimeout);
+        }
         if state.accepting && state.generation == self.generation {
             let mut shelf = lock(&self.slot.as_ref().expect("owned slot").cached)?;
+            if Instant::now() >= deadline {
+                return Err(PoolError::CleanupTimeout);
+            }
             if let Some(mut cached) = self.cached.take() {
                 cached.returned = Instant::now();
                 *shelf = Some(cached);

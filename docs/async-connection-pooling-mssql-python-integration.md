@@ -132,14 +132,15 @@ replacement customer-facing API. The complete flow is:
 
 ```text
 customer connection string + supported options
-  -> existing parser and async option validation
-  -> immutable effective context + authentication binding
-  -> canonical opaque pool key + current-call physical-open factory
+  -> Python's existing parser and supported-option adaptation
+  -> Rust validation/default resolution + immutable effective spec/auth binding
+  -> Rust canonical opaque pool key + current-call physical-open factory
   -> native acquire or direct open
 ```
 
 When configured, `acquire_timeout` applies to the complete async connect,
-including Python credential/key preparation, capacity wait, login and isolation
+including Python credential preparation, Rust option resolution/key construction,
+capacity wait, login and isolation
 initialization. With an explicit pool and no per-call override, use that manager's
 configured acquisition budget; its numeric default is TBD in Doc 1 section 4.1.
 Disabling that pool does not restart or remove an already-established deadline.
@@ -272,10 +273,15 @@ reliable awaited cleanup path.
 
 1. Validate options and owning loop; establish the applicable configured
    acquisition deadline under section 2.2.
-2. Resolve authentication binding and immutable effective context. Token-derived
-   keys require a current token before lookup; stable bindings do not.
-3. Build the key in Python exactly once and construct the per-call factory.
-4. Call native `acquire(key, spec, factory, isolation, control)`.
+2. Python parses/adapts supported connection options and supplies the supported
+   authentication inputs. Token-derived keys require a current token before
+   lookup; stable bindings do not.
+3. Rust validates the options and authentication binding, resolves effective
+   defaults, and constructs the immutable spec and per-call factory. It builds
+   the canonical key exactly once from that same spec/binding.
+4. Inside Rust, call `acquire(key, spec, factory, isolation, control)`.
+   The Python-facing native entry point accepts options/authentication inputs,
+   not a caller-supplied key.
    The native adapter checks out a Deadpool slot under the original deadline and
    generation cancellation. It must meet Doc 1 section 5.3's FIFO grant/claim
    contract and exact per-pool `max_waiting`; these are prototype acceptance gates,
@@ -316,12 +322,15 @@ window.
 sequenceDiagram
     participant App
     participant Wrapper as async_query wrapper
+    participant Native as Rust option/key adapter
     participant Pool as native pool
     participant Slots as Deadpool managed slots
     participant Factory as per-call physical factory
     App->>Wrapper: await AsyncConnection.connect(..., pool=pool)
-    Wrapper->>Wrapper: deadline, context, auth binding, key
-    Wrapper->>Pool: acquire
+    Wrapper->>Wrapper: deadline, parsed options, supported auth inputs
+    Wrapper->>Native: connect with options/auth inputs, not a key
+    Native->>Native: validate, resolve defaults, freeze spec, build HMAC key
+    Native->>Pool: acquire(key, spec, factory, isolation, control)
     Pool->>Slots: await capacity slot under deadline/cancellation
     Slots-->>Pool: clean idle client or empty slot
     alt reusable idle client
@@ -331,7 +340,8 @@ sequenceDiagram
         Factory-->>Pool: client + successful-login auth metadata
         Pool->>Pool: isolation SET + complete drain
     end
-    Pool-->>Wrapper: ready unique lease
+    Pool-->>Native: ready unique lease
+    Native-->>Wrapper: logical connection owning lease
     Wrapper-->>App: new logical AsyncConnection
 ```
 
@@ -386,20 +396,40 @@ Closed state prevents reuse regardless of which error is propagated.
 
 ### 5.1 One key authority
 
-Python's async context/key adapter is the **only** key builder; remove the
-conflicting second Rust `build_pool_key` scheme from the earlier design.
-The private native seam accepts a validated opaque key paired with its effective
-spec; do not expose arbitrary keys as a new customer-facing bypass.
+**Approved ownership revision (2026-11-17):** Rust in `mssql-py-core` is the
+**only** authority for effective connection settings and canonical pool keys,
+as specified in Doc 1 section 7.1. This supersedes Python-side key construction;
+there must not be competing Python and Rust builders.
 
-Canonical serialization must be versioned and length-delimited/structured. Parse
-aliases, defaults, escaping, and duplicate-key semantics with the existing
-parser; normalize only fields whose semantics permit it. Do not lowercase
-passwords, database names, tokens, or case-sensitive application values.
+Python retains the customer connection-string entry point, existing parsing and
+supported-option adaptation, Python API compatibility, and exception translation.
+Reuse its alias, escaping, and duplicate-option semantics; do not add a competing
+connection-string parser in Rust for this flow. Rust reuses the backend's
+validation and default-resolution rules to prepare one immutable effective spec
+and authentication binding before pool lookup. Resolve inherited policies such
+as `MultiSubnetFailover` before keying rather than guessing defaults in Python.
+
+Rust constructs the key from that prepared snapshot and supplies the same spec
+to the physical-open factory. Defaults must not be resolved differently after
+keying. The Python-facing native seam accepts parsed options and supported
+authentication inputs, not arbitrary customer keys. No round trip returning
+effective settings to Python solely for fingerprinting is required.
+
+Canonical serialization in Rust must be versioned and
+length-delimited/structured; normalize only fields whose semantics permit it.
+Do not lowercase passwords, database names, tokens, or case-sensitive application
+values.
 
 Use a process-private random HMAC key to fingerprint the canonical descriptor.
-No full descriptor or secret-bearing connection string may be logged. This is a
-new internal key representation, not a statement that the existing sync pool
-already strips credentials safely.
+No plaintext credentials belong in key bytes; no full descriptor or secret-bearing
+connection string may appear in logs, repr/Debug, exceptions, or diagnostics.
+This is a new internal key representation, not a statement that the existing
+sync pool already strips credentials safely.
+
+This is a design requirement, not evidence that native preparation/keying is
+already implemented or exported by a pinned package. Verify the consuming native
+version's contract before integration; any required dependency update is a
+separately approved change. Sync pooling is unchanged.
 
 ### 5.2 Fields that partition reuse
 
@@ -409,8 +439,10 @@ intent/name, encryption/trust/certificate validation, packet size, language and
 other supported login/session defaults, authentication method, principal binding,
 credential version, and any supported `attrs_before` influencing those settings.
 Include authentication authority/cloud and credential-provider configuration.
-The implementation must have an explicit field-to-key test for every accepted
-connection option; this prose list is not a license to ignore newly added fields.
+The implementation must have explicit Rust field-to-key tests for every accepted
+connection option, with Python boundary tests covering parser/adaptation parity.
+Classify every option as partitioning, equivalent, or rejected; this prose list is
+not a license to ignore newly added fields.
 
 Autocommit, requested isolation, query timeout, and logger are per-logical-lease
 settings if they are reliably reapplied/reset and have no hidden physical
@@ -458,8 +490,9 @@ sentinel `0` conflates this case with SQL auth.
 
 Use `azure.identity.aio` for supported async credential flows. Keep the sync
 `auth.py` contract intact; it currently rejects awaitables intentionally.
-Add dedicated async adapters and reuse safe parsing/key helpers, not the
-synchronous `get_token` call path.
+Add dedicated async adapters and reuse safe parsing/authentication helpers, not
+the synchronous `get_token` call path. Forward supported authentication material
+and bindings to Rust; do not fingerprint them in a second Python key builder.
 
 A blocking Python call made on the asyncio loop blocks that loop even if its
 network library releases the GIL. Conversely, not every synchronous HTTP call
@@ -624,7 +657,7 @@ reuse; B2/B3 and the credential gates remain mandatory.
 | B1 | Extend existing async_query wrapper and preserve connection-string/positional compatibility; add explicit AsyncPool and optional per-pool max_waiting |
 | B2 | Replace raw client Arcs with strongly owned logical lease cells across every cursor/transaction/finalizer path; parent tracks cursors weakly |
 | B3 | Add tracked operation/close coordination, deadline composition, result-delivery cleanup and DB-API mapping |
-| B4 | Implement canonical complete keying and SQL/trusted/raw-token policy with proven encoding |
+| B4 | Implement Rust-owned effective-option preparation and canonical complete keying, Python parser/adaptation parity, and SQL/trusted/raw-token policy with proven encoding; retain per-mode rollout gates |
 | B5 | Implement per-mode aio credential/factory bridges, authority validation, expiry capture and explicit cache close |
 | B6 | Demonstrate end-to-end correctness and topology support before enabling each capability |
 
@@ -643,6 +676,7 @@ claim model and a new stored PoolLease alone do not eliminate stale cursor I/O.
 | Ownership | Retained cursor remains usable after del conn; explicit connection close invalidates old cursors; cursor close does not close siblings; final logical-owner Drop discards; no strong reference cycles; old cursor/finalizer cannot touch next borrower's SPID |
 | Cancellation | Before capacity, after assignment before claim, during credential/open/reset/drain, after acquisition before Python delivery, during shutdown; exact capacity, no lost grants and no pool-owned continuation of a cancelled caller's open |
 | Auth/keying | Different SQL usernames/passwords, TLS/database/intent/attrs partition, account switch on hit, token rotation, unknown expiry, credential changes |
+| Canonicalization | Rust key/factory consume the same resolved spec; every accepted option has partition/equivalence/rejection coverage; aliases/order/defaults, inherited MSF, escaping, Unicode and empty/delimiter-like inputs; exact secret semantics, process-private HMAC isolation and diagnostic redaction; Python parsing/adaptation parity |
 | Bridge | Contextvars propagation, callback from Tokio worker, FEDAUTHINFO expiry, ODBC-versus-TDS token encoding, malicious/unexpected authority rejected |
 | Event loops | Cross-loop use rejected, repeated asyncio.run, manager/credential collection, no strong loop references in idle clients |
 | Sync providers | Executor saturation, timed-out callbacks still running, no over-submission after cancellation, late results ignored |
@@ -661,9 +695,9 @@ do not claim reset is free or piggybacks on the first user statement.
 
 | Owner | Implementation responsibility |
 |---|---|
-| Rust pool developers | Deadpool slot adapter, per-key lifecycle/generations, exact admission policy, deadline/cancellation guards, physical accounting, reset/isolation/ACK, idle timestamps and shutdown evidence |
+| Rust pool developers | Effective-option validation/default resolution and the sole canonical HMAC key builder; key/factory spec consistency; Deadpool slot adapter, per-key lifecycle/generations, exact admission policy, deadline/cancellation guards, physical accounting, reset/isolation/ACK, idle timestamps and shutdown evidence |
 | AQE/PyO3 developers | Revocable logical lease cells; update every execute/fetch/transaction/cursor/finalizer path; close barrier and tracked tasks; result-delivery cleanup; no escaped raw client owners |
-| Python API/auth developers | Existing async_query API compatibility, canonical complete key, current-call factory/TaskLocals, per-mode aio bridges, authority/binding validation, credential cache ownership and cancellation |
+| Python API/auth developers | Existing async_query API and parser/adaptation compatibility; supported options/authentication inputs forwarded to Rust without a Python key builder; current-call factory/TaskLocals, per-mode aio bridges, authority/binding validation, credential cache ownership and cancellation |
 | Validation/release developers | Dependency/license review, pinned-version contract tests, Rust/mock/live-SQL evidence, Python event-loop tests, platform/topology gates and workload measurements |
 
 These are areas of responsibility, not independent ownership silos: a release

@@ -19,12 +19,18 @@ mod common;
 
 use std::time::Duration;
 
+use async_trait::async_trait;
 use mssql_tds::connection::tds_client::TdsClient;
+use mssql_tds::core::CancelHandle;
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::message::transaction_management::TransactionIsolationLevel;
+use mssql_tds::test_client_support::{ResetAckInjection, inject_missing_reset_ack};
 use pool::config::PoolConfig;
-use pool::connection::{AuthBinding, ConnectSpec, PoolKey, SqlConnectionFactory};
+use pool::connection::{
+    AuthBinding, ConnectSpec, ConnectionFactory, OpenedConnection, PoolKey, SqlConnectionFactory,
+};
 use pool::control::AcquireControl;
+use pool::error::{OpenError, PoolError};
 use pool::manager::AsyncPoolManager;
 use pool::session::{Isolation, PoolLease};
 use tokio::time::Instant;
@@ -110,7 +116,7 @@ async fn live_fresh_and_reused_sessions_apply_every_isolation_level() {
             "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
         )
         .await;
-        fresh.return_quiescent().unwrap();
+        fresh.release().await.unwrap();
         let mut reused = acquire(&manager, &spec, level.try_into().unwrap()).await;
         assert_eq!(scalar(reused.client_mut(), "SELECT @@SPID").await, spid);
         assert_eq!(scalar(reused.client_mut(), query).await, expected);
@@ -139,7 +145,7 @@ async fn live_checkout_resets_session_state_and_discards_dirty_candidates() {
         "SET LOCK_TIMEOUT 1234; CREATE TABLE #pool_probe (n int)",
     )
     .await;
-    first.return_quiescent().unwrap();
+    first.release().await.unwrap();
     let mut reused = acquire(
         &manager,
         &spec,
@@ -189,4 +195,306 @@ async fn live_checkout_resets_session_state_and_discards_dirty_candidates() {
     );
     drop(replacement);
     manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires live SQL Server and DB_HOST/DB_USERNAME/SQL_PASSWORD"]
+async fn live_release_drains_and_rolls_back_before_same_spid_checkout() {
+    let owner = manager();
+    let observer_pool = manager();
+    let spec = spec();
+    let mut first = acquire(
+        &owner,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    let spid = scalar(first.client_mut(), "SELECT @@SPID").await;
+    let resource = format!("pool_return_{}", uuid::Uuid::new_v4().simple());
+    first
+        .client_mut()
+        .execute(
+            format!(
+                "BEGIN TRANSACTION; \
+                 EXEC sys.sp_getapplock @Resource='{resource}', @LockMode='Exclusive', \
+                 @LockOwner='Transaction', @LockTimeout=0; SELECT 1; SELECT 2"
+            ),
+            (),
+        )
+        .await
+        .unwrap();
+    assert!(first.client_mut().has_open_batch());
+    assert!(first.client_mut().has_active_transaction());
+    let mut observer = acquire(
+        &observer_pool,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    let try_lock = format!(
+        "DECLARE @result int; \
+         EXEC @result = sys.sp_getapplock @Resource='{resource}', @LockMode='Exclusive', \
+         @LockOwner='Session', @LockTimeout=0; SELECT @result"
+    );
+    assert_eq!(scalar(observer.client_mut(), &try_lock).await, -1);
+    first.release().await.unwrap();
+    // Observe rollback before any checkout RESETCONNECTION can mask a dirty return.
+    assert!(scalar(observer.client_mut(), &try_lock).await >= 0);
+    exec(
+        observer.client_mut(),
+        &format!("EXEC sys.sp_releaseapplock @Resource='{resource}', @LockOwner='Session'"),
+    )
+    .await;
+    let mut reused = acquire(
+        &owner,
+        &spec,
+        TransactionIsolationLevel::Serializable.try_into().unwrap(),
+    )
+    .await;
+    assert_eq!(scalar(reused.client_mut(), "SELECT @@SPID").await, spid);
+    assert_eq!(scalar(reused.client_mut(), "SELECT @@TRANCOUNT").await, 0);
+    assert_eq!(
+        scalar(
+            reused.client_mut(),
+            "SELECT CAST(transaction_isolation_level AS int) \
+             FROM sys.dm_exec_sessions WHERE session_id = @@SPID",
+        )
+        .await,
+        4
+    );
+    reused.release().await.unwrap();
+    observer.release().await.unwrap();
+    owner.shutdown().await.unwrap();
+    observer_pool.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires live SQL Server and DB_HOST/DB_USERNAME/SQL_PASSWORD"]
+async fn live_release_delayed_error_discards_instead_of_caching() {
+    let owner = manager();
+    let spec = spec();
+    let mut first = acquire(
+        &owner,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    let id = first.client_mut().client_connection_id();
+    first
+        .client_mut()
+        .execute(
+            "SELECT 1; RAISERROR('safe return delayed error', 16, 1)".into(),
+            (),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(first.release().await, Err(PoolError::Cleanup(_))));
+    let mut replacement = acquire(
+        &owner,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    assert_ne!(replacement.client_mut().client_connection_id(), id);
+    replacement.release().await.unwrap();
+    owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires live SQL Server, DB_HOST/DB_USERNAME/SQL_PASSWORD and permission to KILL/view sessions"]
+async fn live_dead_idle_socket_is_replaced_and_replacement_is_reusable() {
+    let owner = manager();
+    let observer_pool = manager();
+    let spec = spec();
+    let mut first = acquire(
+        &owner,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    let spid = scalar(first.client_mut(), "SELECT @@SPID").await;
+    let rejected_id = first.client_mut().client_connection_id();
+    let marker = uuid::Uuid::new_v4().simple().to_string();
+    exec(first.client_mut(), &format!("SET CONTEXT_INFO 0x{marker}")).await;
+    first.release().await.unwrap();
+
+    let mut observer = acquire(
+        &observer_pool,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    // Guard against killing an unrelated session if SQL Server recycles the SPID.
+    exec(
+        observer.client_mut(),
+        &format!(
+            "IF EXISTS (SELECT 1 FROM sys.dm_exec_sessions \
+             WHERE session_id = {spid} AND context_info = 0x{marker}) \
+             KILL {spid}; \
+             ELSE THROW 50005, 'pool socket test session is no longer present', 1"
+        ),
+    )
+    .await;
+
+    let mut replacement = acquire(
+        &owner,
+        &spec,
+        TransactionIsolationLevel::Serializable.try_into().unwrap(),
+    )
+    .await;
+    let replacement_id = replacement.client_mut().client_connection_id();
+    assert_ne!(replacement_id, rejected_id);
+    assert!(!replacement.client_mut().reset_pending());
+    assert!(!replacement.client_mut().has_open_batch());
+    assert_eq!(
+        scalar(replacement.client_mut(), "SELECT @@TRANCOUNT").await,
+        0
+    );
+    assert_eq!(
+        scalar(
+            replacement.client_mut(),
+            "SELECT CAST(transaction_isolation_level AS int) \
+             FROM sys.dm_exec_sessions WHERE session_id = @@SPID",
+        )
+        .await,
+        4
+    );
+    replacement.release().await.unwrap();
+    let mut reused = acquire(
+        &owner,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    assert_eq!(reused.client_mut().client_connection_id(), replacement_id);
+    assert_eq!(scalar(reused.client_mut(), "SELECT 1").await, 1);
+    reused.release().await.unwrap();
+    observer.release().await.unwrap();
+    owner.shutdown().await.unwrap();
+    observer_pool.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires live SQL Server and DB_HOST/DB_USERNAME/SQL_PASSWORD"]
+async fn live_injected_missing_reset_ack_reports_exact_error_and_retires_client() {
+    let owner = manager();
+    let spec = spec();
+    let mut first = acquire(
+        &owner,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    let injection = inject_missing_reset_ack(first.client_mut()).unwrap();
+    assert_eq!(scalar(first.client_mut(), "SELECT 37").await, 37);
+    assert_eq!(injection.suppressed(), 0);
+    first.client_mut().prepare_reset_connection(false);
+    let error = first
+        .client_mut()
+        .execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE".into(), ())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        mssql_tds::error::Error::ConnectionResetNotAcknowledged
+    ));
+    assert_eq!(injection.suppressed(), 1);
+    assert!(first.client_mut().is_connection_dead());
+    assert_eq!(injection.clients_dropped(), 0);
+    drop(first);
+    assert_eq!(injection.clients_dropped(), 1);
+    owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires live SQL Server and DB_HOST/DB_USERNAME/SQL_PASSWORD"]
+async fn live_injected_missing_reset_ack_discards_before_one_replacement_open() {
+    struct ReplacementFactory<'a> {
+        injection: &'a ResetAckInjection,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ConnectionFactory for ReplacementFactory<'_> {
+        async fn open(
+            &self,
+            spec: &ConnectSpec,
+            cancel: &CancelHandle,
+        ) -> Result<OpenedConnection, OpenError> {
+            assert_eq!(self.injection.suppressed(), 1);
+            assert_eq!(self.injection.clients_dropped(), 1);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            SqlConnectionFactory.open(spec, cancel).await
+        }
+    }
+
+    let owner = manager();
+    let spec = spec();
+    let mut first = acquire(
+        &owner,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    let spid = scalar(first.client_mut(), "SELECT @@SPID").await;
+    first.release().await.unwrap();
+    let mut healthy = acquire(
+        &owner,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    assert_eq!(scalar(healthy.client_mut(), "SELECT @@SPID").await, spid);
+    let rejected_id = healthy.client_mut().client_connection_id();
+    let injection = inject_missing_reset_ack(healthy.client_mut()).unwrap();
+    healthy.release().await.unwrap();
+    assert_eq!(injection.suppressed(), 0);
+    assert_eq!(injection.clients_dropped(), 0);
+    let factory = ReplacementFactory {
+        injection: &injection,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let mut replacement = owner
+        .acquire(
+            PoolKey::new(vec![1].into_boxed_slice()).unwrap(),
+            &spec,
+            &factory,
+            TransactionIsolationLevel::Serializable.try_into().unwrap(),
+            AcquireControl::from_timeout(
+                Instant::now(),
+                Duration::from_secs(30),
+                CancellationToken::new(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(factory.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let replacement_id = replacement.client_mut().client_connection_id();
+    assert_ne!(replacement_id, rejected_id);
+    assert!(!replacement.client_mut().reset_pending());
+    assert!(!replacement.client_mut().has_open_batch());
+    assert_eq!(
+        scalar(
+            replacement.client_mut(),
+            "SELECT CAST(transaction_isolation_level AS int) \
+             FROM sys.dm_exec_sessions WHERE session_id = @@SPID",
+        )
+        .await,
+        4
+    );
+    replacement.release().await.unwrap();
+    let mut reused = acquire(
+        &owner,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    assert_eq!(reused.client_mut().client_connection_id(), replacement_id);
+    assert_eq!(scalar(reused.client_mut(), "SELECT @@TRANCOUNT").await, 0);
+    assert_eq!(injection.suppressed(), 1);
+    assert_eq!(injection.clients_dropped(), 1);
+    reused.release().await.unwrap();
+    owner.shutdown().await.unwrap();
 }

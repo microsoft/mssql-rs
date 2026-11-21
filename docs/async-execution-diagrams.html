@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Async Execution Design — Diagrams</title>
+<style>
+  body { font-family: Segoe UI, Arial, sans-serif; max-width: 1100px; margin: 24px auto; padding: 0 16px; color: #1f2328; }
+  h1 { border-bottom: 2px solid #d0d7de; padding-bottom: 8px; }
+  h2 { margin-top: 40px; border-bottom: 1px solid #d0d7de; padding-bottom: 6px; }
+  .diagram { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 8px; padding: 16px; margin: 16px 0; overflow-x: auto; }
+  .caption { color: #57606a; font-size: 14px; margin: 4px 0 0; }
+</style>
+</head>
+<body>
+<h1>Async Query Execution — Diagrams</h1>
+<p class="caption">Standalone render of the Mermaid diagrams from <code>docs/async-execution-design.md</code>. Requires internet access (loads Mermaid from CDN).</p>
+
+<h2>3.1 Lifecycle of one query (native Rust)</h2>
+<div class="diagram"><pre class="mermaid">
+flowchart TB
+    S1["Phase 1 - RUN: a worker thread runs the task, serializes the query, and writes the bytes to the socket"]
+    S2["Phase 2 - YIELD: the task reaches .await on the socket read and hands the thread back, so it can run other tasks"]
+    S3["Phase 3 - WAIT: no thread is assigned, the Tokio reactor watches the socket for the reply"]
+    S4["Phase 4 - RESUME: reply bytes arrive, the reactor wakes the task, any free thread resumes it and parses the rows"]
+    S1 --> S2 --> S3 --> S4
+</pre></div>
+
+<h2>3.2 Two connections, two cursors — parallel</h2>
+<div class="diagram"><pre class="mermaid">
+sequenceDiagram
+    participant App as async main
+    participant TA as Task A Conn A
+    participant TB as Task B Conn B
+    participant Rt as Tokio Reactor
+    participant SA as SQL Server socket A
+    participant SB as SQL Server socket B
+
+    App->>TA: spawn execute SELECT A
+    App->>TB: spawn execute SELECT B
+    TA->>SA: write query packet
+    TA->>Rt: await read then yield thread
+    TB->>SB: write query packet
+    TB->>Rt: await read then yield thread
+    Note over Rt: Both tasks waiting, threads are FREE
+    SA-->>Rt: rows ready socket A
+    Rt->>TA: wake, free thread resumes
+    TA-->>App: batch A drained, task completes
+    SB-->>Rt: rows ready socket B
+    Rt->>TB: wake, free thread resumes
+    TB-->>App: batch B drained, task completes
+</pre></div>
+
+<h2>4. Concurrency model: connections vs. cursors</h2>
+<div class="diagram"><pre class="mermaid">
+flowchart TB
+    subgraph ConnA["Connection A"]
+        MA["Arc-Mutex-TdsClient A"]
+        CA["Cursor A1"]
+        CA --> MA
+    end
+    subgraph ConnB["Connection B"]
+        MB["Arc-Mutex-TdsClient B"]
+        CB["Cursor B1"]
+        CB --> MB
+    end
+    MA -. socket A .-> NET["Network and SQL Server"]
+    MB -. socket B .-> NET
+</pre></div>
+
+<h2>5.1 Two event loops</h2>
+<div class="diagram"><pre class="mermaid">
+flowchart LR
+    subgraph Py["Python process"]
+        AL["asyncio event loop, single thread, runs coroutines"]
+    end
+    subgraph Rust["Rust pycore native"]
+        TK["Tokio runtime, worker thread pool and reactor"]
+    end
+    AL <-. must cooperate .-> TK
+</pre></div>
+
+<h2>5.2 Layered architecture</h2>
+<div class="diagram"><pre class="mermaid">
+flowchart TB
+    subgraph L1["Layer 1 - Your Python app"]
+        APP["async def main, await asyncio.gather q_a q_b"]
+    end
+    subgraph L2["Layer 2 - asyncio event loop"]
+        LOOP["Python event loop, 1 thread"]
+    end
+    subgraph L3["Layer 3 - pycore pyclass"]
+        CONN["PyAsyncConnection"]
+        CUR["PyAsyncCursor operations call future_into_py"]
+    end
+    subgraph L4["Layer 4 - pyo3-async-runtimes BRIDGE"]
+        BR["Converts Tokio future to Python awaitable, handles GIL and wakers"]
+    end
+    subgraph L5["Layer 5 - Shared Tokio runtime"]
+        RT["Worker threads and Reactor"]
+    end
+    subgraph L6["Layer 6 - mssql-tds core async"]
+        TDS["Arc-Mutex-TdsClient to socket"]
+    end
+    APP --> LOOP --> CUR --> BR --> RT --> TDS
+</pre></div>
+
+<h2>5.3 The bridge contract - Future in, awaitable out</h2>
+<div class="diagram"><pre class="mermaid">
+flowchart LR
+    subgraph YOURS["pycore - you write"]
+        F["async block = a Future<br/>output implements IntoPyObject"]
+    end
+    subgraph LIB["pyo3-async-runtimes - unchanged"]
+        FIP["future_into_py<br/>poll future, convert output, wake loop"]
+    end
+    PYAW["Python awaitable"]
+    F -->|pass Future in| FIP -->|hand awaitable out| PYAW
+</pre></div>
+
+<h2>5.4 Two connections, two cursors — full picture</h2>
+<p class="caption">Combined execute-then-fetch workflow. These are separate awaitables, not one execute operation returning rows.</p>
+<div class="diagram"><pre class="mermaid">
+flowchart LR
+    subgraph PY["Python asyncio loop - 1 thread"]
+        GA["Coroutine A<br/>await execute, then await fetchall"]
+        GB["Coroutine B<br/>await execute, then await fetchall"]
+    end
+    subgraph PC["pycore - mssql-py-core, your binding"]
+        CA["PyAsyncCursor A<br/>read args, GIL held<br/>call future_into_py<br/>fetch converts Python rows, GIL"]
+        CB["PyAsyncCursor B<br/>read args, GIL held<br/>call future_into_py<br/>fetch converts Python rows, GIL"]
+    end
+    subgraph BR["pyo3-async-runtimes - generic bridge"]
+        WA["Awaitable A<br/>links asyncio Future to Tokio task"]
+        WB["Awaitable B<br/>links asyncio Future to Tokio task"]
+    end
+    subgraph TK["Shared Tokio runtime - worker pool"]
+        TA["Task A runs TdsClient A<br/>send SQL, await socket, parse rows"]
+        TB["Task B runs TdsClient B<br/>send SQL, await socket, parse rows"]
+        RE["Reactor - epoll or IOCP<br/>wakes task whose bytes arrived"]
+    end
+    SA["SQL Server<br/>socket A, Conn A"]
+    SB["SQL Server<br/>socket B, Conn B"]
+
+    GA -->|1 call| CA
+    CA -->|2 spawn| WA
+    WA -->|3 run| TA
+    TA -->|4 send SQL| SA
+    GB --> CB --> WB --> TB --> SB
+    SA -.->|5 rows| RE
+    SB -.-> RE
+    RE -.->|6 wake| WA
+    RE -.-> WB
+    WA -.->|7 build objs| CA
+    WB -.-> CB
+    CA -.->|8 resolve| GA
+    CB -.-> GB
+</pre></div>
+
+<h2>5.5 Python thread / task / GIL timeline</h2>
+<p class="caption">Execution and fetching use separate awaitables. Execution positions the cursor; only fetching returns rows.</p>
+<div class="diagram"><pre class="mermaid">
+sequenceDiagram
+    participant PL as Python loop thread
+    participant TW as Tokio worker thread
+    participant SQL as SQL Server
+
+    Note over PL: GIL HELD - read execute or fetch args
+    PL->>TW: spawn Tokio task, return awaitable
+    Note over PL: GIL RELEASED - loop runs other coroutines
+    TW->>SQL: execute sends query, fetch reads results
+    Note over TW: no GIL needed
+    TW->>TW: await socket - thread freed, no GIL
+    SQL-->>TW: result bytes ready
+    TW->>TW: parse result boundary or fetched rows - no GIL
+    Note over TW: fetch converts rows on blocking pool with GIL
+    TW->>PL: complete the awaitable
+    Note over PL: execution positions cursor, fetch returns rows
+</pre></div>
+
+<h2>5.6 PyO3 bridges the two schedulers</h2>
+<div class="diagram"><pre class="mermaid">
+flowchart LR
+    subgraph PyWorld["Python side - ONE thread"]
+        LOOP["asyncio event loop, cooperative scheduler"]
+        FUT["asyncio.Future, the awaitable"]
+    end
+    subgraph Bridge["PyO3 + pyo3-async-runtimes"]
+        SPAWN["future_into_py, spawns Rust future"]
+        WAKE["completion callback, call_soon_threadsafe"]
+    end
+    subgraph TokWorld["Tokio side - MANY threads"]
+        WORK["work-stealing worker pool"]
+        REACT["reactor, epoll or IOCP"]
+    end
+    LOOP --> SPAWN --> WORK
+    WORK --> REACT
+    REACT --> WAKE --> FUT --> LOOP
+</pre></div>
+
+<h2>5.6 Threads, tasks and GIL at each crossing</h2>
+<div class="diagram"><pre class="mermaid">
+sequenceDiagram
+    participant PL as Python loop thread
+    participant BR as PyO3 bridge
+    participant TW as Tokio worker thread
+    participant RE as Tokio reactor
+    participant SQL as SQL Server
+
+    Note over PL: GIL HELD, normal Python execution
+    PL->>BR: call execute or fetch, read arguments
+    Note over PL,BR: brief GIL-bound work, reading Python args into Rust
+    BR->>TW: tokio spawn the Rust future
+    BR-->>PL: return asyncio.Future, pending
+    Note over PL: GIL RELEASED, loop runs other coroutines
+    TW->>SQL: send query or read results, no GIL
+    TW->>RE: await socket, worker thread released
+    Note over RE: no thread, no GIL, just kernel polling
+    SQL-->>RE: response bytes ready
+    RE->>TW: wake task on any free worker
+    TW->>TW: parse TDS tokens into Rust values, no GIL
+    Note over TW: Python attachment for metadata or fetched-row conversion
+    TW->>BR: operation complete with Python-convertible output
+    Note over BR: BLOCK POINT 2, take loop lock, signal wakeup fd
+    BR->>PL: schedule set_result on the loop
+    Note over PL: loop resumes, execution positioned or fetch rows returned
+</pre></div>
+
+<h2>5.6 Result materialization is GIL-bound</h2>
+<div class="diagram"><pre class="mermaid">
+flowchart LR
+    R1["Rust has parsed rows, no GIL"] --> R2["acquire GIL"]
+    R2 --> R3["convert one chunk to Python rows - GIL HELD"]
+    R3 --> R4["release GIL"]
+</pre></div>
+
+<h2>6.1 Existing synchronous and async paths</h2>
+<p class="caption">PyCoreConnection/PyCoreCursor remain synchronous. PyAsyncConnection/PyAsyncCursor already use the shared runtime and awaitable bridge; Python/AQE pool integration is separate work.</p>
+<div class="diagram"><pre class="mermaid">
+flowchart LR
+    N1["cursor.execute"] --> N2["py.detach"]
+    N2 --> N3["runtime.block_on - BLOCKS the Python thread"]
+    N3 --> N4["execute completes, cursor positioned for fetch"]
+</pre></div>
+<div class="diagram"><pre class="mermaid">
+flowchart LR
+    A1["await cursor.execute"] --> A2["future_into_py"]
+    A2 --> A3["returns an awaitable immediately"]
+    A3 --> A4["Tokio runs the query in background"]
+    A4 --> A5["awaitable resolves, Python resumes"]
+</pre></div>
+
+<h2>7. End-to-end walkthrough</h2>
+<div class="diagram"><pre class="mermaid">
+sequenceDiagram
+    participant App as Python app
+    participant EL as asyncio loop
+    participant Cur as pycore Cursor
+    participant Bridge as pyo3-async-runtimes
+    participant Tok as Tokio
+    participant SQL as SQL Server
+
+    App->>EL: await cursor.execute SELECT A
+    EL->>Cur: call execute
+    Cur->>Bridge: future_into_py wraps client.execute
+    Bridge->>Tok: spawn the Rust future
+    Bridge-->>EL: return Python awaitable, NOT done yet
+    Note over EL: GIL RELEASED here - Python loop free, runs other coroutines Query B
+    Tok->>SQL: write query packet - pure Rust, no GIL needed
+    Tok->>Tok: await socket then Tokio thread freed
+    SQL-->>Tok: first result boundary ready, reactor wakes task
+    Tok->>Tok: parse result boundary and metadata
+    Tok->>Bridge: future completed, result ready
+    Bridge->>EL: wake the awaitable
+    EL->>App: execute completes, cursor positioned for fetch
+    App->>EL: await cursor.fetchall
+    EL->>Cur: call fetchall
+    Cur->>Bridge: wrap fetch future
+    Bridge->>Tok: spawn fetch, read and convert rows
+    Tok->>Bridge: fetch completed with Python rows
+    Bridge->>EL: resolve fetch awaitable
+    EL->>App: fetchall returns rows
+</pre></div>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'default',
+    flowchart: { useMaxWidth: false, htmlLabels: true },
+    sequence: { useMaxWidth: false }
+  });
+</script>
+</body>
+</html>
