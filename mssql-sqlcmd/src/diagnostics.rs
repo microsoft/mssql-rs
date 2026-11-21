@@ -455,7 +455,7 @@ impl Request {
 /// The version of the diagnostic coverage matrix this implementation follows
 /// (`docs/diagnose-coverage.md`): which phases are checked, with which signals,
 /// and which coverage states each can report.
-pub const COVERAGE_MATRIX_VERSION: &str = "1.6";
+pub const COVERAGE_MATRIX_VERSION: &str = "1.7";
 
 /// The link to driver-tracing guidance for `sqlcmd diagnose`, given when the
 /// client's own evidence cannot explain a failure. It is a Microsoft FWLink so
@@ -2213,15 +2213,7 @@ impl Diagnosis {
             self.instance_not_looked_up(target);
             None
         } else {
-            let pipe_tried = primary.and_then(|g| g.pipe);
-            self.instance_resolution(
-                target,
-                lookup,
-                tcp.is_some(),
-                not_tcp.clone(),
-                pipe_tried,
-                timed_out,
-            )
+            self.instance_resolution(target, lookup, tcp.is_some(), not_tcp.clone(), timed_out)
         };
         // SQL Server Browser answered, and nothing was tried after it: the
         // attempt ended (its time limit spent on the lookup, say) before the
@@ -2234,15 +2226,13 @@ impl Diagnosis {
             None
         } else if let Some(port) = lookup_port.filter(|_| target.protocol.uses_tcp()) {
             Some(Unreached::Tcp(port))
-        } else if self.windows
-            && (target.protocol == Protocol::NamedPipe
-                || (target.protocol == Protocol::Default && lookup_pipe.is_some()))
-        {
-            Some(Unreached::Pipe(
-                lookup_pipe.map_or_else(|| standard_pipe(target), str::to_string),
-            ))
         } else {
-            None
+            lookup_pipe
+                .filter(|_| {
+                    self.windows
+                        && matches!(target.protocol, Protocol::NamedPipe | Protocol::Default)
+                })
+                .map(|pipe| Unreached::Pipe(pipe.to_string()))
         };
         let tcp_blocks = if self.wants(Depth::NetworkReachability) {
             let blocked = lookup_blocks
@@ -2734,7 +2724,6 @@ impl Diagnosis {
         lookup: Option<&Step>,
         over_tcp: bool,
         not_tcp: Option<Skip>,
-        pipe_tried: Option<&Step>,
         timed_out: bool,
     ) -> Option<Skip> {
         let id = CheckId::InstanceResolution;
@@ -2789,34 +2778,28 @@ impl Diagnosis {
                 .fields
                 .push(Field::plain(BROWSER_REQUEST, connect_stage::REQUEST_DAC));
         }
-        // An explicit TCP target needs a TCP port: an answer that lists only
-        // a pipe gives it none.
-        let no_tcp_port = step.ok == Some(true)
-            && target.protocol == Protocol::Tcp
-            && step.detail(connect_stage::PORT).is_none();
-        if step.ok == Some(true) && !no_tcp_port {
+        // An explicit transport needs its own endpoint from the answer: a TCP
+        // port for `tcp:`, a pipe for `np:`. The client never falls back to
+        // the instance's standard pipe, as SNI does not: an answer without a
+        // pipe leaves `np:` nothing to open.
+        let no_endpoint = step.ok == Some(true)
+            && match target.protocol {
+                Protocol::Tcp => step.detail(connect_stage::PORT).is_none(),
+                Protocol::NamedPipe => step.detail(connect_stage::PIPE_PATH).is_none(),
+                _ => false,
+            };
+        if step.ok == Some(true) && !no_endpoint {
             if let Some(port) = step.detail(connect_stage::PORT) {
                 check.fields.push(Field::plain("port", port));
             }
-            // The pipe SQL Server Browser listed or, for np: without one,
-            // the instance's standard pipe the client opens next, whether
-            // or not it opened (and before it is tried, after a stop at
-            // resolution).
-            let pipe = match step.detail(connect_stage::PIPE_PATH) {
-                Some(pipe) => Some((pipe.to_string(), "sqlBrowser")),
-                None if target.protocol == Protocol::NamedPipe => Some((
-                    pipe_tried
-                        .and_then(|tried| tried.detail(connect_stage::PIPE_PATH))
-                        .map_or_else(|| standard_pipe(target), str::to_string),
-                    "standard",
-                )),
-                None => None,
-            };
-            if let Some((pipe, source)) = pipe {
+            // The pipe SQL Server Browser listed, which the client opens
+            // next, whether or not it opened (and before it is tried, after a
+            // stop at resolution).
+            if let Some(pipe) = step.detail(connect_stage::PIPE_PATH) {
                 check
                     .fields
-                    .push(Field::identifier("pipe", pipe, Category::Pipe));
-                check.fields.push(Field::plain("pipeSource", source));
+                    .push(Field::identifier("pipe", pipe.to_string(), Category::Pipe));
+                check.fields.push(Field::plain("pipeSource", "sqlBrowser"));
             }
             self.checks.push(check);
             // The port that did not connect, again: the client does not try
@@ -2875,7 +2858,7 @@ impl Diagnosis {
             Skip::BlockedBy(id)
         };
         let code = match step.detail(connect_stage::RESULT) {
-            _ if no_tcp_port => "noTcpPort",
+            _ if no_endpoint => "noTcpPort",
             _ if step.abandoned() && timed_out => "timedOut",
             Some(connect_stage::NO_ENDPOINT) => "noTcpPort",
             Some(code) => code,
@@ -3646,12 +3629,12 @@ impl Diagnosis {
     }
 
     /// The transports the client moved past (shared memory that did not
-    /// open, a TCP path that failed, without a prefix; for `np:host\instance`
-    /// the pipe SQL Server Browser listed, before the standard pipe; for a
-    /// default instance's dedicated administrator connection, port 1434
-    /// before its DAC port): an informational finding each, and their errors
-    /// kept as evidence, marked superseded, as a normal run reports only the
-    /// last transport's.
+    /// open, a TCP path that failed, without a prefix; for a default
+    /// instance's dedicated administrator connection, port 1434 before its
+    /// DAC port): an informational finding each, and their errors kept as
+    /// evidence, marked superseded, as a normal run reports only the last
+    /// transport's. `np:` is no protocol order: its one pipe is the
+    /// connection's.
     fn moved_past(
         &mut self,
         target: &Target,
@@ -3692,24 +3675,7 @@ impl Diagnosis {
                     let reason_english = reason.render("en-US");
                     let next_arg = LocalizedArg::message("next", next_id, next_name);
                     let reason_arg = LocalizedArg::localized_text("reason", &reason);
-                    let finding = if target.protocol == Protocol::NamedPipe {
-                        // `np:` is no protocol order: the client falls back
-                        // from the pipe the Browser listed to the instance's
-                        // standard pipe.
-                        let transport = group.protocol().name();
-                        LocalizedText::new_with_args(
-                            "diagnose.finding.pipe_instance_tries_standard_pipe",
-                            format!(
-                                "The {transport} transport did not open ({reason_english}); for \
-                                 a named instance over named pipes sqlcmd then tries the \
-                                 instance's standard pipe, checked below."
-                            ),
-                            vec![
-                                LocalizedArg::text("transport", transport.to_string()),
-                                reason_arg,
-                            ],
-                        )
-                    } else if group.protocol() == Protocol::SharedMemory {
+                    let finding = if group.protocol() == Protocol::SharedMemory {
                         LocalizedText::new_with_args(
                             "diagnose.finding.shared_memory_not_opened",
                             format!(
@@ -3822,21 +3788,7 @@ impl Diagnosis {
                         let reason_arg = LocalizedArg::localized_text("reason", &reason);
                         let next_arg = LocalizedArg::message("next", next_id, next_name);
                         let transport = group.protocol().name();
-                        let finding = if target.protocol == Protocol::NamedPipe {
-                            LocalizedText::new_with_args(
-                                "diagnose.finding.pipe_instance_attempt_failed",
-                                format!(
-                                    "The {transport} transport opened, but the connection \
-                                     attempt over it failed ({reason_english}); for a named \
-                                     instance over named pipes sqlcmd then tries the instance's \
-                                     standard pipe, checked below."
-                                ),
-                                vec![
-                                    LocalizedArg::text("transport", transport.to_string()),
-                                    reason_arg,
-                                ],
-                            )
-                        } else if group.protocol() == Protocol::SharedMemory {
+                        let finding = if group.protocol() == Protocol::SharedMemory {
                             LocalizedText::new_with_args(
                                 "diagnose.finding.shared_memory_attempt_failed",
                                 format!(
@@ -6309,25 +6261,8 @@ fn own_timeout(text: &LocalizedText) -> Error {
 enum Unreached<'a> {
     /// The TCP port the answer gave.
     Tcp(&'a str),
-    /// The pipe the client opens next: the one the answer gave, or for
-    /// `np:` without one the instance's standard pipe.
+    /// The pipe the answer gave, which the client opens next.
     Pipe(String),
-}
-
-/// The pipe the client opens for `np:host\instance` when SQL Server Browser
-/// gives none: the instance's standard pipe, on `.` for this computer.
-fn standard_pipe(target: &Target) -> String {
-    let server = if target.is_local() {
-        "."
-    } else {
-        target.host.as_str()
-    };
-    match target.instance.as_deref() {
-        Some(instance) if !instance.eq_ignore_ascii_case("default") => {
-            format!(r"\\{server}\pipe\MSSQL${instance}\sql\query")
-        }
-        _ => format!(r"\\{server}\pipe\sql\query"),
-    }
 }
 
 /// The host and port the client makes its SPN from, for the transport
@@ -13775,8 +13710,6 @@ pub(crate) mod tests {
         };
         for (server, pipe) in [
             (r"np:db01\SQL2022", Some(listed)),
-            // Without a pipe in the answer, `np:` opens the standard one.
-            (r"np:db01\SQL2022", None),
             (r"db01\SQL2022", Some(listed)),
         ] {
             let mut short = request(server, Depth::SessionValidation);
@@ -14219,9 +14152,6 @@ pub(crate) mod tests {
         assert!(text.contains(r"db01\SQL2022: port 50001"), "{text}");
     }
 
-    /// The standard pipe of `np:db01\SQL2022`.
-    const STANDARD_PIPE: &str = r"\\db01\pipe\MSSQL$SQL2022\sql\query";
-
     /// A Browser answer for `db01\SQL2022` that lists a TCP port but no pipe.
     fn answered_with_a_port_only() -> Stages {
         Stages::new().add(
@@ -14238,59 +14168,58 @@ pub(crate) mod tests {
         )
     }
 
-    /// Instance resolution names the standard pipe, not the unused port.
-    fn assert_resolved_to_the_standard_pipe(report: &Report) {
-        let lookup = checked(report, CheckId::InstanceResolution);
-        assert_eq!(lookup.coverage, Coverage::Passed, "{report:#?}");
-        assert_eq!(lookup.field("pipe"), Some(STANDARD_PIPE), "{lookup:#?}");
-        assert_eq!(lookup.field("pipeSource"), Some("standard"));
-        let text = report::text(report);
-        assert!(
-            text.contains(&format!(r"db01\SQL2022: pipe {STANDARD_PIPE}")),
-            "{text}"
-        );
-        assert!(!text.contains("port 50001"), "{text}");
-    }
-
-    /// `np:host\instance` whose Browser answer lists a TCP port but no pipe,
-    /// stopped at resolution, before the pipe is tried: the instance resolves
-    /// to the standard pipe the client opens next, not the unused port.
+    /// `np:host\instance` whose Browser answer lists a TCP port but no pipe:
+    /// the client has no pipe to open, as SNI has none (it never falls back
+    /// to the instance's standard pipe). Instance resolution found no usable
+    /// pipe, the checks after it are blocked, no port is asked for, and the
+    /// error reads as SNI's error 28. At every depth: the client stops as
+    /// soon as the answer leaves no transport.
     #[test]
-    fn a_pipe_instance_resolved_without_a_listed_pipe_reads_as_its_standard_pipe() {
-        let report = observed(
-            request(r"np:db01\SQL2022", Depth::EndpointResolution),
-            answered_with_a_port_only(),
-            Ended::Stopped,
-        );
-        assert_resolved_to_the_standard_pipe(&report);
-    }
-
-    /// The same answer, and the standard pipe then failed to open: the
-    /// instance still resolves to that pipe, and the reachability check
-    /// reports it on its own transport.
-    #[test]
-    fn a_standard_pipe_that_failed_to_open_is_still_the_instance_pipe() {
-        let failed_open = answered_with_a_port_only().add(
-            Stage::Pipe,
-            Some(false),
-            3,
-            5,
-            &[
-                (cs::PIPE_PATH, STANDARD_PIPE),
-                (cs::OS_ERROR, "2"),
-                (cs::ERROR, "The system cannot find the file specified."),
-            ],
-        );
-        let report = observed(
-            request(r"np:db01\SQL2022", Depth::NetworkReachability),
-            failed_open,
-            Ended::Failed(Error::Io(std::io::Error::from_raw_os_error(2))),
-        );
-        assert_resolved_to_the_standard_pipe(&report);
-        let tcp = checked(&report, CheckId::TcpConnect);
-        assert_eq!(tcp.field("transport"), Some("namedPipe"), "{tcp:#?}");
-        assert_eq!(tcp.field("pipe"), Some(STANDARD_PIPE));
-        assert_ne!(report.exit_code(), 0);
+    fn a_pipe_instance_whose_browser_lists_no_pipe_has_no_usable_pipe() {
+        for depth in [Depth::EndpointResolution, Depth::SessionValidation] {
+            let report = observed(
+                request(r"np:db01\SQL2022", depth),
+                answered_with_a_port_only(),
+                Ended::Failed(Error::ConnectionError(
+                    "Server doesn't support requested protocol".to_string(),
+                )),
+            );
+            let lookup = checked(&report, CheckId::InstanceResolution);
+            assert_eq!(
+                lookup.coverage,
+                Coverage::Diagnosed,
+                "{depth:?}: {report:#?}"
+            );
+            assert_eq!(lookup.field("result"), Some("noTcpPort"));
+            assert_eq!(lookup.field("pipe"), None, "{lookup:#?}");
+            assert_eq!(lookup.field("pipeSource"), None);
+            assert_eq!(lookup.field(REQUIRES), None);
+            assert!(
+                report.findings.iter().any(|f| f.text.render("en-US")
+                    == "SQL Server Browser on db01 gave no usable pipe for instance SQL2022: \
+                        it answered but listed no endpoint the client can use."),
+                "{depth:?}: {:#?}",
+                report.findings
+            );
+            let text = report::text(&report);
+            assert!(text.contains(r"db01\SQL2022: no usable pipe"), "{text}");
+            assert!(!text.contains("standard pipe"), "{text}");
+            assert!(!text.contains("port 50001"), "{text}");
+            assert!(
+                error_lines(&text)[0].contains(
+                    "SQL Server Network Interfaces: Server doesn't support requested protocol \
+                     [xFFFFFFFF]."
+                ),
+                "{text}"
+            );
+            if depth == Depth::SessionValidation {
+                assert_eq!(
+                    checked(&report, CheckId::ConnectionAttempt).skip,
+                    Some(Skip::BlockedBy(CheckId::InstanceResolution)),
+                    "{report:#?}"
+                );
+            }
+        }
     }
 
     /// A failure before any connect stage (a LocalDB instance that does not
@@ -14419,11 +14348,13 @@ pub(crate) mod tests {
         );
     }
 
-    /// `np:host\instance` is no protocol order: when the pipe SQL Server
-    /// Browser listed does not open, the client tries the instance's
-    /// standard pipe, and the finding says so, not that no prefix was given.
+    /// `np:host\instance` is no protocol order: the client opens the pipe SQL
+    /// Server Browser listed and nothing else, as SNI does (no fallback to
+    /// the instance's standard pipe). That pipe's failure is the
+    /// connection's, worded as the driver words it, with no finding about a
+    /// transport moved past.
     #[test]
-    fn a_pipe_instance_falls_back_to_its_standard_pipe() {
+    fn a_pipe_instance_opens_only_the_pipe_the_browser_listed() {
         let listed = r"\\db01\pipe\MSSQL$SQL2022\listed";
         let stages = Stages::new()
             .add(
@@ -14449,43 +14380,41 @@ pub(crate) mod tests {
                     (cs::OS_ERROR, "2"),
                     (cs::ERROR, "not found"),
                 ],
-            )
-            .add(
-                Stage::Pipe,
-                Some(true),
-                5,
-                7,
-                &[
-                    (cs::KIND, cs::KIND_NAMED_PIPE),
-                    (cs::PIPE_PATH, STANDARD_PIPE),
-                ],
             );
         let report = observed(
             request(r"np:db01\SQL2022", Depth::NetworkReachability),
             stages,
-            Ended::Stopped,
+            Ended::Failed(Error::Io(std::io::Error::from_raw_os_error(2))),
         );
-        let texts: Vec<String> = report
-            .findings
-            .iter()
-            .filter(|f| f.certainty == Certainty::Informational)
-            .map(|f| f.text.render("en-US"))
-            .collect();
-        assert!(
-            texts
-                .iter()
-                .any(|t| t.contains("tries the instance's standard pipe")),
-            "{texts:#?}"
+        let lookup = checked(&report, CheckId::InstanceResolution);
+        assert_eq!(lookup.coverage, Coverage::Passed, "{report:#?}");
+        assert_eq!(lookup.field("pipe"), Some(listed));
+        assert_eq!(lookup.field("pipeSource"), Some("sqlBrowser"));
+        let reachability = checked(&report, CheckId::TcpConnect);
+        assert_eq!(
+            reachability.field("pipe"),
+            Some(listed),
+            "{reachability:#?}"
         );
-        let pseudo = report::text_in(&report, "qps-ploc");
-        assert!(!pseudo.contains("standard pipe"), "{pseudo}");
         assert!(
             report
                 .findings
                 .iter()
-                .all(|f| !f.text.render("en-US").contains("without a protocol prefix")),
+                .all(|f| f.certainty != Certainty::Informational),
             "{:#?}",
             report.findings
+        );
+        assert!(
+            report.errors.iter().all(|e| !e.superseded),
+            "{:#?}",
+            report.errors
+        );
+        let text = report::text(&report);
+        assert!(!text.contains("standard pipe"), "{text}");
+        assert!(
+            error_lines(&text)[0]
+                .contains("Named Pipes Provider: Could not open a connection to SQL Server [2]."),
+            "{text}"
         );
     }
 

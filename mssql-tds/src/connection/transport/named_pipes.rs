@@ -26,44 +26,45 @@ const LOCAL_LOCALHOST: &str = "localhost";
 const LOCAL_IPV4_LOOPBACK: &str = "127.0.0.1";
 const LOCAL_IPV6_LOOPBACK: &str = "::1";
 
-/// Rewrite the server component of a UNC pipe path to `.` when it refers to
-/// the local machine.
+/// The pipe the client opens for one SQL Server Browser listed, as SNI
+/// opens it (`ParseSsrpString`, ssrp.cpp): the listed path with its machine
+/// name replaced by `server`, the server the connection was given, or by
+/// `.` when that server is this computer.
 ///
-/// SQL Browser returns paths like `\\COMPUTERNAME\pipe\MSSQL$INST\sql\query`.
-/// Opening `\\COMPUTERNAME\pipe\...` goes through SMB (network auth), which
-/// often fails with "Access is denied" even on the local machine. Using
-/// `\\.\pipe\...` connects through the local IPC namespace instead, matching
-/// ODBC/SNI behavior.
-pub(crate) fn localize_pipe_path(pipe: &str) -> String {
-    // Must start with \\
-    if !pipe.starts_with("\\\\") {
-        return pipe.to_string();
-    }
-    let after_prefix = &pipe[2..];
-    let sep = match after_prefix.find('\\') {
-        Some(pos) => pos,
-        None => return pipe.to_string(),
+/// SQL Browser returns paths like `\\COMPUTERNAME\pipe\MSSQL$INST\sql\query`,
+/// named by the machine's own name, which this computer may not resolve (a
+/// connection by IP address or another DNS name). Opening the local machine
+/// as `\\COMPUTERNAME\pipe\...` would also go through SMB (network auth),
+/// which often fails with "Access is denied"; `\\.\pipe\...` connects
+/// through the local IPC namespace instead. A path that is not
+/// `\\machine\...` is kept as listed.
+pub(crate) fn pipe_on_server(listed: &str, server: &str) -> String {
+    let Some(rest) = listed
+        .strip_prefix(r"\\")
+        .and_then(|after| after.find('\\').map(|at| &after[at..]))
+    else {
+        return listed.to_string();
     };
-    let server_part = &after_prefix[..sep];
-
-    // Already local
-    if server_part == "." {
-        return pipe.to_string();
+    if is_local_server(server) {
+        format!(r"\\.{rest}")
+    } else {
+        format!(r"\\{server}{rest}")
     }
+}
 
-    let is_local = server_part.eq_ignore_ascii_case(LOCAL_LOCALHOST)
-        || server_part == LOCAL_IPV4_LOOPBACK
-        || server_part == LOCAL_IPV6_LOOPBACK
+/// Whether `server` names this computer: SNI's `IsLocalHost` (`.`,
+/// `(local)`, `localhost` or the computer's name), and the loopback
+/// addresses, which reach the same local pipe.
+fn is_local_server(server: &str) -> bool {
+    server == "."
+        || server.eq_ignore_ascii_case("(local)")
+        || server.eq_ignore_ascii_case(LOCAL_LOCALHOST)
+        || server == LOCAL_IPV4_LOOPBACK
+        || server == LOCAL_IPV6_LOOPBACK
         || hostname::get()
             .ok()
             .and_then(|n| n.into_string().ok())
-            .is_some_and(|name| server_part.eq_ignore_ascii_case(&name));
-
-    if is_local {
-        format!("\\\\.{}", &after_prefix[sep..])
-    } else {
-        pipe.to_string()
-    }
+            .is_some_and(|name| server.eq_ignore_ascii_case(&name))
 }
 
 /// Opens a named pipe with retry logic to handle ERROR_PIPE_BUSY (231).
@@ -254,72 +255,55 @@ impl Stream for NamedPipeClient {
 mod tests {
     use super::*;
 
-    #[test]
-    fn localize_already_local_dot() {
-        let path = r"\\.\pipe\sql\query";
-        assert_eq!(localize_pipe_path(path), path);
-    }
+    const LISTED: &str = r"\\SQL01\pipe\MSSQL$INST\sql\query";
 
+    /// A remote server: the listed pipe on the server as given, whatever
+    /// name the Browser's machine gave itself, as SNI opens it.
     #[test]
-    fn localize_localhost() {
+    fn a_listed_pipe_is_opened_on_the_server_as_given() {
+        for server in ["db01.contoso.com", "10.1.2.3", "SQL01", "sql01"] {
+            assert_eq!(
+                pipe_on_server(LISTED, server),
+                format!(r"\\{server}\pipe\MSSQL$INST\sql\query")
+            );
+        }
         assert_eq!(
-            localize_pipe_path(r"\\localhost\pipe\sql\query"),
-            r"\\.\pipe\sql\query"
+            pipe_on_server(r"\\.\pipe\custom\path", "db01"),
+            r"\\db01\pipe\custom\path"
         );
     }
 
+    /// This computer, however it was named: the local IPC namespace.
     #[test]
-    fn localize_localhost_case_insensitive() {
-        assert_eq!(
-            localize_pipe_path(r"\\LOCALHOST\pipe\sql\query"),
-            r"\\.\pipe\sql\query"
-        );
-    }
-
-    #[test]
-    fn localize_ipv4_loopback() {
-        assert_eq!(
-            localize_pipe_path(r"\\127.0.0.1\pipe\sql\query"),
-            r"\\.\pipe\sql\query"
-        );
-    }
-
-    #[test]
-    fn localize_ipv6_loopback() {
-        assert_eq!(
-            localize_pipe_path(r"\\::1\pipe\sql\query"),
-            r"\\.\pipe\sql\query"
-        );
-    }
-
-    #[test]
-    fn localize_hostname_match() {
+    fn a_listed_pipe_on_this_computer_is_opened_locally() {
         let hostname = hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
             .expect("hostname required");
-        let input = format!(r"\\{}\pipe\sql\query", hostname);
-        assert_eq!(localize_pipe_path(&input), r"\\.\pipe\sql\query");
+        for server in [
+            ".",
+            "(local)",
+            "(LOCAL)",
+            "localhost",
+            "LOCALHOST",
+            "127.0.0.1",
+            "::1",
+            hostname.as_str(),
+            &hostname.to_ascii_lowercase(),
+        ] {
+            assert_eq!(
+                pipe_on_server(LISTED, server),
+                r"\\.\pipe\MSSQL$INST\sql\query",
+                "{server}"
+            );
+        }
     }
 
+    /// A listed value that is not `\\machine\...` is kept as listed.
     #[test]
-    fn localize_remote_server_unchanged() {
-        let path = r"\\remoteserver\pipe\sql\query";
-        assert_eq!(localize_pipe_path(path), path);
-    }
-
-    #[test]
-    fn localize_no_prefix_unchanged() {
-        assert_eq!(localize_pipe_path("sql\\query"), "sql\\query");
-    }
-
-    #[test]
-    fn localize_single_backslash_unchanged() {
-        assert_eq!(localize_pipe_path(r"\pipe"), r"\pipe");
-    }
-
-    #[test]
-    fn localize_no_separator_after_prefix() {
-        assert_eq!(localize_pipe_path(r"\\server"), r"\\server");
+    fn a_listed_value_that_is_no_unc_pipe_is_kept() {
+        for listed in [r"sql\query", r"\pipe", r"\\server"] {
+            assert_eq!(pipe_on_server(listed, "db01"), listed);
+        }
     }
 }
