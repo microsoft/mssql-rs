@@ -45,10 +45,10 @@ sequenceDiagram
     Note over Rt: Both tasks waiting, threads are FREE
     SA-->>Rt: rows ready socket A
     Rt->>TA: wake, free thread resumes
-    TA-->>App: rows for A
+    TA-->>App: batch A drained, task completes
     SB-->>Rt: rows ready socket B
     Rt->>TB: wake, free thread resumes
-    TB-->>App: rows for B
+    TB-->>App: batch B drained, task completes
 </pre></div>
 
 <h2>4. Concurrency model: connections vs. cursors</h2>
@@ -90,8 +90,8 @@ flowchart TB
         LOOP["Python event loop, 1 thread"]
     end
     subgraph L3["Layer 3 - pycore pyclass"]
-        CONN["PyCoreConnection"]
-        CUR["PyCoreCursor.execute calls future_into_py"]
+        CONN["PyAsyncConnection"]
+        CUR["PyAsyncCursor operations call future_into_py"]
     end
     subgraph L4["Layer 4 - pyo3-async-runtimes BRIDGE"]
         BR["Converts Tokio future to Python awaitable, handles GIL and wakers"]
@@ -119,15 +119,16 @@ flowchart LR
 </pre></div>
 
 <h2>5.4 Two connections, two cursors — full picture</h2>
+<p class="caption">Combined execute-then-fetch workflow. These are separate awaitables, not one execute operation returning rows.</p>
 <div class="diagram"><pre class="mermaid">
 flowchart LR
     subgraph PY["Python asyncio loop - 1 thread"]
-        GA["Coroutine A<br/>await cursor_a.execute sql"]
-        GB["Coroutine B<br/>await cursor_b.execute sql"]
+        GA["Coroutine A<br/>await execute, then await fetchall"]
+        GB["Coroutine B<br/>await execute, then await fetchall"]
     end
     subgraph PC["pycore - mssql-py-core, your binding"]
-        CA["PyCoreCursor A<br/>read args, GIL held<br/>call future_into_py<br/>later build Python rows, GIL"]
-        CB["PyCoreCursor B<br/>read args, GIL held<br/>call future_into_py<br/>later build Python rows, GIL"]
+        CA["PyAsyncCursor A<br/>read args, GIL held<br/>call future_into_py<br/>fetch converts Python rows, GIL"]
+        CB["PyAsyncCursor B<br/>read args, GIL held<br/>call future_into_py<br/>fetch converts Python rows, GIL"]
     end
     subgraph BR["pyo3-async-runtimes - generic bridge"]
         WA["Awaitable A<br/>links asyncio Future to Tokio task"]
@@ -157,23 +158,24 @@ flowchart LR
 </pre></div>
 
 <h2>5.5 Python thread / task / GIL timeline</h2>
+<p class="caption">Execution and fetching use separate awaitables. Execution positions the cursor; only fetching returns rows.</p>
 <div class="diagram"><pre class="mermaid">
 sequenceDiagram
     participant PL as Python loop thread
     participant TW as Tokio worker thread
     participant SQL as SQL Server
 
-    Note over PL: GIL HELD - read args, build future
+    Note over PL: GIL HELD - read execute or fetch args
     PL->>TW: spawn Tokio task, return awaitable
     Note over PL: GIL RELEASED - loop runs other coroutines
-    TW->>SQL: write query bytes
+    TW->>SQL: execute sends query, fetch reads results
     Note over TW: no GIL needed
     TW->>TW: await socket - thread freed, no GIL
-    SQL-->>TW: rows ready
-    TW->>TW: parse rows in Rust - no GIL
-    Note over TW: GIL RE-ACQUIRED - convert rows to Python objects
+    SQL-->>TW: result bytes ready
+    TW->>TW: parse result boundary or fetched rows - no GIL
+    Note over TW: fetch converts rows on blocking pool with GIL
     TW->>PL: complete the awaitable
-    Note over PL: GIL HELD - coroutine resumes, returns rows
+    Note over PL: execution positions cursor, fetch returns rows
 </pre></div>
 
 <h2>5.6 PyO3 bridges the two schedulers</h2>
@@ -206,38 +208,39 @@ sequenceDiagram
     participant SQL as SQL Server
 
     Note over PL: GIL HELD, normal Python execution
-    PL->>BR: call execute, read query string and params
+    PL->>BR: call execute or fetch, read arguments
     Note over PL,BR: brief GIL-bound work, reading Python args into Rust
     BR->>TW: tokio spawn the Rust future
     BR-->>PL: return asyncio.Future, pending
     Note over PL: GIL RELEASED, loop runs other coroutines
-    TW->>SQL: write query bytes, no GIL
+    TW->>SQL: send query or read results, no GIL
     TW->>RE: await socket, worker thread released
     Note over RE: no thread, no GIL, just kernel polling
     SQL-->>RE: response bytes ready
     RE->>TW: wake task on any free worker
     TW->>TW: parse TDS tokens into Rust values, no GIL
-    Note over TW: BLOCK POINT 1, acquire GIL to build Python objects
-    TW->>BR: convert rows, then call_soon_threadsafe
+    Note over TW: Python attachment for metadata or fetched-row conversion
+    TW->>BR: operation complete with Python-convertible output
     Note over BR: BLOCK POINT 2, take loop lock, signal wakeup fd
     BR->>PL: schedule set_result on the loop
-    Note over PL: GIL HELD, loop resumes coroutine, returns rows
+    Note over PL: loop resumes, execution positioned or fetch rows returned
 </pre></div>
 
 <h2>5.6 Result materialization is GIL-bound</h2>
 <div class="diagram"><pre class="mermaid">
 flowchart LR
     R1["Rust has parsed rows, no GIL"] --> R2["acquire GIL"]
-    R2 --> R3["build Python list, dicts, values - GIL HELD the whole time"]
+    R2 --> R3["convert one chunk to Python rows - GIL HELD"]
     R3 --> R4["release GIL"]
 </pre></div>
 
-<h2>6.1 Today vs. true async</h2>
+<h2>6.1 Existing synchronous and async paths</h2>
+<p class="caption">PyCoreConnection/PyCoreCursor remain synchronous. PyAsyncConnection/PyAsyncCursor already use the shared runtime and awaitable bridge; Python/AQE pool integration is separate work.</p>
 <div class="diagram"><pre class="mermaid">
 flowchart LR
     N1["cursor.execute"] --> N2["py.detach"]
     N2 --> N3["runtime.block_on - BLOCKS the Python thread"]
-    N3 --> N4["returns rows"]
+    N3 --> N4["execute completes, cursor positioned for fetch"]
 </pre></div>
 <div class="diagram"><pre class="mermaid">
 flowchart LR
@@ -265,11 +268,18 @@ sequenceDiagram
     Note over EL: GIL RELEASED here - Python loop free, runs other coroutines Query B
     Tok->>SQL: write query packet - pure Rust, no GIL needed
     Tok->>Tok: await socket then Tokio thread freed
-    SQL-->>Tok: rows ready, reactor wakes task
-    Tok->>Tok: parse rows into Rust values
+    SQL-->>Tok: first result boundary ready, reactor wakes task
+    Tok->>Tok: parse result boundary and metadata
     Tok->>Bridge: future completed, result ready
     Bridge->>EL: wake the awaitable
-    EL->>App: await returns rows as Python objects
+    EL->>App: execute completes, cursor positioned for fetch
+    App->>EL: await cursor.fetchall
+    EL->>Cur: call fetchall
+    Cur->>Bridge: wrap fetch future
+    Bridge->>Tok: spawn fetch, read and convert rows
+    Tok->>Bridge: fetch completed with Python rows
+    Bridge->>EL: resolve fetch awaitable
+    EL->>App: fetchall returns rows
 </pre></div>
 
 <script type="module">

@@ -1,4 +1,10 @@
 # Async Query Execution Design for mssql-python
+
+This document explains the existing preview async API, not a proposal to add
+async support. `PyAsyncConnection` and `PyAsyncCursor` already use the shared
+Tokio runtime and `pyo3-async-runtimes`. Integrating the private Rust pool with
+that API remains separate work governed by the
+[pool integration design](./async-connection-pooling-mssql-python-integration.md).
 ---
 ## Table of Contents
 
@@ -7,7 +13,7 @@
   - [Glossary](#glossary)
   - [1. Why "async"? The core idea](#1-why-async-the-core-idea)
   - [2. Problem statement \& goals](#2-problem-statement--goals)
-    - [What's missing today](#whats-missing-today)
+    - [Current baseline and remaining work](#current-baseline-and-remaining-work)
     - [Goals](#goals)
     - [Non-goals](#non-goals)
     - [Success criteria](#success-criteria)
@@ -15,7 +21,7 @@
     - [Current architecture of `mssql-python`](#current-architecture-of-mssql-python)
     - [Complexities with asyncio + Tokio](#complexities-with-asyncio--tokio)
     - [Prior art](#prior-art)
-  - [4. Proposed architecture / interop design](#4-proposed-architecture--interop-design)
+  - [4. Existing architecture / interop design](#4-existing-architecture--interop-design)
   - [5. Design rules \& invariants](#5-design-rules--invariants)
   - [6. Mental model: tasks vs. threads](#6-mental-model-tasks-vs-threads)
   - [7. Async in Rust + Python](#7-async-in-rust--python)
@@ -35,13 +41,13 @@
       - [Two kinds of "blocking" — only one matters](#two-kinds-of-blocking--only-one-matters)
       - [The GIL is a lock on objects, not on a code layer](#the-gil-is-a-lock-on-objects-not-on-a-code-layer)
       - [The one place to watch: result materialization (point E)](#the-one-place-to-watch-result-materialization-point-e)
-  - [8. Today vs. true async: what must change in pycore](#8-today-vs-true-async-what-must-change-in-pycore)
-    - [8.1 The current (blocking) model](#81-the-current-blocking-model)
-    - [8.2 The changes](#82-the-changes)
-    - [8.3 The three things pycore must get right](#83-the-three-things-pycore-must-get-right)
+  - [8. Sync vs. existing async in pycore](#8-sync-vs-existing-async-in-pycore)
+    - [8.1 The synchronous model](#81-the-synchronous-model)
+    - [8.2 The existing async model](#82-the-existing-async-model)
+    - [8.3 Invariants preserved by the async surface](#83-invariants-preserved-by-the-async-surface)
   - [9. End-to-end walkthrough between Python and Rust](#9-end-to-end-walkthrough-between-python-and-rust)
-  - [10. Rollout plan](#10-rollout-plan)
-    - [Delivery: experimental namespace first](#delivery-experimental-namespace-first)
+  - [10. Preview delivery and integration boundaries](#10-preview-delivery-and-integration-boundaries)
+    - [Existing namespace](#existing-namespace)
     - [Versioning \& deprecation](#versioning--deprecation)
     - [Documentation \& migration](#documentation--migration)
   - [11. Appendix](#11-appendix)
@@ -87,23 +93,33 @@ That is what we mean by *true async*.
 
 ## 2. Problem statement & goals
 
-### What's missing today
+### Current baseline and remaining work
 
-`mssql-python` executes queries today through **DDBC (Direct Database Connectivity)** — a bundled **C++ extension that drives the Microsoft ODBC Driver for SQL Server directly**, without an external driver manager. ODBC's execution model is **synchronous and blocking**: `SQLExecDirect` / `SQLFetch` block until the server responds. The C++ layer releases the GIL around the blocking call, but the **calling thread / coroutine is still parked** for the whole round-trip. Consequences:
+The synchronous DDBC/ODBC path blocks its calling thread during database I/O,
+even when it releases the GIL. `PyCoreConnection` and `PyCoreCursor` are also
+synchronous bindings: they use a per-connection runtime and `block_on`.
 
-- **No native `async` / `await`.** The DDBC/ODBC path has no integration with the `asyncio` event loop. Applications built on `asyncio` (FastAPI, aiohttp, async ETL) cannot `await` a query — they must offload every call to a **thread pool** (`run_in_executor`, `asyncio.to_thread`), a workaround rather than real async.
-- **Thread-pool tax.** Concurrency is capped by the executor's thread count; each in-flight query consumes an OS thread that sits idle waiting on the network — exactly the waste async is meant to remove.
-- **Event-loop stalls.** Any accidental direct (non-offloaded) call blocks the whole event loop, freezing unrelated tasks.
-- **ODBC async mode is not a fit.** ODBC's optional async execution (`SQL_ATTR_ASYNC_ENABLE`) is polling-based and does not map cleanly onto `asyncio`'s awaitable model.
-- **A Rust path already exists but is not async-exposed.** `mssql-python` is already adopting a Rust core, **`mssql-py-core`** (PyO3 bindings over the async `mssql-rs` / `mssql-tds` stack), currently used for select features such as bulk copy (BCP). That core is **fully async under the hood (Tokio)**, but its async capability is **not yet surfaced to Python** — and where it is used today it is driven **synchronously** via `runtime.block_on(...)`. So asyncio users still cannot `await` a query on either path.
+The preview async path already exists alongside those sync APIs:
+
+- [Module registration](../mssql-py-core/src/lib.rs) exports `PyAsyncConnection`
+  and `PyAsyncCursor`.
+- [The async runtime](../mssql-py-core/src/async_runtime.rs) initializes one shared
+  Tokio executor for async connections and the `future_into_py` bridge.
+- [Async execution](../mssql-py-core/src/async_execute.rs) and
+  [fetching](../mssql-py-core/src/async_fetch.rs) expose awaitable operations.
+  Execution positions on a result; fetching reads and converts its rows.
+
+The private Rust pool's safe return is implemented, but wiring that pool into
+Python/AQE ownership, close barriers and result delivery remains deferred.
+Native async support itself is not that deferred slice.
 
 ### Goals
 
-- Provide **native `async def` / `await`** APIs on connections and cursors that integrate with the running `asyncio` loop.
+- Explain the existing native awaitable connection/cursor APIs and their integration with the running `asyncio` loop.
 - **Never block the event loop** during a query — the loop stays free to run other coroutines while a query is in flight.
 - **True concurrency across connections** without a thread-per-query model.
-- Deliver async by **surfacing the async Rust path** (`mssql-py-core` over `mssql-tds`) to Python via the **`pyo3-async-runtimes`** bridge, rather than trying to make the synchronous ODBC path async or reinventing plumbing.
-- Consolidate the Rust path onto **one shared Tokio runtime** for the whole process (instead of one runtime per connection).
+- Preserve the existing **`pyo3-async-runtimes`** bridge over `mssql-tds`, rather than making the synchronous ODBC path async.
+- Preserve **one shared Tokio runtime for the async surface**; synchronous connections still own their separate runtimes.
 
 ### Non-goals
 
@@ -127,8 +143,9 @@ That is what we mean by *true async*.
 ### Current architecture of `mssql-python`
 
 - **Primary path today — DDBC.** Query execution goes through **DDBC**, a **C++ extension** that drives the bundled **Microsoft ODBC Driver for SQL Server** directly (no external driver manager). Python `connect()`, `cursor.execute()`, and `fetchall()` map onto **synchronous ODBC calls**; the C++ layer releases the GIL around the blocking call, but the calling thread/coroutine is blocked for the round-trip.
-- **Emerging path — `mssql-py-core` (Rust).** A newer Rust binding crate, `mssql-py-core`, exposes **PyO3 `#[pyclass]` types** (`PyCoreConnection`, `PyCoreCursor`) over the async `mssql-rs` (`mssql-tds`) stack. It is consumed by `mssql-python` for select features (e.g. BCP / bulk copy). Today it still bridges **synchronously** — each method reads its Python args (GIL held), then calls `runtime.block_on(...)` inside `py.detach()` — with `Arc<Mutex<TdsClient>>` for thread safety and, currently, a **Tokio runtime per connection**.
-- **This design targets the Rust path.** Native asyncio support is delivered by evolving the `mssql-py-core` bridge to return awaitables; the ODBC path stays synchronous.
+- **Synchronous Rust bindings.** `PyCoreConnection` and `PyCoreCursor` use `runtime.block_on(...)` inside `py.detach()`, with a runtime per connection.
+- **Existing async Rust bindings.** `PyAsyncConnection` and `PyAsyncCursor` use the shared async runtime and return awaitables through `pyo3-async-runtimes`. Logical connection state and operation claims guard access to the physical client's async mutex.
+- **Scope.** This document explains that async path. The ODBC path stays synchronous, and Python/AQE pool integration has its own design and approval gates.
 
 ### Complexities with asyncio + Tokio
 
@@ -147,11 +164,11 @@ That is what we mean by *true async*.
 
 ---
 
-## 4. Proposed architecture / interop design
+## 4. Existing architecture / interop design
 
 This section is the **overview**; the detailed mechanics, mental models, and diagrams follow in **sections 4–11**.
 
-- **Event-loop handoff (asyncio → Tokio).** A pycore method hands its Rust `Future` to **`pyo3-async-runtimes`** via `future_into_py`, which **spawns it on a shared, process-wide Tokio runtime** and returns a Python awaitable. One global runtime — not one per connection — so all connections share the worker pool. See [§7.1](#71-the-core-problem-two-event-loops)–[§7.3](#73-pyo3-async-runtimes-as-generic-bridge-plugin-the-contract) and [§8](#8-today-vs-true-async-what-must-change-in-pycore).
+- **Event-loop handoff (asyncio → Tokio).** A pycore method hands its Rust `Future` to **`pyo3-async-runtimes`** via `future_into_py`, which **spawns it on a shared, process-wide Tokio runtime** and returns a Python awaitable. All async connections share that worker pool; synchronous connections do not use it. See [§7.1](#71-the-core-problem-two-event-loops)–[§7.3](#73-pyo3-async-runtimes-as-generic-bridge-plugin-the-contract) and [§8](#8-sync-vs-existing-async-in-pycore).
 - **Future / coroutine bridging.** A Rust `async` block *is* a `Future`; the bridge converts it into an `asyncio.Future`. The contract is just **`Future` in → awaitable out** (plus `IntoPyObject` for the result). See [§7.3](#73-pyo3-async-runtimes-as-generic-bridge-plugin-the-contract).
 - **GIL management.** The GIL is **held** only to read Python args in and build Python rows out; **released** for the whole network round-trip and TDS parsing. See [§7.5](#75-when-is-a-thread-assigned-when-is-a-task-assigned-when-is-the-gil-held)–[§7.6](#76-how-pyo3-bridges-the-schedulers-and-where-it-briefly-blocks).
 - **Threading model (which thread runs what).** The **Python loop thread** runs coroutines; **Tokio worker threads** run queries; the **reactor** wakes tasks. Detailed timelines are in [§7.5](#75-when-is-a-thread-assigned-when-is-a-task-assigned-when-is-the-gil-held); the full crossing diagram is in [§7.6](#76-how-pyo3-bridges-the-schedulers-and-where-it-briefly-blocks).
@@ -166,9 +183,9 @@ These hold for both native Rust and the Python bridge:
 1. **Tasks, not threads, carry queries.** At every `.await` on the network, the thread is released and reused.
 2. **The reactor (epoll/IOCP) wakes the right task** when the server's bytes arrive; any free worker thread resumes it.
 3. **Parallelism scales with connections, not cursors.** One cursor per connection = zero lock contention. Multiple cursors on one connection are serialized until MARS is implemented.
-4. **`Arc<Mutex<TdsClient>>` guards one connection's socket** so only one thread touches it at a time. It does **not** couple different connections.
+4. **Logical ownership and operation claims guard access to the client's mutex.** The mutex serializes one connection's I/O; it does not couple different connections. A mutex alone is not a pooled close/settlement barrier.
 5. **The statement handle is a plain server-side `i32`.** Keep it pinned to its originating connection; no synchronization concern.
-6. **For Python true async:** one shared Tokio runtime + `future_into_py` (replacing per-connection `Runtime` + `block_on`), with the GIL held only at the data boundaries.
+6. **For the existing Python async API:** one shared Tokio runtime + `future_into_py`, with the GIL held at Python-object boundaries. The synchronous API retains `block_on`.
 7. **The JS binding (`mssql-js`) is the working reference model** — its `#[napi] async fn` methods already return promises without blocking the Node.js event loop.
 
 ---
@@ -210,7 +227,7 @@ flowchart LR
 - **Tokio** runs tasks on its own worker threads (Section 6).
 - The bridge's job: when Python does `await cursor.execute(...)`, hand the real work to **Tokio**, and give Python back an **awaitable** that resolves when Tokio finishes — **without blocking Python's loop**.
 
-This is exactly what the **`pyo3-async-runtimes`** crate provides (via `future_into_py`). It is the missing piece versus today's `block_on` design.
+This is the bridge the existing async API already uses. It does not replace the synchronous API's `block_on` calls.
 
 ### 7.2 The layered architecture
 
@@ -223,8 +240,8 @@ flowchart TB
         LOOP["Python event loop, 1 thread"]
     end
     subgraph L3["Layer 3 - pycore pyclass"]
-        CONN["PyCoreConnection"]
-        CUR["PyCoreCursor.execute calls future_into_py"]
+        CONN["PyAsyncConnection"]
+        CUR["PyAsyncCursor operations call future_into_py"]
     end
     subgraph L4["Layer 4 - pyo3-async-runtimes BRIDGE"]
         BR["Converts Tokio future to Python awaitable, handles GIL and wakers"]
@@ -246,27 +263,46 @@ Layers 3 and 4 are **two different crates with different jobs**, and it's import
 | --------------- | ------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
 | **What it is**  | *Existing* crate in mssql-rs which is SQL-specific binding                                                                | A *generic* third-party library                                              |
 | **Knows about** | TDS, `TdsClient`, connections, cursors, rows                                                                              | Nothing about databases — only futures & loops                               |
-| **Contains**    | `#[pyclass] PyCoreConnection`, `PyCoreCursor.execute()`, arg reading, result → Python conversion, `Arc<Mutex<TdsClient>>` | `future_into_py`, the shared Tokio runtime, the Tokio↔asyncio waker plumbing |
+| **Contains**    | `PyAsyncConnection`, `PyAsyncCursor`, operation claims, TDS execution/fetching, error mapping and Python conversion | `future_into_py`, runtime registration and the Tokio↔asyncio waker plumbing |
 | **Role**        | Defines *what* Python can call and *what* the query does                                                                  | Defines *how* a Rust future becomes an awaitable Python can `await`          |
 | **Dependency**  | Uses pyo3-async-runtimes                                                                                                  | Used by pycore (and any other async binding)                                 |
 
-**The relationship:** pycore is the **application layer**; pyo3-async-runtimes is the **generic bridge** it calls into. The Layer 3 line `PyCoreCursor.execute calls future_into_py` is exactly pycore (L3) reaching down into pyo3-async-runtimes (L4):
+**The relationship:** pycore is the **application layer**; pyo3-async-runtimes is the **generic bridge** it calls into.
+
+The following Rust-only helper demonstrates a completion-only bridge. It owns
+an already connected client, discards rows and drains the entire batch before
+resolving. Failure or abandonment drops that owned client; it is not cached.
+This is not an implementation of `PyAsyncCursor`: production cursor methods
+also maintain logical ownership, operation/cancellation guards and fetch state.
 
 ```rust
-// pycore (Layer 3) — your code, knows about TDS
-#[pymethods]
-impl PyCoreCursor {
-    fn execute<'p>(&self, py: Python<'p>, sql: String) -> PyResult<Bound<'p, PyAny>> {
-        let client = self.tds_client.clone();
-        // hand a Rust future to pyo3-async-runtimes (Layer 4) — generic bridge
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut c = client.lock().await;
-            c.execute(sql, None, None).await?;   // mssql-tds work (Layer 6)
-            Ok(())
-        })
-    }
+use mssql_tds::connection::tds_client::TdsClient;
+use pyo3::prelude::*;
+
+use crate::async_errors::map_tds_error;
+
+fn execute_and_drain<'py>(
+    py: Python<'py>,
+    mut client: TdsClient,
+    sql: String,
+) -> PyResult<Bound<'py, PyAny>> {
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        client
+            .execute(sql, ())
+            .await
+            .map_err(|error| map_tds_error("execute", error, client.take_info_messages()))?;
+        client
+            .close_query()
+            .await
+            .map_err(|error| map_tds_error("drain", error, client.take_info_messages()))?;
+        Ok(())
+    })
 }
 ```
+
+`map_tds_error` is the existing internal DB-API mapper in
+[async_errors.rs](../mssql-py-core/src/async_errors.rs), not a public extension
+point. A delayed error encountered while draining also rejects the awaitable.
 
 - **pycore** wrote everything except `future_into_py`.
 - **pyo3-async-runtimes** provides *only* `future_into_py` (and the runtime/waker machinery behind it): it takes your Rust future, spawns it on Tokio, and returns a Python awaitable.
@@ -314,23 +350,27 @@ flowchart LR
     F -->|pass Future in| FIP -->|hand awaitable out| PYAW
 ```
 
-**What you write vs. what the library does:**
+**Execution is not row delivery.** `TdsClient::execute(sql, options)` returns a
+`StatementResult` navigation boundary, not a row collection. The existing
+Python cursor keeps execution and fetching separate:
 
-```rust
-// ---- WHAT YOU WRITE (in pycore) ----
-#[pymethods]
-impl PyCoreCursor {
-    fn execute<'p>(&self, py: Python<'p>, sql: String) -> PyResult<Bound<'p, PyAny>> {
-        let client = self.tds_client.clone();
-        // You hand it a Future. That is the entire handshake.
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut c = client.lock().await;
-            let rows = c.execute(sql, None, None).await?;
-            Ok(rows)   // output must be convertible to a Python object
-        })
-    }
-}
+```python
+cursor = connection.cursor()
+try:
+    await cursor.execute("SELECT 1 AS value")
+    rows = await cursor.fetchall()
+finally:
+    await cursor.close()
 ```
+
+`fetchall()` reads and converts the current result set; `nextset()` navigates
+additional results. Cursor close drains remaining results when the caller is
+finished. See [async_execute.rs](../mssql-py-core/src/async_execute.rs) and
+[async_fetch.rs](../mssql-py-core/src/async_fetch.rs) for the existing error mapping,
+row conversion and guarded result delivery. Do not add an unconditional drain
+to cursor `execute`: that would discard rows intended for subsequent fetches.
+
+**What the bridge does (conceptual pseudocode, not its implementation):**
 
 ```text
 // ---- WHAT THE LIBRARY DOES (unchanged, generic) ----
@@ -351,26 +391,27 @@ future_into_py(py, fut):
 
 **Analogy:** a **power adapter**. It doesn't know if you plug in a laptop or a lamp; it just conforms to a standard plug (`Future`) on one side and a standard socket (asyncio `Future`) on the other. You make your code fit the plug; the adapter handles the conversion across the boundary.
 
-**So, concretely, all you do:**
-1. Add the dependency with the `tokio-runtime` feature (above).
-2. Register/initialize the Tokio runtime once at module init.
-3. In each `#[pymethods]` function, wrap the async work in `future_into_py(py, async { ... })`.
-4. Make sure return types are pyo3-convertible (usually automatic via derives / built-in impls).
+The dependency, shared runtime registration and awaitable bridge already exist.
+The bridge does not implement database ownership, cancellation settlement,
+DB-API errors or row conversion; those remain pycore responsibilities.
 
 ### 7.4 Example Walkthrough - Two connections, two cursors (mssql-python)
 
+These diagrams combine `execute` followed by `fetchall` on each connection.
+They are not one operation returning rows: execution and each fetch have
+separate awaitables, with cursor/session state retained between operations.
 
 ```mermaid
 flowchart TB
 
 subgraph PY["Python asyncio Loop"]
-    GA["Coroutine A<br/>await cursor_a.execute()"]
-    GB["Coroutine B<br/>await cursor_b.execute()"]
+    GA["Coroutine A<br/>await execute, then await fetchall"]
+    GB["Coroutine B<br/>await execute, then await fetchall"]
 end
 
 subgraph PC["mssql-py-core"]
-    CA["PyCoreCursor A<br/>Read arguments<br/>Hold GIL"]
-    CB["PyCoreCursor B<br/>Read arguments<br/>Hold GIL"]
+    CA["PyAsyncCursor A<br/>Read arguments<br/>Hold GIL"]
+    CB["PyAsyncCursor B<br/>Read arguments<br/>Hold GIL"]
 end
 
 subgraph BR["pyo3-async-runtimes"]
@@ -383,8 +424,8 @@ subgraph TK["Tokio Runtime"]
     TB["Tokio Task B"]
 end
 
-GA -->|"execute()"| CA
-GB -->|"execute()"| CB
+GA -->|"execute, then fetch"| CA
+GB -->|"execute, then fetch"| CB
 
 CA -->|"future_into_py()"| WA
 CB -->|"future_into_py()"| WB
@@ -435,37 +476,36 @@ subgraph PY["Python asyncio"]
     GB["Coroutine B resumes"]
 end
 
-TA -.->|"Complete Future"| WA
-TB -.->|"Complete Future"| WB
-
-WA -.->|"Build Python rows"| CA
-WB -.->|"Build Python rows"| CB
-CA -.->|"Resume coroutine"| GA
-CB -.->|"Resume coroutine"| GB
+TA -.->|"Fetched row writers"| CA
+TB -.->|"Fetched row writers"| CB
+CA -.->|"Complete fetch future"| WA
+CB -.->|"Complete fetch future"| WB
+WA -.->|"Resume coroutine with rows"| GA
+WB -.->|"Resume coroutine with rows"| GB
 ```
 
 **Follow the workflow path** (shown for Query A; Query B mirrors it):
 
-1. **call** — the coroutine `await`s `cursor.execute()`, entering **pycore**.
+1. **call** — the coroutine awaits `cursor.execute()` and subsequently a fetch operation, entering **pycore** for each.
 2. **spawn** — pycore reads the SQL/params (**GIL held** briefly), then hands a Rust future to **pyo3-async-runtimes**, which spawns it as a Tokio task and returns an awaitable.
 3. **run** — the task runs on a **Tokio worker thread**.
 4. **send SQL** — the task writes the query to SQL Server over **socket A** (pure Rust, **no GIL**), then `await`s the reply and **frees the thread**.
-5. **rows** — SQL Server replies; the bytes arrive on the socket and the **Reactor** notices.
-6. **wake** — the Reactor wakes Task A on any free worker; it parses the rows into Rust values.
-7. **build objs** — back in pycore, rows are converted to **Python objects** (**GIL re-acquired** briefly).
-8. **resolve** — the awaitable resolves and the coroutine's `await` returns the result.
+5. **result boundary** — execution parses the first result boundary and resolves its awaitable, positioning the cursor.
+6. **fetch** — the next awaitable reads rows; the reactor wakes its task when more bytes arrive.
+7. **build objs** — pycore converts fetched row writers to Python objects on Tokio's blocking pool under `Python::attach`.
+8. **resolve** — the fetch awaitable resolves with rows. The bridge does not implement row conversion itself.
 
 **Why this is truly parallel:**
 - A and B use **separate sockets** and **separate tasks** with no shared lock, so steps 3–6 **overlap**.
 - The Python loop thread is **free during steps 3–6**, so it runs Query B while Query A is in flight — that's what `asyncio.gather(A.execute(), B.execute())` exploits.
-- Results come back independently; each `await` resolves when its own rows arrive.
+- Execution and fetch complete independently on each connection; only the fetch awaitable returns rows.
 - **Parallelism = number of connections** — the same rule as native Rust.
 
 ### 7.5 When is a thread assigned? When is a task assigned? When is the GIL held?
 
-The mental rule: **a task lasts the whole query; a thread is borrowed only for the busy moments.**
+The mental rule: **each awaited operation has a future; a thread is borrowed only for the busy moments.**
 
-- **Task — always.** `cursor.execute()` creates exactly **one task** (a future) that exists from start to finish. In Python true-async, your `await` coroutine is bridged to **one Tokio task**.
+- **Task — per operation.** Execution and fetching use separate bridged futures. Cursor/session state owns the query between them; conversion may also use blocking-pool tasks.
 - **Thread — only intermittently.** A thread is borrowed only while real CPU work happens — building/sending the query bytes and parsing the reply rows. During the network wait (the long part), **no thread is assigned at all** — just the reactor watching the socket.
 
 #### Native Rust — thread vs. task timeline
@@ -479,21 +519,26 @@ The mental rule: **a task lasts the whole query; a thread is borrowed only for t
 
 #### Python async — thread + task + GIL timeline
 
-There are **two threads** in play: the single **Python event-loop thread**, and the **Tokio worker threads**. The query runs on a Tokio worker — *not* on the Python loop thread.
+There are two execution domains: the Python event-loop thread and Tokio.
+Network I/O runs on Tokio workers; Python row conversion runs on Tokio's
+blocking pool. The following crossing applies to execution and fetching
+separately; only a fetch operation returns rows.
 
 | Phase                                             | Python coroutine    | Tokio task | Which thread is busy           | GIL                                  |
 | ------------------------------------------------- | ------------------- | ---------- | ------------------------------ | ------------------------------------ |
-| 1. Enter `execute()`                              | running             | not yet    | Python loop thread             | 🔒 **HELD** — read args, build future |
+| 1. Enter `execute()` or a fetch operation          | running             | not yet    | Python loop thread             | 🔒 **HELD** — read args, build future |
 | 2. `future_into_py` returns awaitable             | suspended (`await`) | spawned    | Python loop thread → **freed** | 🔓 **RELEASED**                       |
-| 3. Send query bytes                               | pending             | running    | Tokio worker                   | 🔓 not held                           |
+| 3. Send query / read result bytes                 | pending             | running    | Tokio worker                   | 🔓 not held                           |
 | 4. **Network wait**                               | pending             | parked     | **none**                       | 🔓 not held                           |
-| 5. Parse rows (Rust values)                       | pending             | running    | Tokio worker                   | 🔓 not held                           |
-| 6. Convert rows → Python objects, complete future | resolving           | finishing  | Tokio worker                   | 🔒 **RE-ACQUIRED** briefly            |
+| 5. Parse result boundary / fetch Rust row writers | pending             | running    | Tokio worker                   | 🔓 not held                           |
+| 6. Materialize metadata or fetched rows, complete future | resolving      | finishing  | Tokio blocking pool / bridge   | 🔒 **RE-ACQUIRED** for Python objects |
 | 7. Coroutine resumes, returns                     | running             | done       | Python loop thread             | 🔒 **HELD**                           |
 
-**Key insight:** the GIL is held only at the **two boundaries** (steps 1 and 6–7) — reading inputs in and converting results out. It is **released for the entire query** (steps 2–5), which is exactly why *other* Python coroutines (e.g., Query B) can run while Query A is in flight.
+**Key insight:** native network I/O and TDS parsing do not hold the GIL.
+Python-object input, metadata and fetched-row conversion do. Execution does not
+convert a row collection before returning.
 
-> **Note on step 6:** the "GIL RE-ACQUIRED" happens on the **Tokio worker thread**, not the Python loop thread — and *not* because the worker is "running Python." It re-acquires the GIL because **building Python objects touches the CPython object heap**, which the GIL protects. Any thread (Python or Rust) must hold the GIL to create Python objects. See [Section 7.6](#76-how-pyo3-bridges-the-schedulers-and-where-it-briefly-blocks) for the full mechanics and the exact blocking points.
+> **Note on step 6:** fetched-row conversion uses Tokio's blocking pool and `Python::attach`, not the Python event-loop thread. Building Python objects needs the GIL even when initiated in Rust. See [Section 7.6](#76-how-pyo3-bridges-the-schedulers-and-where-it-briefly-blocks).
 
 #### GIL flow (Python)
 
@@ -503,17 +548,17 @@ sequenceDiagram
     participant TW as Tokio worker thread
     participant SQL as SQL Server
 
-    Note over PL: GIL HELD - read args, build future
+    Note over PL: GIL HELD - read execute or fetch args
     PL->>TW: spawn Tokio task, return awaitable
     Note over PL: GIL RELEASED - loop runs other coroutines
-    TW->>SQL: write query bytes
+    TW->>SQL: execute sends query, fetch reads results
     Note over TW: no GIL needed
     TW->>TW: await socket - thread freed, no GIL
-    SQL-->>TW: rows ready
-    TW->>TW: parse rows in Rust - no GIL
-    Note over TW: GIL RE-ACQUIRED - convert rows to Python objects
+    SQL-->>TW: result bytes ready
+    TW->>TW: parse result boundary or fetched rows - no GIL
+    Note over TW: fetch converts rows on blocking pool with GIL
     TW->>PL: complete the awaitable
-    Note over PL: GIL HELD - coroutine resumes, returns rows
+    Note over PL: execution positions cursor, fetch returns rows
 ```
 
 **One-line takeaways:**
@@ -548,6 +593,9 @@ flowchart LR
 
 #### Step-by-step: threads, tasks, and GIL at each crossing
 
+This crossing occurs separately for execution and fetching. Execution publishes
+cursor/result metadata; a fetch operation materializes rows.
+
 ```mermaid
 sequenceDiagram
     participant PL as Python loop thread
@@ -557,34 +605,34 @@ sequenceDiagram
     participant SQL as SQL Server
 
     Note over PL: GIL HELD, normal Python execution
-    PL->>BR: call execute, read query string and params
+    PL->>BR: call execute or fetch, read arguments
     Note over PL,BR: brief GIL-bound work, reading Python args into Rust
     BR->>TW: tokio spawn the Rust future
     BR-->>PL: return asyncio.Future, pending
     Note over PL: GIL RELEASED, loop runs other coroutines
-    TW->>SQL: write query bytes, no GIL
+    TW->>SQL: send query or read results, no GIL
     TW->>RE: await socket, worker thread released
     Note over RE: no thread, no GIL, just kernel polling
     SQL-->>RE: response bytes ready
     RE->>TW: wake task on any free worker
     TW->>TW: parse TDS tokens into Rust values, no GIL
-    Note over TW: BLOCK POINT 1, acquire GIL to build Python objects
-    TW->>BR: convert rows, then call_soon_threadsafe
+    Note over TW: Python attachment for metadata or fetched-row conversion
+    TW->>BR: operation complete with Python-convertible output
     Note over BR: BLOCK POINT 2, take loop lock, signal wakeup fd
     BR->>PL: schedule set_result on the loop
-    Note over PL: GIL HELD, loop resumes coroutine, returns rows
+    Note over PL: loop resumes, execution positioned or fetch rows returned
 ```
 
 #### Where does momentary blocking actually happen?
 
-| #   | Point                                                         | Layer (control)             | Who blocks                 | On what                                                    | Typical duration              |
+| #   | Point                                                         | Layer (control)             | Who blocks                 | On what                                                    | Cost (not measured here)      |
 | --- | ------------------------------------------------------------- | --------------------------- | -------------------------- | ---------------------------------------------------------- | ----------------------------- |
-| A   | **Enter `execute()`** — read query/params from Python         | **PyO3** (Rust holding GIL) | Python loop thread         | Holds GIL while marshalling args into Rust                 | microseconds                  |
+| A   | **Enter execute/fetch** — read arguments from Python          | **PyO3** (Rust holding GIL) | Python loop thread         | Holds GIL while marshalling args into Rust                 | argument-size dependent       |
 | B   | **Network round-trip**                                        | **Rust / Tokio**            | nobody                     | —                                                          | the whole query (no blocking) |
 | C   | **TDS parsing (Rust values)**                                 | **Rust**                    | Tokio worker               | pure Rust, no GIL                                          | depends on rows               |
-| D   | **Block Point 1: `Python::with_gil`** to build result objects | **PyO3**                    | Tokio worker               | Must **acquire the GIL**; waits if another thread holds it | microseconds if uncontended   |
-| E   | **Materialize result rows → Python objects**                  | **PyO3**                    | whichever thread holds GIL | GIL held for the whole conversion                          | scales with result size       |
-| F   | **Block Point 2: `call_soon_threadsafe`**                     | **PyO3** (bridge)           | Tokio worker               | Takes the event loop's internal lock + writes wakeup byte  | sub-microsecond               |
+| D   | **`Python::attach`** for metadata or fetched rows              | **PyO3**                    | Tokio blocking-pool thread | Waits to access the Python object heap                     | GIL-contention dependent      |
+| E   | **Fetch: materialize rows → Python objects in chunks**        | **PyO3**                    | whichever thread holds GIL | GIL held during each conversion chunk                     | scales with fetched rows      |
+| F   | **`call_soon_threadsafe`**                                    | **PyO3** (bridge)           | completion thread          | Schedules the completion on the Python loop                | scheduler dependent           |
 | G   | **Resume coroutine, return**                                  | **Python**                  | Python loop thread         | Holds GIL as normal                                        | microseconds                  |
 
 Control starts in **PyO3** (A), crosses fully into **Rust/Tokio** for the expensive part (B–C), returns to **PyO3** at the boundary to build objects and wake the loop (D–F), and finally lands back in **Python** (G).
@@ -594,9 +642,10 @@ Control starts in **PyO3** (A), crosses fully into **Rust/Tokio** for the expens
 | Kind                                      | What it is                                                        | Impact                                                                              |
 | ----------------------------------------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
 | **Network blocking** (the expensive one)  | Waiting on SQL Server                                             | ❌ **Never happens** — no thread, no GIL parked.                                     |
-| **GIL boundary blocking** (the cheap one) | Brief GIL acquire/release at the in/out edges (points A, D, F, G) | ✅ Happens, but **microsecond-scale** and unavoidable for any Python↔native binding. |
+| **GIL boundary blocking**                | GIL acquire/release and Python-object work (points A, D, F, G)     | ✅ Can wait for contention and grows with conversion work.                           |
 
-**Yes, there is momentary blocking — but only at the GIL boundaries, measured in microseconds, never during the query itself.**
+GIL contention and conversion can delay completion; this document does not
+measure their latency. Native network waits do not park the Python loop thread.
 
 #### The GIL is a lock on objects, not on a code layer
 
@@ -613,18 +662,16 @@ A common misconception is "the GIL is held only when a thread runs Python code."
 
 So result materialization happens "in PyO3" because PyO3 is the only thing that can translate Rust values into Python objects — and that translation must hold the GIL, not because we are "in Python," but because **building Python objects touches the CPython object heap**:
 
-```rust
-// Running on a Tokio worker thread (native Rust, NO GIL yet)
-let rows: Vec<RustRow> = client.execute(...).await?;   // pure Rust, no GIL
-
-Python::with_gil(|py| {              // worker ACQUIRES the GIL here (may wait briefly)
-    let list = PyList::empty(py);
-    for r in rows {
-        list.append(r.into_py(py))?; // building Python objects -> needs GIL
-    }
-    Ok(list.into())
-})                                   // GIL RELEASED when this block ends
+```text
+fetch TDS rows into Rust row writers       // no Python objects
+submit a conversion chunk to spawn_blocking
+    Python::attach: convert writers to Python tuples and append to the list
+return the Python result through the awaitable bridge
 ```
+
+This is conceptual pseudocode for the existing
+[fetch materialization](../mssql-py-core/src/async_fetch.rs), not an `execute`
+return type. The implementation already converts list results in chunks.
 
 **Mental model:** the GIL is a lock on the **Python object heap**, not a lock on "Python code." Any thread — Python or Rust — that touches that heap must hold it.
 
@@ -635,32 +682,35 @@ This is the **only** GIL section whose cost scales with data size:
 ```mermaid
 flowchart LR
     R1["Rust has parsed rows, no GIL"] --> R2["acquire GIL"]
-    R2 --> R3["build Python list, dicts, values - GIL HELD the whole time"]
+    R2 --> R3["convert one chunk to Python rows - GIL HELD"]
     R3 --> R4["release GIL"]
 ```
 
 - For a small result, negligible. For a **huge result set** (e.g. 1M rows), the conversion holds the GIL long enough to **momentarily stall other coroutines**, because only one thread can build Python objects at a time.
 - This does **not** break concurrency of the *queries* (they already overlapped during the network phase) — it only **serializes the final row-materialization**.
-- Mitigations if it ever matters: **stream/fetch in chunks** (convert a batch at a time, yielding between batches) or expose `fetchmany()` so the app pulls rows incrementally instead of one giant conversion.
+- The existing API offers `fetchmany()`, and list materialization already converts in chunks. This reduces long conversion sections but is not a measured upper bound on GIL latency.
 
 ---
 
-## 8. Today vs. true async: what must change in pycore
+## 8. Sync vs. existing async in pycore
 
-### 8.1 The current (blocking) model
+### 8.1 The synchronous model
 
-On the Rust path, `mssql-py-core` bridges with `runtime.block_on(...)` inside `py.detach()` (GIL released). Each `cursor.execute()` **blocks the calling Python thread** until the query completes — this is *not* true async. (The default DDBC/ODBC path is likewise synchronous; see [§2](#2-problem-statement--goals).)
+`PyCoreConnection` and `PyCoreCursor` bridge with `runtime.block_on(...)` inside
+`py.detach()`. Their synchronous calls block the calling Python thread. This
+does not describe `PyAsyncConnection` or `PyAsyncCursor`. The DDBC/ODBC path is
+also synchronous.
 
-**Today (blocking):**
+**Existing synchronous path:**
 
 ```mermaid
 flowchart LR
     N1["cursor.execute"] --> N2["py.detach"]
     N2 --> N3["runtime.block_on - BLOCKS the Python thread"]
-    N3 --> N4["returns rows"]
+    N3 --> N4["execute completes, cursor positioned for fetch"]
 ```
 
-**Proposed (true async):**
+**Existing async path:**
 
 ```mermaid
 flowchart LR
@@ -670,18 +720,22 @@ flowchart LR
     A4 --> A5["awaitable resolves, Python resumes"]
 ```
 
-### 8.2 The changes
+### 8.2 The existing async model
 
-| Piece         | Today                                   | True async                                                |
+| Piece         | Synchronous Rust API                    | Existing async Rust API                                   |
 | ------------- | --------------------------------------- | --------------------------------------------------------- |
 | Tokio runtime | one `Runtime::new()` **per connection** | **one shared** multi-thread runtime for the whole process |
 | Call style    | `runtime.block_on(...)`                 | `future_into_py(...)` returns an awaitable                |
 | Python thread | **blocked** during query                | **free** — the loop keeps running                         |
 | API           | `def execute`                           | `async def execute`                                       |
 
-### 8.3 The three things pycore must get right
+The async native methods return awaitables; the Python wrapper exposes awaited
+connection/cursor operations. Pool integration must reuse this runtime and
+surface, not replace either API or collapse execution and fetching into one call.
 
-1. **One shared Tokio runtime** (not per-connection). Created once (e.g. via `pyo3_async_runtimes::tokio::get_runtime()`) and used by every connection. This lets tasks from different connections share the worker pool and overlap.
+### 8.3 Invariants preserved by the async surface
+
+1. **One shared async Tokio runtime.** `async_runtime::init` already registers it with the bridge, and async connections reuse it. Synchronous connections retain their own runtimes.
 2. **GIL discipline.** Hold the GIL only at the **boundaries** — reading the query string in, and converting result rows out. During the network wait and TDS parsing, the GIL is **released**, so other Python coroutines run. The bridge acquires the GIL only when it needs to wake the awaitable.
 3. **The statement handle.** A prepared-statement handle is just a server-side `i32` that SQL Server owns. Hold it as a plain integer field on the cursor and send it back on the next `sp_execute`, always on the **same connection** that created it. No thread affinity, no locking — the bridge never needs to touch it specially.
 
@@ -689,7 +743,7 @@ flowchart LR
 
 ## 9. End-to-end walkthrough between Python and Rust
 
-What happens on `await cursor.execute("SELECT ...")` in the true-async Python design:
+What happens on `await cursor.execute("SELECT ...")` followed by fetching in the existing async API:
 
 ```mermaid
 sequenceDiagram
@@ -708,11 +762,18 @@ sequenceDiagram
     Note over EL: GIL RELEASED here - Python loop free, runs other coroutines Query B
     Tok->>SQL: write query packet - pure Rust, no GIL needed
     Tok->>Tok: await socket then Tokio thread freed
-    SQL-->>Tok: rows ready, reactor wakes task
-    Tok->>Tok: parse rows into Rust values
+    SQL-->>Tok: first result boundary ready, reactor wakes task
+    Tok->>Tok: parse result boundary and metadata
     Tok->>Bridge: future completed, result ready
     Bridge->>EL: wake the awaitable
-    EL->>App: await returns rows as Python objects
+    EL->>App: execute completes, cursor positioned for fetch
+    App->>EL: await cursor.fetchall
+    EL->>Cur: call fetchall
+    Cur->>Bridge: wrap fetch future
+    Bridge->>Tok: spawn fetch, read and convert rows
+    Tok->>Bridge: fetch completed with Python rows
+    Bridge->>EL: resolve fetch awaitable
+    EL->>App: fetchall returns rows
 ```
 
 **Step by step:**
@@ -720,27 +781,27 @@ sequenceDiagram
 2. The actual query is **spawned onto the shared Tokio runtime**. The bridge links "this Python awaitable" to "this Tokio task."
 3. **Python's asyncio loop is now free** — it runs your other coroutines (e.g., Query B on the other connection).
 4. Tokio does the real work exactly as in the native-Rust case: send packet → yield on `.await` → reactor wakes it when SQL Server replies → parse rows. **No Python thread and no Tokio thread is parked during the network wait.**
-5. When the Rust future finishes, the bridge **wakes the Python awaitable** (via asyncio's thread-safe callback), and `await` returns with the results converted to Python objects.
+5. The bridge wakes the execution awaitable when the cursor is positioned on a result. A subsequent fetch operation reads and converts rows; execution itself does not return a row collection.
 
 ---
 
-## 10. Rollout plan
+## 10. Preview delivery and integration boundaries
 
-### Delivery: experimental namespace first
+### Existing namespace
 
-- Ship the async API behind an **experimental / opt-in surface** (e.g. an `aio` submodule such as `mssql_python.aio`, or dedicated async classes) so it lands without affecting sync users.
-- Optionally gate the native build with a **Cargo feature** (e.g. `async`) during early iterations.
-- Promote to **default-available** (not default-*on*; the sync API stays) once the success criteria in [§2](#2-problem-statement--goals) are met and the API is stable.
+- The preview Python entry point is `mssql_python.async_query.AsyncConnection`; the native module already exports its async classes.
+- Extend that existing surface for approved pool integration. Do not introduce an `aio` namespace or a new Cargo feature based on this explanatory document.
+- Runtime sharing does not make the sync API async or change sync pooling.
 
 ### Versioning & deprecation
 
-- The async API is **additive** — no breaking changes to existing sync signatures — so it ships in a **minor** release.
-- If shared internals change shape (e.g. consolidating to one Tokio runtime), keep sync behavior identical and note any observable change in the changelog.
+- The existing async API is preview/unstable; this document does not promise a release version or stable signatures.
+- Keep sync behavior unchanged when extending async internals. The async shared runtime is already implemented, not a pending consolidation of sync runtimes.
 - No sync APIs are deprecated by this work. If that ever changes, follow a standard **deprecate → warn (one minor cycle) → remove (next major)** policy.
 
 ### Documentation & migration
 
-- Add an **async quickstart** (connect, `await cursor.execute`, `async for` / `fetch`), with a note that concurrency scales with connections (use a pool).
+- Keep async examples on the existing connect/execute/fetch surface. Concurrency scales with connections; the proposed async pool is not yet available through Python.
 - Provide a **migration guide** for asyncio users currently using `run_in_executor`, showing the before/after.
 - Document the **one-shared-runtime** model and the result-materialization caveat ([§7.6](#76-how-pyo3-bridges-the-schedulers-and-where-it-briefly-blocks)) for large result sets.
 - Cross-link this design doc from the `mssql-py-core` README.
@@ -776,7 +837,10 @@ S1 --> S2 --> S3 --> S4
 
 #### 11.1.2 Example Walkthrough: Two connections, two cursors (Async)
 
-Each connection is its **own TCP socket** and its **own `TdsClient`**. Held as `Arc<Mutex<TdsClient>>` and driven as two tasks. **async main** launches Task A and Task B; each task writes its query to its own SQL Server socket, then parks; the Tokio Reactor watches both sockets and wakes whichever task's reply arrives first.
+Each connection has its own socket and `TdsClient`. In the native example below,
+each task owns its client without a shared mutex. The caller launches both
+tasks; each sends its query and drains the response before completing.
+The Tokio reactor watches both sockets and wakes the task whose bytes arrive.
 
 ```mermaid
 sequenceDiagram
@@ -796,10 +860,10 @@ sequenceDiagram
     Note over Rt: Both tasks waiting, threads are FREE
     SA-->>Rt: rows ready socket A
     Rt->>TA: wake, free thread resumes
-    TA-->>App: rows for A
+    TA-->>App: batch A drained, task completes
     SB-->>Rt: rows ready socket B
     Rt->>TB: wake, free thread resumes
-    TB-->>App: rows for B
+    TB-->>App: batch B drained, task completes
 ```
 
 Both connections run genuinely in parallel — separate sockets, separate tasks — even on a single-threaded runtime, because the *waiting* is overlapped.
@@ -808,41 +872,53 @@ Both connections run genuinely in parallel — separate sockets, separate tasks 
 
 | Participant                 | What it actually is                                                                                                                                                                                                      |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **async main**              | Your program's entry point — the top-level `async fn main` on the Tokio runtime. It launches both queries with `tokio::spawn` and waits for both (`tokio::join!`). It drives; it doesn't do the query work itself.       |
-| **Task A**                  | The lightweight future for the first query, running on **Connection A**. It owns "send SELECT A, await the reply, parse rows." A unit of work, not a thread.                                                             |
+| **Caller**                  | Runs on Tokio, launches both queries with `tokio::spawn` and waits for both (`tokio::join!`). |
+| **Task A**                  | Owns Connection A, sends its query, awaits the response and drains the batch. A unit of work, not a thread. |
 | **Task B**                  | The same for the second query on **Connection B** — an independent future. A and B share no lock, so they run concurrently.                                                                                              |
 | **Tokio Reactor**           | The runtime's I/O watcher, built on the OS's `epoll` (Linux) / `IOCP` (Windows). It monitors the sockets and **wakes the specific task** when its bytes arrive — this is what lets a task sleep with no thread assigned. |
 | **SQL Server socket A / B** | The two **TCP connections** to SQL Server, one per `TdsClient`. Separate byte pipes, so queries A and B travel and return in parallel.                                                                                   |
 
 #### 11.1.3 What the Rust app looks like
 
+This completion-only function accepts two already connected clients. Each task
+owns its client, applies a 30-second execution timeout and drains the batch,
+discarding rows. Row-returning applications fetch rows before draining instead.
+
 ```rust
-#[tokio::main]
-async fn main() -> TdsResult<()> {
-    // Two independent connections = two sockets = true parallelism
-    let conn_a = Arc::new(Mutex::new(provider.create_client(ctx_a, &ds_a, None).await?));
-    let conn_b = Arc::new(Mutex::new(provider.create_client(ctx_b, &ds_b, None).await?));
+use mssql_tds::connection::tds_client::{ExecuteOptions, TdsClient};
 
-    // Spawn two tasks — they run concurrently, no dedicated threads
-    let a = tokio::spawn({
-        let c = conn_a.clone();
-        async move {
-            let mut client = c.lock().await;
-            client.execute("SELECT * FROM A".into(), Some(30), None).await
-            // ... read rows ...
-        }
+async fn run_two_queries(
+    mut conn_a: TdsClient,
+    mut conn_b: TdsClient,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let a = tokio::spawn(async move {
+        conn_a
+            .execute(
+                "SELECT 1 AS value".into(),
+                ExecuteOptions {
+                    timeout: Some(30),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        conn_a.close_query().await
     });
-    let b = tokio::spawn({
-        let c = conn_b.clone();
-        async move {
-            let mut client = c.lock().await;
-            client.execute("SELECT * FROM B".into(), Some(30), None).await
-        }
+    let b = tokio::spawn(async move {
+        conn_b
+            .execute(
+                "SELECT 2 AS value".into(),
+                ExecuteOptions {
+                    timeout: Some(30),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        conn_b.close_query().await
     });
 
-    // Both run at the same time; join waits for both
     let (ra, rb) = tokio::join!(a, b);
-    ra??; rb??;
+    ra??;
+    rb??;
     Ok(())
 }
 ```
@@ -881,4 +957,4 @@ flowchart TB
 
 ---
 
-*This document reflects the async architecture of the `mssql-tds` core and the design direction for true-async Python bindings in `mssql-py-core`.*
+*This document describes the existing async architecture of `mssql-tds` and `mssql-py-core`. Python/AQE pool integration remains a separate implementation slice.*
