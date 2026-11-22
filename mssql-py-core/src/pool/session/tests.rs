@@ -139,6 +139,34 @@ fn isolation_sql_is_closed_and_no_change_is_rejected() {
 }
 
 #[tokio::test]
+async fn initialize_rejects_unfinished_streamed_write_before_carrier() {
+    for reuse in [false, true] {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut client =
+            tds_client_from_tokens_gated(vec![], Arc::new(Semaphore::new(0)), dropped.clone());
+        client
+            .begin_sp_executesql(
+                "SELECT @v".into(),
+                vec![RpcParameter::data_at_exec(
+                    Some("@v".into()),
+                    StatusFlags::NONE,
+                    StreamedSqlType::VarBinaryMax,
+                )],
+                (),
+            )
+            .await
+            .unwrap();
+        client.write_streamed_chunk(&[1; 8192]).await.unwrap();
+        assert!(!client.has_open_batch());
+        assert!(matches!(
+            initialize(opened(client), &spec(), &isolation(), reuse).await,
+            Err(PoolError::InvalidSession)
+        ));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
 async fn fresh_then_cached_checkout_sends_isolation_and_only_reuse_arms_reset() {
     let manager = manager(1);
     let (client, sent) = tds_client_from_tokens_capturing(vec![
