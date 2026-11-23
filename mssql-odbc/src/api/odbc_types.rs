@@ -896,10 +896,8 @@ pub const SQL_INSENSITIVE: SqlULen = 1;
 pub const SQL_SC_UNIQUE: SqlULen = 2;
 /// `SQL_ATTR_RETRIEVE_DATA` default: data is retrieved on fetch.
 pub const SQL_RD_ON: SqlULen = 1;
-/// Value msodbcsql substitutes for any non-zero `SQL_ATTR_MAX_LENGTH` request,
-/// reporting `01S02`. The cap is cosmetic on both drivers: a value longer than
-/// this is still returned whole.
-pub const MSODBCSQL_MAX_LENGTH: SqlULen = 8000;
+/// Smallest nonzero `SQL_ATTR_MAX_LENGTH` accepted by msodbcsql.
+pub const MIN_TEXT_SIZE: SqlULen = 8000;
 /// Largest `SQL_ATTR_QUERY_TIMEOUT` msodbcsql accepts; larger requests are
 /// clamped to it and reported with `01S02` (`MAX_QUERY_TIMEOUT`,
 /// msodbcsql `sqlcmisc.cpp:3988`).

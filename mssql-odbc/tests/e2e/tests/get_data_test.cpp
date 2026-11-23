@@ -2560,6 +2560,89 @@ ODBC_TEST_F_MODES(GetDataLiveTest, FetchDrainsPartiallyReadPlpFromPriorRow,
     SQLCloseCursor(stmt_);
 }
 
+// Benefits-from-mock-tds: assert the separate SET batch occurs only when the
+// effective setting changes. The live test measures the bytes SQL Server returns.
+ODBC_TEST_F(GetDataLiveTest, MaxLengthCapsPlpBeforeBufferConversion) {
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+              SQLSetStmtAttr(stmt_, SQL_ATTR_MAX_LENGTH, reinterpret_cast<SQLPOINTER>(100), 0));
+    EXPECT_EQ("01S02", StmtDiagState());
+    struct Case {
+        const char* expression;
+        SQLSMALLINT target;
+        SQLLEN terminator;
+        SQLLEN bytes;
+    };
+    const Case cases[] = {
+        {"REPLICATE(CAST('a' AS varchar(max)),9000)", SQL_C_CHAR, 1, 8000},
+        {"REPLICATE(CAST(N'a' AS nvarchar(max)),9000)", SQL_C_WCHAR, sizeof(SQLWCHAR), 8000},
+        {"CONVERT(varbinary(max),REPLICATE(CAST('a' AS varchar(max)),9000))", SQL_C_BINARY, 0, 8000},
+        // The next UTF-8 character needs three bytes; only one is left under TEXTSIZE.
+        {"CAST((REPLICATE(CAST(N'a' AS nvarchar(max)),7999)+NCHAR(8364)) "
+         "COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS varchar(max))", SQL_C_BINARY, 0, 7999},
+    };
+    for (const auto& c : cases) {
+        std::vector<SQLCHAR> expected(c.bytes, 'a');
+        if (c.target == SQL_C_WCHAR) {
+            const SQLWCHAR unit = 'a';
+            for (size_t i = 0; i < expected.size(); i += sizeof(unit)) {
+                std::memcpy(expected.data() + i, &unit, sizeof(unit));
+            }
+        }
+        for (const bool bound : {false, true}) {
+            for (const SQLLEN size : {c.bytes + c.terminator, SQLLEN{4096}}) {
+                SCOPED_TRACE(::testing::Message() << c.expression << " bound=" << bound
+                                                  << " buffer bytes=" << size);
+                ASSERT_SQL_OK(ExecDirect(std::string("SELECT ") + c.expression), SQL_HANDLE_STMT, stmt_);
+                std::vector<SQLCHAR> buffer(size, 0xCC);
+                SQLLEN length = -1;
+                if (bound) {
+                    ASSERT_EQ(SQL_SUCCESS, SQLBindCol(stmt_, 1, c.target, buffer.data(), size, &length));
+                } else {
+                    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+                }
+                const auto rc = bound ? SQLFetch(stmt_)
+                                      : SQLGetData(stmt_, 1, c.target, buffer.data(), size, &length);
+                const SQLLEN copied = (std::min)(c.bytes, size - c.terminator);
+                ASSERT_EQ(copied == c.bytes ? SQL_SUCCESS : SQL_SUCCESS_WITH_INFO, rc);
+                EXPECT_EQ(copied == c.bytes ? "" : "01004", StmtDiagState());
+                EXPECT_EQ(c.bytes, length);
+                EXPECT_TRUE(std::equal(expected.begin(), expected.begin() + copied, buffer.begin()));
+                if (!bound && copied < c.bytes) {
+                    ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, c.target, buffer.data(), size, &length));
+                    EXPECT_EQ(c.bytes - copied, length);
+                    EXPECT_TRUE(std::equal(expected.begin() + copied, expected.end(), buffer.begin()));
+                    EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, c.target, buffer.data(), size, &length));
+                }
+                ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+                ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
+            }
+        }
+    }
+}
+
+ODBC_TEST_F(GetDataLiveTest, MaxLengthFollowsExecutingStatement) {
+    auto expect_textsize = [](SQLHSTMT stmt, SQLINTEGER expected) {
+        auto sql = ODBCTestUtils::ToSqlTStr("SELECT @@TEXTSIZE");
+        ASSERT_SQL_OK(SQLExecDirect(stmt, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS), SQL_HANDLE_STMT, stmt);
+        ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt));
+        SQLINTEGER size = 0;
+        ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt, 1, SQL_C_SLONG, &size, sizeof(size), nullptr));
+        EXPECT_EQ(expected, size);
+        ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt));
+    };
+    ASSERT_EQ(SQL_SUCCESS, SQLSetConnectAttr(dbc_, SQL_ATTR_MAX_LENGTH, reinterpret_cast<SQLPOINTER>(9001), 0));
+    SQLHSTMT other = AllocStmt();
+    ASSERT_NE(nullptr, other);
+    expect_textsize(stmt_, 9001);
+    expect_textsize(other, 9001);
+    ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_MAX_LENGTH, nullptr, 0));
+    expect_textsize(stmt_, -1);
+    expect_textsize(other, 9001);
+    ASSERT_EQ(SQL_SUCCESS, SQLSetConnectAttr(dbc_, SQL_ATTR_MAX_LENGTH, nullptr, 0));
+    expect_textsize(other, -1);
+    FreeStmt(other);
+}
+
 // Closing the cursor mid-PLP discards the rest of the value, so the connection
 // takes the next query and the statement re-executes.
 // Benefits-from-mock-tds: show whether the close drained the remaining PLP

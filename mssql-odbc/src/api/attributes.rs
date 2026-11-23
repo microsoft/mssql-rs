@@ -81,7 +81,7 @@ type AttrRow = (SqlInteger, &'static str, u8);
 /// The 0-29 band is the ODBC 2.x statement-option fan-out: msodbcsql accepts
 /// statement options on a connection handle and applies them to every statement
 /// on that connection, but refuses to read them back. This driver implements
-/// the fan-out only for `SQL_ATTR_QUERY_TIMEOUT`; the rest are listed so they
+/// the fan-out for `SQL_ATTR_QUERY_TIMEOUT` and `SQL_ATTR_MAX_LENGTH`; the rest are listed so they
 /// report `HYC00` rather than `HY092`.
 static DBC_ATTRS: &[AttrRow] = &[
     (0, "SQL_ATTR_QUERY_TIMEOUT", OP_SET),

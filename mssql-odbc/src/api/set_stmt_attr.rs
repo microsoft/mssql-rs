@@ -15,10 +15,11 @@
 //! rather than rejecting an over-large request; the stored timeout is enforced
 //! against the running statement by `SQLExecute`/`SQLExecDirectW` (AB#46385).
 //! `SQL_ATTR_MAX_ROWS` is stored and genuinely enforced by the fetch path.
+//! `SQL_ATTR_MAX_LENGTH` selects the server TEXTSIZE before statement execution.
 //! Other recognized parameter and cursor controls are stored and
 //! round-tripped without effect, because msodbcsql reports back whatever was
 //! written; the handful whose reported value msodbcsql pins regardless of the
-//! request (`SQL_ATTR_MAX_LENGTH`, `SQL_ATTR_KEYSET_SIZE`,
+//! request (`SQL_ATTR_KEYSET_SIZE`,
 //! `SQL_ATTR_SIMULATE_CURSOR`) substitute and warn with `01S02`.
 //! Parameter-array attributes are stored and consumed by `SQLExecute`; data-at-
 //! execution and output arrays remain explicitly unsupported.
@@ -53,7 +54,7 @@ use tracing::{debug, error, warn};
 
 use crate::api::attributes::{AttrOp, AttrScope, unimplemented_attr_diag};
 use crate::api::odbc_types::{
-    MAX_QUERY_TIMEOUT, MSODBCSQL_MAX_LENGTH, SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC,
+    MAX_QUERY_TIMEOUT, MIN_TEXT_SIZE, SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC,
     SQL_ATTR_CONCURRENCY, SQL_ATTR_CURSOR_SCROLLABLE, SQL_ATTR_CURSOR_SENSITIVITY,
     SQL_ATTR_CURSOR_TYPE, SQL_ATTR_IMP_PARAM_DESC, SQL_ATTR_IMP_ROW_DESC, SQL_ATTR_KEYSET_SIZE,
     SQL_ATTR_MAX_LENGTH, SQL_ATTR_MAX_ROWS, SQL_ATTR_METADATA_ID, SQL_ATTR_PARAM_BIND_OFFSET_PTR,
@@ -104,6 +105,16 @@ use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 /// instead; see [`InertStmtAttrs::claim_ignored_report`].
 static CURSOR_TYPE_SUBSTITUTED: AtomicBool = AtomicBool::new(false);
 static CONCURRENCY_SUBSTITUTED: AtomicBool = AtomicBool::new(false);
+
+/// msodbcsql `sqlcmisc.cpp`: zero is unlimited; other values must fit
+/// between SQL_PREC_BIGCHARBINARY and INT32_MAX.
+pub(super) fn clamp_max_length(requested: SqlULen) -> SqlULen {
+    if requested == 0 {
+        0
+    } else {
+        requested.clamp(MIN_TEXT_SIZE, i32::MAX as usize)
+    }
+}
 
 /// Returns whether this is the first time `latch` has been reached, taking it
 /// if so.
@@ -461,18 +472,9 @@ unsafe fn sql_set_stmt_attr_w_safe(
             SQL_SUCCESS
         }
         SQL_ATTR_MAX_LENGTH => {
-            // msodbcsql substitutes MSODBCSQL_MAX_LENGTH for any non-zero
-            // request and reports 01S02; the cap is then never applied, and a
-            // longer value still comes back whole. Mirror the reported value
-            // and the warning so an application that inspects either sees the
-            // same thing from both drivers.
             let requested = value_ptr as SqlULen;
-            let effective = if requested == 0 {
-                0
-            } else {
-                MSODBCSQL_MAX_LENGTH
-            };
-            state.inert_attrs.set(SQL_ATTR_MAX_LENGTH, effective);
+            let effective = clamp_max_length(requested);
+            stmt.max_length.store(effective, Ordering::Relaxed);
             if requested == effective {
                 SQL_SUCCESS
             } else {
@@ -1129,6 +1131,12 @@ unsafe fn sql_get_stmt_attr_w_safe(
         }
         SQL_ATTR_QUERY_TIMEOUT => unsafe {
             write_if_some(value_ptr as *mut SqlULen, state.query_timeout as SqlULen);
+        },
+        SQL_ATTR_MAX_LENGTH => unsafe {
+            write_if_some(
+                value_ptr.cast::<SqlULen>(),
+                stmt.max_length.load(Ordering::Relaxed),
+            );
         },
         SQL_ATTR_MAX_ROWS => unsafe {
             write_if_some(value_ptr as *mut SqlULen, state.max_rows);
@@ -2565,18 +2573,23 @@ mod tests {
         assert_eq!(get_attr(h.stmt, SQL_ROWSET_SIZE), 7);
     }
 
-    /// A non-zero `SQL_ATTR_MAX_LENGTH` is substituted rather than honored, and
-    /// the substitution is announced. The cap is cosmetic on msodbcsql too — a
-    /// longer value still comes back whole — so only the reported state matters.
     #[test]
-    fn max_length_substitutes_and_warns() {
+    fn max_length_substitutes_only_outside_server_range() {
         let h = TestHandles::with_env_dbc_stmt();
-        assert_eq!(
-            set_attr(h.stmt, SQL_ATTR_MAX_LENGTH, 10),
-            SQL_SUCCESS_WITH_INFO
-        );
-        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_01S02);
-        assert_eq!(get_attr(h.stmt, SQL_ATTR_MAX_LENGTH), MSODBCSQL_MAX_LENGTH);
+        for (request, expected) in [
+            (10, MIN_TEXT_SIZE),
+            (8001, 8001),
+            (usize::MAX, i32::MAX as usize),
+        ] {
+            let rc = set_attr(h.stmt, SQL_ATTR_MAX_LENGTH, request);
+            if request == expected {
+                assert_eq!(rc, SQL_SUCCESS);
+            } else {
+                assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
+                assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_01S02);
+            }
+            assert_eq!(get_attr(h.stmt, SQL_ATTR_MAX_LENGTH), expected);
+        }
     }
 
     #[test]
@@ -2591,9 +2604,9 @@ mod tests {
     #[test]
     fn max_length_at_the_substituted_value_is_accepted_silently() {
         let h = TestHandles::with_env_dbc_stmt();
-        let rc = set_attr(h.stmt, SQL_ATTR_MAX_LENGTH, MSODBCSQL_MAX_LENGTH);
+        let rc = set_attr(h.stmt, SQL_ATTR_MAX_LENGTH, MIN_TEXT_SIZE);
         assert_eq!(rc, SQL_SUCCESS);
-        assert_eq!(get_attr(h.stmt, SQL_ATTR_MAX_LENGTH), MSODBCSQL_MAX_LENGTH);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_MAX_LENGTH), MIN_TEXT_SIZE);
     }
 
     #[test]

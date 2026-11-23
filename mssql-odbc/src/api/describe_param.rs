@@ -22,7 +22,7 @@ use super::exec_common::{
 };
 use super::odbc_types::*;
 use super::sqlstate::*;
-use super::txn::begin_transaction_if_manual;
+use super::txn::apply_statement_options;
 use super::util::write_if_some;
 use crate::api::type_rules::parameter_size_is_precision;
 use crate::error::{free_errors, post_sql_error};
@@ -377,8 +377,9 @@ fn describe_param_operation(
         }
     };
 
-    if let Err(e) = begin_transaction_if_manual(
+    if let Err(e) = apply_statement_options(
         dbc,
+        stmt,
         &mut client,
         "SQLDescribeParam",
         query_timeout,

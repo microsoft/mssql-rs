@@ -201,6 +201,15 @@ for grammar and reference-driver measurements.
 
 ## Fetch buffering
 
+`SQL_ATTR_MAX_LENGTH` limits the bytes SQL Server sends for large character
+and binary values, before conversion to the requested C type. Zero (the
+default) means unlimited; nonzero values outside 8000–2147483647 are clamped
+with `01S02`. On a connection handle, the setter updates existing statements
+and the default for new ones. Before execution, the driver sends `SET TEXTSIZE`
+only if the executing statement's limit differs from the last one it applied.
+Reaching that server limit does not post `01004`; truncating the resulting
+value to fit an application buffer still does. XML is not limited by TEXTSIZE.
+
 Fetch reuses binding storage between calls while honoring descriptor changes on
 the next fetch. The connection retains one heap-allocated protocol client to
 avoid large client copies during result retrieval; cancellation and connection

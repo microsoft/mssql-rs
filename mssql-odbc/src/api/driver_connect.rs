@@ -570,6 +570,7 @@ fn do_connect(
     // (`TdsHlp.cpp: BATCHCTX::NewPacketSize`), a separate internal detail.
     state.effective_packet_size = Some(resolved_packet_size);
     state.wire.install(client);
+    state.applied_max_length = Some(0);
     state.connection_state = ConnectionState::Connected;
     debug!("SQLDriverConnectW: connected successfully");
 

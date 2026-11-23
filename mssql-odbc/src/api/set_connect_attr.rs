@@ -22,7 +22,7 @@ use crate::api::attributes::{AttrOp, AttrScope, unimplemented_attr_diag};
 use crate::api::odbc_types::{
     DATACLASSIFICATION_VERSION_MAX, SQL_ATTR_ACCESS_MODE, SQL_ATTR_ANSI_APP, SQL_ATTR_AUTOCOMMIT,
     SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT,
-    SQL_ATTR_PACKET_SIZE, SQL_ATTR_QUERY_TIMEOUT, SQL_ATTR_RESET_CONNECTION,
+    SQL_ATTR_MAX_LENGTH, SQL_ATTR_PACKET_SIZE, SQL_ATTR_QUERY_TIMEOUT, SQL_ATTR_RESET_CONNECTION,
     SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_ACCESS_TOKEN, SQL_COPT_SS_DATACLASSIFICATION_VERSION,
     SQL_COPT_SS_ENCRYPT, SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_LONGASMAX,
     SQL_COPT_SS_MULTISUBNET_FAILOVER, SQL_COPT_SS_RESET_CONNECTION, SQL_COPT_SS_TNIR,
@@ -225,8 +225,23 @@ unsafe fn sql_set_connect_attr_w_impl(
         return SQL_ERROR;
     };
     free_errors(&mut state);
-
     match attribute {
+        SQL_ATTR_MAX_LENGTH => {
+            let requested = value_ptr as usize;
+            let effective = super::set_stmt_attr::clamp_max_length(requested);
+            state.stmt_max_length = effective;
+            for &raw in &state.statements {
+                // SAFETY: the held DBC lock prevents child handle removal.
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+                stmt.max_length
+                    .store(effective, std::sync::atomic::Ordering::Relaxed);
+            }
+            if effective != requested {
+                post_diag(&mut state, WARN_OPTION_VALUE_CHANGED);
+                return SQL_SUCCESS_WITH_INFO;
+            }
+            SQL_SUCCESS
+        }
         SQL_COPT_SS_ACCESS_TOKEN => {
             // The access token is a pre-connect attribute; reject it once a
             // connection attempt has started. msodbcsql posts HY011 ("attribute
@@ -862,7 +877,7 @@ mod tests {
     /// A statement attribute aimed at a connection is `HYC00`, not `HY092`:
     /// msodbcsql accepts the ODBC 2.x statement options here and fans them out
     /// to every statement (`SQL_ATTR_MAX_ROWS` = 1). This driver implements the
-    /// fan-out only for `SQL_ATTR_QUERY_TIMEOUT`.
+    /// fan-out for `SQL_ATTR_QUERY_TIMEOUT` and `SQL_ATTR_MAX_LENGTH`.
     #[test]
     fn statement_option_on_a_connection_reports_not_implemented() {
         let h = TestHandles::with_env_dbc();

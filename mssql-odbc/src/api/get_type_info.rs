@@ -24,7 +24,7 @@ use super::exec_common::{
     query_timeout_expired_error,
 };
 use super::sqlstate::*;
-use super::txn::begin_transaction_if_manual;
+use super::txn::apply_statement_options;
 use super::util::COLMETA_NULLABLE_FLAG;
 use crate::api::odbc_types::{
     SQL_ALL_TYPES, SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_CHAR, SQL_DATETIME, SQL_DECIMAL,
@@ -215,8 +215,9 @@ fn sql_get_type_info_w_operation(
         }
     };
 
-    if let Err(e) = begin_transaction_if_manual(
+    if let Err(e) = apply_statement_options(
         dbc,
+        stmt,
         &mut client,
         "SQLGetTypeInfoW",
         query_timeout,

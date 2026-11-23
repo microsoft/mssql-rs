@@ -75,7 +75,7 @@ use super::odbc_types::{
     SqlWChar,
 };
 use super::sqlstate::{ERR_INVALID_CURSOR_STATE, ERR_INVALID_STRING_OR_BUFFER_LENGTH, post_diag};
-use super::txn::begin_transaction_if_manual;
+use super::txn::apply_statement_options;
 use super::util::{COLMETA_NULLABLE_FLAG, read_utf16};
 use crate::error::free_errors;
 use crate::handles::stmt::{
@@ -610,7 +610,7 @@ fn run_catalog_operation(
     };
 
     if let Err(e) =
-        begin_transaction_if_manual(dbc, &mut client, name, query_timeout, &cancel_handle)
+        apply_statement_options(dbc, stmt, &mut client, name, query_timeout, &cancel_handle)
     {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
@@ -1950,7 +1950,7 @@ mod tests {
     }
 
     /// `SQL_ATTR_QUERY_TIMEOUT` must also bound the implicit transaction begin
-    /// `begin_transaction_if_manual` sends before a catalog RPC when the
+    /// `apply_statement_options` sends before a catalog RPC when the
     /// connection is in manual-commit mode — AB#46385's AC2 makes the
     /// pre-execute steps a first-class requirement, and AC5 requires each
     /// covered entry point to be mutation-resistant.
@@ -1959,7 +1959,7 @@ mod tests {
     /// `ExecuteOptions` half and nothing else: reverting the pre-execute
     /// arguments back to `0` left the whole suite green. This delays only the
     /// server's answer to the Begin request, so it fails if the wiring into
-    /// `flush_pending_unprepare` / `begin_transaction_if_manual` regresses even
+    /// `flush_pending_unprepare` / `apply_statement_options` regresses even
     /// though the RPC step itself is untouched — mirroring
     /// `exec_direct_query_timeout_bounds_a_delayed_implicit_transaction_begin`.
     #[test]
@@ -1981,7 +1981,7 @@ mod tests {
             crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
         mock_server.set_tm_begin_delay(BEGIN_DELAY);
         // Manual-commit mode with no transaction open yet is what makes
-        // `begin_transaction_if_manual` send a real Begin request instead of
+        // `apply_statement_options` send a real Begin request instead of
         // returning immediately.
         dbc.inner.lock().unwrap().autocommit = false;
 

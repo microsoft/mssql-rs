@@ -221,6 +221,7 @@ unsafe fn alloc_stmt(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> 
     free_errors(&mut dbc_state);
 
     let mut stmt = Box::new(StmtHandle::new(input_handle, dbc_state.stmt_query_timeout));
+    *stmt.max_length.get_mut() = dbc_state.stmt_max_length;
     let Ok(stmt_state) = stmt.inner.get_mut() else {
         error!("SQLAllocHandle(STMT): new statement mutex poisoned");
         return SQL_ERROR;

@@ -55,7 +55,7 @@
 //   34. StatementAttributesRoundTrip                   - written values survive
 //   34b.MetadataIdTrueIsNotImplemented                 - HYC00, state stays false
 //   35. RowsetSizeIsIndependentOfRowArraySize          - 9 and 27 are not aliases
-//   36. MaxLengthIsSubstitutedWithAWarning             - non-zero -> 8000 + 01S02
+//   36. MaxLengthIsSubstitutedWithAWarning             - below minimum -> 8000 + 01S02
 //   37. KeysetSizeIsRefusedWithAWarning                - non-zero -> 01S02, stays 0
 //   38. SimulateCursorOnlyAcceptsUnique                - anything else -> 01S02
 //   39. CursorSensitivityUnspecifiedNormalisesToInsensitive - silent normalisation
@@ -1314,9 +1314,7 @@ TEST_F(AttributesTest, RowsetSizeIsIndependentOfRowArraySize) {
 }
 
 // -------------------------------------------------------------------
-// Variation 36 - SQL_ATTR_MAX_LENGTH is not honoured, so msodbcsql
-// substitutes its own limit and says so rather than accepting a cap it
-// will not apply. Zero means "no limit" and passes silently.
+// Variation 36 - zero is unlimited; 8000 is the smallest non-zero cap.
 // -------------------------------------------------------------------
 TEST_F(AttributesTest, MaxLengthIsSubstitutedWithAWarning) {
     EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_MAX_LENGTH, 0));

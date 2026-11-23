@@ -17,7 +17,7 @@ use super::exec_common::{
     query_timeout_expired_error, snapshot_bound_params,
 };
 use super::sqlstate::*;
-use super::txn::begin_transaction_if_manual;
+use super::txn::apply_statement_options;
 use super::util::read_utf16_long;
 use crate::api::odbc_types::{
     SQL_BIND_BY_COLUMN, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_ROWCOUNT_TOTAL, SQL_NTS, SqlHandle,
@@ -430,8 +430,9 @@ fn sql_exec_direct_w_operation(
         }
     };
 
-    if let Err(e) = begin_transaction_if_manual(
+    if let Err(e) = apply_statement_options(
         dbc,
+        stmt,
         &mut client,
         "SQLExecDirectW",
         query_timeout,
@@ -1528,7 +1529,7 @@ mod tests {
     /// blocked server-side (e.g. behind another session's row lock).
     ///
     /// Drives the real `SQLExecDirectW` code path (`claim_connection`,
-    /// `begin_transaction_if_manual`, the elapsed-time deduction, and the
+    /// `apply_statement_options`, the elapsed-time deduction, and the
     /// final `execute`) against a real `TdsClient` connected to a mock TDS
     /// server that holds its response for `RESPONSE_DELAY` — far longer than
     /// the statement's configured timeout. Reverting the timeout wiring back
@@ -1584,7 +1585,7 @@ mod tests {
     }
 
     /// `SQL_ATTR_QUERY_TIMEOUT` must also bound the implicit transaction begin
-    /// `begin_transaction_if_manual` sends before the statement itself when
+    /// `apply_statement_options` sends before the statement itself when
     /// the connection is in manual-commit mode — mirroring msodbcsql's
     /// `CheckOptions`/`ExecTMRImmediate` (`sqlccmd.cpp:10572-10585`), which
     /// passes the statement's own query timeout to that TM request. Unlike
@@ -1592,7 +1593,7 @@ mod tests {
     /// delays the query response), this delays only the server's answer to
     /// the Begin request, via the mock server's reserved
     /// `TM_BEGIN_DELAY_KEY`, so it fails if the timeout wiring into
-    /// `begin_transaction_if_manual` regresses even though the query step
+    /// `apply_statement_options` regresses even though the query step
     /// itself is untouched.
     #[test]
     fn exec_direct_query_timeout_bounds_a_delayed_implicit_transaction_begin() {
@@ -1614,7 +1615,7 @@ mod tests {
             crate::test_support::connect_mock_server(dbc, SELECT_SQL, QueryResponse::select_one());
         mock_server.set_tm_begin_delay(BEGIN_DELAY);
         // Manual-commit mode with no transaction open yet is what makes
-        // `begin_transaction_if_manual` send a real Begin request instead of
+        // `apply_statement_options` send a real Begin request instead of
         // returning immediately.
         dbc.inner.lock().unwrap().autocommit = false;
 

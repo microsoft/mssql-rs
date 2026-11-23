@@ -2179,7 +2179,7 @@ mod tests {
     }
 
     /// `SQLExecDirectW` calls `deduct_query_timeout` twice in sequence — once
-    /// after `flush_pending_unprepare`, once after `begin_transaction_if_manual`
+    /// after `flush_pending_unprepare`, once after `apply_statement_options`
     /// — each time measuring the *cumulative* elapsed time since the call
     /// began against the *original, fixed* budget (not the previous call's
     /// return value). Composing them must charge each step's elapsed time
