@@ -2560,6 +2560,78 @@ ODBC_TEST_F_MODES(GetDataLiveTest, FetchDrainsPartiallyReadPlpFromPriorRow,
     SQLCloseCursor(stmt_);
 }
 
+// Closing the cursor mid-PLP discards the rest of the value, so the connection
+// takes the next query and the statement re-executes.
+// Benefits-from-mock-tds: show whether the close drained the remaining PLP
+// chunks or sent an attention, which the results cannot reveal.
+ODBC_TEST_F_MODES(GetDataLiveTest, PartialPlpReadThenCloseReleasesConnection,
+                  odbc_concurrency::kAllModes) {
+    constexpr SQLLEN kTotal = 20000;
+    const std::string sql = "SELECT REPLICATE(CAST('a' AS varchar(max)), 20000), 7";
+    for (const bool close_cursor : {true, false}) {
+        SCOPED_TRACE(close_cursor ? "SQLCloseCursor" : "SQLFreeStmt(SQL_CLOSE)");
+        ASSERT_SQL_OK(ExecDirect(sql), SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+        std::vector<SQLCHAR> buffer(kTotal + 1);
+        SQLLEN indicator = -99;
+        ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+                  SQLGetData(stmt_, 1, SQL_C_CHAR, buffer.data(), 101, &indicator));
+        EXPECT_EQ("01004", StmtDiagState());
+        EXPECT_EQ(kTotal, indicator);
+        ASSERT_EQ(SQL_SUCCESS, close_cursor ? SQLCloseCursor(stmt_) : SQLFreeStmt(stmt_, SQL_CLOSE));
+
+        SQLHSTMT next = AllocStmt();
+        ASSERT_NE(nullptr, next);
+        auto query = ODBCTestUtils::ToSqlTStr("SELECT 8");
+        ASSERT_SQL_OK(SQLExecDirect(next, const_cast<SQLTCHAR*>(query.c_str()), SQL_NTS),
+                      SQL_HANDLE_STMT, next);
+        ASSERT_EQ(SQL_SUCCESS, SQLFetch(next));
+        SQLINTEGER value = -1;
+        ASSERT_EQ(SQL_SUCCESS, SQLGetData(next, 1, SQL_C_SLONG, &value, 0, nullptr));
+        EXPECT_EQ(8, value);
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(next));
+        FreeStmt(next);
+
+        ASSERT_SQL_OK(ExecDirect(sql), SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+        ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_CHAR, buffer.data(),
+                                          static_cast<SQLLEN>(buffer.size()), &indicator));
+        EXPECT_EQ(kTotal, indicator);
+        EXPECT_EQ(std::string(kTotal, 'a'), reinterpret_cast<const char*>(buffer.data()));
+        ASSERT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 2, SQL_C_SLONG, &value, 0, nullptr));
+        EXPECT_EQ(7, value);
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+    }
+}
+
+// SQLMoreResults mid-PLP discards the rest of the value and the unread row, then
+// moves to the batch's next result set.
+// Benefits-from-mock-tds: show that the skipped PLP chunks and row were read off
+// the wire rather than cancelled, which the results cannot reveal.
+ODBC_TEST_F_MODES(GetDataLiveTest, PartialPlpReadThenMoreResultsReachesNextResult,
+                  odbc_concurrency::kAllModes) {
+    ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST('a' AS varchar(max)), 20000) "
+                             "UNION ALL SELECT 'unread'; SELECT 'next'"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    SQLCHAR prefix[101] = {};
+    SQLLEN indicator = -99;
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+              SQLGetData(stmt_, 1, SQL_C_CHAR, prefix, sizeof(prefix), &indicator));
+    EXPECT_EQ("01004", StmtDiagState());
+    EXPECT_EQ(20000, indicator);
+
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    EXPECT_EQ("", StmtDiagState());
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    SQLRETURN rc = SQL_ERROR;
+    EXPECT_EQ("next", GetChar(1, &rc));
+    EXPECT_EQ(SQL_SUCCESS, rc);
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+}
+
 // Requesting a column past the end of the row returns SQLSTATE 07009.
 ODBC_TEST_F_MODES(GetDataLiveTest, ColumnBeyondEndReturns07009, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(123 AS INT) AS c1"), SQL_HANDLE_STMT, stmt_);
