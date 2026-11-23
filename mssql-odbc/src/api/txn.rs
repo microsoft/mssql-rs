@@ -429,8 +429,10 @@ pub(super) fn apply_statement_options(
         return Ok(());
     };
 
-    // CheckOptions in msodbcsql sends a separate language batch on a change,
-    // never a prefix on the user's SQL or a client-side limit on fetched bytes.
+    // CheckOptions sends one language batch for all changed SET options, after
+    // any separate transaction-manager BEGIN. TEXTSIZE is currently our only
+    // wire SET here (MAX_ROWS is enforced at fetch). Append future SET options
+    // to this batch rather than issuing more requests.
     let remaining = super::exec_common::deduct_query_timeout(timeout_secs, started.elapsed())
         .map_err(|()| super::exec_common::query_timeout_expired_error())?;
     let sql = if requested == 0 {
@@ -2237,7 +2239,7 @@ mod tests {
 
     #[test]
     fn textsize_changes_once_and_failed_set_does_not_cache_success() {
-        use mssql_tds::test_client_support::{done_no_more, tds_client_from_tokens};
+        use mssql_tds::test_client_support::{done_no_more, tds_client_from_tokens_capturing};
         use std::sync::atomic::Ordering;
 
         let h = TestHandles::with_env_dbc_stmt();
@@ -2245,14 +2247,18 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         // One server response: any additional batch will run out of tokens.
-        let mut client = tds_client_from_tokens(vec![done_no_more()]);
+        let (mut client, sent) = tds_client_from_tokens_capturing(vec![done_no_more()]);
         let mut apply = |length| {
             stmt.max_length.store(length, Ordering::Relaxed);
             apply_statement_options(dbc, stmt, &mut client, "test", 0, &CancelHandle::new())
         };
         apply(0).unwrap();
+        assert!(sent.lock().unwrap().is_empty());
         apply(8000).unwrap();
+        let batch_size = sent.lock().unwrap().len();
+        assert!(batch_size > 0);
         apply(8000).unwrap();
+        assert_eq!(sent.lock().unwrap().len(), batch_size);
         assert!(apply(0).is_err());
         assert_eq!(dbc.inner.lock().unwrap().applied_max_length, None);
     }
