@@ -12,10 +12,31 @@
 //   8.  DateTime2AndDateTimeOffset          - datetime2 → SQL_TYPE_TIMESTAMP, datetimeoffset → -155
 //   9.  NVarCharColumnSizeIsCharCount       - NVARCHAR(100) → colSize=100 (chars, not bytes)
 //  10.  ClrUdtColumnsReportSqlSsUdt          - CLR UDT type, size, scale, and nullability
+//  11.  UnicodeNamesAndSurrogateTruncation  - BMP/supplementary names and UTF-16 truncation
 
 #include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 #include "odbc_sql_server_types.h"
+
+#include <algorithm>
+#include <iterator>
+#include <string>
+
+namespace {
+
+std::basic_string<SQLWCHAR> ToSqlWString(const std::u16string& value) {
+    return {value.begin(), value.end()};
+}
+
+std::u16string FromSqlWString(const SQLWCHAR* value, size_t capacity) {
+    std::u16string result;
+    for (size_t i = 0; i < capacity && value[i] != 0; ++i) {
+        result.push_back(static_cast<char16_t>(value[i]));
+    }
+    return result;
+}
+
+} // namespace
 
 // SQLDescribeColW with SQL_NULL_HSTMT — DM rejects before driver.
 TEST(DescribeColTest, NullHandle) {
@@ -119,6 +140,55 @@ ODBC_TEST_F_MODES(DescribeColLiveTest, NameTruncationReturnsInfo, odbc_concurren
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
     // Per spec, *NameLengthPtr is the untruncated character length of the column name.
     EXPECT_EQ(sizeof("this_is_a_long_column_name") - 1, nameLen);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+
+    SQLCloseCursor(stmt_);
+}
+
+// Benefits-from-mock-tds: a mock could inject COLMETADATA names directly and
+// verify the wide metadata path independently of SQL Server's identifier parser.
+ODBC_TEST_F_MODES(DescribeColLiveTest, UnicodeNamesAndSurrogateTruncation,
+                  odbc_concurrency::kAllModes) {
+    const std::u16string sql =
+        u"SELECT 1 AS [a\u4E2D\u6587], 2 AS [x\U0001F600z]";
+    std::basic_string<SQLWCHAR> wide_sql = ToSqlWString(sql);
+    ASSERT_SQL_OK(SQLExecDirectW(stmt_, wide_sql.data(), SQL_NTS), SQL_HANDLE_STMT, stmt_);
+
+    SQLSMALLINT dataType = 0;
+    SQLULEN colSize = 0;
+    SQLSMALLINT decDigits = 0;
+    SQLSMALLINT nullable = 0;
+    SQLSMALLINT nameLength = 0;
+    SQLWCHAR name[8] = {};
+
+    ASSERT_SQL_OK(SQLDescribeColW(stmt_, 1, name, 8, &nameLength, &dataType, &colSize,
+                                  &decDigits, &nullable),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(u"a\u4E2D\u6587", FromSqlWString(name, std::size(name)));
+    EXPECT_EQ(3, nameLength);
+
+    std::fill(std::begin(name), std::end(name), 0);
+    ASSERT_SQL_OK(SQLDescribeColW(stmt_, 2, name, 8, &nameLength, &dataType, &colSize,
+                                  &decDigits, &nullable),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(u"x\U0001F600z", FromSqlWString(name, std::size(name)));
+    EXPECT_EQ(4, nameLength);
+
+    SQLWCHAR shortBmpName[2] = {};
+    SQLRETURN rc = SQLDescribeColW(stmt_, 1, shortBmpName, 2, &nameLength, &dataType,
+                                   &colSize, &decDigits, &nullable);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+    EXPECT_EQ(u"a", FromSqlWString(shortBmpName, std::size(shortBmpName)));
+    EXPECT_EQ(3, nameLength);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+
+    SQLWCHAR splitPairName[3] = {};
+    rc = SQLDescribeColW(stmt_, 2, splitPairName, 3, &nameLength, &dataType, &colSize,
+                         &decDigits, &nullable);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+    EXPECT_EQ(u"x", FromSqlWString(splitPairName, std::size(splitPairName)).substr(0, 1));
+    EXPECT_EQ(static_cast<SQLWCHAR>(0xD83D), splitPairName[1]);
+    EXPECT_EQ(4, nameLength);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
 
     SQLCloseCursor(stmt_);

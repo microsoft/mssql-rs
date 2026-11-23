@@ -22,7 +22,25 @@
 #include "odbc_test_fixture.h"
 
 #include <cstring>
+#include <iterator>
 #include <string>
+#include <vector>
+
+namespace {
+
+std::basic_string<SQLWCHAR> ToSqlWString(const std::u16string& value) {
+    return {value.begin(), value.end()};
+}
+
+std::u16string FromSqlWString(const SQLWCHAR* value, size_t capacity) {
+    std::u16string result;
+    for (size_t i = 0; i < capacity && value[i] != 0; ++i) {
+        result.push_back(static_cast<char16_t>(value[i]));
+    }
+    return result;
+}
+
+} // namespace
 
 class GetDiagRecTest : public ::testing::Test {
 protected:
@@ -264,4 +282,43 @@ ODBC_TEST_F(GetDiagRecLiveTest, ParameterizedThrowPostsOneStatementRecordAndClea
 
     SQLCloseCursor(stmt_);
     SQLFreeStmt(stmt_, SQL_RESET_PARAMS);
+}
+
+// Benefits-from-mock-tds: a mock could emit an ERROR token with an exact UTF-16
+// message, avoiding SQL Server's error-message formatting in this live check.
+ODBC_TEST_F(GetDiagRecLiveTest, UnicodeThrowMessageTruncatesWithinSurrogatePair) {
+    const std::string token = WorkerToken("diag");
+    const std::u16string message =
+        u"Unicode diagnostic: \u4E2D" + std::u16string(token.begin(), token.end()) + u"\U0001F600";
+    const std::u16string sql = u"THROW 50000, N'" + message + u"', 1;";
+    std::basic_string<SQLWCHAR> wide_sql = ToSqlWString(sql);
+    ASSERT_EQ(SQL_ERROR, SQLExecDirectW(stmt_, wide_sql.data(), SQL_NTS));
+
+    SQLWCHAR state[6] = {};
+    SQLINTEGER native = 0;
+    SQLWCHAR fullTextBuffer[512] = {};
+    SQLSMALLINT fullLength = 0;
+    ASSERT_EQ(SQL_SUCCESS,
+              SQLGetDiagRecW(SQL_HANDLE_STMT, stmt_, 1, state, &native, fullTextBuffer,
+                             static_cast<SQLSMALLINT>(std::size(fullTextBuffer)), &fullLength));
+    EXPECT_EQ(u"42000", FromSqlWString(state, 5));
+    EXPECT_EQ(50000, native);
+    const std::u16string fullText = FromSqlWString(fullTextBuffer, std::size(fullTextBuffer));
+    ASSERT_GE(fullText.size(), message.size());
+    EXPECT_EQ(message, fullText.substr(fullText.size() - message.size()));
+    EXPECT_EQ(fullText.size(), static_cast<size_t>(fullLength));
+
+    const size_t prefixLength = fullText.size() - message.size();
+    const SQLSMALLINT shortLength =
+        static_cast<SQLSMALLINT>(prefixLength + message.size());
+    std::vector<SQLWCHAR> shortText(shortLength, 0);
+    SQLSMALLINT reportedLength = 0;
+    const SQLRETURN rc = SQLGetDiagRecW(SQL_HANDLE_STMT, stmt_, 1, state, &native,
+                                        shortText.data(), shortLength, &reportedLength);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+    EXPECT_EQ(fullLength, reportedLength);
+    const std::u16string truncated = FromSqlWString(shortText.data(), shortText.size());
+    ASSERT_EQ(prefixLength + message.size() - 1, truncated.size());
+    EXPECT_EQ(message.substr(0, message.size() - 1), truncated.substr(prefixLength));
+    EXPECT_EQ(static_cast<char16_t>(0xD83D), truncated.back());
 }
