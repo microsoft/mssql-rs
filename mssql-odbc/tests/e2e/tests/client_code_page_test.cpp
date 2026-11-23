@@ -5,6 +5,7 @@
 #include "odbc_test_fixture.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -931,6 +932,93 @@ ODBC_TEST_F(ClientCodePageTest, MalformedServerBytesDecodeWithoutError) {
             ASSERT_EQ("", ReadRows(prefix + "v FROM @t", 1, route.c_type, route.bound, rows));
             ASSERT_EQ(1u, rows.size());
             EXPECT_EQ(Hex(expected), Hex(rows[0][0]));
+        }
+    }
+}
+
+// Text the override page cannot hold gets one '?' per UTF-16 unit, never an
+// error. As in get_data_test.cpp's native-client cases, a lossy value that fits
+// stays SQL_SUCCESS without a diagnostic even with WARN_ON_CP_ERROR on. The leg's
+// own sample character, and the supplementary pair on UTF-8, are lossless controls.
+ODBC_TEST_F(ClientCodePageTest, UnrepresentableTextSubstitutesInFittingBuffer) {
+    struct Value {
+        std::string expression;
+        std::string utf8;
+        bool lossy;
+    };
+    const ServerText& sample = TextForCodePage(client_code_page_);
+    const Value values[] = {
+        {"NCHAR(65)+NCHAR(55357)+NCHAR(56832)+NCHAR(66)",
+         "A\xF0\x9F\x98\x80"
+         "B",
+         client_code_page_ != 65001},
+        {sample.expression, sample.utf8, false},
+    };
+    constexpr SQLUSMALLINT kColumns = 3;
+    constexpr SQLLEN kBufferBytes = 16;
+    for (const Value& value : values) {
+        SCOPED_TRACE(value.expression);
+        bool lossy = false;
+        const std::string expected =
+            ODBCTestUtils::Utf8ToCodePage(value.utf8, client_code_page_, &lossy);
+        ASSERT_EQ(value.lossy, lossy);
+        if (value.lossy) {
+            ASSERT_EQ(Hex("A??B"), Hex(expected));
+        }
+        ASSERT_LT(expected.size(), static_cast<size_t>(kBufferBytes));
+        const std::string sql =
+            "SELECT CAST(" + value.expression + " AS nvarchar(10)), CAST((" + value.expression +
+            ") COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS varchar(10)), CAST(" +
+            value.expression + " AS nvarchar(max))";
+        for (const bool warn : {false, true}) {
+            ASSERT_EQ(SQL_SUCCESS,
+                      SQLSetConnectAttr(dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR,
+                                        reinterpret_cast<SQLPOINTER>(static_cast<uintptr_t>(warn)),
+                                        0));
+            SQLUINTEGER setting = 99;
+            ASSERT_EQ(SQL_SUCCESS, SQLGetConnectAttr(dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR, &setting,
+                                                     sizeof(setting), nullptr));
+            ASSERT_EQ(static_cast<SQLUINTEGER>(warn), setting);
+            for (const bool bound : {false, true}) {
+                SCOPED_TRACE(::testing::Message()
+                             << (bound ? "SQLBindCol" : "SQLGetData") << " warn=" << warn);
+                // One canary byte past the declared buffer length.
+                std::vector<std::vector<SQLCHAR>> buffers(
+                    kColumns, std::vector<SQLCHAR>(static_cast<size_t>(kBufferBytes) + 1, 0xCC));
+                SQLLEN indicators[kColumns] = {-99, -99, -99};
+                ASSERT_EQ(SQL_SUCCESS, Execute(sql))
+                    << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+                if (bound) {
+                    for (SQLUSMALLINT column = 1; column <= kColumns; ++column) {
+                        ASSERT_EQ(SQL_SUCCESS,
+                                  SQLBindCol(stmt_, column, SQL_C_CHAR, buffers[column - 1].data(),
+                                             kBufferBytes, &indicators[column - 1]));
+                    }
+                    EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+                    EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
+                } else {
+                    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+                    for (SQLUSMALLINT column = 1; column <= kColumns; ++column) {
+                        SCOPED_TRACE(column);
+                        EXPECT_EQ(SQL_SUCCESS,
+                                  SQLGetData(stmt_, column, SQL_C_CHAR, buffers[column - 1].data(),
+                                             kBufferBytes, &indicators[column - 1]));
+                        EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
+                    }
+                }
+                for (SQLUSMALLINT column = 1; column <= kColumns; ++column) {
+                    SCOPED_TRACE(column);
+                    const auto& buffer = buffers[column - 1];
+                    EXPECT_EQ(Hex(expected),
+                              Hex(std::string(reinterpret_cast<const char*>(buffer.data()),
+                                              expected.size())));
+                    EXPECT_EQ(0, buffer[expected.size()]);
+                    EXPECT_EQ(0xCC, buffer.back());
+                    EXPECT_EQ(static_cast<SQLLEN>(expected.size()), indicators[column - 1]);
+                }
+                SQLFreeStmt(stmt_, SQL_CLOSE);
+                SQLFreeStmt(stmt_, SQL_UNBIND);
+            }
         }
     }
 }
