@@ -599,16 +599,8 @@ MSSQL_ODBC_MT_THREADS=8 MSSQL_ODBC_MT_ITERS=20 \
 `MSSQL_ODBC_MT_ITERS` (default 1) how many times each runs the body, and
 `MSSQL_ODBC_MT_TIMEOUT_SECONDS` (default 300) the hang watchdog, which applies
 separately to a multithreaded variant's fixture `SetUp`, its run, and its
-`TearDown` (the single-threaded test has none, like `TEST_F`).
-
-The `more_results_test_mt` CTest entry sets the watchdog to 1,800 seconds: its
-delayed-tail test serializes 400 iterations of a 2.5-second SQL delay on one
-non-MARS connection. The shared-DBC retry budget is 80% of that deadline
-(1,440 seconds), rather than the default 240 seconds. Other entries retain
-the default watchdog.
-
-On a hang the watchdog writes a minidump on Windows (to
-`MSSQL_ODBC_MT_DUMP_DIR`, default the
+`TearDown` (the single-threaded test has none, like `TEST_F`). On a hang the
+watchdog writes a minidump on Windows (to `MSSQL_ODBC_MT_DUMP_DIR`, default the
 working directory) or aborts elsewhere. It leaves a process
 alone when a debugger is attached or when it cannot tell (detection covers
 Windows, Linux, and macOS). The profiles, the other `MSSQL_ODBC_MT_*`

@@ -160,8 +160,7 @@ ODBC_TEST_F(OutputParamsTest, CurrentBindOffsetDisplacesAllDescriptorPointers) {
 // AB#49060: outputs are written after the result sets, so the APD offset
 // pointer in force then (not at execute) decides where they land.
 ODBC_TEST_F(OutputParamsTest, WriteBackFollowsAnApdOffsetPointerRepointedAfterExecute) {
-    const std::string proc = "[" + WorkerToken("#outputs") + "]";
-    ASSERT_SQL_OK(Direct("CREATE PROCEDURE " + proc + " @v int OUTPUT AS "
+    ASSERT_SQL_OK(Direct("CREATE PROCEDURE #outputs @v int OUTPUT AS "
                         "SET NOCOUNT ON; SELECT 1; SET @v=73"),
                   SQL_HANDLE_STMT, stmt_);
     std::array<SQLINTEGER, 4> values = {-1, -1, -1, -1};
@@ -174,7 +173,7 @@ ODBC_TEST_F(OutputParamsTest, WriteBackFollowsAnApdOffsetPointerRepointedAfterEx
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLSetDescField(apd, 0, SQL_DESC_BIND_OFFSET_PTR, &none, 0),
                   SQL_HANDLE_DESC, apd);
-    ASSERT_SQL_OK(Direct("{call " + proc + "(?)}"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(Direct("{call #outputs(?)}"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLSetDescField(apd, 0, SQL_DESC_BIND_OFFSET_PTR, &one_slot, 0),
                   SQL_HANDLE_DESC, apd);
     FetchOnlyRow();

@@ -337,8 +337,7 @@ one driver race found so far, AB#49225, came from `SharedDbc`. Order of effort:
   converted to `ODBC_TEST_F`; the watchdog still ends a hung phase after 5
   minutes, except `more_results_test_mt`, whose CTest entry sets 30 minutes.
   Its delayed procedure tail serializes 16 x 25 x 2.5 s (at least 1,000 s)
-  on one non-MARS DBC; the 80% retry budget is therefore 1,440 s. This does
-  not change the SQL query timeout or the result assertions.
+  on one non-MARS DBC; the 80% retry budget is therefore 1,440 s.
 - Weekly is 16 x 25, not 16 x 50: once the fetch and parameter suites ran in
   every mode (#756, #780), 16 x 50 needed about 5,300 s for
   `get_data_test_mt` and 4,500 s for `param_conversions_test_mt`, past the
@@ -353,8 +352,7 @@ one driver race found so far, AB#49225, came from `SharedDbc`. Order of effort:
   to 48 minutes (build 188193). Run a new test's `_mt` entry locally in every
   mode before review.
 - msodbcsql's stress leg checks that tests suit the modes, not its thread
-  safety. Its 2 x 1 pass does not establish parity at the Rust driver's
-  16 x 25 workload.
+  safety.
 - Cost, Windows, local server, Debug driver: 16 x 50 costs about 5 s per
   converted test, mostly `SharedEnv` connects. The fetch and GetData suites
   (AB#49260, 1,547 variants) take about 50 s (mssql-odbc) and 72 s (msodbcsql)
