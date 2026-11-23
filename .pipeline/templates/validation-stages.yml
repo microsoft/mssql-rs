@@ -597,6 +597,7 @@ stages:
                 cargo nextest run --frozen --package mssql-tds --all-features --lib \
                   -E 'test(cancellation_preserves_a_parser_paused_mid_row) | test(attention_timeout_while_draining_after_a_partial_row_retires_the_connection)'
               displayName: Run deterministic transport cancellation tests (macOS, pre-SQL)
+              condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
               timeoutInMinutes: 15
             # Covers Colima's 32m retry budget, SQL's 20m budget, and cleanup.
             - script: bash .pipeline/scripts/background-step.sh wait "$(Agent.TempDirectory)/macos-sql" 3300

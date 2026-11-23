@@ -1969,6 +1969,7 @@ def test_macos_pr_runs_native_odbc_e2e_against_existing_sql():
     assert cancellation_tests["displayName"] == (
         "Run deterministic transport cancellation tests (macOS, pre-SQL)"
     )
+    assert cancellation_tests["condition"] == _PR
     assert "cancellation_preserves_a_parser_paused_mid_row" in cancellation_tests["script"]
     assert (
         "attention_timeout_while_draining_after_a_partial_row_retires_the_connection"
