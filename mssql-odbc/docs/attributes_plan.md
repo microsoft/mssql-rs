@@ -65,6 +65,7 @@ mssql-python, so `SQL_ATTR_CONNECTION_POOLING` is out of scope.
 | `SQL_COPT_SS_ACCESS_TOKEN` | ✅ | — | pre-connect only |
 | `SQL_ATTR_ANSI_APP` | ✅ no-op | ✗ `HYC00` | deliberate |
 | `SQL_ATTR_QUERY_TIMEOUT` | ✅ fan-out | ✗ `HY092` | write-only on a connection |
+| `SQL_ATTR_MAX_LENGTH` | ✅ fan-out | ✗ `HY092` | sets the limit on existing statements and the default for new statements; read it on the statement |
 | **`SQL_ATTR_CURRENT_CATALOG`** | ✅ | ✅ | **delivered by S3** |
 | `SQL_COPT_SS_INTEGRATED_SECURITY` | ✅ | ✅ | attribute overrides keyword |
 | `SQL_COPT_SS_ENCRYPT` | ✅ | ✅ | attribute overrides keyword |

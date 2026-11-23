@@ -734,7 +734,8 @@ ODBC_TEST_F_MODES(UnicodeColAttributeLiveTest, UnicodeNamesAndByteLengths,
     table_name_ = table;
     const std::u16string column = u"column_\u5217\U0001F600";
     const std::u16string label = u"label_\u540D\U0001F600";
-    std::u16string create = u"CREATE TABLE [" + table + u"] ([" + column + u"] INT NOT NULL)";
+    std::u16string create = u"DROP TABLE IF EXISTS [" + table + u"]; CREATE TABLE [" + table +
+                            u"] ([" + column + u"] INT NOT NULL)";
     std::basic_string<SQLWCHAR> wide_sql = ToSqlWString(create);
     ASSERT_SQL_OK(SQLExecDirectW(stmt_, wide_sql.data(), SQL_NTS), SQL_HANDLE_STMT, stmt_);
 

@@ -2264,6 +2264,59 @@ mod tests {
     }
 
     #[test]
+    fn textsize_timeout_leaves_statement_and_connection_reusable() {
+        use crate::api::odbc_types::{SQL_ATTR_MAX_LENGTH, SQL_ATTR_QUERY_TIMEOUT, SQL_C_SLONG};
+        use crate::api::{SQLExecDirectW, SQLFetch, SQLGetData, SQLSetStmtAttrW};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let set = "SET TEXTSIZE 8000";
+        let server = connect_mock_server(
+            dbc,
+            set,
+            QueryResponse::new(Vec::new(), Vec::new()).with_delay(SLOW_RESPONSE),
+        );
+        for (attr, value) in [
+            (SQL_ATTR_QUERY_TIMEOUT, 1usize),
+            (SQL_ATTR_MAX_LENGTH, 8000),
+        ] {
+            assert_eq!(SQL_SUCCESS, unsafe {
+                SQLSetStmtAttrW(h.stmt, attr, value as SqlPointer, 0)
+            });
+        }
+        let execute = |sql: &str| {
+            let sql: Vec<u16> = sql.encode_utf16().collect();
+            unsafe { SQLExecDirectW(h.stmt, sql.as_ptr(), sql.len().try_into().unwrap()) }
+        };
+
+        assert_eq!(SQL_ERROR, execute("SELECT 0"));
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_eq!(
+            stmt.inner.lock().unwrap().diag_records()[0].sql_state,
+            *b"HYT00"
+        );
+        assert_eq!(dbc.inner.lock().unwrap().applied_max_length, None);
+
+        server.register_query(set, QueryResponse::new(Vec::new(), Vec::new()));
+        server.register_query("SELECT 1", QueryResponse::select_one());
+        assert_eq!(SQL_SUCCESS, execute("SELECT 1"));
+        assert_eq!(SQL_SUCCESS, unsafe { SQLFetch(h.stmt) });
+        let mut value = 0i32;
+        let mut length = 0;
+        assert_eq!(SQL_SUCCESS, unsafe {
+            SQLGetData(
+                h.stmt,
+                1,
+                SQL_C_SLONG,
+                std::ptr::from_mut(&mut value).cast(),
+                4,
+                &mut length,
+            )
+        });
+        assert_eq!((value, length), (1, 4));
+    }
+
+    #[test]
     fn implicit_begin_records_server_transaction_even_when_its_response_fails() {
         use mssql_tds::test_client_support::{
             env_change_begin_transaction, tds_client_from_tokens,
