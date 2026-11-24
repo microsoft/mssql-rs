@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use mssql_tds::connection::client_context::ClientContext;
+use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags, StreamedSqlType};
 use mssql_tds::test_client_support::*;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
@@ -138,6 +139,34 @@ fn isolation_sql_is_closed_and_no_change_is_rejected() {
 }
 
 #[tokio::test]
+async fn initialize_rejects_unfinished_streamed_write_before_carrier() {
+    for reuse in [false, true] {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut client =
+            tds_client_from_tokens_gated(vec![], Arc::new(Semaphore::new(0)), dropped.clone());
+        client
+            .begin_sp_executesql(
+                "SELECT @v".into(),
+                vec![RpcParameter::data_at_exec(
+                    Some("@v".into()),
+                    StatusFlags::NONE,
+                    StreamedSqlType::VarBinaryMax,
+                )],
+                (),
+            )
+            .await
+            .unwrap();
+        client.write_streamed_chunk(&[1; 8192]).await.unwrap();
+        assert!(!client.has_open_batch());
+        assert!(matches!(
+            initialize(opened(client), &spec(), &isolation(), reuse).await,
+            Err(PoolError::InvalidSession)
+        ));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
 async fn fresh_then_cached_checkout_sends_isolation_and_only_reuse_arms_reset() {
     let manager = manager(1);
     let (client, sent) = tds_client_from_tokens_capturing(vec![
@@ -201,7 +230,10 @@ async fn missing_ack_and_delayed_errors_discard_candidates_before_one_fresh_open
         vec![env_change_reset_connection(), done_more_with_count(0)],
     ] {
         let manager = manager(1);
-        cache(&manager, opened(tds_client_from_tokens(tokens))).await;
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let client =
+            tds_client_from_tokens_gated(tokens, Arc::new(Semaphore::new(20)), dropped.clone());
+        cache(&manager, opened(client)).await;
         let factory = Factory::new(vec![opened(tds_client_from_tokens(vec![done_no_more()]))]);
         let mut lease = manager
             .acquire(
@@ -214,9 +246,33 @@ async fn missing_ack_and_delayed_errors_discard_candidates_before_one_fresh_open
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
         assert!(quiescent(lease.client_mut()));
         assert_eq!(factory.calls.load(Ordering::SeqCst), 1);
     }
+}
+
+#[tokio::test]
+async fn known_dead_candidate_is_replaced_without_sending_a_reset() {
+    let manager = manager(1);
+    let (mut client, sent) = tds_client_from_tokens_capturing(vec![]);
+    client.mark_connection_dead();
+    cache(&manager, opened(client)).await;
+    let factory = Factory::new(vec![opened(tds_client_from_tokens(vec![done_no_more()]))]);
+    let mut lease = manager
+        .acquire(
+            key(),
+            &spec(),
+            &factory,
+            isolation(),
+            control(CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(sent.lock().unwrap().is_empty());
+    assert!(quiescent(lease.client_mut()));
+    assert_eq!(factory.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -642,4 +698,402 @@ async fn preparation_reset_retry_wait_open_and_isolation_share_the_original_dead
     assert_eq!(dropped.load(Ordering::SeqCst), 2);
     drop(held);
     manager.shutdown().await.unwrap();
+}
+
+async fn lease(manager: &AsyncPoolManager, client: TdsClient) -> PoolLease {
+    let mut slot = manager
+        .reserve(key(), control(CancellationToken::new()))
+        .await
+        .unwrap()
+        .unwrap();
+    slot.install(opened(client)).unwrap();
+    slot.publish().unwrap();
+    PoolLease {
+        slot,
+        discard: false,
+    }
+}
+
+#[tokio::test]
+async fn release_drains_all_results_before_discovering_and_rolling_back_raw_transaction() {
+    let manager = manager(1);
+    let (client, sent) = tds_client_from_tokens_capturing(vec![
+        col_metadata_empty(),
+        env_change_begin_transaction(42),
+        done_more_with_count(0),
+        col_metadata_empty(),
+        done_no_more(),
+        env_change_rollback_transaction(),
+        done_no_more(),
+        env_change_reset_connection(),
+        done_no_more(),
+    ]);
+    let id = client.client_connection_id();
+    let mut first = lease(&manager, client).await;
+    first
+        .client_mut()
+        .execute("BEGIN TRANSACTION; SELECT 1; SELECT 2".into(), ())
+        .await
+        .unwrap();
+    assert!(first.client_mut().has_open_batch());
+    assert!(!first.client_mut().has_active_transaction());
+    sent.lock().unwrap().clear();
+    first.release().await.unwrap();
+    assert_eq!(sent.lock().unwrap()[0], 14, "transaction manager request");
+    let factory = Factory::new(vec![]);
+    let mut reused = manager
+        .acquire(
+            key(),
+            &spec(),
+            &factory,
+            isolation(),
+            control(CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reused.client_mut().client_connection_id(), id);
+    assert!(quiescent(reused.client_mut()));
+    assert_eq!(factory.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn release_rejects_unfinished_streamed_write_before_capacity_handoff() {
+    for in_transaction in [false, true] {
+        let manager = manager(1);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let tokens = if in_transaction {
+            vec![env_change_begin_transaction(42), done_no_more()]
+        } else {
+            vec![]
+        };
+        let client =
+            tds_client_from_tokens_gated(tokens, Arc::new(Semaphore::new(2)), dropped.clone());
+        let mut first = lease(&manager, client).await;
+        if in_transaction {
+            first
+                .client_mut()
+                .execute("BEGIN TRANSACTION".into(), ())
+                .await
+                .unwrap();
+        }
+        first
+            .client_mut()
+            .begin_sp_executesql(
+                "SELECT @v".into(),
+                vec![RpcParameter::data_at_exec(
+                    Some("@v".into()),
+                    StatusFlags::NONE,
+                    StreamedSqlType::VarBinaryMax,
+                )],
+                (),
+            )
+            .await
+            .unwrap();
+        first
+            .client_mut()
+            .write_streamed_chunk(&[1; 8192])
+            .await
+            .unwrap();
+        assert!(!first.client_mut().has_open_batch());
+        assert!(first.client_mut().command_is_busy());
+        let mut waiting = Box::pin(manager.reserve(key(), control(CancellationToken::new())));
+        assert!(poll(waiting.as_mut()).is_pending());
+
+        assert!(
+            matches!(first.release().await, Err(PoolError::Cleanup(ref cause))
+            if matches!(cause.as_ref(), mssql_tds::error::Error::ProtocolError(_)))
+        );
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        let slot = waiting.await.unwrap().unwrap();
+        drop(slot);
+        manager.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn release_failures_preserve_errors_and_destroy_before_capacity_handoff() {
+    for (tokens, sql_error_expected) in [
+        (
+            vec![
+                col_metadata_empty(),
+                sql_error(50003, 16, "private drain message"),
+                done_no_more(),
+            ],
+            true,
+        ),
+        (vec![col_metadata_empty()], false),
+        (
+            vec![
+                col_metadata_empty(),
+                env_change_begin_transaction(42),
+                done_no_more(),
+                sql_error(50004, 16, "private rollback message"),
+                done_no_more(),
+            ],
+            true,
+        ),
+        (
+            vec![
+                col_metadata_empty(),
+                env_change_begin_transaction(42),
+                done_no_more(),
+                done_no_more(),
+            ],
+            false,
+        ),
+    ] {
+        let manager = manager(1);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let client =
+            tds_client_from_tokens_gated(tokens, Arc::new(Semaphore::new(20)), dropped.clone());
+        let mut first = lease(&manager, client).await;
+        first
+            .client_mut()
+            .execute("SELECT 1".into(), ())
+            .await
+            .unwrap();
+        let mut waiting = Box::pin(manager.reserve(key(), control(CancellationToken::new())));
+        assert!(poll(waiting.as_mut()).is_pending());
+        let error = first.release().await.unwrap_err();
+        if sql_error_expected {
+            assert!(matches!(error, PoolError::Cleanup(ref cause)
+                if matches!(cause.as_ref(), mssql_tds::error::Error::SqlServerError { .. })));
+        } else {
+            assert!(matches!(error, PoolError::Cleanup(_)));
+        }
+        assert!(!format!("{error:?}").contains("private"));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        let slot = waiting.await.unwrap().unwrap();
+        drop(slot);
+        manager.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn interrupted_release_discards_during_drain_and_rollback_before_waking_waiters() {
+    for during_rollback in [false, true] {
+        for timeout in [false, true] {
+            let manager = manager(1);
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let gate = Arc::new(Semaphore::new(if during_rollback { 3 } else { 1 }));
+            let client = tds_client_from_tokens_gated(
+                vec![
+                    col_metadata_empty(),
+                    env_change_begin_transaction(42),
+                    done_no_more(),
+                    env_change_rollback_transaction(),
+                    done_no_more(),
+                ],
+                gate,
+                dropped.clone(),
+            );
+            let mut first = lease(&manager, client).await;
+            first
+                .client_mut()
+                .execute("BEGIN TRANSACTION; SELECT 1".into(), ())
+                .await
+                .unwrap();
+            let mut release = Box::pin(first.release());
+            assert!(poll(release.as_mut()).is_pending());
+            let mut waiting = Box::pin(
+                manager.reserve(
+                    key(),
+                    AcquireControl::from_timeout(
+                        Instant::now(),
+                        Duration::from_secs(30),
+                        CancellationToken::new(),
+                    )
+                    .unwrap(),
+                ),
+            );
+            assert!(poll(waiting.as_mut()).is_pending());
+            assert_eq!(dropped.load(Ordering::SeqCst), 0);
+            if timeout {
+                tokio::time::advance(Duration::from_secs(10)).await;
+                assert!(matches!(
+                    poll(release.as_mut()),
+                    Poll::Ready(Err(PoolError::CleanupTimeout))
+                ));
+            }
+            drop(release);
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            drop(waiting.await.unwrap().unwrap());
+            manager.shutdown().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn release_shares_one_budget_and_caps_a_callers_deadline() {
+    for caller_budget in [Duration::from_secs(8), Duration::from_secs(20)] {
+        let manager = manager(1);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Semaphore::new(1));
+        let client = tds_client_from_tokens_gated(
+            vec![
+                col_metadata_empty(),
+                env_change_begin_transaction(42),
+                done_no_more(),
+                env_change_rollback_transaction(),
+                done_no_more(),
+            ],
+            gate.clone(),
+            dropped.clone(),
+        );
+        let mut first = lease(&manager, client).await;
+        first
+            .client_mut()
+            .execute("SELECT 1".into(), ())
+            .await
+            .unwrap();
+        let start = Instant::now();
+        let mut release = Box::pin(first.release_with_deadline(start + caller_budget));
+        assert!(poll(release.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(6)).await;
+        gate.add_permits(2);
+        assert!(poll(release.as_mut()).is_pending());
+        let total = caller_budget.min(Duration::from_secs(10));
+        tokio::time::advance(total - Duration::from_secs(6)).await;
+        assert!(matches!(
+            poll(release.as_mut()),
+            Poll::Ready(Err(PoolError::CleanupTimeout))
+        ));
+        assert_eq!(Instant::now() - start, total);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn discard_expired_deadline_and_unpolled_release_never_clean_or_cache() {
+    for mode in 0..4 {
+        let manager = manager(1);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let client =
+            tds_client_from_tokens_gated(vec![], Arc::new(Semaphore::new(0)), dropped.clone());
+        let mut first = lease(&manager, client).await;
+        match mode {
+            0 => {
+                first.mark_discard();
+                first.release().await.unwrap();
+            }
+            1 => assert!(matches!(
+                first.release_with_deadline(Instant::now()).await,
+                Err(PoolError::CleanupTimeout)
+            )),
+            2 => drop(first.release()),
+            _ => drop(first),
+        }
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        let mut slot = manager
+            .reserve(key(), control(CancellationToken::new()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(slot.take_value().is_none());
+    }
+}
+
+#[tokio::test]
+async fn release_across_disable_reenable_discards_old_generation() {
+    let manager = manager(1);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(Semaphore::new(1));
+    let client = tds_client_from_tokens_gated(
+        vec![col_metadata_empty(), done_no_more()],
+        gate.clone(),
+        dropped.clone(),
+    );
+    let mut first = lease(&manager, client).await;
+    first
+        .client_mut()
+        .execute("SELECT 1".into(), ())
+        .await
+        .unwrap();
+    let mut release = Box::pin(first.release());
+    assert!(poll(release.as_mut()).is_pending());
+    manager.disable();
+    let budget = Duration::from_secs(10);
+    manager
+        .enable(
+            PoolConfig::new(budget, budget, budget)
+                .unwrap()
+                .with_max_size(1)
+                .unwrap(),
+        )
+        .unwrap();
+    let mut waiting = Box::pin(manager.reserve(key(), control(CancellationToken::new())));
+    assert!(poll(waiting.as_mut()).is_pending());
+    gate.add_permits(1);
+    release.await.unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    let mut slot = waiting.await.unwrap().unwrap();
+    assert!(slot.take_value().is_none());
+}
+
+#[tokio::test]
+async fn cancelling_completed_release_cannot_reclaim_the_next_owners_client() {
+    let manager = manager(1);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let client = tds_client_from_tokens_gated(vec![], Arc::new(Semaphore::new(0)), dropped.clone());
+    let first = lease(&manager, client).await;
+    let mut waiting = Box::pin(manager.reserve(key(), control(CancellationToken::new())));
+    assert!(poll(waiting.as_mut()).is_pending());
+    let mut release = Box::pin(first.release());
+    assert!(matches!(poll(release.as_mut()), Poll::Ready(Ok(()))));
+    drop(release);
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    let mut assigned = waiting.await.unwrap().unwrap();
+    assert!(assigned.value_mut().is_some());
+    drop(assigned);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn release_rejects_foreign_runtime_before_start_and_before_resuming_io() {
+    for start_on_owner in [false, true] {
+        let manager = manager(1);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Semaphore::new(1));
+        let client = tds_client_from_tokens_gated(
+            vec![col_metadata_empty(), done_no_more()],
+            gate.clone(),
+            dropped.clone(),
+        );
+        let mut first = lease(&manager, client).await;
+        first
+            .client_mut()
+            .execute("SELECT 1".into(), ())
+            .await
+            .unwrap();
+        let mut release = Box::pin(first.release());
+        if start_on_owner {
+            assert!(poll(release.as_mut()).is_pending());
+        }
+        gate.add_permits(1);
+        let (release, outcome) = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let outcome = poll(release.as_mut());
+                (release, outcome)
+            })
+        })
+        .join()
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            Poll::Ready(Err(PoolError::InvalidRequest {
+                field: "runtime",
+                ..
+            }))
+        ));
+        assert_eq!(gate.available_permits(), 1, "no foreign-runtime I/O");
+        drop(release);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        manager.shutdown().await.unwrap();
+    }
 }

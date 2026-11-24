@@ -466,26 +466,35 @@ steps:
 
 # mssql-py-core is outside the workspace, so its Rust unit tests are not part of
 # the mssql-tds nextest run above. Run them in the build container and publish
-# the JUnit results to the ADO test tab. Pure unit tests, so no SQL Server needed.
+# the JUnit results to the ADO test tab, including the live SQL pool harness.
 - script: |
     BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
 
     bash .pipeline/scripts/docker-cargo-run.sh --rm \
+      --network testnet \
       -v $PWD:/workspace \
       -v $HOME/.cargo/registry:/root/.cargo/registry \
       -v $HOME/.cargo/git:/root/.cargo/git \
+      -e SQL_PASSWORD \
+      -e DB_HOST="sql1" \
+      -e DB_USERNAME="sa" \
+      -e TRUST_SERVER_CERTIFICATE="true" \
       -w /workspace \
       $BUILD_IMAGE \
       /workspace/.pipeline/scripts/containerized-pycore-rust-test.sh
   displayName: Run Rust unit tests (mssql-py-core)
   condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), ne('${{ parameters.architecture }}', 'ARM64'))
+  env:
+    SQL_PASSWORD: $(SQL_PASSWORD)
 
 - task: PublishTestResults@2
   condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'), ne('${{ parameters.architecture }}', 'ARM64'))
   displayName: Publish mssql-py-core Rust test results
   inputs:
     testResultsFormat: JUnit
-    testResultsFiles: $(Build.SourcesDirectory)/mssql-py-core/target/nextest/ci/junit.xml
+    testResultsFiles: |
+      $(Build.SourcesDirectory)/mssql-py-core/target/nextest/ci/junit.xml
+      $(Build.SourcesDirectory)/mssql-py-core/target/nextest/pool-sql/junit.xml
     testRunTitle: $(System.PhaseName)-PyCore-Rust
     failTaskOnFailedTests: false
     publishRunAttachments: true

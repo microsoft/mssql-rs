@@ -2,7 +2,7 @@
 
 Start here when reading the private Rust/Tokio pool manager and SQL checkout
 implementation. They are compiled in normal builds, but are not connected to AQE
-or exposed to Python. Production return-to-pool cleanup remains gated. The A1
+or exposed to Python. Explicit awaited release implements return-to-pool cleanup. The A1
 Deadpool experiment in [fit.rs](fit.rs) is test-only, not a production pool or
 evidence of live SQL reuse.
 
@@ -23,7 +23,7 @@ For native SQL initialization and reuse, see
 | `PoolConfig` in [config.rs](config.rs) | Validated per-key capacity and queue limits, idle policy and separate acquisition/cleanup/shutdown budgets. Builders return updated settings; they do not reconfigure a running manager. |
 | `AcquireControl` in [control.rs](control.rs) | One caller-owned absolute deadline and cancellation token shared across acquisition stages. It drops interrupted work, but does not supervise detached work or cancel TDS/Python operations for their owners. |
 | `AcquireStage` in [error.rs](error.rs) | Identifies where acquisition timed out; changing stages does not start a new budget. |
-| `PoolKey` in [connection.rs](connection.rs) | Opaque fingerprint that partitions reuse. The caller adapter must supply a fingerprint, never a raw connection string or token; this type only rejects empty input, not noncanonical keys. |
+| `PoolKey` in [connection.rs](connection.rs) | Opaque fingerprint that partitions reuse. The Rust preparation adapter must supply a fingerprint, never a raw connection string or token; this type only rejects empty input, not noncanonical keys. |
 | `PreparedSqlConnection` in [connection_key.rs](../connection_key.rs) | Private Rust SQL-auth key authority above the scheduler. Validates Python-adapted options, freezes native endpoint policy, and derives a process-private HMAC key and authentication binding paired with the same immutable `ConnectSpec`. Not exported to Python or called by direct/pooled connect. |
 | `AuthBinding` in [connection.rs](connection.rs) | Separate opaque identity/credential-version fingerprint expected for a physical open. Equality is not proof of a real login principal. |
 | `TokenExpiry` and `AuthMetadata` in [connection.rs](connection.rs) | Distinguish non-token authentication, known UTC expiry and unknown raw-token expiry. Metadata carries the binding to compare with the expected one; it does not implement credential refresh or reuse policy. |
@@ -34,6 +34,7 @@ For native SQL initialization and reuse, see
 | `Isolation` in [session.rs](session.rs) | Selects one concrete transaction isolation SET; rejects `NoChange` before checkout. |
 | `AsyncPoolManager::acquire` in [session.rs](session.rs) | Validates pooled options, reserves a Deadpool slot, initializes a fresh connection or resets a cached candidate, and publishes only after authentication checks and fully drained, quiescent initialization. |
 | `PoolLease` in [session.rs](session.rs) | Uniquely owns the client and capacity guard. Client access is borrowed from the lease; Drop discards rather than returning a reusable session. |
+| `PoolLease::release` / `release_with_deadline` in [session.rs](session.rs) | Drain before residual rollback under one capped cleanup deadline, then atomically return only a quiescent client to its accepting generation. Cancellation or failure discards before slot return. |
 | `PoolResult`, `PoolError` and `OpenError` in [error.rs](error.rs) | Typed outcomes, including preserved TDS/provider causes. Routine `Display`/`Debug` excludes source messages; Python error mapping is later integration work. |
 
 `max_waiting = None` means unlimited waiting; a configured limit is positive and
@@ -44,7 +45,7 @@ not a background cleanup task.
 ## How the contracts fit
 
 Native SQL checkout is implemented within the private manager. Production
-return-to-pool cleanup and AQE/Python integration remain unwired:
+return is available through the lease; AQE/Python integration remains unwired:
 
 ```text
 Caller adapter
@@ -149,8 +150,15 @@ including on otherwise unrelated Rust PRs. There is no older-version fallback.
   macOS Network.framework always force-cancels on Drop, including interrupted
   physical opens; discarded clients cannot keep a deferred graceful drain alive
   after releasing their slot. No pool-specific disposal option is required.
-  `return_quiescent()` is test-only, not a production check-in API. Safe,
-  awaited return belongs to AB#50052.
+  `return_quiescent()` is test-only fault injection, not a production check-in API.
+  Callers use `release()` or pass their original close deadline to
+  `release_with_deadline()`. Both cap cleanup at the configured timeout.
+  `mark_discard()` is irreversible and must be used after interrupted or
+  indeterminate client I/O; later successful draining cannot undo it.
+  Marked leases discard locally without protocol cleanup. No release path commits
+  or requires graceful logout; errors and timeouts discard synchronously.
+  Unfinished streamed parameter writes are not quiescent: release reports a
+  cleanup error and discards before rollback or capacity return.
 - Rust's key authority constructs canonical keys and expected authentication
   bindings; its integration with native checkout remains unwired.
   Native checkout owns pooled-context validation, including the zero-recovery

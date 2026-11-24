@@ -9,6 +9,10 @@ cd /workspace/mssql-py-core
 cargo llvm-cov clean --workspace
 cargo llvm-cov nextest --frozen --profile ci --no-fail-fast --no-report
 
+echo '==> Running live SQL pool tests...'
+cargo llvm-cov nextest --frozen --test pool_sql -E 'test(live_)' \
+  --run-ignored only --profile pool-sql --no-fail-fast --no-report
+
 echo '==> Generating mssql-py-core Rust coverage report...'
 # Scope to mssql-py-core's own sources: the mssql-tds path dependency is covered
 # comprehensively by the mssql-tds suite and would otherwise leak into this report.

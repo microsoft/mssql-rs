@@ -62,6 +62,10 @@ before connecting; certificate validation remains enabled.
 cancellation, and other per-command settings. Use `advance()` for subsequent
 results in a batch. See the [API reference](https://docs.rs/mssql-tds).
 
+`command_is_busy()` includes unfinished streamed parameter writes, unlike
+`has_open_batch()`. Draining results with `close_query()` does not complete such
+a write; finish its parameters or cancel it before issuing another command.
+
 ## Feature flags
 
 | Feature | Default | Purpose |
