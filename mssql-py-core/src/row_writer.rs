@@ -78,6 +78,7 @@ fn decode_async_string(value: &SqlString) -> TdsResult<Cow<'_, str>> {
         EncodingType::Utf8 => std::str::from_utf8(&value.bytes)
             .map(Cow::Borrowed)
             .map_err(|error| Error::TypeConversionError(format!("Invalid UTF-8: {error}"))),
+        // Inbound decoding resolves encodings today; reject unresolved values defensively.
         EncodingType::DelayedSet => Err(Error::TypeConversionError(
             "Cannot decode a string before its encoding is resolved".to_string(),
         )),

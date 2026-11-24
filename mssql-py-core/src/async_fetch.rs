@@ -1216,8 +1216,8 @@ mod tests {
         FetchCancellationGuard, arm_fetch_publication_pause, pause_fetch_publication_if_armed,
     };
     use super::{
-        FetchGuard, FetchOutput, MaterializationGuard, map_fetch_error,
-        map_materialization_join_error, map_nextset_error, materialize_rows,
+        FetchGuard, FetchOutput, LIST_MATERIALIZE_CHUNK_SIZE, MaterializationGuard,
+        map_fetch_error, map_materialization_join_error, map_nextset_error, materialize_rows,
     };
     use crate::async_fetch::BufferedResults;
     use crate::async_session::{
@@ -1268,6 +1268,27 @@ mod tests {
                     assert!(error.to_string().contains("Invalid UTF-8"));
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_utf8_in_later_chunk_rejects_entire_batch() {
+        for output in [FetchOutput::Many, FetchOutput::All] {
+            let mut rows = Vec::with_capacity(LIST_MATERIALIZE_CHUNK_SIZE + 1);
+            for _ in 0..LIST_MATERIALIZE_CHUNK_SIZE {
+                let mut writer = PyRowWriter::new(1);
+                writer.write_string(0, Cow::Borrowed(b"valid"), EncodingType::Utf8);
+                rows.push(writer);
+            }
+            let mut writer = PyRowWriter::new(1);
+            writer.write_string(0, Cow::Borrowed(b"\x80"), EncodingType::Utf8);
+            rows.push(writer);
+
+            let error = materialize_rows(output, rows).await.unwrap_err();
+            Python::attach(|py| {
+                assert!(error.is_instance_of::<crate::async_errors::DataError>(py));
+            });
+            assert!(error.to_string().contains("Invalid UTF-8"));
         }
     }
 
