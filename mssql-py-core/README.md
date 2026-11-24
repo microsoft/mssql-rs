@@ -41,8 +41,9 @@ For SDK authors integrating the native runtime:
 - Async cursors retain their logical connection when the connection wrapper is
   collected. Explicit `await connection.close()` revokes cursor access;
   `await cursor.close()` leaves the parent and sibling cursors usable. The last
-  logical owner discards any remaining direct client. This does not enable
-  connection pooling or add concurrent-close coordination.
+  logical owner discards any remaining direct client. After parent revocation,
+  cursor close releases local results even if an earlier close attempt was
+  interrupted by connection shutdown.
 - Native async execute, executemany, and streaming fetch/nextset awaitables
   expose an internal `_cancel_and_settle()` hook for SDK integration. Buffered
   and exhausted fetch/nextset paths and `fetchmany(size <= 0)` do not expose
@@ -55,9 +56,10 @@ For SDK authors integrating the native runtime:
   Python future alone still returns immediately while recovery runs in the
   background. The hook adds per-operation lifetime bookkeeping, not per-row
   copies, and does not change synchronous or connection/authentication APIs.
-  logical owner discards any remaining direct client. After parent revocation,
-  cursor close releases local results even if an earlier close attempt was
-  interrupted by connection shutdown.
+  Streaming fetches retain exclusive session ownership during Python row
+  conversion while rows or later result sets remain. Cancellation can settle
+  that batch without waiting for conversion. Fully exhausted batches release
+  ownership before conversion, so blocked conversion does not delay reuse.
 - Concurrent async connection closes await one teardown outcome. Cancelling a
   close waiter does not stop cleanup. Direct close uses one five-second budget
   to settle operations, drain results, finalize transactions and close the
@@ -70,10 +72,11 @@ For SDK authors integrating the native runtime:
   Cleanup rechecks its original deadline after waiting for transaction
   authorization; an expired budget cannot start transaction finalization.
 - Cancelling `executemany` during parameter binding leaves the connection and
-  existing transaction usable. After execution claims the session, cancellation
-  before result delivery breaks the connection, even if native execution has
-  finished. Close rechecks this after draining and publishes its outcome
-  atomically with cancellation. Cancellation before commit authorization prevents
+  existing transaction usable. After execution claims the session, await its
+  cancellation settlement hook before reusing the connection. Query workers
+  remain registered with the connection so concurrent close can join them within
+  its cleanup budget. Close rechecks interruption after draining and publishes
+  its outcome atomically with cancellation. Cancellation before commit authorization prevents
   the request; cancellation afterward reports failure with a potentially unknown
   transaction outcome, without retrying commit.
 - A broken connection still needs `await connection.close()`. The `closed`

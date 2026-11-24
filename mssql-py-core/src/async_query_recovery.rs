@@ -225,7 +225,10 @@ impl Drop for CompletionGuard {
     }
 }
 
-async fn run_query_in_background<F, T>(future: F, control: Arc<QueryControl>) -> PyResult<T>
+pub(crate) async fn run_query_in_background<F, T>(
+    future: F,
+    control: Arc<QueryControl>,
+) -> PyResult<T>
 where
     F: Future<Output = PyResult<T>> + Send + 'static,
     T: Send + 'static,
@@ -234,16 +237,26 @@ where
         control: Arc::clone(&control),
         completed: false,
     };
-    let result = tokio::spawn(async move {
+    let session = Arc::clone(&control.session);
+    let worker_control = Arc::clone(&control);
+    let worker = async move {
         let mut completion = CompletionGuard {
-            control,
+            control: worker_control,
             completed: false,
         };
         let result = future.await;
         completion.completed = true;
         result
-    })
-    .await;
+    };
+    let receiver = match session.spawn_task(worker) {
+        Ok((receiver, _)) => receiver,
+        Err(error) => {
+            waiting.completed = true;
+            control.complete();
+            return Err(map_claim_error(error));
+        }
+    };
+    let result = receiver.await;
     waiting.completed = true;
     result
         .map_err(|error| PyRuntimeError::new_err(format!("Async query worker failed: {error}")))?
@@ -318,6 +331,41 @@ mod tests {
         release_tx.send(()).unwrap();
         control.wait_for_settlement().await.unwrap();
         assert!(session.claim_execute(2).is_ok());
+    }
+
+    #[tokio::test]
+    async fn close_can_abort_and_join_a_query_worker() {
+        let session = Arc::new(AsyncConnectionState::new());
+        let claim = session.claim_execute(1).unwrap();
+        let control = QueryControl::new(Arc::clone(&session), "execute");
+        control.register_execute(claim.operation_id);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let future = async move {
+            entered_tx.send(()).unwrap();
+            std::future::pending::<PyResult<()>>().await
+        };
+        let mut waiting = Box::pin(run_query_in_background(future, Arc::clone(&control)));
+        assert!(matches!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        entered_rx.await.unwrap();
+
+        let mut tasks = session.take_close_tasks();
+        assert_eq!(tasks.len(), 1);
+        tasks.abort_all();
+        assert!(tasks.join_next().await.unwrap().unwrap_err().is_cancelled());
+        assert!(
+            waiting
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("worker failed")
+        );
+        assert!(control.is_settled());
+        assert!(session.is_broken());
     }
 
     #[test]

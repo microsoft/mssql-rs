@@ -1225,17 +1225,35 @@ def test_nextset_cancellation_during_description_materialization_does_not_publis
 
 
 @pytest.mark.integration
-def test_fetchall_cancellation_during_row_materialization_keeps_connection_reusable(
-    client_context,
+@pytest.mark.parametrize(
+    "operation, sql",
+    [
+        pytest.param(
+            "fetchone",
+            "SELECT CAST(value AS decimal(10, 2)) FROM (VALUES (1), (2)) AS source(value)",
+            id="partial-fetchone",
+        ),
+        pytest.param(
+            "fetchmany",
+            "SELECT CAST(value AS decimal(10, 2)) FROM (VALUES (1), (2)) AS source(value)",
+            id="partial-fetchmany",
+        ),
+        pytest.param(
+            "fetchall",
+            "SELECT CAST(1 AS decimal(10, 2)); SELECT 99",
+            id="fetchall-with-later-results",
+        ),
+        pytest.param(
+            "fetchall",
+            "SELECT CAST(1 AS decimal(10, 2))",
+            id="exhausted-fetchall",
+        ),
+    ],
+)
+def test_fetch_cancellation_during_row_materialization_keeps_connection_reusable(
+    client_context, operation, sql,
 ):
-    """Row conversion cancellation does not reclaim already-released TDS ownership.
-
-    1. Fetch the complete SQL row, then block its Python decimal conversion.
-    2. Cancel the Python-facing Future while conversion remains blocked.
-    3. Run another query before releasing the worker to prove protocol ownership
-       was released as soon as the row read completed.
-    4. Release the worker and wait for its import to finish during cleanup.
-    """
+    """Cancellation settles an owned batch without waiting for row conversion."""
 
     async def run():
         conn = await connect(client_context)
@@ -1245,14 +1263,15 @@ def test_fetchall_cancellation_during_row_materialization_keeps_connection_reusa
         decimal_module = None
         try:
             cursor = conn.cursor()
-            await cursor.execute(
-                "SELECT CAST(1 AS decimal(10, 2)) AS value", use_prepare=False
-            )
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            await cursor.execute(sql, use_prepare=False)
             # Force row conversion through the blocking import hook.
             decimal_module = sys.modules.pop("decimal")
             sys.meta_path.insert(0, finder)
 
-            task = asyncio.ensure_future(cursor.fetchall())
+            pending = cursor.fetchmany(1) if operation == "fetchmany" else getattr(cursor, operation)()
+            task = asyncio.ensure_future(pending)
             for _ in range(200):
                 if entered.is_set():
                     break
@@ -1265,12 +1284,11 @@ def test_fetchall_cancellation_during_row_materialization_keeps_connection_reusa
             with pytest.raises(asyncio.CancelledError):
                 await task
 
-            # Do not release materialization yet: successful reuse here proves
-            # the completed TDS read no longer owns the session.
+            # Keep conversion blocked until the same SQL session can be reused.
             await asyncio.wait_for(asyncio.shield(task._cancel_and_settle()), timeout=1)
             probe = conn.cursor()
-            await probe.execute("SELECT 2", use_prepare=False)
-            assert await probe.fetchone() == (2,)
+            await probe.execute("SELECT 2, @@SPID", use_prepare=False)
+            assert await probe.fetchall() == [(2, session_id)]
             release.set()
             # Wait outside the event-loop thread for the import lock to clear.
             await asyncio.to_thread(__import__, "decimal")

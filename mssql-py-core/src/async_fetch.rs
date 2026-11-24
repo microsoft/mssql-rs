@@ -23,7 +23,7 @@ use crate::async_cursor::{PyAsyncCursor, map_claim_error};
 use crate::async_description::{DescriptionState, materialize};
 use crate::async_errors::{InternalError, map_tds_error};
 use crate::async_handle::LogicalConnection;
-use crate::async_query_recovery::{QueryControl, query_future_into_py};
+use crate::async_query_recovery::{QueryControl, query_future_into_py, run_query_in_background};
 use crate::async_session::{
     AsyncConnectionState, ClaimError, CursorId, FetchCompletion, FetchId, OperationId,
 };
@@ -32,7 +32,6 @@ use crate::row_writer::PyRowWriter;
 
 const FETCH_YIELD_INTERVAL: usize = 256;
 const LIST_MATERIALIZE_CHUNK_SIZE: usize = 256;
-// Keep in sync with mssql-tds's shared five-second send/parser/drain budget.
 
 #[cfg(debug_assertions)]
 struct FetchPublicationPause {
@@ -436,38 +435,20 @@ fn map_materialization_join_error(error: tokio::task::JoinError) -> PyErr {
     PyRuntimeError::new_err(format!("Failed to materialize fetched rows: {error}"))
 }
 
-/// Runs fetch protocol work in a task that outlives its Python awaitable.
-///
-/// Tokio detaches a spawned task when its join handle is dropped. Keeping the
-/// TDS future inside that task preserves parser state long enough to drain
-/// through DONE_ATTN; the surrounding cancellation guard only signals it.
 async fn run_fetch_in_background<F, T>(
     future: F,
     session_state: Arc<AsyncConnectionState>,
     operation_id: OperationId,
     fetch_id: FetchId,
     operation: &'static str,
-    dispatch: Option<tracing::Dispatch>,
 ) -> PyResult<T>
 where
     F: Future<Output = PyResult<T>> + Send + 'static,
     T: Send + 'static,
 {
-    let mut cancellation_guard = FetchCancellationGuard::new(
-        session_state.clone(),
-        operation_id,
-        fetch_id,
-        operation,
-        dispatch,
-    );
-    let (receiver, _) = session_state.spawn_task(future).map_err(map_claim_error)?;
-    let result = receiver.await;
-    cancellation_guard.complete();
-    result.map_err(|error| {
-        crate::async_errors::OperationalError::new_err(format!(
-            "PyAsyncCursor.{operation} background task failed: {error}"
-        ))
-    })?
+    let control = QueryControl::new(session_state, operation);
+    control.register_fetch(operation_id, fetch_id);
+    run_query_in_background(future, control).await
 }
 
 async fn fetch_rows_on_client(client: &mut TdsClient, limit: usize) -> Result<FetchBatch, Error> {
@@ -630,6 +611,18 @@ fn fetch<'py>(
                 } else {
                     FetchStatus::Ready
                 };
+                let retains_ownership = !exhausted || has_open_batch;
+                let materialization_started = Instant::now();
+                let materialization = materialize_rows(output, batch.rows);
+                tokio::pin!(materialization);
+                let materialized = if retains_ownership {
+                    tokio::select! {
+                        result = &mut materialization => Some(result),
+                        () = worker_control.cancelled() => None,
+                    }
+                } else {
+                    None
+                };
                 match fetch_guard.complete(batch.exhausted, has_open_batch) {
                     FetchCompletion::Published | FetchCompletion::NoLongerActive => {}
                     FetchCompletion::CancellationRequested => {
@@ -658,11 +651,24 @@ fn fetch<'py>(
                     }
                 }
                 fetch_state.set(fetch_status);
-                worker_control.complete();
-                let materialization_started = Instant::now();
+                if !retains_ownership {
+                    worker_control.complete();
+                }
                 let mut materialization_guard =
                     MaterializationGuard::new(operation, materialization_dispatch);
-                match materialize_rows(output, batch.rows).await {
+                let materialized = if retains_ownership {
+                    materialized.ok_or_else(|| {
+                        map_fetch_error(
+                            operation,
+                            Error::OperationCancelledError("Fetch was cancelled".to_string()),
+                            Vec::new(),
+                            started.elapsed().as_millis(),
+                        )
+                    })?
+                } else {
+                    materialization.await
+                };
+                match materialized {
                     Ok(rows) => {
                         materialization_guard.complete();
                         let materialization_ms = materialization_started.elapsed().as_millis();
@@ -792,7 +798,6 @@ fn fetch_buffered<'py>(
         operation_id,
         fetch_id,
         operation,
-        None,
     );
     match pyo3_async_runtimes::tokio::future_into_py(py, future) {
         Ok(awaitable) => Ok(awaitable),
@@ -1153,7 +1158,6 @@ fn next_buffered_set<'py>(
         operation_id,
         fetch_id,
         "nextset",
-        None,
     );
     match pyo3_async_runtimes::tokio::future_into_py(py, future) {
         Ok(awaitable) => Ok(awaitable),

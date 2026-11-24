@@ -899,8 +899,7 @@ pub(crate) fn execute<'py>(
         }
     };
 
-    match pyo3_async_runtimes::tokio::future_into_py(py, session_state.clone().run_tracked(future))
-    {
+    match query_future_into_py(py, future, query_control) {
         Ok(awaitable) => Ok(awaitable),
         Err(error) => {
             session_state.release_operation(operation_id);
@@ -941,6 +940,8 @@ pub(crate) fn executemany<'py>(
     let seq_of_parameters = seq_of_parameters.clone().unbind();
     let trace_dispatch = dispatch.clone();
     let task_state = session_state.clone();
+    let query_control = QueryControl::new(session_state.clone(), "executemany");
+    let worker_control = Arc::clone(&query_control);
 
     let future = move |preflight_task: Arc<PreflightTask>| async move {
         let started = Instant::now();
@@ -1177,7 +1178,7 @@ pub(crate) fn executemany<'py>(
         }
     };
 
-    pyo3_async_runtimes::tokio::future_into_py(py, task_state.run_tracked_preflight(future))
+    query_future_into_py(py, task_state.run_tracked_preflight(future), query_control)
 }
 
 #[cfg(test)]
