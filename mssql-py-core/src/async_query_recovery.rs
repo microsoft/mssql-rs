@@ -94,10 +94,10 @@ impl QueryControl {
         if !state.completed {
             self.deadline
                 .get_or_init(|| tokio::time::Instant::now() + SETTLEMENT_TIMEOUT);
-            self.cancelled.cancel();
             if let Some(target) = state.target {
                 self.cancel_target(target);
             }
+            self.cancelled.cancel();
         }
     }
 
