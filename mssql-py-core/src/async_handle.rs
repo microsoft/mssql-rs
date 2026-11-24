@@ -236,7 +236,13 @@ impl LogicalConnection {
             )
         })?;
         // This mutex-protected check authorizes finalization after draining.
-        if state.is_broken() {
+        if state.is_broken_before_deadline(deadline).map_err(|error| {
+            map_tds_error(
+                "Connection cleanup failed",
+                error,
+                client.take_info_messages(),
+            )
+        })? {
             return match mode {
                 CloseMode::Commit => Err(OperationalError::new_err(
                     "Cannot commit a broken connection; connection discarded",

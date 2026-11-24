@@ -53,6 +53,8 @@ For SDK authors integrating the native runtime:
   is discarded, and a clean exit requiring commit reports failure. Cursor
   finalization racing close preserves the same transaction intent. This does not
   enable connection pooling.
+  Cleanup rechecks its original deadline after waiting for transaction
+  authorization; an expired budget cannot start transaction finalization.
 - Cancelling `executemany` during parameter binding leaves the connection and
   existing transaction usable. After execution claims the session, cancellation
   before result delivery breaks the connection, even if native execution has
@@ -62,6 +64,8 @@ For SDK authors integrating the native runtime:
   transaction outcome, without retrying commit.
 - A broken connection still needs `await connection.close()`. The `closed`
   property indicates teardown, not whether the connection is healthy.
+  Cursor close reports a broken-session interruption as `InterfaceError`,
+  including when the session breaks while that close waits for client access.
 - Explicit `commit()` and `rollback()` also recheck interruption after draining
   and before reporting completion. Interruption before authorization prevents
   finalization; interruption during finalization reports an unknown outcome

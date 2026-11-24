@@ -25,7 +25,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
-use mssql_tds::error::{Error, SqlInfoMessage};
+use mssql_tds::error::Error;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
@@ -85,7 +85,7 @@ impl CursorCleanup {
     }
 
     /// Borrow through the close claim; a revoked parent needs only local cursor cleanup.
-    async fn run(self, claim: CursorCloseClaim) -> Result<(), (Error, Vec<SqlInfoMessage>)> {
+    async fn run(self, claim: CursorCloseClaim) -> PyResult<()> {
         let mut cleanup_guard =
             SessionOperationGuard::new(self.session_state.clone(), claim.operation_id);
         let (result, has_open_batch, info_messages) = {
@@ -99,10 +99,7 @@ impl CursorCleanup {
                 }
                 Err(error) => {
                     cleanup_guard.settle(false);
-                    return Err((
-                        Error::UsageError(format!("Cursor cleanup rejected: {error:?}")),
-                        Vec::new(),
-                    ));
+                    return Err(map_claim_error(error));
                 }
             };
             let result = async {
@@ -127,7 +124,7 @@ impl CursorCleanup {
         // Cleanup consumes the close attempt even when draining or unprepare fails.
         self.clear_result_state();
         self.closed.store(true, Ordering::Release);
-        result.map_err(|error| (error, info_messages))?;
+        result.map_err(|error| map_tds_error("Cursor close failed", error, info_messages))?;
         Ok(())
     }
 }
@@ -148,7 +145,7 @@ struct FinalizerCompletionGuard {
 impl FinalizerCleanup {
     async fn run(mut self, claim: CursorCloseClaim) {
         let cleanup = self.cleanup.take().expect("finalizer cleanup is available");
-        if let Err((error, _)) = cleanup.run(claim).await {
+        if let Err(error) = cleanup.run(claim).await {
             record_result_set_status("error");
             tracing::warn!("PyAsyncCursor finalizer cleanup failed: {error}");
         } else {
@@ -412,7 +409,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use mssql_tds::error::Error;
     use mssql_tds::test_client_support::tds_client_from_tokens_capturing;
     use pyo3::prelude::*;
     use pyo3::types::{PyCFunction, PyDict};
@@ -459,7 +455,10 @@ mod tests {
         (cursor, transport)
     }
 
-    fn assert_queued_operation_after_revocation(operation: &str, closed: bool) {
+    fn assert_queued_operation_after_lifecycle_change(
+        operation: &str,
+        lifecycle: ConnectionLifecycle,
+    ) {
         let (mut cursor, transport) = cursor();
         let (claimed_tx, claimed_rx) = oneshot::channel();
         cursor.tracing_dispatch = Some(tracing::Dispatch::new(
@@ -512,10 +511,13 @@ mod tests {
             globals.set_item("wait_for_claim", wait_for_claim).unwrap();
             let release = std::sync::Mutex::new(Some(release_tx));
             let revoke = PyCFunction::new_closure(py, None, None, move |_, _| {
-                if closed {
-                    connection.state.mark_closed();
-                } else {
-                    connection.state.begin_close();
+                match lifecycle {
+                    ConnectionLifecycle::Closed => connection.state.mark_closed(),
+                    ConnectionLifecycle::Closing => {
+                        connection.state.begin_close();
+                    }
+                    ConnectionLifecycle::Broken => connection.state.mark_broken(),
+                    ConnectionLifecycle::Open => unreachable!(),
                 }
                 release.lock().unwrap().take().unwrap().send(()).unwrap();
                 Ok::<(), PyErr>(())
@@ -529,8 +531,14 @@ mod tests {
                 }
                 _ => format!("cursor.{operation}()"),
             };
-            let expected = if closed { "closed" } else { "closing" };
-            let assert_result = if operation == "close" {
+            let expected = match lifecycle {
+                ConnectionLifecycle::Closed => "closed",
+                ConnectionLifecycle::Closing => "closing",
+                ConnectionLifecycle::Broken => "broken",
+                ConnectionLifecycle::Open => unreachable!(),
+            };
+            let assert_result = if operation == "close" && lifecycle != ConnectionLifecycle::Broken
+            {
                 r#"    assert await asyncio.wait_for(pending, 5) is None
     try:
         cursor.fetchone()
@@ -551,13 +559,18 @@ mod tests {
 "#
                 )
             };
+            let close_again = if lifecycle == ConnectionLifecycle::Broken {
+                ""
+            } else {
+                "    assert await cursor.close() is None\n"
+            };
             let code = CString::new(format!(
                 r#"import asyncio
 async def run():
     pending = {call}
     await asyncio.wait_for(wait_for_claim(), 5)
     revoke()
-{assert_result}    assert await cursor.close() is None
+{assert_result}{close_again}
 asyncio.run(run())
 "#
             ))
@@ -565,46 +578,51 @@ asyncio.run(run())
             py.run(&code, Some(&globals), None).unwrap();
         });
         runtime.block_on(holding).unwrap();
-        assert!(fetch_state.status() == FetchStatus::NoResultSet);
-        assert_eq!(
-            state.lifecycle(),
-            if closed {
-                ConnectionLifecycle::Closed
-            } else {
-                ConnectionLifecycle::Closing
-            }
+        assert!(
+            fetch_state.status()
+                == if lifecycle == ConnectionLifecycle::Broken {
+                    FetchStatus::Ready
+                } else {
+                    FetchStatus::NoResultSet
+                }
         );
+        assert_eq!(state.lifecycle(), lifecycle);
         assert!(transport.lock().unwrap().is_empty());
     }
 
     #[test]
     fn queued_execute_rejects_revoked_parent() {
-        for closed in [false, true] {
-            assert_queued_operation_after_revocation("execute", closed);
+        for lifecycle in [ConnectionLifecycle::Closing, ConnectionLifecycle::Closed] {
+            assert_queued_operation_after_lifecycle_change("execute", lifecycle);
         }
     }
 
     #[test]
     fn queued_executemany_rejects_revoked_parent() {
-        for closed in [false, true] {
-            assert_queued_operation_after_revocation("executemany", closed);
+        for lifecycle in [ConnectionLifecycle::Closing, ConnectionLifecycle::Closed] {
+            assert_queued_operation_after_lifecycle_change("executemany", lifecycle);
         }
     }
 
     #[test]
     fn queued_fetch_variants_and_nextset_reject_revoked_parent() {
         for operation in ["fetchone", "fetchmany", "fetchall", "nextset"] {
-            for closed in [false, true] {
-                assert_queued_operation_after_revocation(operation, closed);
+            for lifecycle in [ConnectionLifecycle::Closing, ConnectionLifecycle::Closed] {
+                assert_queued_operation_after_lifecycle_change(operation, lifecycle);
             }
         }
     }
 
     #[test]
     fn queued_cursor_close_cleans_local_results_after_parent_revocation() {
-        for closed in [false, true] {
-            assert_queued_operation_after_revocation("close", closed);
+        for lifecycle in [ConnectionLifecycle::Closing, ConnectionLifecycle::Closed] {
+            assert_queued_operation_after_lifecycle_change("close", lifecycle);
         }
+    }
+
+    #[test]
+    fn queued_cursor_close_reports_broken_session_as_interface_error() {
+        assert_queued_operation_after_lifecycle_change("close", ConnectionLifecycle::Broken);
     }
 
     #[tokio::test]
@@ -652,11 +670,18 @@ asyncio.run(run())
                 Some(state.claim_connection_operation().unwrap().0)
             };
 
-            let (error, info_messages) = cursor.cleanup().run(claim).await.unwrap_err();
-
-            assert!(info_messages.is_empty());
-            assert!(matches!(error, Error::UsageError(message) if message ==
-                format!("Cursor cleanup rejected: {}", if broken { "Broken" } else { "Busy" })));
+            let error = cursor.cleanup().run(claim).await.unwrap_err();
+            Python::attach(|py| {
+                assert!(error.is_instance_of::<crate::async_errors::InterfaceError>(py));
+                assert_eq!(
+                    error.value(py).str().unwrap().to_str().unwrap(),
+                    if broken {
+                        "Connection is broken"
+                    } else {
+                        "Connection is busy with another cursor operation"
+                    }
+                );
+            });
             assert!(!cursor.closed.load(Ordering::Acquire));
             assert!(transport.lock().unwrap().is_empty());
             if let Some(replacement) = replacement {
@@ -936,10 +961,9 @@ impl PyAsyncCursor {
         let operation_id = claim.operation_id;
         let cursor_id = cleanup.cursor_id;
         let future = async move {
-            cleanup.run(claim).await.map_err(|(error, info_messages)| {
+            cleanup.run(claim).await.inspect_err(|error| {
                 record_result_set_status("error");
                 tracing::error!("PyAsyncCursor::close: failed: {error}");
-                map_tds_error("Cursor close failed", error, info_messages)
             })?;
             record_result_set_status("closed");
             Python::attach(|py| Ok(py.None()))

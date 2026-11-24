@@ -38,11 +38,15 @@ finalization and transport close. Forced task abortion is joined before client
 destruction; scheduling/destruction can outlast the deadline and is reported as
 a timeout, not success. The original deadline is checked between cleanup phases
 and before reporting success, including when a future is immediately ready.
+Transaction authorization rechecks that deadline after acquiring the session
+mutex; time spent waiting for the mutex cannot authorize expired cleanup.
 This direct-connection limit does not select the future
 pool's configuration defaults.
 
 Connection lifecycle errors use `InterfaceError`; transaction and cleanup
 failures use the shared DB-API mapper with available server diagnostics. An
+admitted cursor close that encounters a broken session while waiting for client
+access also reports `InterfaceError`, not a programming error. An
 existing block exception stays primary. Interrupted/indeterminate work prevents
 commit on close and reports failure if clean exit required commit. Successfully
 settled cooperative fetch cancellation preserves direct-session recovery and

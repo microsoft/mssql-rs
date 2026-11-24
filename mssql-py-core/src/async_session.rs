@@ -307,6 +307,15 @@ impl AsyncConnectionState {
         self.lock().broken
     }
 
+    pub(crate) fn is_broken_before_deadline(
+        &self,
+        deadline: Instant,
+    ) -> mssql_tds::core::TdsResult<bool> {
+        let state = self.lock();
+        check_cleanup_deadline(deadline)?;
+        Ok(state.broken)
+    }
+
     pub(crate) fn mark_for_discard(&self) {
         self.discard.store(true, Ordering::Release);
     }
@@ -731,6 +740,40 @@ mod tests {
         AsyncConnectionState, ClaimError, ConnectionLifecycle, FetchCompletion, OperationPhase,
         PreflightTask, SessionOperationGuard,
     };
+
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::await_holding_lock)] // Expire the mock deadline while authorization is blocked.
+    async fn close_authorization_rechecks_deadline_after_waiting_for_state_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        let state = Arc::new(AsyncConnectionState::new());
+        state.begin_close();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(!state.is_broken_before_deadline(deadline).unwrap());
+        let held = state.lock();
+        let (started, waiting) = mpsc::channel();
+        let (completed, outcome) = mpsc::channel();
+        let worker_state = state.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let worker = std::thread::spawn(move || {
+            let _runtime = runtime.enter();
+            started.send(()).unwrap();
+            completed
+                .send(worker_state.is_broken_before_deadline(deadline))
+                .unwrap();
+        });
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(outcome.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        drop(held);
+        let result = outcome.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        let error = result.expect_err("expired cleanup was authorized after the state lock wait");
+        assert!(matches!(error, mssql_tds::error::Error::TimeoutError(_)));
+        assert!(error.to_string().contains("Connection cleanup timed out"));
+    }
 
     #[test]
     fn allocates_unique_cursor_ids() {
