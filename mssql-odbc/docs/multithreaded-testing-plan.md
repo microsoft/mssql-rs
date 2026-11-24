@@ -336,9 +336,6 @@ one driver race found so far, AB#49225, came from `SharedDbc`. Order of effort:
   minutes and each ctest entry 180, leaving room for the suites still to be
   converted to `ODBC_TEST_F`; the watchdog still ends a hung phase after 5
   minutes.
-- `DelayedProcedureTailKeepsTheBatch` runs single-only. Its 2.5 s delay
-  preserves the query-timeout regression check without serializing 400
-  executions (at least 1,000 s) on a shared DBC.
 - Weekly is 16 x 25, not 16 x 50: once the fetch and parameter suites ran in
   every mode (#756, #780), 16 x 50 needed about 5,300 s for
   `get_data_test_mt` and 4,500 s for `param_conversions_test_mt`, past the
