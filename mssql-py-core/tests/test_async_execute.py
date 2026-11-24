@@ -23,7 +23,7 @@ async def connect(client_context, *, autocommit=True):
 
 async def wait_for_server_wait(observer, session_id, pending):
     cursor = observer.cursor()
-    async with asyncio.timeout(5):
+    async def poll():
         while True:
             await cursor.execute(
                 "SELECT wait_type FROM sys.dm_exec_requests WHERE session_id = ?",
@@ -35,6 +35,8 @@ async def wait_for_server_wait(observer, session_id, pending):
             if rows and rows[0][0] == "WAITFOR":
                 return
             await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(poll(), timeout=5)
 
 
 @pytest.mark.integration
