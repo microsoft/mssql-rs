@@ -1369,9 +1369,9 @@ No application SQL is replayed.
 This slice enables SQL-password login only, rejects nonzero session-recovery
 counts and Always Encrypted, and checks the caller/factory authentication binding.
 It does not construct canonical keys or add token/trusted-auth pooling.
-`PoolLease` Drop discards; the quiescent-return seam remains test-only.
-There is no production check-in, Python pool API or change to AQE's direct path.
-Safe return belongs to AB#50052.
+`PoolLease` Drop discards; the unchecked quiescent-return seam remains test-only.
+Safe return is implemented in A4 below. There is no Python pool API or change to
+AQE's direct path.
 
 The deterministic suite uses scripted TDS clients and gated reads. The native
 live-SQL harness compiles the private pool modules without exporting them from
@@ -1385,8 +1385,84 @@ cargo nextest run --manifest-path .\mssql-py-core\Cargo.toml --frozen --test poo
 Live tests require `DB_HOST`, `DB_USERNAME`, `SQL_PASSWORD` and the existing
 `DB_PORT`/TLS settings. They cover all five isolation levels on fresh and
 same-SPID cached checkout, reset of session settings/temp tables, and rejection
-of a fault-injected active transaction. They do not prove return cleanup,
+of a fault-injected active transaction. Additional A4 live tests are described
+below; test implementation alone does not establish live execution,
 authentication parity, or support for untested platforms/server topologies.
+
+The dead-idle-socket test uses a second connection to `KILL` the successfully
+returned session, guarded by a unique `CONTEXT_INFO` marker. It requires
+permission to view other sessions and kill the test session (CI uses `sa`).
+Checkout must replace that connection, restore isolation and permit subsequent
+reuse of the replacement. A live socket failure is not evidence of a successful
+carrier response with a deliberately omitted acknowledgement.
+
+The live missing-reset-ACK tests use a `test-util`-only, per-client injector.
+After real network/TLS parsing, it withholds exactly one reset ENVCHANGE from
+the batch response reader, before normal reset verification. Other tokens and
+the remaining request budget are preserved. The tests require evidence that a
+real ACK was intercepted, the normal `ConnectionResetNotAcknowledged` error,
+and destruction of the failed client before one replacement login. A healthy
+control reuses its session, and the replacement must itself remain reusable.
+The injection cannot be installed on a scripted transport or an active client,
+and is absent from production builds.
+
+This is live SQL-backed fault injection, not evidence that SQL Server naturally
+omits the acknowledgement. The existing Windows/macOS native and Linux container
+CI selectors include these `live_` tests; their platform-specific execution
+results must be verified separately.
+
+### 10.5 A4 private safe return
+
+AB#50052 adds `PoolLease::release`, `release_with_deadline` and irreversible
+`mark_discard`. Explicit release drains unread results, then rolls back any
+remaining transaction, and requires a live, quiescent client before check-in.
+An unfinished streamed parameter write is busy even without an open result batch;
+release reports a cleanup error and discards before rollback, rather than
+completing the application's RPC or caching the client.
+One deadline covers drain, rollback and return: the earlier of the caller's
+original close deadline and now plus configured `cleanup_timeout`.
+Acquisition deadlines and cancellation tokens do not become cleanup budgets.
+The owning runtime is checked before each cleanup poll and before return.
+
+The slot guard owns the client throughout cleanup. Failure, timeout or dropping
+the release future destroys the client before making its empty slot available.
+Successful transfer and generation validation occur synchronously under the pool
+state lock; cancellation after transfer cannot reclaim the next owner's client.
+Old-generation returns discard, including across disable/re-enable.
+Bare Drop and marked-discard release perform local destruction without draining,
+rollback, commit, detached cleanup or a graceful-logout guarantee.
+
+Callers must mark interrupted or indeterminate client I/O for discard before
+release; a later successful drain does not prove that operation safe.
+AQE close barriers, Python result delivery and DB-API mapping remain separate
+integration work and do not yet call these APIs.
+
+Scripted tests cover multi-result drain before transaction discovery/rollback,
+delayed server and transport errors, missing rollback acknowledgement,
+cancellation and timeout during drain/rollback, shared and capped deadlines,
+unpolled release, sticky discard, runtime migration, generation changes and
+post-transfer cancellation. The native live harness adds a transaction-owned
+application lock observed from a second session to prove rollback *before*
+checkout reset, same-SPID reuse/isolation, and discard after a delayed drain
+error. These live tests require the same SQL-password environment above.
+
+PR validation runs the pool contracts and live harness on native Windows/macOS,
+and the live harness alongside Python-core Rust tests in the Linux build
+container. The `pool-sql` nextest profile keeps live JUnit results separate from
+the `ci` unit-test results. Only the explicitly selected live tests are unignored;
+unrelated ignored compatibility tests remain excluded. Native pool validation
+fetches Python-core dependencies before frozen runs, independently of optional
+formatting and Clippy steps.
+
+Local Windows evidence (SQL Server 2019 Developer, 15.0.2210.4, TCP/TLS with
+certificate trust enabled, SQL-password authentication): all four live harness
+tests passed, including pre-reset rollback observation and delayed-error discard.
+The run used a temporary low-privilege login, removed afterward.
+[PR validation build 193984](https://dev.azure.com/SqlClientDrivers/904996cc-6198-4d39-8540-eca72bdf0b7b/_build/results?buildId=193984)
+verified this Rust slice on Linux, macOS and Windows: each executed and published
+all four live tests. Linux also passed 530 Python-core Rust tests; native macOS
+and Windows each passed 133 pool contracts. This does not verify the deferred
+Python/AQE integration or other authentication/topology combinations.
 
 ### Upstream contracts reviewed
 
