@@ -635,10 +635,11 @@ def test_executemany_preflight_yields_to_event_loop(mock_client_context):
     asyncio.run(run())
 
 
-def test_executemany_preflight_cancellation_keeps_session_usable(mock_client_context):
+@pytest.mark.integration
+def test_executemany_preflight_cancellation_keeps_session_usable(client_context):
     async def run():
         logger = RecordingLogger()
-        conn = await connect(mock_client_context, logger)
+        conn = await connect(client_context, logger)
         try:
             cursor = conn.cursor()
             logger.events.clear()
@@ -649,6 +650,7 @@ def test_executemany_preflight_cancellation_keeps_session_usable(mock_client_con
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
+            await asyncio.wait_for(asyncio.shield(task._cancel_and_settle()), timeout=6)
 
             assert await cursor.execute("SET NOCOUNT ON", use_prepare=False) is cursor
             assert any(
@@ -1471,7 +1473,7 @@ def test_executemany_logs_description_materialization_failure(client_context):
 
 
 @pytest.mark.integration
-def test_executemany_logs_interruption_during_execution(client_context):
+def test_executemany_logs_cancellation_and_keeps_session_reusable(client_context):
     async def run():
         logger = RecordingLogger()
         conn = await connect(client_context, logger)
@@ -1498,35 +1500,18 @@ def test_executemany_logs_interruption_during_execution(client_context):
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
+            await asyncio.wait_for(asyncio.shield(task._cancel_and_settle()), timeout=6)
 
             probe = conn.cursor()
-            for _ in range(100):
-                try:
-                    await probe.execute("SELECT 1", use_prepare=False)
-                except RuntimeError as error:
-                    if "busy" in str(error).lower():
-                        await asyncio.sleep(0.01)
-                        continue
-                    assert "broken" in str(error).lower()
-                    break
-                else:
-                    pytest.fail("Cancelled executemany left the connection reusable")
-            else:
-                pytest.fail("Cancelled executemany left the connection permanently busy")
-
-            for _ in range(100):
-                if any(
-                    level == 30
-                    and "PyAsyncCursor::executemany: interrupted" in message
-                    and "phase=execution" in message
-                    and "connection marked broken" in message
-                    and module == "async_execute.rs"
-                    for level, message, module in logger.events
-                ):
-                    break
-                await asyncio.sleep(0.01)
-            else:
-                pytest.fail(f"Missing execution interruption warning: {logger.events}")
+            await probe.execute("SELECT 1", use_prepare=False)
+            assert await probe.fetchone() == (1,)
+            assert any(
+                level == 40
+                and "PyAsyncCursor::executemany: failed" in message
+                and "connection_marked_broken=false" in message
+                and module == "async_execute.rs"
+                for level, message, module in logger.events
+            )
         finally:
             await conn.close()
 

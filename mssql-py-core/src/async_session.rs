@@ -4,6 +4,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::async_query_recovery::SETTLEMENT_TIMEOUT_SECONDS;
 use mssql_tds::core::CancelHandle;
 
 pub(crate) type CursorId = u64;
@@ -109,10 +110,11 @@ impl SessionOperationGuard {
         }
     }
 
-    pub(crate) fn finish_execute(&mut self, has_open_batch: bool) {
-        self.session_state
+    pub(crate) fn finish_execute(&mut self, has_open_batch: bool) -> bool {
+        self.completed = self
+            .session_state
             .finish_execute(self.operation_id, has_open_batch);
-        self.completed = true;
+        self.completed
     }
 
     pub(crate) fn settle(&mut self, has_open_batch: bool) {
@@ -205,7 +207,16 @@ impl AsyncConnectionState {
         };
 
         let operation_id = self.allocate_operation_id();
-        let cancel_handle = CancelHandle::new();
+        let mut cancel_handle = if drain_previous {
+            state
+                .active_operation
+                .as_mut()
+                .and_then(|active| active.cancel_handle.take())
+                .unwrap_or_default()
+        } else {
+            CancelHandle::new()
+        };
+        cancel_handle.set_cancel_timeout_secs(SETTLEMENT_TIMEOUT_SECONDS);
         state.active_operation = Some(ActiveOperation {
             cursor_id: Some(cursor_id),
             operation_id,
@@ -313,13 +324,16 @@ impl AsyncConnectionState {
         })
     }
 
-    pub(crate) fn finish_execute(&self, operation_id: OperationId, has_open_batch: bool) {
+    pub(crate) fn finish_execute(&self, operation_id: OperationId, has_open_batch: bool) -> bool {
         let mut state = self.lock();
         let Some(active) = state.active_operation.as_mut() else {
-            return;
+            return true;
         };
         if active.operation_id != operation_id {
-            return;
+            return true;
+        }
+        if active.cancel_requested {
+            return false;
         }
 
         if has_open_batch {
@@ -327,6 +341,26 @@ impl AsyncConnectionState {
         } else {
             state.active_operation = None;
         }
+        true
+    }
+
+    pub(crate) fn cancel_execute(&self, operation_id: OperationId) -> bool {
+        let cancel_handle = {
+            let mut state = self.lock();
+            let Some(active) = state.active_operation.as_mut() else {
+                return false;
+            };
+            if active.operation_id != operation_id || active.phase != OperationPhase::Executing {
+                return false;
+            }
+            let Some(cancel_handle) = active.cancel_handle.take() else {
+                return false;
+            };
+            active.cancel_requested = true;
+            cancel_handle
+        };
+        cancel_handle.cancel();
+        true
     }
 
     /// Publishes a completed fetch only while it still owns an uncancelled read.

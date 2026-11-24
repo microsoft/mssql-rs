@@ -17,6 +17,7 @@ mod async_execute;
 mod async_fetch;
 mod async_handle;
 mod async_parameters;
+mod async_query_recovery;
 mod async_runtime;
 mod async_session;
 mod async_tracing;

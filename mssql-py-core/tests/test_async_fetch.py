@@ -829,12 +829,14 @@ def test_nextset_asyncio_timeout_resynchronizes_connection(client_context):
                 use_prepare=False,
             )
 
+            nextset = cursor.nextset()
             with pytest.raises(asyncio.TimeoutError):
                 # wait_for requests cancellation of nextset when 10 ms elapse.
-                await asyncio.wait_for(cursor.nextset(), timeout=0.01)
+                await asyncio.wait_for(nextset, timeout=0.01)
+            await asyncio.wait_for(asyncio.shield(nextset._cancel_and_settle()), timeout=6)
 
             probe = conn.cursor()
-            await execute_after_cancellation_settles(probe, "SELECT 3")
+            await probe.execute("SELECT 3", use_prepare=False)
             assert await probe.fetchone() == (3,)
         finally:
             await conn.close()
@@ -1137,14 +1139,7 @@ def test_nextset_logs_result_transitions(client_context):
 def test_nextset_cancellation_during_description_materialization_does_not_publish_rows(
     client_context,
 ):
-    """Cancellation during description conversion cannot publish stale metadata.
-
-    1. Force decimal metadata conversion through a deliberately blocked worker.
-    2. Schedule ``nextset`` and yield until that worker reaches the block.
-    3. Cancel the Python Future, then release the worker.
-    4. Verify cancellation wins the publication race: description stays empty.
-    5. Wait for ATTENTION settlement and prove the connection remains reusable.
-    """
+    """Cancellation settles without waiting for blocked description conversion."""
 
     async def run():
         conn = await connect(client_context)
@@ -1161,7 +1156,8 @@ def test_nextset_cancellation_during_description_materialization_does_not_publis
                 use_prepare=False,
             )
             # ensure_future schedules the PyO3 Future on the current event loop.
-            task = asyncio.ensure_future(cursor.nextset())
+            native_nextset = cursor.nextset()
+            task = asyncio.ensure_future(native_nextset)
             for _ in range(200):
                 if entered.is_set():
                     break
@@ -1170,17 +1166,15 @@ def test_nextset_cancellation_during_description_materialization_does_not_publis
             else:
                 pytest.fail("Description materialization did not start")
 
-            # Cancellation is requested while the detached task still owns the
-            # session. Releasing the worker lets it observe that request and
-            # settle ATTENTION without publishing its completed description.
             task.cancel()
-            release.set()
             with pytest.raises(asyncio.CancelledError):
                 await task
+            await asyncio.wait_for(native_nextset._cancel_and_settle(), timeout=1)
 
             assert cursor.description is None
+            release.set()
             probe = conn.cursor()
-            await execute_after_cancellation_settles(probe, "SELECT 3")
+            await probe.execute("SELECT 3")
             assert await probe.fetchone() == (3,)
             assert cursor.description is None
         finally:
@@ -1237,6 +1231,7 @@ def test_fetchall_cancellation_during_row_materialization_keeps_connection_reusa
 
             # Do not release materialization yet: successful reuse here proves
             # the completed TDS read no longer owns the session.
+            await asyncio.wait_for(asyncio.shield(task._cancel_and_settle()), timeout=1)
             probe = conn.cursor()
             await probe.execute("SELECT 2", use_prepare=False)
             assert await probe.fetchone() == (2,)
@@ -1868,19 +1863,14 @@ def test_fetch_rejects_concurrent_read_on_same_cursor(client_context, operation)
 @pytest.mark.integration
 @pytest.mark.parametrize("operation", ["fetchone", "fetchmany", "fetchall"])
 def test_cancelling_blocked_fetch_resynchronizes_session(client_context, operation):
-    """Every fetch API resynchronizes when cancelled during a blocked row read.
-
-    1. Start a large result and choose one of the three fetch APIs.
-    2. Schedule its awaitable and yield one event-loop turn so reading begins.
-    3. Cancel it and verify Python receives ``CancelledError``.
-    4. Wait for the detached Rust task to finish ATTENTION settlement.
-    5. Execute another query to prove the shared session can be reused.
-    """
+    """Cancel a live large-row fetch, settle, and reuse the same SQL session."""
 
     async def run():
         conn = await connect(client_context)
         cursor = conn.cursor()
         try:
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
             await cursor.execute(
                 "SELECT REPLICATE(CAST('x' AS varchar(max)), 32000000)",
                 use_prepare=False,
@@ -1895,13 +1885,15 @@ def test_cancelling_blocked_fetch_resynchronizes_session(client_context, operati
             task = asyncio.ensure_future(awaitable)
             # Give the scheduled fetch one turn to enter the large row read.
             await asyncio.sleep(0)
+            assert not task.done(), "Large-row fetch completed before cancellation"
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
+            await asyncio.wait_for(asyncio.shield(awaitable._cancel_and_settle()), timeout=6)
 
             probe = conn.cursor()
-            await execute_after_cancellation_settles(probe, "SELECT 1")
-            assert await probe.fetchone() == (1,)
+            await probe.execute("SELECT 1, @@SPID", use_prepare=False)
+            assert await probe.fetchall() == [(1, session_id)]
         finally:
             await conn.close()
 

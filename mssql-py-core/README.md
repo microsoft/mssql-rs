@@ -43,6 +43,16 @@ For SDK authors integrating the native runtime:
   `await cursor.close()` leaves the parent and sibling cursors usable. The last
   logical owner discards any remaining direct client. This does not enable
   connection pooling or add concurrent-close coordination.
+- Native async execute, executemany, streaming fetch, and nextset awaitables
+  expose an internal `_cancel_and_settle()` hook for SDK integration. It signals
+  only the originating operation and returns an awaitable that completes after
+  protocol recovery. Shield that awaitable from caller cancellation before
+  reusing the connection. Recovery is bounded to five seconds from the first
+  cancellation; repeated waits do not restart that budget. Failed or timed-out
+  recovery leaves the connection broken. Cancelling the original
+  Python future alone still returns immediately while recovery runs in the
+  background. The hook adds per-operation lifetime bookkeeping, not per-row
+  copies, and does not change synchronous or connection/authentication APIs.
 - [Connection settings](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md#connection-policy-and-migration)
   for native connection options and defaults.
 - [Bulk-copy behavior](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/docs/bulk-copy.md)
