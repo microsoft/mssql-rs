@@ -293,8 +293,9 @@ ODBC_TEST_F_MODES(MoreResultsLiveTest, FailedProcedureRowSetReleasesTheConnectio
 // Benefits-from-mock-tds: assert that the look-ahead sends no ATTENTION and
 // leaves the later statement's tokens unread; tds_client.rs's
 // completing_a_failed_statement_leaves_a_delayed_procedure_tail pins that.
+// Single-only: repeating the 2.5 s delay on one shared DBC dominates stress runtime.
 ODBC_TEST_F_MODES(MoreResultsLiveTest, DelayedProcedureTailKeepsTheBatch,
-                  odbc_concurrency::kAllModes) {
+                  odbc_concurrency::kSingle) {
     ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, reinterpret_cast<SQLPOINTER>(2), 0),
                   SQL_HANDLE_STMT, stmt_);
     SqlTString sql = ODBCTestUtils::ToSqlTStr(

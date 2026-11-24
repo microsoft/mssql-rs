@@ -341,12 +341,6 @@ if(WIN32)
     endforeach()
 endif()
 add_odbc_test(more_results_test  tests/more_results_test.cpp)
-if(ODBC_E2E_CONCURRENT)
-    # The delayed tail serializes 16 x 25 x 2.5 s on one non-MARS DBC.
-    # A 30-minute watchdog leaves 24 minutes for the shared-DBC retry budget.
-    set_tests_properties(more_results_test_mt PROPERTIES
-        ENVIRONMENT "MSSQL_ODBC_MT_TIMEOUT_SECONDS=1800")
-endif()
 add_odbc_test(output_params_test tests/output_params_test.cpp)
 add_odbc_test(dml_output_test    tests/dml_output_test.cpp)
 add_odbc_test(call_routing_test tests/call_routing_test.cpp)
