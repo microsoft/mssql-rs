@@ -474,7 +474,8 @@ alone proves these properties.
 ```mermaid
 flowchart TD
     PY["mssql-python async_query API"] --> B["PyO3 adapter and logical lease cell"]
-    B --> M["mssql-py-core pool manager"]
+    B --> P["Rust effective-spec preparation and canonical HMAC key"]
+    P --> M["mssql-py-core pool manager"]
     M --> K["Per-key adapter: lifecycle, generation and queue policy"]
     K --> D["Deadpool managed slots: capacity, fair wait and storage"]
     D --> L["Driver PoolLease: slot guard and unique TdsClient"]
@@ -854,20 +855,59 @@ exists.
 
 ### 7.1 Key contract
 
-Doc 2 is the sole owner of canonical key construction. The pool receives an opaque `PoolKey`
-plus an immutable effective `ConnectSpec`; it must not infer identity by parsing labels such as
-`msi:` or `acct:`.
+**Approved ownership revision (2026-11-17):** Rust in `mssql-py-core` is the sole
+authority for effective connection settings and canonical key construction. This
+supersedes the earlier Python-owned key scheme. Doc 2 defines the Python boundary
+and authentication integration, not a second key builder.
+
+Python keeps the existing connection-string parser and supported-option adaptation,
+including alias, escaping and duplicate-option semantics. Rust prepares one
+immutable effective spec and authentication binding before keying, using backend
+validation/default resolution, including inherited `MultiSubnetFailover`. The
+physical-open path must use that same snapshot without re-resolving defaults.
+This layer is separate from Deadpool slot scheduling and does not add Python
+types or a second connection-string parser to the pool core.
+
+The internal Rust pool receives an opaque `PoolKey` and the matching effective
+`ConnectSpec`; it must not infer identity by parsing labels such as `msi:` or
+`acct:`. The Python-facing binding accepts supported options/authentication
+inputs, not arbitrary customer keys. No settings round trip to Python solely
+for fingerprinting is required.
 
 A key partitions all effective login/transport/security settings and the intended principal
 **and credential version**. Removing SQL username/password without an equivalent authentication
 discriminator is incorrect: a caller with a wrong password must not obtain a previous caller's
 authenticated SQL session.
 
-Use a versioned, unambiguous canonical serialization and process-private keyed fingerprint; no
-plaintext password/token in key bytes or diagnostics. Do not use a sanitized logging string,
+Use versioned, structured or length-delimited canonical serialization and a
+process-private randomly keyed HMAC fingerprint. Preserve exact credential and
+case-sensitive value semantics. No plaintext credentials belong in key bytes;
+no secret-bearing descriptor belongs in logs, Debug/repr, exceptions or diagnostics.
+Do not use a sanitized logging string,
 delimiter concatenation of unescaped fields, or a public hash of a low-entropy password as the
 canonical scheme. The factory must not change endpoint, database, TLS policy, principal, or
 credential binding under the supplied key.
+
+Every accepted option needs explicit partition/equivalence/rejection tests,
+including aliases/order/defaults, inherited MSF, Unicode/escaping/empty and
+delimiter-like inputs, credential rotation, process-key isolation and diagnostic
+redaction. Exclude lease settings only where reapplication/reset and absence of
+physical effects are established.
+
+The private SQL-auth preparation in `connection_key.rs` implements this key
+authority without exporting a Python API or enabling pooled connect. It reuses
+the existing native context adaptation and TDS endpoint-policy preparation.
+Packet size follows Rust ODBC: zero/omission retains the TDS default (8000),
+nonzero values clamp to 512-32768, and invalid unsigned integers are rejected.
+Unknown IP preference follows Rust ODBC's IPv4First fallback. Existing direct
+async/sync context conversion is unchanged. Effective retry values partition
+keys; this does not enable nonzero recovery for pooled sessions.
+
+The direct PyCore adapter still defaults packet size to 4096 and falls back,
+rather than clamping out-of-range values. Reconcile or explicitly gate/document
+this application-visible default difference before enabling pooled connect.
+Factories must use the prepared context, not re-adapt the original options after
+fingerprinting.
 
 Stable identity keys require a trusted caller binding that is valid before lookup. A miss-only
 provider cannot detect an account change on a hit. On sign-out, account switch, or credential
@@ -934,8 +974,9 @@ or "refresh in place" of the socket, and no token string comparison optimization
 
 For **exact-token** binding, the prepared request carries that same token on a miss. A different
 token requires a different key. If a known-expiry token is already ineligible, fail with
-`TokenExpired`; do not call a rotating provider under the old key. The Python layer resolves a
-current token/key once per logical connect as needed, within the total acquisition deadline.
+`TokenExpired`; do not call a rotating provider under the old key. Python
+credential adapters capture the current token once where needed, and Rust keys
+that token/binding with the effective spec, within the total acquisition deadline.
 
 Expiry is a conservative reuse policy, not a claim that SQL Server disconnects an established
 session exactly when its login token expires. An already published lease is not forcibly
@@ -1023,6 +1064,9 @@ response to a pool error.
 ## 9. API and idle management
 
 ### 9.1 Authoritative interface shape
+
+This is the internal Rust interface. Rust preparation constructs the matching
+key/spec pair; the Python-facing binding must not accept caller-supplied keys.
 
 ```rust
 impl AsyncPoolManager {
@@ -1193,8 +1237,9 @@ reject booleans, negative/non-finite values and conversion overflow.
 
 `PoolKey` and `AuthBinding` accept opaque fingerprints only. This foundation
 does not canonicalize connection strings, select a fingerprint algorithm,
-verify a real login principal or implement token refresh. Doc 2 remains the
-key authority; authentication adapters must supply verified login metadata.
+verify a real login principal or implement token refresh. The separate Rust
+SQL-auth key authority is `connection_key.rs` under section 7.1; authentication
+adapters must supply verified login metadata.
 `ConnectSpec` receives already-validated effective options, including the
 pooled recovery restriction. A3 adds the SQL-password physical factory below.
 

@@ -26,6 +26,10 @@
 
 pub(crate) mod cell_decryptor;
 pub(crate) mod crypto;
+// Internal cross-crate consumers must use the same approved platform providers.
+/// Internal native-binding support, not a semver-stable application API.
+#[doc(hidden)]
+pub use crypto::{fill_random, hmac_sha256};
 pub(crate) mod describe_parameter_encryption;
 pub(crate) mod encryption;
 mod error;
