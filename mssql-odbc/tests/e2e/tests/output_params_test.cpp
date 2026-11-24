@@ -190,7 +190,6 @@ ODBC_TEST_F(OutputParamsTest, WriteBackFollowsAnApdOffsetPointerRepointedAfterEx
         }
         FAIL() << "Procedure creation failed: " << error << "\n" << catalog;
     }
-    ASSERT_SQL_OK(created, SQL_HANDLE_STMT, stmt_);
     std::array<SQLINTEGER, 4> values = {-1, -1, -1, -1};
     std::array<SQLLEN, 2> indicators = {-1, -1};
     SQLLEN none = 0;
