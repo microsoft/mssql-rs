@@ -160,9 +160,37 @@ ODBC_TEST_F(OutputParamsTest, CurrentBindOffsetDisplacesAllDescriptorPointers) {
 // AB#49060: outputs are written after the result sets, so the APD offset
 // pointer in force then (not at execute) decides where they land.
 ODBC_TEST_F(OutputParamsTest, WriteBackFollowsAnApdOffsetPointerRepointedAfterExecute) {
-    ASSERT_SQL_OK(Direct("CREATE PROCEDURE #outputs @v int OUTPUT AS "
-                        "SET NOCOUNT ON; SELECT 1; SET @v=73"),
-                  SQL_HANDLE_STMT, stmt_);
+    const SQLRETURN created = Direct("CREATE PROCEDURE #outputs @v int OUTPUT AS "
+                                     "SET NOCOUNT ON; SELECT 1; SET @v=73");
+    if (!SQL_SUCCEEDED(created)) {
+        const std::string error = ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        SCOPED_TRACE(error);
+        ASSERT_EQ(SQL_NO_DATA, Exhaust());
+        SQLHSTMT probe = AllocStmt();
+        ASSERT_NE(nullptr, probe) << error;
+        ASSERT_SQL_OK(Direct(
+                          "SELECT CONCAT('spid=', @@SPID, ' version=', "
+                          "CONVERT(varchar(32), SERVERPROPERTY('ProductVersion')), "
+                          "' visible_object_id=', OBJECT_ID('tempdb..#outputs'), "
+                          "' catalog_name=', name, ' catalog_object_id=', object_id) "
+                          "FROM (VALUES (1)) AS anchor(n) LEFT JOIN tempdb.sys.objects "
+                          "ON name LIKE '#outputs%'",
+                          probe),
+                      SQL_HANDLE_STMT, probe);
+        std::string catalog;
+        SQLRETURN fetched;
+        while ((fetched = SQLFetch(probe)) != SQL_NO_DATA) {
+            ASSERT_SQL_OK(fetched, SQL_HANDLE_STMT, probe);
+            std::array<SQLCHAR, 512> row = {};
+            SQLLEN length = 0;
+            ASSERT_SQL_OK(SQLGetData(probe, 1, SQL_C_CHAR, row.data(),
+                                    static_cast<SQLLEN>(row.size()), &length),
+                          SQL_HANDLE_STMT, probe);
+            catalog.append(reinterpret_cast<const char*>(row.data())).append("\n");
+        }
+        FAIL() << "Procedure creation failed: " << error << "\n" << catalog;
+    }
+    ASSERT_SQL_OK(created, SQL_HANDLE_STMT, stmt_);
     std::array<SQLINTEGER, 4> values = {-1, -1, -1, -1};
     std::array<SQLLEN, 2> indicators = {-1, -1};
     SQLLEN none = 0;
