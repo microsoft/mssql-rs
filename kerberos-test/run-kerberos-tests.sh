@@ -157,7 +157,7 @@ docker exec "$CONTAINER_NAME" mkdir -p /workspace
 # profile from .config/nextest.toml.
 copy_workspace() {
     # Cargo.lock is gitignored, so CI checkouts have none.
-    local paths=(Cargo.toml .config mssql-tds mssql-tds-cli mssql-mock-tds)
+    local paths=(Cargo.toml .config mssql-tds mssql-tds-cli mssql-mock-tds mssql-rs)
     if [ -f "$REPO_ROOT/Cargo.lock" ]; then
         paths+=(Cargo.lock)
     fi
@@ -188,6 +188,7 @@ members = [
     "mssql-tds",
     "mssql-tds-cli",
     "mssql-mock-tds",
+    "mssql-rs",
 ]
 resolver = "2"
 

@@ -7,7 +7,8 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$ArtifactDirectory
+    [Parameter(Mandatory = $true)][string]$ArtifactDirectory,
+    [ValidateSet('True', 'False')][string]$RequireMssqlRs = 'False'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -23,11 +24,14 @@ if ($manifest.schemaVersion -ne 1) {
 
 $entries = @($manifest.crates)
 $expectedNames = @('mssql-tds', 'mssql-mock-tds')
+if ($entries.Count -eq 3) {
+    $expectedNames += 'mssql-rs'
+}
+elseif ($RequireMssqlRs -eq 'True') {
+    throw 'The selected build artifact must contain mssql-rs.'
+}
 if ($entries.Count -ne $expectedNames.Count) {
     throw "Expected $($expectedNames.Count) crates, found $($entries.Count)"
-}
-if ($entries[0].version -ne $entries[1].version) {
-    throw "Crate versions must match: $($entries[0].version) != $($entries[1].version)"
 }
 
 $artifactRoot = [System.IO.Path]::GetFullPath($ArtifactDirectory).TrimEnd(
@@ -44,6 +48,9 @@ for ($index = 0; $index -lt $expectedNames.Count; $index++) {
     }
     if ([string]::IsNullOrWhiteSpace($entry.version)) {
         throw "No version recorded for $expectedName"
+    }
+    if ($entry.version -ne $entries[0].version) {
+        throw "Crate versions must match: $($entries[0].version) != $($entry.version)"
     }
 
     $cratePath = [System.IO.Path]::GetFullPath(
@@ -67,44 +74,47 @@ for ($index = 0; $index -lt $expectedNames.Count; $index++) {
     }
     $expectedFiles += $cratePath
 
-    if ($expectedName -eq 'mssql-mock-tds') {
+    if ($expectedName -ne 'mssql-tds') {
         $packagedManifestPath = "$expectedName-$($entry.version)/Cargo.toml"
         $packagedManifest = (& tar -xOf $cratePath $packagedManifestPath) -join "`n"
         if ($LASTEXITCODE -ne 0) {
             throw "Could not read $packagedManifestPath from $expectedFileName"
         }
 
-        $dependency = [regex]::Match(
-            $packagedManifest,
-            '(?ms)^\[dependencies\.mssql-tds\]\s*$(?<body>.*?)(?=^\[|\z)'
-        )
-        if (-not $dependency.Success) {
-            throw "$expectedFileName has no mssql-tds dependency"
+        $dependencyKinds = @('dependencies')
+        if ($expectedName -eq 'mssql-rs') {
+            $dependencyKinds += 'dev-dependencies'
         }
+        foreach ($kind in $dependencyKinds) {
+            $pattern = '(?ms)^\[{0}\.mssql-tds\]\s*$(?<body>.*?)(?=^\[|\z)' -f $kind
+            $dependency = [regex]::Match($packagedManifest, $pattern)
+            if (-not $dependency.Success) {
+                throw "$expectedFileName has no mssql-tds $kind entry"
+            }
 
-        $dependencyVersion = [regex]::Match(
-            $dependency.Groups['body'].Value,
-            '(?m)^\s*version\s*=\s*"([^"]+)"'
-        )
-        if (-not $dependencyVersion.Success -or $dependencyVersion.Groups[1].Value -ne $entry.version) {
-            $actualVersion = if ($dependencyVersion.Success) {
-                $dependencyVersion.Groups[1].Value
+            $dependencyVersion = [regex]::Match(
+                $dependency.Groups['body'].Value,
+                '(?m)^\s*version\s*=\s*"([^"]+)"'
+            )
+            if (-not $dependencyVersion.Success -or $dependencyVersion.Groups[1].Value -ne $entry.version) {
+                $actualVersion = if ($dependencyVersion.Success) {
+                    $dependencyVersion.Groups[1].Value
+                }
+                else {
+                    '<missing>'
+                }
+                throw "$expectedFileName records mssql-tds $kind version '$actualVersion', expected '$($entry.version)'"
             }
-            else {
-                '<missing>'
+            if ($dependency.Groups['body'].Value -match '(?m)^\s*(path|registry|registry-index)\s*=') {
+                throw "$expectedFileName does not resolve mssql-tds from crates.io"
             }
-            throw "$expectedFileName records mssql-tds dependency version '$actualVersion', expected '$($entry.version)'"
-        }
-        if ($dependency.Groups['body'].Value -match '(?m)^\s*(path|registry|registry-index)\s*=') {
-            throw "$expectedFileName does not resolve mssql-tds from crates.io"
         }
     }
 
-    $variableName = if ($expectedName -eq 'mssql-tds') {
-        'mssqlTdsCrateVersion'
-    }
-    else {
-        'mssqlMockTdsCrateVersion'
+    $variableName = switch ($expectedName) {
+        'mssql-tds' { 'mssqlTdsCrateVersion' }
+        'mssql-mock-tds' { 'mssqlMockTdsCrateVersion' }
+        'mssql-rs' { 'mssqlRsCrateVersion' }
     }
     Write-Host "##vso[task.setvariable variable=$variableName]$($entry.version)"
 }

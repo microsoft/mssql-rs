@@ -474,7 +474,8 @@ alone proves these properties.
 ```mermaid
 flowchart TD
     PY["mssql-python async_query API"] --> B["PyO3 adapter and logical lease cell"]
-    B --> M["mssql-py-core pool manager"]
+    B --> P["Rust effective-spec preparation and canonical HMAC key"]
+    P --> M["mssql-py-core pool manager"]
     M --> K["Per-key adapter: lifecycle, generation and queue policy"]
     K --> D["Deadpool managed slots: capacity, fair wait and storage"]
     D --> L["Driver PoolLease: slot guard and unique TdsClient"]
@@ -854,20 +855,59 @@ exists.
 
 ### 7.1 Key contract
 
-Doc 2 is the sole owner of canonical key construction. The pool receives an opaque `PoolKey`
-plus an immutable effective `ConnectSpec`; it must not infer identity by parsing labels such as
-`msi:` or `acct:`.
+**Approved ownership revision (2026-11-17):** Rust in `mssql-py-core` is the sole
+authority for effective connection settings and canonical key construction. This
+supersedes the earlier Python-owned key scheme. Doc 2 defines the Python boundary
+and authentication integration, not a second key builder.
+
+Python keeps the existing connection-string parser and supported-option adaptation,
+including alias, escaping and duplicate-option semantics. Rust prepares one
+immutable effective spec and authentication binding before keying, using backend
+validation/default resolution, including inherited `MultiSubnetFailover`. The
+physical-open path must use that same snapshot without re-resolving defaults.
+This layer is separate from Deadpool slot scheduling and does not add Python
+types or a second connection-string parser to the pool core.
+
+The internal Rust pool receives an opaque `PoolKey` and the matching effective
+`ConnectSpec`; it must not infer identity by parsing labels such as `msi:` or
+`acct:`. The Python-facing binding accepts supported options/authentication
+inputs, not arbitrary customer keys. No settings round trip to Python solely
+for fingerprinting is required.
 
 A key partitions all effective login/transport/security settings and the intended principal
 **and credential version**. Removing SQL username/password without an equivalent authentication
 discriminator is incorrect: a caller with a wrong password must not obtain a previous caller's
 authenticated SQL session.
 
-Use a versioned, unambiguous canonical serialization and process-private keyed fingerprint; no
-plaintext password/token in key bytes or diagnostics. Do not use a sanitized logging string,
+Use versioned, structured or length-delimited canonical serialization and a
+process-private randomly keyed HMAC fingerprint. Preserve exact credential and
+case-sensitive value semantics. No plaintext credentials belong in key bytes;
+no secret-bearing descriptor belongs in logs, Debug/repr, exceptions or diagnostics.
+Do not use a sanitized logging string,
 delimiter concatenation of unescaped fields, or a public hash of a low-entropy password as the
 canonical scheme. The factory must not change endpoint, database, TLS policy, principal, or
 credential binding under the supplied key.
+
+Every accepted option needs explicit partition/equivalence/rejection tests,
+including aliases/order/defaults, inherited MSF, Unicode/escaping/empty and
+delimiter-like inputs, credential rotation, process-key isolation and diagnostic
+redaction. Exclude lease settings only where reapplication/reset and absence of
+physical effects are established.
+
+The private SQL-auth preparation in `connection_key.rs` implements this key
+authority without exporting a Python API or enabling pooled connect. It reuses
+the existing native context adaptation and TDS endpoint-policy preparation.
+Packet size follows Rust ODBC: zero/omission retains the TDS default (8000),
+nonzero values clamp to 512-32768, and invalid unsigned integers are rejected.
+Unknown IP preference follows Rust ODBC's IPv4First fallback. Existing direct
+async/sync context conversion is unchanged. Effective retry values partition
+keys; this does not enable nonzero recovery for pooled sessions.
+
+The direct PyCore adapter still defaults packet size to 4096 and falls back,
+rather than clamping out-of-range values. Reconcile or explicitly gate/document
+this application-visible default difference before enabling pooled connect.
+Factories must use the prepared context, not re-adapt the original options after
+fingerprinting.
 
 Stable identity keys require a trusted caller binding that is valid before lookup. A miss-only
 provider cannot detect an account change on a hit. On sign-out, account switch, or credential
@@ -903,8 +943,10 @@ trait ConnectionFactory: Send + Sync {
 ```
 
 The pool reserves capacity first and invokes `open` only for a physical open. The production
-adapter calls `TdsConnectionProvider::create_client(context, &datasource, Some(cancel))`. The
-pool owns isolation/reset/return policy, not the factory. Deterministic tests inject a Rust
+adapter calls `TdsConnectionProvider::create_client`, passing the context,
+datasource and cancellation handle explicitly. macOS Network.framework always
+force-cancels on Drop; no pool-specific disposal option is required. The pool owns
+isolation/reset/return policy, not the factory. Deterministic tests inject a Rust
 factory returning scripted clients.
 
 The factory supports SQL/trusted auth, a raw pre-acquired token, or the public async
@@ -932,8 +974,9 @@ or "refresh in place" of the socket, and no token string comparison optimization
 
 For **exact-token** binding, the prepared request carries that same token on a miss. A different
 token requires a different key. If a known-expiry token is already ineligible, fail with
-`TokenExpired`; do not call a rotating provider under the old key. The Python layer resolves a
-current token/key once per logical connect as needed, within the total acquisition deadline.
+`TokenExpired`; do not call a rotating provider under the old key. Python
+credential adapters capture the current token once where needed, and Rust keys
+that token/binding with the effective spec, within the total acquisition deadline.
 
 Expiry is a conservative reuse policy, not a claim that SQL Server disconnects an established
 session exactly when its login token expires. An already published lease is not forcibly
@@ -1021,6 +1064,9 @@ response to a pool error.
 ## 9. API and idle management
 
 ### 9.1 Authoritative interface shape
+
+This is the internal Rust interface. Rust preparation constructs the matching
+key/spec pair; the Python-facing binding must not accept caller-supplied keys.
 
 ```rust
 impl AsyncPoolManager {
@@ -1191,10 +1237,11 @@ reject booleans, negative/non-finite values and conversion overflow.
 
 `PoolKey` and `AuthBinding` accept opaque fingerprints only. This foundation
 does not canonicalize connection strings, select a fingerprint algorithm,
-verify a real login principal or implement token refresh. Doc 2 remains the
-key authority; authentication adapters must supply verified login metadata.
+verify a real login principal or implement token refresh. The separate Rust
+SQL-auth key authority is `connection_key.rs` under section 7.1; authentication
+adapters must supply verified login metadata.
 `ConnectSpec` receives already-validated effective options, including the
-pooled recovery restriction. No concrete physical factory is enabled yet.
+pooled recovery restriction. A3 adds the SQL-password physical factory below.
 
 `AcquireControl::run` drops its caller-owned future on cancellation/timeout.
 It does not cancel a TDS `CancelHandle`, supervise detached transport work, or
@@ -1210,10 +1257,9 @@ for the compiled lifecycle adapter.
 
 The core developer can build A2's manager and lifecycle behind these contracts.
 The AQE developer can work on B2/B3's logical ownership and close coordination
-on the existing direct path. There is no placeholder `PoolLease`, `ConnHandle` or Python `AsyncPool`.
-A2's compiled manager is described below; ready SQL acquisition, the full
-reset/return protocol, real SQL validation and platform matrix remain
-subsequent approved slices.
+on the existing direct path. There is no `ConnHandle` or Python `AsyncPool`.
+A2's compiled manager and A3's private SQL checkout are described below.
+Safe return, AQE integration and platform certification remain separate slices.
 
 ### 10.3 A2 compiled lifecycle
 
@@ -1297,6 +1343,50 @@ check causes the corresponding regression test to fail.
 
 These tests are lifecycle and scripted-client evidence, not live pooled SQL,
 transport-child-task settlement, Python bridge or performance certification.
+
+### 10.4 A3 private SQL checkout
+
+`pool/session.rs` implements `AsyncPoolManager::acquire` and a uniquely owned
+`PoolLease`. The current-call factory opens only after slot reservation. Fresh
+and cached clients execute and fully drain a concrete isolation SET before
+publication, including READ COMMITTED. Cached checkout arms full reset and
+requires the TDS reset acknowledgement and a quiescent, live session afterward.
+Dead, dirty or reset-invalid candidates are discarded. Retries are bounded by
+the initial cached-candidate snapshot, surrender capacity and rejoin FIFO;
+the final replacement may retain its empty reservation for one fresh open.
+Fresh login and initialization failures propagate without retry.
+
+All stages retain the original absolute acquisition deadline, cancellation
+signal and pool generation. Operation guards cancel TDS handles on interruption;
+caller-owned parallel TCP attempts drop synchronously before slot release.
+Network.framework connections always force-cancel on Drop, including interrupted
+opens and initialization, rather than draining TLS asynchronously after capacity
+has been released. This behavior applies to ordinary and pooled connections
+without changing connection configuration. Explicitly awaited close remains
+graceful.
+No application SQL is replayed.
+
+This slice enables SQL-password login only, rejects nonzero session-recovery
+counts and Always Encrypted, and checks the caller/factory authentication binding.
+It does not construct canonical keys or add token/trusted-auth pooling.
+`PoolLease` Drop discards; the quiescent-return seam remains test-only.
+There is no production check-in, Python pool API or change to AQE's direct path.
+Safe return belongs to AB#50052.
+
+The deterministic suite uses scripted TDS clients and gated reads. The native
+live-SQL harness compiles the private pool modules without exporting them from
+the cdylib and reuses `mssql-tds/tests/common` environment/SQL helpers:
+
+```powershell
+cargo nextest run --manifest-path .\mssql-py-core\Cargo.toml --frozen --lib -E 'test(pool::)' --no-fail-fast
+cargo nextest run --manifest-path .\mssql-py-core\Cargo.toml --frozen --test pool_sql -E 'test(live_)' --run-ignored only
+```
+
+Live tests require `DB_HOST`, `DB_USERNAME`, `SQL_PASSWORD` and the existing
+`DB_PORT`/TLS settings. They cover all five isolation levels on fresh and
+same-SPID cached checkout, reset of session settings/temp tables, and rejection
+of a fault-injected active transaction. They do not prove return cleanup,
+authentication parity, or support for untested platforms/server topologies.
 
 ### Upstream contracts reviewed
 

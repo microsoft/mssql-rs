@@ -185,8 +185,7 @@ impl<C: Send + 'static> AsyncPoolManager<C> {
         }
     }
 
-    /// Reserves capacity only. A3 supplies the public acquire initialization
-    /// sequence; A2 does not publish a ready SQL connection.
+    /// Reserves capacity only; session acquisition initializes before publication.
     pub(super) async fn reserve(
         &self,
         key: PoolKey,

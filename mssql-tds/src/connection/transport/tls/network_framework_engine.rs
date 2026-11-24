@@ -401,6 +401,7 @@ pub(crate) mod tests {
         let mut stream = connect(address, &trusting(), None).await.unwrap();
         stream.write_all(&pattern(MEGABYTE)).await.unwrap();
         within(stream.shutdown()).await.unwrap();
+        drop(stream);
 
         let received = within(server).await.unwrap();
         assert_eq!(received.len(), MEGABYTE);
@@ -410,17 +411,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn dropping_the_stream_closes_the_connection() {
         let (listener, address) = listen().await;
-        let server = serve(listener, |mut tls| async move {
-            let mut received = Vec::new();
-            tls.read_to_end(&mut received).await.unwrap();
-            received
-        });
+        let server = serve(listener, until_the_client_leaves);
 
-        let mut stream = connect(address, &trusting(), None).await.unwrap();
-        stream.write_all(b"goodbye").await.unwrap();
+        let stream = connect(address, &trusting(), None).await.unwrap();
         drop(stream);
 
-        assert_eq!(within(server).await.unwrap(), b"goodbye");
+        within(server).await.unwrap();
     }
 
     /// Makes the server's end of `tcp` reset the connection when it is dropped.
@@ -494,18 +490,41 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_a_stream_the_server_stopped_reading_still_ends_it() {
+    async fn dropping_a_stalled_stream_aborts_before_returning() {
         let (stream, ended, release, server) = stalled_stream(Release::Close).await;
         let drain_started = stream.drain_probe();
+        let cancelled = stream.cancellation_probe();
+
         drop(stream);
 
-        assert!(
-            drain_started(),
-            "normal drop must still start graceful close"
-        );
-        ends_soon(ended).await;
+        assert!(ended(), "drop must abort before returning");
+        assert!(!drain_started(), "drop must not start graceful drain");
+        ends_soon(cancelled).await;
         release.send(()).unwrap();
         within(server).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_attempt_drop_aborts_before_returning() {
+        let (_listener, address) = listen().await;
+        let validation = trusting();
+        let params = TlsConnectParams {
+            validation: &validation,
+            host_name: HOST,
+            server_host_name: HOST,
+            server_certificate_path: None,
+        };
+        let connector = Connector::new(&params, 30_000, 1_000);
+        let (stream, _) = connector.0.start(address).unwrap();
+        let ended = stream.end_probe();
+        let drain_started = stream.drain_probe();
+        let cancelled = stream.cancellation_probe();
+
+        drop(stream);
+
+        assert!(ended(), "an abandoned open must abort synchronously");
+        assert!(!drain_started());
+        ends_soon(cancelled).await;
     }
 
     #[tokio::test]
@@ -532,7 +551,10 @@ pub(crate) mod tests {
         assert!(shutdown.is_err(), "the shutdown should wait for the server");
         drop(stream);
 
-        ends_soon(ended).await;
+        assert!(
+            ended(),
+            "drop must abort an interrupted shutdown before returning"
+        );
         release.send(()).unwrap();
         within(server).await.unwrap();
     }

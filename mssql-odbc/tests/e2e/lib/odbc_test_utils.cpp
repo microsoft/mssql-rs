@@ -142,9 +142,27 @@ std::string ConvertNativeTestText(const std::string& utf8, const std::string& en
 }
 
 std::string CodePageIconvName(unsigned codePage) {
-    if (codePage != 1252 && codePage != 1251 && codePage != 932) {
-        throw std::invalid_argument("unsupported test code page " +
-                                    std::to_string(codePage));
+    switch (codePage) {
+        case 437:
+        case 850:
+        case 874:
+        case 932:
+        case 936:
+        case 949:
+        case 950:
+        case 1250:
+        case 1251:
+        case 1252:
+        case 1253:
+        case 1254:
+        case 1255:
+        case 1256:
+        case 1257:
+        case 1258:
+            break;
+        default:
+            throw std::invalid_argument("unsupported test code page " +
+                                        std::to_string(codePage));
     }
     std::string encoding = "CP" + std::to_string(codePage);
 #if defined(__GLIBC__) || defined(__APPLE__)

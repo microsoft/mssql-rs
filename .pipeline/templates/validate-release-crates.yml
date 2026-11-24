@@ -3,6 +3,11 @@
 
 # Re-download the immutable selected build artifact in every job, never an
 # intermediate artifact or a directory supplied by another job.
+parameters:
+- name: requireMssqlRs
+  type: boolean
+  default: false
+
 steps:
 - download: officialBuild
   artifact: 'drop_Build_RustCrates'
@@ -11,5 +16,6 @@ steps:
 - pwsh: >
     & "$(Build.SourcesDirectory)/.pipeline/scripts/validate-crate-release-artifact.ps1"
     -ArtifactDirectory "$(Pipeline.Workspace)/officialBuild/drop_Build_RustCrates"
+    -RequireMssqlRs '${{ parameters.requireMssqlRs }}'
   displayName: 'Validate Rust crate release artifact'
   workingDirectory: '$(Build.SourcesDirectory)'

@@ -36,4 +36,4 @@ cd mssql-tds
 # Rust defaults to static linking on musl, but GSSAPI uses dlopen() to load
 # the Kerberos library at runtime. Static binaries cannot use dlopen().
 echo "==> Building tests with GSSAPI (dlopen-based, dynamic linking for dlopen support)"
-RUSTFLAGS="-C target-feature=-crt-static" cargo nextest archive --target "$RUST_TARGET" --features gssapi --archive-file ../tdslib-nextest-musl.tar.zst -p mssql-tds
+RUSTFLAGS="-C target-feature=-crt-static" cargo nextest archive --target "$RUST_TARGET" --features mssql-tds/gssapi,mssql-rs/arrow,mssql-rs/jiff,mssql-rs/serde,mssql-rs/time --archive-file ../tdslib-nextest-musl.tar.zst --package mssql-tds --package mssql-rs

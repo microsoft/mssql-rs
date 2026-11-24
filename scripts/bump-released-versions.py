@@ -5,7 +5,7 @@
 
 Two independent tracks run per invocation:
 
-- the released Rust crates (``mssql-tds``, ``mssql-mock-tds``) against crates.io;
+- the released Rust crates (``mssql-tds``, ``mssql-mock-tds``, ``mssql-rs``) against crates.io;
 - the ``mssql-python-rs`` distribution in ``mssql-py-core/pyproject.toml`` against PyPI.
 
 Each track files a tracking issue, pushes a branch, and opens one pull request
@@ -27,7 +27,8 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-CRATES = ("mssql-tds", "mssql-mock-tds")
+CRATES = ("mssql-tds", "mssql-mock-tds", "mssql-rs")
+TDS_DEPENDENTS = ("mssql-mock-tds", "mssql-rs")
 PYTHON_DIST = "mssql-python-rs"
 PYPROJECT = Path("mssql-py-core") / "pyproject.toml"
 
@@ -56,7 +57,7 @@ def table_version_pattern(table):
     )
 
 
-MOCK_TDS_DEPENDENCY = re.compile(
+TDS_DEPENDENCY = re.compile(
     r"^(mssql-tds = \{ path = \"\.\./mssql-tds\", version = )\"[^\"]+\"",
     re.MULTILINE,
 )
@@ -187,13 +188,15 @@ def write_table_version(path, table, version):
     path.write_text(updated, encoding="utf-8")
 
 
-def write_mock_tds_dependency(path, version):
+def write_tds_dependency(path, version, expected_count=1):
     text = path.read_text(encoding="utf-8")
-    updated, count = MOCK_TDS_DEPENDENCY.subn(
-        lambda match: f'{match.group(1)}"{version}"', text, count=1
+    updated, count = TDS_DEPENDENCY.subn(
+        lambda match: f'{match.group(1)}"{version}"', text
     )
-    if count != 1:
-        raise ValueError(f"{path}: no versioned mssql-tds path dependency to update.")
+    if count != expected_count:
+        raise ValueError(
+            f"{path}: expected {expected_count} versioned mssql-tds path dependencies, found {count}."
+        )
     path.write_text(updated, encoding="utf-8")
 
 
@@ -232,32 +235,35 @@ def summary_line(package, old, new):
 
 def planned_bumps(root, published):
     current = cargo_versions(root)
-    if current["mssql-tds"] != current["mssql-mock-tds"]:
-        raise ValueError(
-            f"mssql-tds {current['mssql-tds']} and mssql-mock-tds {current['mssql-mock-tds']} "
-            "must match for a release; choose versions manually."
-        )
+    for crate in TDS_DEPENDENTS:
+        if current["mssql-tds"] != current[crate]:
+            raise ValueError(
+                f"mssql-tds {current['mssql-tds']} and {crate} {current[crate]} "
+                "must match for a release; choose versions manually."
+            )
     selected = [crate for crate in CRATES if current[crate] in published[crate]]
-    if "mssql-mock-tds" in selected and "mssql-tds" not in selected:
-        selected.remove("mssql-mock-tds")
-        print("mssql-mock-tds: waiting for its mssql-tds dependency to be published.")
+    for crate in TDS_DEPENDENTS:
+        if crate in selected and "mssql-tds" not in selected:
+            selected.remove(crate)
+            print(f"{crate}: waiting for its mssql-tds dependency to be published.")
     changes = {crate: (current[crate], next_minor(current[crate])) for crate in selected}
     if "mssql-tds" in changes:
         core_target = changes["mssql-tds"][1]
-        mock_version = current["mssql-mock-tds"]
-        if version_tuple(mock_version) < version_tuple(core_target):
-            changes["mssql-mock-tds"] = (mock_version, core_target)
-        elif version_tuple(mock_version) > version_tuple(core_target):
-            raise ValueError(
-                f"mssql-mock-tds {mock_version} is ahead of mssql-tds target {core_target}; "
-                "choose versions manually."
-            )
-        elif mock_version in published["mssql-mock-tds"]:
-            raise ValueError(
-                f"mssql-mock-tds {mock_version} is already published; choose the next version manually."
-            )
-        else:
-            changes.pop("mssql-mock-tds", None)
+        for crate in TDS_DEPENDENTS:
+            version = current[crate]
+            if version_tuple(version) < version_tuple(core_target):
+                changes[crate] = (version, core_target)
+            elif version_tuple(version) > version_tuple(core_target):
+                raise ValueError(
+                    f"{crate} {version} is ahead of mssql-tds target {core_target}; "
+                    "choose versions manually."
+                )
+            elif version in published[crate]:
+                raise ValueError(
+                    f"{crate} {version} is already published; choose the next version manually."
+                )
+            else:
+                changes.pop(crate, None)
     for crate, (_old, new) in changes.items():
         if new in published[crate]:
             raise ValueError(f"{crate} {new} is already published; choose the next version manually.")
@@ -277,13 +283,17 @@ def planned_python_bump(root, published):
 
 
 def apply_crate_bumps(root, changes):
+    paths = {f"{crate}/Cargo.toml" for crate in changes}
     for crate, (_old, new) in changes.items():
         write_table_version(root / crate / "Cargo.toml", "package", new)
     if "mssql-tds" in changes:
-        write_mock_tds_dependency(
-            root / "mssql-mock-tds" / "Cargo.toml", changes["mssql-tds"][1]
-        )
-    return sorted({f"{crate}/Cargo.toml" for crate in (*changes, "mssql-mock-tds")})
+        for crate in TDS_DEPENDENTS:
+            write_tds_dependency(
+                root / crate / "Cargo.toml", changes["mssql-tds"][1],
+                expected_count=2 if crate == "mssql-rs" else 1,
+            )
+            paths.add(f"{crate}/Cargo.toml")
+    return sorted(paths)
 
 
 def apply_python_bump(root, changes):
@@ -335,12 +345,17 @@ def crate_issue_body(summary, changes):
         for crate, (_old, new) in changes.items()
     ]
     if "mssql-tds" in changes:
-        snippets.append(
-            "mssql-mock-tds/Cargo.toml dependency\n"
-            "```toml\n"
-            f"mssql-tds = {{ path = \"../mssql-tds\", version = \"{changes['mssql-tds'][1]}\", default-features = false }}\n"
-            "```"
-        )
+        for crate in TDS_DEPENDENTS:
+            version = changes["mssql-tds"][1]
+            dependency = f'mssql-tds = {{ path = "../mssql-tds", version = "{version}", default-features = false'
+            dev_dependency = (
+                f'\n[dev-dependencies]\n{dependency}, features = ["test-util"] }}'
+                if crate == "mssql-rs" else ""
+            )
+            snippets.append(
+                f"{crate}/Cargo.toml dependencies\n"
+                f"```toml\n[dependencies]\n{dependency} }}{dev_dependency}\n```"
+            )
     affected = ", ".join(f"`{crate}`" for crate in changes)
     return issue_body(CRATE_MARKER, summary, affected, snippets)
 
