@@ -10,6 +10,7 @@ import subprocess
 import sys
 import textwrap
 import warnings
+from uuid import uuid4
 
 import pytest
 import mssql_py_core
@@ -24,7 +25,7 @@ class RecordingLogger:
 
 
 def test_async_connection_exposes_user_facing_docstrings():
-    assert "Do not cancel" in mssql_py_core.PyAsyncConnection.__doc__
+    assert "Cancelling a close waiter" in mssql_py_core.PyAsyncConnection.__doc__
     assert "autocommit" in mssql_py_core.PyAsyncConnection.connect.__doc__
     assert "Idempotent" in mssql_py_core.PyAsyncConnection.close.__doc__
 
@@ -244,10 +245,15 @@ def test_connection_operations_reuse_connect_logger(client_context):
 
         logger.messages.clear()
         await conn.close()
-        assert any(
-            "PyAsyncConnection::close: connection closed" in message
-            for message in logger.messages
-        )
+
+        async def wait_for_close_log():
+            while not any(
+                "PyAsyncConnection::close: connection closed" in message
+                for message in logger.messages
+            ):
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_close_log(), 5)
 
     asyncio.run(run())
 
@@ -291,9 +297,223 @@ def test_close_resolves_to_none(client_context):
     asyncio.run(run())
 
 
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "autocommit,exit_kind,expected_count",
+    [
+        (False, "clean", 1),
+        (False, "exception", 0),
+        (False, "explicit", 0),
+        (True, "clean", 0),
+        (True, "exception", 0),
+        (True, "explicit", 0),
+    ],
+)
+def test_close_drains_results_and_preserves_transaction_intent(
+    client_context, autocommit, exit_kind, expected_count
+):
+    async def run():
+        table = f"##aqe_b3_{uuid4().hex}"
+        observer = await mssql_py_core.PyAsyncConnection.connect(
+            client_context, autocommit=True
+        )
+        probe = observer.cursor()
+        worker = None
+        try:
+            await probe.execute(f"CREATE TABLE {table} (value int)", use_prepare=False)
+            worker = await mssql_py_core.PyAsyncConnection.connect(
+                client_context, autocommit=autocommit
+            )
+            cursor = worker.cursor()
+            begin = "BEGIN TRANSACTION;" if autocommit else ""
+            await cursor.execute(
+                f"{begin} INSERT INTO {table} VALUES (1);"
+                "SELECT 10 AS value; SELECT 20 AS value",
+                use_prepare=False,
+            )
+            if exit_kind == "explicit":
+                await worker.close()
+            elif exit_kind == "exception":
+                error = ValueError("application error")
+                assert await worker.__aexit__(ValueError, error, None) is None
+            else:
+                assert await worker.__aexit__(None, None, None) is None
+            await asyncio.gather(worker.close(), worker.close())
+            assert worker.closed
+            with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
+                await cursor.fetchone()
+            await cursor.close()
+            await probe.execute(f"SELECT COUNT(*) FROM {table}", use_prepare=False)
+            assert await probe.fetchall() == [(expected_count,)]
+        finally:
+            if worker is not None:
+                await worker.close()
+            await probe.close()
+            await observer.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("use_prepare", [False, True])
+def test_clean_context_exit_commits_after_last_cursor_is_dropped(client_context, use_prepare):
+    async def run():
+        table = f"##aqe_b3_finalizer_{uuid4().hex}"
+        observer = await mssql_py_core.PyAsyncConnection.connect(
+            client_context, autocommit=True
+        )
+        probe = observer.cursor()
+        worker = None
+        try:
+            await probe.execute(f"CREATE TABLE {table} (value int)", use_prepare=False)
+            worker = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            async with worker:
+                cursor = worker.cursor()
+                await cursor.execute(
+                    f"INSERT INTO {table} VALUES (?)", 1, use_prepare=use_prepare
+                )
+                deadline = asyncio.get_running_loop().time() + 5
+                while sys.getrefcount(cursor) != 2:
+                    if asyncio.get_running_loop().time() >= deadline:
+                        pytest.fail("Execute result still retains the cursor")
+                    await asyncio.sleep(0)
+                del cursor
+            await probe.execute(f"SELECT COUNT(*) FROM {table}", use_prepare=False)
+            assert await probe.fetchall() == [(1,)]
+        finally:
+            if worker is not None and not worker.closed:
+                await worker.close()
+            await probe.close()
+            await observer.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("exit_kind", ["clean", "exception", "failed_commit"])
+def test_delayed_drain_error_prevents_commit_and_preserves_block_exception(
+    client_context, exit_kind
+):
+    async def run():
+        table = f"##aqe_b3_error_{uuid4().hex}"
+        observer = await mssql_py_core.PyAsyncConnection.connect(
+            client_context, autocommit=True
+        )
+        probe = observer.cursor()
+        worker = None
+        try:
+            await probe.execute(f"CREATE TABLE {table} (value int)", use_prepare=False)
+            worker = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            cursor = worker.cursor()
+            await cursor.execute(
+                f"INSERT INTO {table} VALUES (1); SELECT 10 AS value;"
+                "RAISERROR ('B3 delayed drain error', 16, 1)",
+                use_prepare=False,
+            )
+            if exit_kind == "failed_commit":
+                with pytest.raises(mssql_py_core.DatabaseError, match="B3 delayed drain error"):
+                    await worker.commit()
+                with pytest.raises(
+                    mssql_py_core.OperationalError, match="Cannot commit a broken connection"
+                ):
+                    await worker.__aexit__(None, None, None)
+            elif exit_kind == "exception":
+                original = ValueError("keep this exception")
+                assert await worker.__aexit__(ValueError, original, None) is None
+                if hasattr(original, "add_note"):
+                    assert original.__notes__ == [
+                        "Connection cleanup failed; connection discarded"
+                    ]
+            else:
+                with pytest.raises(
+                    mssql_py_core.DatabaseError, match="B3 delayed drain error"
+                ) as caught:
+                    await worker.__aexit__(None, None, None)
+                assert any(item["number"] == 50000 for item in caught.value.sql_errors)
+                with pytest.raises(mssql_py_core.DatabaseError) as repeated:
+                    await worker.close()
+                assert repeated.value is not caught.value
+                assert repeated.value.sql_errors == caught.value.sql_errors
+            assert worker.closed
+            await probe.execute(f"SELECT COUNT(*) FROM {table}", use_prepare=False)
+            assert await probe.fetchall() == [(0,)]
+        finally:
+            if worker is not None and not worker.closed:
+                await worker.close()
+            await probe.close()
+            await observer.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_failed_close_awaitable_construction_still_closes(client_context):
+    async def connect():
+        return await mssql_py_core.PyAsyncConnection.connect(client_context)
+
+    connection = asyncio.run(connect())
+    cursor = connection.cursor()
+    with pytest.raises(RuntimeError, match="running event loop"):
+        connection.close()
+
+    async def finish():
+        await connection.close()
+        assert connection.closed
+        with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
+            await cursor.execute("SELECT 1", use_prepare=False)
+        await cursor.close()
+
+    asyncio.run(finish())
+
+
 # ---------------------------------------------------------------------------
 # Commit / Rollback
 # ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+@pytest.mark.parametrize("transaction_method", ["commit", "rollback"])
+def test_failed_transaction_awaitable_construction_preserves_pending_work(
+    client_context, transaction_method
+):
+    table = f"##aqe_b3_construction_{uuid4().hex}"
+
+    async def setup():
+        observer = await mssql_py_core.PyAsyncConnection.connect(
+            client_context, autocommit=True
+        )
+        probe = observer.cursor()
+        await probe.execute(f"CREATE TABLE {table} (value int)", use_prepare=False)
+        worker = await mssql_py_core.PyAsyncConnection.connect(
+            client_context, autocommit=False
+        )
+        cursor = worker.cursor()
+        await cursor.execute(f"INSERT INTO {table} VALUES (1)", use_prepare=False)
+        await cursor.execute(
+            "SELECT 10 AS value UNION ALL SELECT 20 AS value", use_prepare=False
+        )
+        return observer, probe, worker, cursor
+
+    observer, probe, worker, cursor = asyncio.run(setup())
+
+    async def verify():
+        assert await cursor.fetchall() == [(10,), (20,)]
+        assert await cursor.execute("SET NOCOUNT ON", use_prepare=False) is cursor
+        await worker.commit()
+        await probe.execute(f"SELECT COUNT(*) FROM {table}", use_prepare=False)
+        assert await probe.fetchall() == [(1,)]
+
+    async def cleanup():
+        await worker.close()
+        await probe.close()
+        await observer.close()
+
+    try:
+        with pytest.raises(RuntimeError, match="running event loop"):
+            getattr(worker, transaction_method)()
+        asyncio.run(verify())
+    finally:
+        asyncio.run(cleanup())
+
 
 @pytest.mark.integration
 def test_commit_without_active_transaction_is_noop(client_context):
@@ -325,13 +545,13 @@ def test_rollback_without_active_transaction_is_noop(client_context):
 
 @pytest.mark.integration
 def test_commit_after_close_raises_connection_closed(client_context):
-    """commit() on a closed connection raises RuntimeError synchronously."""
+    """commit() on a closed connection raises InterfaceError synchronously."""
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
             await conn.close()
-            with pytest.raises(RuntimeError, match="Connection is closed"):
+            with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
                 await conn.commit()
 
     asyncio.run(run())
@@ -339,13 +559,13 @@ def test_commit_after_close_raises_connection_closed(client_context):
 
 @pytest.mark.integration
 def test_rollback_after_close_raises_connection_closed(client_context):
-    """rollback() on a closed connection raises RuntimeError synchronously."""
+    """rollback() on a closed connection raises InterfaceError synchronously."""
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
             await conn.close()
-            with pytest.raises(RuntimeError, match="Connection is closed"):
+            with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
                 await conn.rollback()
 
     asyncio.run(run())
@@ -482,7 +702,7 @@ def test_async_context_manager_rejects_closed_connection(client_context):
             await conn.close()
 
             entered = False
-            with pytest.raises(RuntimeError, match="Connection is closed"):
+            with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
                 async with conn:
                     entered = True
             assert entered is False
@@ -550,13 +770,13 @@ def test_cursor_returns_pyasynccursor(client_context):
 
 @pytest.mark.integration
 def test_cursor_after_close_raises_connection_closed(client_context):
-    """cursor() on a closed connection raises RuntimeError synchronously."""
+    """cursor() on a closed connection raises InterfaceError synchronously."""
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
             await conn.close()
-            with pytest.raises(RuntimeError, match="Connection is closed"):
+            with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
                 conn.cursor()
 
     asyncio.run(run())

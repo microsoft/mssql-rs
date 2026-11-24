@@ -55,6 +55,37 @@ For SDK authors integrating the native runtime:
   Python future alone still returns immediately while recovery runs in the
   background. The hook adds per-operation lifetime bookkeeping, not per-row
   copies, and does not change synchronous or connection/authentication APIs.
+  logical owner discards any remaining direct client. After parent revocation,
+  cursor close releases local results even if an earlier close attempt was
+  interrupted by connection shutdown.
+- Concurrent async connection closes await one teardown outcome. Cancelling a
+  close waiter does not stop cleanup. Direct close uses one five-second budget
+  to settle operations, drain results, finalize transactions and close the
+  transport. Explicit close rolls back active transactions even in autocommit
+  mode; clean context exit commits only when autocommit is off. Cleanup failures
+  are reported, without masking an existing block exception. A broken connection
+  is discarded, and a clean exit requiring commit reports failure. Cursor
+  finalization racing close preserves the same transaction intent. This does not
+  enable connection pooling.
+  Cleanup rechecks its original deadline after waiting for transaction
+  authorization; an expired budget cannot start transaction finalization.
+- Cancelling `executemany` during parameter binding leaves the connection and
+  existing transaction usable. After execution claims the session, cancellation
+  before result delivery breaks the connection, even if native execution has
+  finished. Close rechecks this after draining and publishes its outcome
+  atomically with cancellation. Cancellation before commit authorization prevents
+  the request; cancellation afterward reports failure with a potentially unknown
+  transaction outcome, without retrying commit.
+- A broken connection still needs `await connection.close()`. The `closed`
+  property indicates teardown, not whether the connection is healthy.
+  Cursor close reports a broken-session interruption as `InterfaceError`,
+  including when the session breaks while that close waits for client access.
+- Explicit `commit()` and `rollback()` also recheck interruption after draining
+  and before reporting completion. Interruption before authorization prevents
+  finalization; interruption during finalization reports an unknown outcome
+  without retrying the transaction request.
+- If creating a `commit()` or `rollback()` awaitable fails before native work
+  starts, pending transactions and unread cursor results remain available.
 - [Connection settings](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md#connection-policy-and-migration)
   for native connection options and defaults.
 - [Bulk-copy behavior](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/docs/bulk-copy.md)

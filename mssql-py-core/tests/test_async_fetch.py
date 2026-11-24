@@ -74,7 +74,7 @@ async def execute_after_cancellation_settles(cursor, operation):
         try:
             await cursor.execute(operation, use_prepare=False)
             return
-        except RuntimeError as error:
+        except mssql_py_core.InterfaceError as error:
             if "busy" not in str(error).lower():
                 raise
             if asyncio.get_running_loop().time() >= deadline:
@@ -301,7 +301,7 @@ def test_fetchone_returns_rows_and_releases_final_exhaustion(client_context):
             )
 
             assert await owner.fetchone() == (1,)
-            with pytest.raises(RuntimeError, match="busy with another cursor"):
+            with pytest.raises(mssql_py_core.InterfaceError, match="busy with another cursor"):
                 await other.execute("SELECT 3", use_prepare=False)
             assert await owner.fetchone() == (2,)
             assert await owner.fetchone() is None
@@ -488,7 +488,7 @@ def test_fetchmany_stops_at_current_result_set(client_context):
 
             assert await owner.fetchmany(10) == [(1,)]
             assert await owner.fetchmany(10) == []
-            with pytest.raises(RuntimeError, match="busy with another cursor"):
+            with pytest.raises(mssql_py_core.InterfaceError, match="busy with another cursor"):
                 await other.execute("SELECT 3", use_prepare=False)
 
             await owner.close()
@@ -540,7 +540,7 @@ def test_fetchall_empty_result_and_current_result_set_boundary(client_context):
             await owner.execute("SELECT 1; SELECT 2", use_prepare=False)
             assert await owner.fetchall() == [(1,)]
             assert await owner.fetchall() == []
-            with pytest.raises(RuntimeError, match="busy with another cursor"):
+            with pytest.raises(mssql_py_core.InterfaceError, match="busy with another cursor"):
                 await other.execute("SELECT 3", use_prepare=False)
         finally:
             await conn.close()
@@ -649,7 +649,7 @@ def test_fetch_interleaving_across_result_transitions_and_ownership(client_conte
             assert await owner.fetchmany(2) == [(2,), (3,)]
             assert await owner.fetchall() == [(4,), (5,), (6,)]
             assert await owner.fetchall() == []
-            with pytest.raises(RuntimeError, match="busy with another cursor"):
+            with pytest.raises(mssql_py_core.InterfaceError, match="busy with another cursor"):
                 await other.execute("SELECT 99", use_prepare=False)
 
             assert await owner.nextset() is True
@@ -708,7 +708,7 @@ def test_execute_preserves_leading_statement_without_rows(client_context, use_pr
                 mssql_py_core.ProgrammingError, match="No active result set"
             ):
                 await owner.fetchone()
-            with pytest.raises(RuntimeError, match="busy with another cursor"):
+            with pytest.raises(mssql_py_core.InterfaceError, match="busy with another cursor"):
                 await other.execute("SELECT 2", use_prepare=False)
 
             assert await owner.nextset() is True
@@ -883,6 +883,40 @@ def test_cancelled_fetchone_resynchronizes_connection(client_context):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("operation", ["fetchall", "nextset"])
+def test_buffered_fetch_cancellation_preserves_direct_connection(client_context, operation):
+    if not hasattr(mssql_py_core, "_arm_fetch_publication_pause"):
+        pytest.skip("requires a debug build with fetch publication test hooks")
+
+    async def run():
+        conn = await connect(client_context)
+        task = None
+        try:
+            cursor = conn.cursor()
+            await cursor.executemany("SELECT CAST(? AS int) AS value", [(1,), (2,)])
+            paused = mssql_py_core._arm_fetch_publication_pause()
+            task = asyncio.ensure_future(getattr(cursor, operation)())
+            await asyncio.wait_for(paused, timeout=5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            probe = conn.cursor()
+            await execute_after_cancellation_settles(probe, "SELECT 3")
+            assert await probe.fetchone() == (3,)
+        finally:
+            mssql_py_core._release_fetch_publication_pause()
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_closed_connection_rejects_late_fetch_cancellation(client_context):
     if not hasattr(mssql_py_core, "_arm_fetch_publication_pause"):
         pytest.skip("requires a debug build with fetch publication test hooks")
@@ -900,11 +934,13 @@ def test_closed_connection_rejects_late_fetch_cancellation(client_context):
             task = asyncio.ensure_future(cursor.fetchone())
             await asyncio.wait_for(paused, timeout=5)
 
-            await conn.close()
+            closing = conn.close()
+            assert not closing.done()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            with pytest.raises(RuntimeError, match="Connection is closed"):
+            await closing
+            with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
                 await cursor.execute("SELECT 3", use_prepare=False)
             assert await cursor.close() is None
         finally:
@@ -1316,7 +1352,7 @@ def test_nextset_rejects_concurrent_operation_and_cancellation_resynchronizes_se
                 use_prepare=False,
             )
             task = asyncio.ensure_future(cursor.nextset())
-            with pytest.raises(RuntimeError, match="busy with another cursor operation"):
+            with pytest.raises(mssql_py_core.InterfaceError, match="busy with another cursor operation"):
                 cursor.nextset()
             # sleep(0) yields one event-loop turn without adding a real delay.
             await asyncio.sleep(0)
@@ -1361,7 +1397,7 @@ def test_fetchone_preserves_later_result_sets(client_context):
 
             assert await owner.fetchone() == (1,)
             assert await owner.fetchone() is None
-            with pytest.raises(RuntimeError, match="busy with another cursor"):
+            with pytest.raises(mssql_py_core.InterfaceError, match="busy with another cursor"):
                 await other.execute("SELECT 3", use_prepare=False)
 
             await owner.close()
@@ -1808,7 +1844,7 @@ def test_fetchone_after_connection_close_raises(mock_client_context):
         cursor = conn.cursor()
         await conn.close()
 
-        with pytest.raises(RuntimeError, match="Connection is closed"):
+        with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
             await cursor.fetchone()
 
     asyncio.run(run())
@@ -1824,7 +1860,7 @@ def test_exhausted_fetchone_after_connection_close_raises(client_context):
         assert await cursor.fetchone() is None
 
         await conn.close()
-        with pytest.raises(RuntimeError, match="Connection is closed"):
+        with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
             await cursor.fetchone()
 
     asyncio.run(run())
@@ -1848,7 +1884,7 @@ def test_fetch_rejects_concurrent_read_on_same_cursor(client_context, operation)
                 "fetchall": lambda: cursor.fetchall(),
             }
             first = operations[operation]()
-            with pytest.raises(RuntimeError, match="busy with another cursor operation"):
+            with pytest.raises(mssql_py_core.InterfaceError, match="busy with another cursor operation"):
                 operations[operation]()
             result = await first
             value = result[0] if operation == "fetchone" else result[0][0]

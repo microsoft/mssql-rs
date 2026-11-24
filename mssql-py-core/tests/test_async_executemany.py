@@ -635,34 +635,94 @@ def test_executemany_preflight_yields_to_event_loop(mock_client_context):
     asyncio.run(run())
 
 
-@pytest.mark.integration
-def test_executemany_preflight_cancellation_keeps_session_usable(client_context):
+@pytest.mark.parametrize(
+    "context_fixture",
+    ["mock_client_context", pytest.param("client_context", marks=pytest.mark.integration)],
+)
+def test_executemany_preflight_cancellation_keeps_session_usable(request, context_fixture):
     async def run():
         logger = RecordingLogger()
-        conn = await connect(client_context, logger)
-        try:
-            cursor = conn.cursor()
-            logger.events.clear()
-            task = asyncio.ensure_future(
-                cursor.executemany("SELECT ?", itertools.repeat((1,)))
-            )
-            await asyncio.sleep(0)
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-            await asyncio.wait_for(asyncio.shield(task._cancel_and_settle()), timeout=6)
+        conn = await connect(request.getfixturevalue(context_fixture), logger)
+        started = threading.Event()
 
-            assert await cursor.execute("SET NOCOUNT ON", use_prepare=False) is cursor
-            assert any(
+        def rows():
+            started.set()
+            yield from itertools.repeat((1,))
+
+        async def wait_for_preflight():
+            while not started.is_set():
+                await asyncio.sleep(0)
+
+        async def wait_for_interruption():
+            while not any(
                 level == 30
                 and "PyAsyncCursor::executemany: interrupted during parameter preflight"
                 in message
                 and "connection remains usable" in message
                 and module == "async_execute.rs"
                 for level, message, module in logger.events
+            ):
+                await asyncio.sleep(0)
+
+        try:
+            cursor = conn.cursor()
+            logger.events.clear()
+            task = asyncio.ensure_future(
+                cursor.executemany("SELECT ?", rows())
             )
+            await asyncio.wait_for(wait_for_preflight(), 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await asyncio.wait_for(asyncio.shield(task._cancel_and_settle()), timeout=6)
+
+            await asyncio.wait_for(wait_for_interruption(), 5)
+            assert await cursor.execute("SET NOCOUNT ON", use_prepare=False) is cursor
         finally:
             await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("completion", ["commit", "context_exit"])
+def test_cancelled_executemany_preflight_preserves_transaction(client_context, completion):
+    async def run():
+        table = f"##aqe_b3_preflight_{uuid.uuid4().hex}"
+        observer = await connect(client_context)
+        probe = observer.cursor()
+        worker = None
+        started = threading.Event()
+
+        def rows():
+            started.set()
+            yield from itertools.repeat((1,))
+
+        async def wait_for_preflight():
+            while not started.is_set():
+                await asyncio.sleep(0)
+
+        try:
+            await execute(probe, f"CREATE TABLE {table} (value int)")
+            worker = await connect(client_context, autocommit=False)
+            async with worker:
+                cursor = worker.cursor()
+                await execute(cursor, f"INSERT INTO {table} VALUES (1)")
+                task = asyncio.ensure_future(cursor.executemany("SELECT ?", rows()))
+                await asyncio.wait_for(wait_for_preflight(), 5)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert await execute(cursor, "SET NOCOUNT ON") is cursor
+                if completion == "commit":
+                    await worker.commit()
+            await execute(probe, f"SELECT COUNT(*) FROM {table}")
+            assert await probe.fetchall() == [(1,)]
+        finally:
+            if worker is not None and not worker.closed:
+                await worker.close()
+            await probe.close()
+            await observer.close()
 
     asyncio.run(run())
 
@@ -991,12 +1051,12 @@ def test_executemany_exhausted_nextset_checks_connection_lifecycle(client_contex
 
             close_awaitable = conn.close()
             # Shutdown may complete before this coroutine gets its next turn.
-            with pytest.raises(RuntimeError, match=r"Connection is (?:closing|closed)"):
+            with pytest.raises(mssql_py_core.InterfaceError, match=r"Connection is (?:closing|closed)"):
                 await cursor.nextset()
             assert cursor.description == description
 
             await close_awaitable
-            with pytest.raises(RuntimeError, match="Connection is closed"):
+            with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
                 await cursor.nextset()
             assert cursor.description == description
         finally:
@@ -1497,21 +1557,41 @@ def test_executemany_logs_cancellation_and_keeps_session_reusable(client_context
             else:
                 pytest.fail("ExecuteMany did not start wire execution")
 
+            probe = conn.cursor()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
             await asyncio.wait_for(asyncio.shield(task._cancel_and_settle()), timeout=6)
 
-            probe = conn.cursor()
-            await probe.execute("SELECT 1", use_prepare=False)
-            assert await probe.fetchone() == (1,)
-            assert any(
-                level == 40
-                and "PyAsyncCursor::executemany: failed" in message
-                and "connection_marked_broken=false" in message
-                and module == "async_execute.rs"
-                for level, message, module in logger.events
-            )
+            for _ in range(100):
+                try:
+                    await probe.execute("SELECT 1", use_prepare=False)
+                except mssql_py_core.InterfaceError as error:
+                    if "busy" in str(error).lower():
+                        await asyncio.sleep(0.01)
+                        continue
+                    assert "broken" in str(error).lower()
+                    break
+                else:
+                    pytest.fail("Cancelled executemany left the connection reusable")
+            else:
+                pytest.fail("Cancelled executemany left the connection permanently busy")
+
+            assert not conn.closed
+
+            for _ in range(100):
+                if any(
+                    level == 30
+                    and "PyAsyncCursor::executemany: interrupted" in message
+                    and "phase=execution" in message
+                    and "connection marked broken" in message
+                    and module == "async_execute.rs"
+                    for level, message, module in logger.events
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail(f"Missing execution interruption warning: {logger.events}")
         finally:
             await conn.close()
 
