@@ -22,15 +22,49 @@ string and maps supported options into the core context. The preview currently
 allows SQL password/trusted authentication and rejects other `Authentication=`
 modes. Token-provider/Entra parity is **new work**, not existing async behavior.
 
-`PyAsyncConnection::connect` directly creates a TDS client. Cursors hold cloned
-`Arc<Mutex<TdsClient>>` references. `AsyncConnectionState` has operation claims and
-Open/Closing/Closed/Broken states; `begin_close` only changes lifecycle and is
-**not** a barrier that joins all operations. Some cursor/fetch finalization uses
-background work. The shared Tokio runtime already exists.
+`PyAsyncConnection::connect` directly creates a TDS client. Connections and
+cursors retain one revocable logical cell with a uniquely owned direct handle.
+Connection I/O, cursor I/O and cursor finalizers register native tasks before
+running. Close stops admission, settles those tasks, then removes the physical
+handle. Dormant unread results are drained by close rather than treated as
+running operations. Cursor finalizers register before scheduling; close can
+settle or supersede their cleanup without treating an unstarted finalizer as
+indeterminate I/O. Failed drains still prevent clean-exit commit.
 
-Current connection-level error mapping still includes `RuntimeError`, and
-explicit close logs/swallows some cleanup errors. The required mapping and
-error-reporting below are intentional preview improvements, not verified parity.
+Direct connections implement the B3 close coordinator: concurrent close callers
+observe one outcome, and cancelling a waiter does not cancel teardown. One
+five-second direct-close budget covers operation settlement, drain, transaction
+finalization and transport close. Forced task abortion is joined before client
+destruction; scheduling/destruction can outlast the deadline and is reported as
+a timeout, not success. The original deadline is checked between cleanup phases
+and before reporting success, including when a future is immediately ready.
+Transaction authorization rechecks that deadline after acquiring the session
+mutex; time spent waiting for the mutex cannot authorize expired cleanup.
+This direct-connection limit does not select the future
+pool's configuration defaults.
+
+Connection lifecycle errors use `InterfaceError`; transaction and cleanup
+failures use the shared DB-API mapper with available server diagnostics. An
+admitted cursor close that encounters a broken session while waiting for client
+access also reports `InterfaceError`, not a programming error. An
+existing block exception stays primary. Interrupted/indeterminate work prevents
+commit on close and reports failure if clean exit required commit. Successfully
+settled cooperative fetch cancellation preserves direct-session recovery and
+transaction intent, but keeps sticky discard eligibility for future pool reuse.
+`executemany` preflight cancellation preserves the session only before that task
+claims execution. Cancellation after its claim and before result delivery breaks
+the session, even after native execution finishes. Close rechecks broken state
+after draining, authorizing transaction finalization under the session mutex.
+Cancellation before that authorization prevents commit. Cancellation afterward
+but before atomic close-outcome publication reports failure with a potentially
+unknown transaction outcome; commit is never retried. Publication and cancellation
+are ordered by the same session mutex, without holding it during network I/O.
+Explicit commit/rollback also recheck broken state after draining. Transaction
+claim release and the completion interruption check share the session mutex.
+Interruption after authorization but before that completion check reports a
+potentially unknown outcome without replaying the request.
+Pool leases, production clean return and Python pool APIs remain
+separate implementation slices.
 
 ### 1.2 Required compatibility
 

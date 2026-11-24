@@ -9,6 +9,8 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
+use crate::async_session::ClaimError;
+
 create_exception!(mssql_py_core, Error, PyException);
 create_exception!(mssql_py_core, Warning, PyException);
 create_exception!(mssql_py_core, InterfaceError, Error);
@@ -19,6 +21,16 @@ create_exception!(mssql_py_core, IntegrityError, DatabaseError);
 create_exception!(mssql_py_core, InternalError, DatabaseError);
 create_exception!(mssql_py_core, ProgrammingError, DatabaseError);
 create_exception!(mssql_py_core, NotSupportedError, DatabaseError);
+
+pub(crate) fn map_connection_claim(error: ClaimError, busy_message: &str) -> PyErr {
+    match error {
+        ClaimError::Closing => InterfaceError::new_err("Connection is closing"),
+        ClaimError::Closed => InterfaceError::new_err("Connection is closed"),
+        ClaimError::Broken => InterfaceError::new_err("Connection is broken"),
+        ClaimError::Busy => InterfaceError::new_err(busy_message.to_owned()),
+        ClaimError::NoResultSet => ProgrammingError::new_err("No active result set"),
+    }
+}
 
 pub(crate) fn add_exceptions(module: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = module.py();

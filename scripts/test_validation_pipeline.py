@@ -1201,8 +1201,22 @@ def test_macos_startup_budgets_allow_a_full_retry_and_fit_outer_limits():
     tests = next(job for job in build["jobs"] if job.get("job") == "Test_MacOS")
     rust = next(step for step in tests["steps"] if step.get("template") == "build-template.yml")
     python = load_template("test-mssql-python-macos-template.yml")["steps"]
+    before_test_steps = rust["parameters"]["beforeTestSteps"]
+    cancellation_tests = next(
+        step for step in before_test_steps
+        if step.get("displayName") == "Run deterministic transport cancellation tests (macOS, pre-SQL)"
+    )
+    assert cancellation_tests["displayName"] == (
+        "Run deterministic transport cancellation tests (macOS, pre-SQL)"
+    )
+    assert cancellation_tests["timeoutInMinutes"] == 15
+    assert "cancellation_preserves_a_parser_paused_mid_row" in cancellation_tests["script"]
+    assert (
+        "attention_timeout_while_draining_after_a_partial_row_retires_the_connection"
+        in cancellation_tests["script"]
+    )
     joins = [
-        rust["parameters"]["beforeTestSteps"][0],
+        next(step for step in before_test_steps if step.get("displayName") == "Wait for Colima and SQL Server"),
         next(step for step in python if step.get("displayName") == "Wait for Colima and SQL Server"),
     ]
     for join in joins:
@@ -2042,7 +2056,28 @@ def test_macos_pr_runs_native_odbc_e2e_against_existing_sql():
     assert rust["parameters"].get("enableTests", True) is True
     assert rust["parameters"]["prebuildTests"] is True
     assert rust["parameters"]["backgroundCoverageReport"] is True
-    join_sql, verify = rust["parameters"]["beforeTestSteps"]
+    before_test_steps = rust["parameters"]["beforeTestSteps"]
+    cancellation_tests = next(
+        step for step in before_test_steps
+        if step.get("displayName") == "Run deterministic transport cancellation tests (macOS, pre-SQL)"
+    )
+    join_sql = next(
+        step for step in before_test_steps
+        if step.get("displayName") == "Wait for Colima and SQL Server"
+    )
+    verify = next(
+        step for step in before_test_steps
+        if step.get("displayName") == "Verify macOS SQL Server before tests"
+    )
+    assert cancellation_tests["displayName"] == (
+        "Run deterministic transport cancellation tests (macOS, pre-SQL)"
+    )
+    assert cancellation_tests["condition"] == _PR
+    assert "cancellation_preserves_a_parser_paused_mid_row" in cancellation_tests["script"]
+    assert (
+        "attention_timeout_while_draining_after_a_partial_row_retires_the_connection"
+        in cancellation_tests["script"]
+    )
     assert join_sql["script"] == (
         'bash .pipeline/scripts/background-step.sh wait "$(Agent.TempDirectory)/macos-sql" 3300'
     )
@@ -2119,6 +2154,71 @@ def test_macos_pr_runs_native_odbc_e2e_against_existing_sql():
         "failTaskOnFailedTests": True,
         "failTaskOnMissingResultsFile": True,
     }
+
+
+def test_windows_and_macos_run_python_lifecycle_tests():
+    stages = load_template("validation-stages.yml")["stages"]
+    build = next(stage for stage in stages if stage["stage"] == "Build")
+    jobs = {job.get("job"): job for job in build["jobs"]}
+
+    for job_name, display_name, publish_name, command_key in (
+        (
+            "Build_Windows",
+            "Run Python lifecycle tests (Windows)",
+            "Publish Python lifecycle test results (Windows)",
+            "pwsh",
+        ),
+        (
+            "Test_MacOS",
+            "Run Python lifecycle tests (macOS)",
+            "Publish Python lifecycle test results (macOS)",
+            "script",
+        ),
+    ):
+        step = next(
+            item for item in jobs[job_name]["steps"]
+            if item.get("displayName") == display_name
+        )
+        publish = next(
+            item for item in jobs[job_name]["steps"]
+            if item.get("displayName") == publish_name
+        )
+        assert command_key in step
+        assert "tests/run_platform_lifecycle_tests.py" in step[command_key]
+        assert step["condition"] == _PR
+        assert step["timeoutInMinutes"] == 20
+        assert step["env"] == {
+            "SQL_SERVER": "localhost,1433",
+            "SQL_DATABASE": "master",
+            "DB_USERNAME": "sa",
+            "SQL_PASSWORD": "$(SQL_PASSWORD)",
+            "TRUST_SERVER_CERTIFICATE": "true",
+        }
+        assert jobs[job_name]["steps"].index(step) < jobs[job_name]["steps"].index(publish)
+        assert publish["task"] == "PublishTestResults@2"
+        assert publish["condition"] == (
+            "and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))"
+        )
+        assert publish["inputs"] == {
+            "testResultsFormat": "JUnit",
+            "testResultsFiles": (
+                "$(Build.SourcesDirectory)/mssql-py-core/pytest-platform-lifecycle-results.xml"
+            ),
+            "testRunTitle": "$(System.PhaseName)-PythonLifecycle",
+            "failTaskOnFailedTests": True,
+            "failTaskOnMissingResultsFile": False,
+        }
+
+    runner_path = _ROOT / "mssql-py-core" / "tests" / "run_platform_lifecycle_tests.py"
+    runner_spec = importlib.util.spec_from_file_location("platform_lifecycle_runner", runner_path)
+    assert runner_spec and runner_spec.loader
+    runner = importlib.util.module_from_spec(runner_spec)
+    runner_spec.loader.exec_module(runner)
+    available_tests = set()
+    for file in runner.TEST_FILES:
+        source = (_ROOT / "mssql-py-core" / "tests" / file).read_text(encoding="utf-8")
+        available_tests.update(re.findall(r"^\s*def\s+(test_\w+)\s*\(", source, re.MULTILINE))
+    assert set(runner.TEST_NAMES) <= available_tests
 
 
 def test_non_windows_format_installs_rustfmt_first():
