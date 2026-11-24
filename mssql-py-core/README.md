@@ -43,8 +43,10 @@ For SDK authors integrating the native runtime:
   `await cursor.close()` leaves the parent and sibling cursors usable. The last
   logical owner discards any remaining direct client. This does not enable
   connection pooling or add concurrent-close coordination.
-- Native async execute, executemany, streaming fetch, and nextset awaitables
-  expose an internal `_cancel_and_settle()` hook for SDK integration. It signals
+- Native async execute, executemany, and streaming fetch/nextset awaitables
+  expose an internal `_cancel_and_settle()` hook for SDK integration. Buffered
+  and exhausted fetch/nextset paths and `fetchmany(size <= 0)` do not expose
+  the hook; SDKs must check for it before invoking it. The hook signals
   only the originating operation and returns an awaitable that completes after
   protocol recovery. Shield that awaitable from caller cancellation before
   reusing the connection. Recovery is bounded to five seconds from the first
