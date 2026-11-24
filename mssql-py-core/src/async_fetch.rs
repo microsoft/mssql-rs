@@ -623,8 +623,8 @@ fn fetch<'py>(
                         ));
                     }
                 }
-                worker_control.complete();
                 fetch_state.set(fetch_status);
+                worker_control.complete();
                 let materialization_started = Instant::now();
                 let mut materialization_guard =
                     MaterializationGuard::new(operation, materialization_dispatch);
