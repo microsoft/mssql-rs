@@ -31,7 +31,7 @@ use crate::async_parameters::{
     ParameterBindingPlan, ParameterMetadata, bind_parameters, parse_input_sizes,
 };
 use crate::async_session::{
-    AsyncConnectionState, CursorId, ExecuteClaim, OperationId, SessionOperationGuard,
+    AsyncConnectionState, CursorId, ExecuteClaim, OperationId, PreflightTask, SessionOperationGuard,
 };
 use crate::async_tracing::{in_cursor_operation_span, record_result_set_status};
 use crate::row_writer::PyRowWriter;
@@ -824,7 +824,8 @@ pub(crate) fn execute<'py>(
         }
     };
 
-    match pyo3_async_runtimes::tokio::future_into_py(py, future) {
+    match pyo3_async_runtimes::tokio::future_into_py(py, session_state.clone().run_tracked(future))
+    {
         Ok(awaitable) => Ok(awaitable),
         Err(error) => {
             session_state.release_operation(operation_id);
@@ -864,8 +865,9 @@ pub(crate) fn executemany<'py>(
     } = resources;
     let seq_of_parameters = seq_of_parameters.clone().unbind();
     let trace_dispatch = dispatch.clone();
+    let task_state = session_state.clone();
 
-    let future = async move {
+    let future = move |preflight_task: Arc<PreflightTask>| async move {
         let started = Instant::now();
         let preflight_started = Instant::now();
         let mut preflight_guard = ExecuteManyPreflightGuard::new(cursor_id, trace_dispatch.clone());
@@ -910,7 +912,7 @@ pub(crate) fn executemany<'py>(
         if closed.load(Ordering::Acquire) {
             return Err(PyRuntimeError::new_err("Cursor is closed"));
         }
-        let claim = session_state
+        let claim = preflight_task
             .claim_execute(cursor_id)
             .map_err(map_claim_error)?;
         let operation_id = claim.operation_id;
@@ -1062,14 +1064,15 @@ pub(crate) fn executemany<'py>(
         };
         in_cursor_operation_span(execution, cursor_id, operation_id, "executemany", "pending").await
     };
-    let future = async move {
+    let future = move |preflight_task| async move {
+        let future = future(preflight_task);
         match dispatch {
             Some(dispatch) => future.with_subscriber(dispatch).await,
             None => future.await,
         }
     };
 
-    pyo3_async_runtimes::tokio::future_into_py(py, future)
+    pyo3_async_runtimes::tokio::future_into_py(py, task_state.run_tracked_preflight(future))
 }
 
 #[cfg(test)]

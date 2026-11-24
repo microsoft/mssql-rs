@@ -57,7 +57,7 @@ def test_execute_rejects_another_cursor_while_results_are_pending(mock_client_co
             first = conn.cursor()
             second = conn.cursor()
             await first.execute("SELECT 1", use_prepare=False)
-            with pytest.raises(RuntimeError, match="busy with another cursor"):
+            with pytest.raises(mssql_py_core.InterfaceError, match="busy with another cursor"):
                 await second.execute("SELECT 2")
         finally:
             await conn.close()
@@ -70,7 +70,7 @@ def test_execute_after_connection_close_raises(mock_client_context):
         conn = await connect(mock_client_context)
         cursor = conn.cursor()
         await conn.close()
-        with pytest.raises(RuntimeError, match="Connection is closed"):
+        with pytest.raises(mssql_py_core.InterfaceError, match="Connection is closed"):
             await cursor.execute("SELECT 1")
 
     asyncio.run(run())

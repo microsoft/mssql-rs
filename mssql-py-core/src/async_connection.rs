@@ -12,7 +12,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use pyo3::exceptions::{PyFutureWarning, PyOverflowError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyFutureWarning, PyOverflowError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
 use tracing::instrument::WithSubscriber;
@@ -24,8 +24,8 @@ use mssql_tds::error::Error as TdsError;
 use crate::async_cursor::PyAsyncCursor;
 use crate::async_entra_credentials::BuiltInEntraCredential;
 use crate::async_entra_token_factory::AsyncPythonEntraIdTokenFactory;
-use crate::async_errors::InterfaceError;
-use crate::async_handle::LogicalConnection;
+use crate::async_errors::{InterfaceError, map_connection_claim};
+use crate::async_handle::{CLOSE_TIMEOUT, CloseMode, LogicalConnection};
 use crate::async_session::{AsyncConnectionState, ClaimError, OperationId};
 use crate::connection::PyCoreConnection;
 use crate::python_logger_adapter::python_logger_dispatch;
@@ -94,16 +94,6 @@ fn emit_preview_warning(py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
-/// Map a TDS error to a Python exception with per-operation context.
-///
-/// TODO(User Story 47181): map TdsError to a DB-API-compliant exception,
-/// preserving SQLSTATE + server error number.
-/// <https://sqlclientdrivers.visualstudio.com/mssql-python/_workitems/edit/47181>
-fn map_tds_error(op: &str, user_msg: &str, e: impl std::fmt::Display) -> PyErr {
-    tracing::error!("PyAsyncConnection::{op}: failed: {e}");
-    PyRuntimeError::new_err(format!("{user_msg}: {e}"))
-}
-
 fn map_connect_error(error: TdsError, uses_async_auth: bool) -> PyErr {
     if matches!(error, TdsError::TokenAcquisitionCancelled)
         || (uses_async_auth && matches!(error, TdsError::OperationCancelledError(_)))
@@ -121,23 +111,13 @@ fn map_connect_error(error: TdsError, uses_async_auth: bool) -> PyErr {
     crate::async_errors::map_tds_error("Failed to connect to SQL Server", error, Vec::new())
 }
 
-/// Maps a connection lifecycle or session-ownership rejection to `RuntimeError`.
-///
-/// A busy connection may be owned by either a cursor or another connection-level
-/// operation. DB-API-specific exception mapping is tracked separately.
 fn map_claim_error(error: ClaimError) -> PyErr {
-    match error {
-        ClaimError::Closing => PyRuntimeError::new_err("Connection is closing"),
-        ClaimError::Closed => PyRuntimeError::new_err("Connection is closed"),
-        ClaimError::Broken => PyRuntimeError::new_err("Connection is broken"),
-        ClaimError::Busy => PyRuntimeError::new_err("Connection is busy with another operation"),
-        ClaimError::NoResultSet => PyRuntimeError::new_err("No active result set"),
-    }
+    map_connection_claim(error, "Connection is busy with another operation")
 }
 
 /// Owns the session claim for an in-flight commit or rollback.
 ///
-/// `complete()` releases the claim after success or a handled TDS error. Dropping
+/// `complete()` checks interruption when releasing the claim. Dropping
 /// before completion indicates cancellation or an interrupted protocol exchange,
 /// so the connection is marked broken before the claim is released.
 struct ConnectionOperationGuard {
@@ -156,10 +136,13 @@ impl ConnectionOperationGuard {
         }
     }
 
-    /// Releases the claim and prevents drop-time connection poisoning.
-    fn complete(&mut self) {
-        self.session_state.release_operation(self.operation_id);
+    /// Releases the claim while checking for interruption during finalization.
+    fn complete(&mut self) -> PyResult<()> {
+        let result = self
+            .session_state
+            .complete_connection_operation(self.operation_id);
         self.completed = true;
+        result
     }
 }
 
@@ -183,39 +166,11 @@ where
     }
 }
 
-/// Detach the direct handle before shutdown so retained cursors cannot reacquire it.
-/// Preserve the preview API's existing rollback and logged-cleanup-error policy.
-async fn close_client(client: Arc<LogicalConnection>, autocommit: bool) -> bool {
-    let Some(mut handle) = client.take_for_close().await else {
-        return true;
-    };
-    let guard = handle.client_mut();
-    if !autocommit
-        && guard.has_active_transaction()
-        && let Err(error) = guard.rollback_transaction(None, None).await
-    {
-        tracing::warn!(
-            "PyAsyncConnection::close: failed to roll back active transaction: {}",
-            error
-        );
-    }
-    match guard.close_connection().await {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(
-                "PyAsyncConnection::close: error during graceful shutdown: {}",
-                error
-            );
-            false
-        }
-    }
-}
-
 /// Asynchronous Python connection backed by the Core TDS client.
 ///
-/// This API is a preview and may change between minor releases. Do not cancel
-/// an in-progress `commit()`, `rollback()`, or `close()` if the connection will
-/// be reused.
+/// This API is a preview and may change between minor releases. Cancelling
+/// commit or rollback invalidates the connection. Cancelling a close waiter
+/// does not stop bounded cleanup; another close waits for the same outcome.
 #[pyclass]
 pub struct PyAsyncConnection {
     /// Removing this wrapper's reference does not revoke surviving cursor owners.
@@ -396,66 +351,42 @@ impl PyAsyncConnection {
     #[getter]
     fn closed(&self) -> bool {
         self.tds_client.is_none()
+            || matches!(
+                self.session_state.ensure_open(),
+                Err(ClaimError::Closing | ClaimError::Closed)
+            )
     }
 
     /// Inverse of `.closed`, provided for sync-path parity with `PyCoreConnection`.
     fn is_connected(&self) -> bool {
-        self.tds_client.is_some()
+        !self.closed()
     }
 
     fn __repr__(&self) -> &'static str {
-        if self.tds_client.is_none() {
+        if self.closed() {
             "PyAsyncConnection(closed)"
         } else {
             "PyAsyncConnection(connected)"
         }
     }
 
-    /// Close the connection. Rolls back active work when autocommit is disabled.
-    /// Idempotent; rollback and shutdown errors are logged and swallowed.
+    /// Close the connection, draining results before rolling back active work.
+    /// Idempotent; concurrent callers await the same cleanup and outcome.
+    /// Cleanup has one five-second budget, even if a caller is cancelled.
     /// Returns an awaitable that resolves to `None`.
     fn close<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let dispatch = self.tracing_dispatch.clone();
         let _guard = dispatch.as_ref().map(tracing::dispatcher::set_default);
         tracing::info!("PyAsyncConnection::close: initiating close");
-        // `take()` before spawning: gives the future 'static ownership; marks conn closed.
-        let client_opt = self.tds_client.take();
-        let autocommit = self.autocommit.load(Ordering::Relaxed);
-        let session_state = self.session_state.clone();
-        if client_opt.is_some() {
-            session_state.begin_close();
-        }
-
-        pyo3_async_runtimes::tokio::future_into_py(
-            py,
-            with_optional_dispatch(
-                async move {
-                    let Some(client) = client_opt else {
-                        tracing::debug!("PyAsyncConnection::close: already closed, no-op");
-                        return Python::attach(|py| Ok(py.None()));
-                    };
-
-                    tracing::info!(
-                        "PyAsyncConnection::close: sending TDS logout and tearing down transport"
-                    );
-                    if close_client(client, autocommit).await {
-                        session_state.mark_closed();
-                    } else {
-                        session_state.mark_broken();
-                    }
-                    tracing::info!("PyAsyncConnection::close: connection closed");
-                    Python::attach(|py| Ok(py.None()))
-                },
-                dispatch,
-            ),
-        )
+        self.close_awaitable(py, CloseMode::Rollback, None)
     }
 
     /// Async context manager entry. Resolves to `self` with no I/O.
     fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        if slf.borrow(py).tds_client.is_none() {
-            return Err(PyRuntimeError::new_err("Connection is closed"));
-        }
+        slf.borrow(py)
+            .session_state
+            .ensure_open()
+            .map_err(map_claim_error)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(slf) })
     }
 
@@ -465,195 +396,40 @@ impl PyAsyncConnection {
         &mut self,
         py: Python<'py>,
         exc_type: &Bound<'_, PyAny>,
-        _exc_val: &Bound<'_, PyAny>,
+        exc_val: &Bound<'_, PyAny>,
         _exc_tb: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let client_opt = self.tds_client.take();
         let autocommit = self.autocommit.load(Ordering::Relaxed);
         let has_block_error = !exc_type.is_none();
-        let dispatch = self.tracing_dispatch.clone();
-        let session_state = self.session_state.clone();
-        if client_opt.is_some() {
-            session_state.begin_close();
-        }
-
-        pyo3_async_runtimes::tokio::future_into_py(
-            py,
-            with_optional_dispatch(
-                async move {
-                    let Some(client) = client_opt else {
-                        session_state.mark_closed();
-                        return Python::attach(|py| Ok(py.None()));
-                    };
-
-                    let Some(mut handle) = client.take_for_close().await else {
-                        session_state.mark_closed();
-                        return Python::attach(|py| Ok(py.None()));
-                    };
-                    let guard = handle.client_mut();
-                    let finalize_result = if !autocommit && guard.has_active_transaction() {
-                        if has_block_error {
-                            guard
-                                .rollback_transaction(None, None)
-                                .await
-                                .map_err(|error| {
-                                    map_tds_error(
-                                        "__aexit__",
-                                        "Rollback on context exit failed",
-                                        error,
-                                    )
-                                })
-                        } else {
-                            guard.commit_transaction(None, None).await.map_err(|error| {
-                                map_tds_error("__aexit__", "Commit on context exit failed", error)
-                            })
-                        }
-                    } else {
-                        Ok(())
-                    };
-
-                    let close_result = guard.close_connection().await.map_err(|error| {
-                        map_tds_error("__aexit__", "Close on context exit failed", error)
-                    });
-                    if close_result.is_ok() {
-                        session_state.mark_closed();
-                    } else {
-                        session_state.mark_broken();
-                    }
-
-                    if has_block_error {
-                        if let Err(error) = finalize_result {
-                            tracing::warn!(
-                                "PyAsyncConnection::__aexit__: cleanup failed while preserving block exception: {}",
-                                error
-                            );
-                        }
-                        if let Err(error) = close_result {
-                            tracing::warn!(
-                                "PyAsyncConnection::__aexit__: close failed while preserving block exception: {}",
-                                error
-                            );
-                        }
-                        return Python::attach(|py| Ok(py.None()));
-                    }
-
-                    finalize_result?;
-                    close_result?;
-                    Python::attach(|py| Ok(py.None()))
-                },
-                dispatch,
-            ),
-        )
+        let mode = if !autocommit && !has_block_error {
+            CloseMode::Commit
+        } else {
+            CloseMode::Rollback
+        };
+        self.close_awaitable(py, mode, has_block_error.then(|| exc_val.clone().unbind()))
     }
 
     /// Commit the current transaction. No-op if none is active.
-    /// Raises `RuntimeError` synchronously if the connection is closed.
+    /// Drains pending results first; interrupted or failed I/O invalidates the connection.
     fn commit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        // Clone the Arc so the future is `'static + Send`.
-        let client = self
-            .tds_client
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Connection is closed"))?
-            .clone();
-        let dispatch = self.tracing_dispatch.clone();
-        let session_state = self.session_state.clone();
-        let operation_id = session_state
-            .claim_connection_operation()
-            .map_err(map_claim_error)?;
-
-        let result = pyo3_async_runtimes::tokio::future_into_py(
-            py,
-            with_optional_dispatch(
-                async move {
-                    let mut operation_guard =
-                        ConnectionOperationGuard::new(session_state, operation_id);
-                    let result = async {
-                        let mut client = client
-                            .lock_operation(operation_id)
-                            .await
-                            .map_err(map_claim_error)?;
-                        if client.has_active_transaction() {
-                            tracing::info!("PyAsyncConnection::commit: sending TM_COMMIT");
-                            client
-                                .commit_transaction(None, None)
-                                .await
-                                .map_err(|error| map_tds_error("commit", "Commit failed", error))?;
-                            tracing::info!("PyAsyncConnection::commit: transaction committed");
-                        }
-                        Python::attach(|py| Ok(py.None()))
-                    }
-                    .await;
-                    operation_guard.complete();
-                    result
-                },
-                dispatch,
-            ),
-        );
-        if result.is_err() {
-            self.session_state.release_operation(operation_id);
-        }
-        result
+        self.transaction_awaitable(py, CloseMode::Commit)
     }
 
     /// Roll back the current transaction. No-op if none is active.
-    /// Raises `RuntimeError` synchronously if the connection is closed.
+    /// Drains pending results first; interrupted or failed I/O invalidates the connection.
     fn rollback<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        // Clone the Arc so the future is `'static + Send`.
-        let client = self
-            .tds_client
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Connection is closed"))?
-            .clone();
-        let dispatch = self.tracing_dispatch.clone();
-        let session_state = self.session_state.clone();
-        let operation_id = session_state
-            .claim_connection_operation()
-            .map_err(map_claim_error)?;
-
-        let result = pyo3_async_runtimes::tokio::future_into_py(
-            py,
-            with_optional_dispatch(
-                async move {
-                    let mut operation_guard =
-                        ConnectionOperationGuard::new(session_state, operation_id);
-                    let result = async {
-                        let mut client = client
-                            .lock_operation(operation_id)
-                            .await
-                            .map_err(map_claim_error)?;
-                        if client.has_active_transaction() {
-                            tracing::info!("PyAsyncConnection::rollback: sending TM_ROLLBACK");
-                            client
-                                .rollback_transaction(None, None)
-                                .await
-                                .map_err(|error| {
-                                    map_tds_error("rollback", "Rollback failed", error)
-                                })?;
-                            tracing::info!("PyAsyncConnection::rollback: transaction rolled back");
-                        }
-                        Python::attach(|py| Ok(py.None()))
-                    }
-                    .await;
-                    operation_guard.complete();
-                    result
-                },
-                dispatch,
-            ),
-        );
-        if result.is_err() {
-            self.session_state.release_operation(operation_id);
-        }
-        result
+        self.transaction_awaitable(py, CloseMode::Rollback)
     }
 
-    /// Create an async cursor. Sync per DB-API 2.0. Raises `RuntimeError` if the
+    /// Create an async cursor. Sync per DB-API 2.0. Raises `InterfaceError` if the
     /// connection is closed. Additional cursors are allowed; all share the same
     /// TDS session and serialize on the same async mutex.
     fn cursor(&self) -> PyResult<PyAsyncCursor> {
+        self.session_state.ensure_open().map_err(map_claim_error)?;
         let client = self
             .tds_client
             .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Connection is closed"))?
+            .ok_or_else(|| InterfaceError::new_err("Connection is closed"))?
             .clone();
         Ok(PyAsyncCursor::new(
             client,
@@ -666,6 +442,118 @@ impl PyAsyncConnection {
     }
 }
 
+impl PyAsyncConnection {
+    fn transaction_awaitable<'py>(
+        &self,
+        py: Python<'py>,
+        mode: CloseMode,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self
+            .tds_client
+            .as_ref()
+            .ok_or_else(|| InterfaceError::new_err("Connection is closed"))?
+            .clone();
+        let state = self.session_state.clone();
+        let (operation_id, previous) = state
+            .claim_connection_operation()
+            .map_err(map_claim_error)?;
+        let future_state = state.clone();
+        let dispatch = self.tracing_dispatch.clone();
+        let future = async move {
+            let mut guard = ConnectionOperationGuard::new(future_state, operation_id);
+            let mut client = client
+                .lock_operation(operation_id)
+                .await
+                .map_err(map_claim_error)?;
+            let result = async {
+                client.close_query().await?;
+                if guard.session_state.is_broken() {
+                    return Err(TdsError::OperationCancelledError(
+                        match mode {
+                            CloseMode::Commit => {
+                                "Cannot commit a broken connection; connection discarded"
+                            }
+                            CloseMode::Rollback => {
+                                "Cannot roll back a broken connection; connection discarded"
+                            }
+                        }
+                        .into(),
+                    ));
+                }
+                if client.has_active_transaction() {
+                    match mode {
+                        CloseMode::Commit => client.commit_transaction(None, None).await?,
+                        CloseMode::Rollback => client.rollback_transaction(None, None).await?,
+                    }
+                }
+                Ok::<(), TdsError>(())
+            }
+            .await;
+            let result = result.map_err(|error| {
+                crate::async_errors::map_tds_error(
+                    "Transaction completion failed",
+                    error,
+                    client.take_info_messages(),
+                )
+            });
+            drop(client);
+            if result.is_ok() {
+                guard.complete()?;
+            }
+            result?;
+            Python::attach(|py| Ok(py.None()))
+        };
+        match pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            state
+                .clone()
+                .run_tracked(with_optional_dispatch(future, dispatch)),
+        ) {
+            Ok(awaitable) => Ok(awaitable),
+            Err(error) => {
+                state.restore_connection_operation(operation_id, previous);
+                Err(error)
+            }
+        }
+    }
+
+    fn close_awaitable<'py>(
+        &self,
+        py: Python<'py>,
+        mode: CloseMode,
+        block_error: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self
+            .tds_client
+            .as_ref()
+            .ok_or_else(|| InterfaceError::new_err("Connection is closed"))?;
+        // Start before constructing the awaitable: construction failure cannot strand cleanup.
+        let receiver = client.start_close(mode, CLOSE_TIMEOUT, self.tracing_dispatch.clone());
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = LogicalConnection::wait_closed(receiver).await;
+            if let Some(block_error) = block_error {
+                if result.is_err() {
+                    tracing::warn!("Connection cleanup failed while preserving block exception");
+                    Python::attach(|py| {
+                        let error = block_error.bind(py);
+                        if error.hasattr("add_note")? {
+                            error.call_method1(
+                                "add_note",
+                                ("Connection cleanup failed; connection discarded",),
+                            )?;
+                        }
+                        Ok::<(), PyErr>(())
+                    })
+                    .unwrap_or_else(|_| tracing::warn!("Could not annotate block exception"));
+                }
+            } else {
+                result?;
+            }
+            Python::attach(|py| Ok(py.None()))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;
@@ -673,9 +561,241 @@ mod tests {
     use mssql_tds::error::{Error, SqlErrorInfo, SqlServerDiagnostics, TimeoutErrorType};
     use pyo3::prelude::*;
 
-    use super::{PyAsyncConnection, close_client, map_connect_error};
+    use super::{CLOSE_TIMEOUT, CloseMode, PyAsyncConnection, map_connect_error};
     use crate::async_errors::{DatabaseError, OperationalError};
     use crate::async_handle::LogicalConnection;
+
+    #[test]
+    fn cancelled_python_close_waiter_does_not_finish_a_concurrent_close_early() {
+        use pyo3::types::{PyCFunction, PyDict};
+
+        let runtime = pyo3_async_runtimes::tokio::get_runtime();
+        let (client, transport) =
+            mssql_tds::test_client_support::tds_client_from_tokens_capturing(Vec::new());
+        let connection = std::sync::Arc::new(LogicalConnection::new(client));
+        let state = connection.state.clone();
+        let (operation, _) = state.claim_connection_operation().unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let worker = connection.clone();
+        let (result, _) = state
+            .spawn_task(async move {
+                let _client = worker.lock_operation(operation).await.unwrap();
+                started.send(()).unwrap();
+                wait.await.unwrap();
+            })
+            .unwrap();
+        runtime.block_on(ready).unwrap();
+        let wrapper = PyAsyncConnection {
+            tds_client: Some(connection),
+            tracing_dispatch: None,
+            autocommit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_state: state.clone(),
+            default_query_timeout: 0,
+        };
+        Python::attach(|py| {
+            let globals = PyDict::new(py);
+            globals
+                .set_item("conn", Py::new(py, wrapper).unwrap())
+                .unwrap();
+            let release = std::sync::Mutex::new(Some(release));
+            let release = PyCFunction::new_closure(py, None, None, move |_, _| {
+                release.lock().unwrap().take().unwrap().send(()).unwrap();
+                Ok::<(), PyErr>(())
+            })
+            .unwrap();
+            globals.set_item("release", release).unwrap();
+            py.run(
+                cr"import asyncio
+async def run():
+    first = conn.close()
+    second = conn.close()
+    assert not first.done()
+    assert not second.done()
+    first.cancel()
+    try:
+        await first
+    except asyncio.CancelledError:
+        pass
+    else:
+        raise AssertionError('close caller cancellation was not preserved')
+    assert not second.done()
+    release()
+    await asyncio.wait_for(second, 5)
+    assert conn.closed
+    assert await conn.close() is None
+asyncio.run(run())",
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+        });
+        runtime.block_on(result).unwrap();
+        assert_eq!(std::sync::Arc::strong_count(&transport), 1);
+        assert!(transport.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn late_waiter_cancellation_cannot_commit_or_report_transaction_success() {
+        use std::pin::Pin;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+        use std::task::{Context, Waker};
+
+        use crate::async_session::SessionOperationGuard;
+        use mssql_tds::connection::tds_client::ExecuteOptions;
+        use mssql_tds::test_client_support::{
+            col_metadata_empty, done_no_more, env_change_begin_transaction,
+            env_change_commit_transaction, env_change_rollback_transaction,
+            tds_client_from_tokens_capturing,
+        };
+        use pyo3::types::PyDict;
+        use tracing::{Subscriber, span::Attributes};
+        use tracing_subscriber::{Layer, layer::Context as LayerContext, prelude::*};
+
+        type Waiter = Pin<Box<dyn std::future::Future<Output = PyResult<()>> + Send>>;
+        struct CancelAtPhase {
+            phase: &'static str,
+            waiter: Arc<Mutex<Option<Waiter>>>,
+        }
+        impl<S: Subscriber> Layer<S> for CancelAtPhase {
+            fn on_new_span(
+                &self,
+                attributes: &Attributes<'_>,
+                _id: &tracing::span::Id,
+                _context: LayerContext<'_, S>,
+            ) {
+                if attributes.metadata().name() == self.phase {
+                    drop(self.waiter.lock().unwrap().take().unwrap());
+                }
+            }
+        }
+
+        let runtime = pyo3_async_runtimes::tokio::get_runtime();
+        for (phase, mode) in [
+            ("close_query", CloseMode::Commit),
+            ("commit_transaction", CloseMode::Commit),
+            ("close_query", CloseMode::Rollback),
+            ("rollback_transaction", CloseMode::Rollback),
+            ("no_cancellation", CloseMode::Commit),
+            ("no_cancellation", CloseMode::Rollback),
+        ] {
+            let (mut client, transport) = tds_client_from_tokens_capturing(vec![
+                env_change_begin_transaction(7),
+                col_metadata_empty(),
+                done_no_more(),
+                match mode {
+                    CloseMode::Commit => env_change_commit_transaction(),
+                    CloseMode::Rollback => env_change_rollback_transaction(),
+                },
+                done_no_more(),
+            ]);
+            runtime
+                .block_on(client.execute("SELECT 1".into(), ExecuteOptions::default()))
+                .unwrap();
+            let initial_bytes = transport.lock().unwrap().len();
+            let connection = Arc::new(LogicalConnection::new(client));
+            let state = connection.state.clone();
+            let future_state = state.clone();
+            let (release, wait) = tokio::sync::oneshot::channel();
+            let (completed, completion) = tokio::sync::oneshot::channel();
+            let mut waiter: Waiter = Box::pin(state.clone().run_tracked_preflight(
+                move |preflight| async move {
+                    wait.await.unwrap();
+                    let claim = preflight.claim_execute(1).unwrap();
+                    let mut guard = SessionOperationGuard::new(future_state, claim.operation_id);
+                    guard.finish_execute(true);
+                    completed.send(()).unwrap();
+                    Ok(())
+                },
+            ));
+            assert!(
+                waiter
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            release.send(()).unwrap();
+            runtime.block_on(completion).unwrap();
+            let waiter = Arc::new(Mutex::new(Some(waiter)));
+            let subscriber = tracing_subscriber::registry().with(CancelAtPhase {
+                phase,
+                waiter: waiter.clone(),
+            });
+            let wrapper = PyAsyncConnection {
+                tds_client: Some(connection),
+                tracing_dispatch: Some(tracing::Dispatch::new(subscriber)),
+                autocommit: Arc::new(AtomicBool::new(false)),
+                session_state: state.clone(),
+                default_query_timeout: 0,
+            };
+            Python::attach(|py| {
+                let globals = PyDict::new(py);
+                globals
+                    .set_item("conn", Py::new(py, wrapper).unwrap())
+                    .unwrap();
+                globals
+                    .set_item("OperationalError", py.get_type::<OperationalError>())
+                    .unwrap();
+                globals
+                    .set_item(
+                        "method",
+                        match mode {
+                            CloseMode::Commit => "commit",
+                            CloseMode::Rollback => "rollback",
+                        },
+                    )
+                    .unwrap();
+                globals
+                    .set_item(
+                        "expected",
+                        if phase == "no_cancellation" {
+                            None
+                        } else if phase == "close_query" {
+                            Some(match mode {
+                                CloseMode::Commit => "Cannot commit a broken connection",
+                                CloseMode::Rollback => "Cannot roll back a broken connection",
+                            })
+                        } else {
+                            Some("outcome may be unknown")
+                        },
+                    )
+                    .unwrap();
+                py.run(
+                    cr"import asyncio
+async def run():
+    if expected is None:
+        assert await getattr(conn, method)() is None
+    else:
+        try:
+            await getattr(conn, method)()
+        except OperationalError as error:
+            assert expected in str(error), error
+        else:
+            raise AssertionError('interrupted transaction reported success')
+    await conn.close()
+asyncio.run(run())",
+                    Some(&globals),
+                    None,
+                )
+                .unwrap();
+            });
+            if phase == "no_cancellation" {
+                let waiting = waiter.lock().unwrap().take().unwrap();
+                runtime.block_on(waiting).unwrap();
+                assert!(!state.is_broken());
+            } else {
+                assert!(waiter.lock().unwrap().is_none());
+                assert!(state.is_broken());
+            }
+            if phase == "close_query" {
+                assert_eq!(transport.lock().unwrap().len(), initial_bytes);
+            } else {
+                assert!(transport.lock().unwrap().len() > initial_bytes);
+            }
+            assert_eq!(Arc::strong_count(&transport), 1);
+        }
+    }
 
     #[test]
     fn context_exit_after_handle_revocation_closes_without_io() {
@@ -727,8 +847,20 @@ asyncio.run(run())",
         let connection = std::sync::Arc::new(LogicalConnection::new(client));
         drop(connection.take_for_close().await.unwrap());
 
-        assert!(close_client(connection.clone(), false).await);
-        assert!(close_client(connection.clone(), true).await);
+        LogicalConnection::wait_closed(connection.start_close(
+            CloseMode::Rollback,
+            CLOSE_TIMEOUT,
+            None,
+        ))
+        .await
+        .unwrap();
+        LogicalConnection::wait_closed(connection.start_close(
+            CloseMode::Commit,
+            CLOSE_TIMEOUT,
+            None,
+        ))
+        .await
+        .unwrap();
         assert_eq!(std::sync::Arc::strong_count(&transport), 1);
         assert!(transport.lock().unwrap().is_empty());
         assert!(connection.take_for_close().await.is_none());
