@@ -2638,6 +2638,8 @@ ODBC_TEST_F(GetDataLiveTest, MaxLengthFollowsExecutingStatement) {
     ASSERT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, SQL_ATTR_MAX_LENGTH, nullptr, 0));
     expect_textsize(stmt_, -1);
     expect_textsize(other, 9001);
+    ASSERT_EQ(SQL_SUCCESS, SQLSetConnectAttr(dbc_, SQL_ATTR_MAX_LENGTH, reinterpret_cast<SQLPOINTER>(8001), 0));
+    expect_textsize(stmt_, 8001);
     ASSERT_EQ(SQL_SUCCESS, SQLSetConnectAttr(dbc_, SQL_ATTR_MAX_LENGTH, nullptr, 0));
     expect_textsize(other, -1);
     FreeStmt(other);

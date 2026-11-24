@@ -596,22 +596,15 @@ fn run_catalog_operation(
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
-    let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
-        Ok(remaining) => remaining,
-        Err(()) => {
-            return fail_with_tds(
-                dbc,
-                stmt,
-                statement_handle,
-                client,
-                &query_timeout_expired_error(),
-            );
-        }
-    };
-
-    if let Err(e) =
-        apply_statement_options(dbc, stmt, &mut client, name, query_timeout, &cancel_handle)
-    {
+    if let Err(e) = apply_statement_options(
+        dbc,
+        stmt,
+        &mut client,
+        name,
+        budget,
+        started,
+        &cancel_handle,
+    ) {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 

@@ -402,7 +402,8 @@ pub(super) fn apply_statement_options(
     stmt: &StmtHandle,
     client: &mut TdsClient,
     op: &str,
-    timeout_secs: u32,
+    budget: u32,
+    started: std::time::Instant,
     cancel: &CancelHandle,
 ) -> Result<(), mssql_tds::error::Error> {
     let (autocommit, already_recorded, generation, applied) = match dbc.inner.lock() {
@@ -420,21 +421,23 @@ pub(super) fn apply_statement_options(
         }
     };
     let requested = stmt.max_length.load(std::sync::atomic::Ordering::Relaxed);
-    let change_textsize = applied != Some(requested);
-    let started = change_textsize.then(std::time::Instant::now);
-    if !(autocommit || already_recorded && client.has_active_transaction()) {
-        begin_manual_transaction(dbc, client, op, timeout_secs, cancel, generation)?;
-    }
-    let Some(started) = started else {
-        return Ok(());
+    // Charge each request from the start of the statement, including any deferred unprepare.
+    let remaining = || {
+        super::exec_common::deduct_query_timeout(budget, started.elapsed())
+            .map_err(|()| super::exec_common::query_timeout_expired_error())
     };
+    if !(autocommit || already_recorded && client.has_active_transaction()) {
+        begin_manual_transaction(dbc, client, op, remaining()?, cancel, generation)?;
+    }
+    if applied == Some(requested) {
+        return Ok(());
+    }
 
     // CheckOptions sends one language batch for all changed SET options, after
     // any separate transaction-manager BEGIN. TEXTSIZE is currently our only
     // wire SET here (MAX_ROWS is enforced at fetch). Append future SET options
     // to this batch rather than issuing more requests.
-    let remaining = super::exec_common::deduct_query_timeout(timeout_secs, started.elapsed())
-        .map_err(|()| super::exec_common::query_timeout_expired_error())?;
+    let remaining = remaining()?;
     let sql = if requested == 0 {
         String::from("SET TEXTSIZE -1")
     } else {
@@ -2250,7 +2253,15 @@ mod tests {
         let (mut client, sent) = tds_client_from_tokens_capturing(vec![done_no_more()]);
         let mut apply = |length| {
             stmt.max_length.store(length, Ordering::Relaxed);
-            apply_statement_options(dbc, stmt, &mut client, "test", 0, &CancelHandle::new())
+            apply_statement_options(
+                dbc,
+                stmt,
+                &mut client,
+                "test",
+                0,
+                Instant::now(),
+                &CancelHandle::new(),
+            )
         };
         apply(0).unwrap();
         assert!(sent.lock().unwrap().is_empty());
@@ -2327,8 +2338,15 @@ mod tests {
         dbc.inner.lock().unwrap().autocommit = false;
         let mut client = tds_client_from_tokens(vec![env_change_begin_transaction(42)]);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let result =
-            apply_statement_options(dbc, stmt, &mut client, "test", 0, &CancelHandle::new());
+        let result = apply_statement_options(
+            dbc,
+            stmt,
+            &mut client,
+            "test",
+            0,
+            Instant::now(),
+            &CancelHandle::new(),
+        );
         assert!(result.is_err(), "the response has no terminating DONE");
         assert!(client.has_active_transaction());
         assert!(dbc.inner.lock().unwrap().local_tran_started);

@@ -266,6 +266,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 &mut client,
                 "SQLExecute",
                 query_timeout,
+                started,
                 &cancel_handle,
             ) {
                 // Nothing ran, so put the staged statement (and any pending orphan)
@@ -378,6 +379,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 &mut client,
                 "SQLExecute",
                 query_timeout,
+                started,
                 &cancel_handle,
             ) {
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
@@ -532,6 +534,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 &mut client,
                 "SQLExecute",
                 query_timeout,
+                started,
                 &cancel_handle,
             ) {
                 if let Ok(mut stmt_state) = stmt.inner.lock() {

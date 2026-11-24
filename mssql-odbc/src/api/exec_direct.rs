@@ -417,25 +417,13 @@ fn sql_exec_direct_w_operation(
     // granularity deduction (`dwQueryTimeoutInMS` in `DropPrepHandle`). An
     // already-exhausted budget fails immediately with HYT00 rather than
     // sending the next step unbounded.
-    let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
-        Ok(remaining) => remaining,
-        Err(()) => {
-            return fail_with_tds(
-                dbc,
-                stmt,
-                statement_handle,
-                client,
-                &query_timeout_expired_error(),
-            );
-        }
-    };
-
     if let Err(e) = apply_statement_options(
         dbc,
         stmt,
         &mut client,
         "SQLExecDirectW",
-        query_timeout,
+        budget,
+        started,
         &cancel_handle,
     ) {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
@@ -1638,6 +1626,45 @@ mod tests {
             state.diag_records[0].sql_state, *b"HYT00",
             "a query-timeout expiry must report HYT00, got {:?}",
             state.diag_records[0].sql_state
+        );
+    }
+
+    #[test]
+    fn unprepare_and_begin_exhaust_budget_before_textsize() {
+        use crate::handles::DbcHandle;
+        use crate::test_support::{arm_pending_unprepare, connect_mock_server};
+        use mssql_mock_tds::QueryResponse;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let server =
+            connect_mock_server(dbc, "SET TEXTSIZE 8000", QueryResponse::new(vec![], vec![]));
+        // Neither request exhausts the one-second timeout by itself.
+        let delay = Duration::from_millis(600);
+        server.set_rpc_delay(delay);
+        server.set_tm_begin_delay(delay);
+        arm_pending_unprepare(dbc, stmt);
+        dbc.inner.lock().unwrap().autocommit = false;
+        stmt.inner.lock().unwrap().query_timeout = 1;
+        stmt.max_length.store(8000, Ordering::Relaxed);
+
+        assert_eq!(
+            SQL_ERROR,
+            sql_exec_direct_w_safe(h.stmt, stmt, "SELECT 1".into())
+        );
+        assert_eq!(
+            stmt.inner.lock().unwrap().diag_records[0].sql_state,
+            *b"HYT00"
+        );
+        let state = dbc.inner.lock().unwrap();
+        assert!(state.local_tran_started);
+        assert_eq!(
+            state.applied_max_length,
+            Some(0),
+            "SET TEXTSIZE must not run"
         );
     }
 
