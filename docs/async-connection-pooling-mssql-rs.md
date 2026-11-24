@@ -1388,6 +1388,28 @@ same-SPID cached checkout, reset of session settings/temp tables, and rejection
 of a fault-injected active transaction. They do not prove return cleanup,
 authentication parity, or support for untested platforms/server topologies.
 
+#### Pool-core acceptance (AB#50003)
+
+The compiled core's acceptance evidence is separate from the test-only A1
+experiment and from Python integration. Run the focused command in section 10.3
+against the current checkout; earlier results do not validate subsequent changes.
+
+| Criterion | Deterministic evidence |
+|---|---|
+| Strict per-key capacity | [Manager tests](../mssql-py-core/src/pool/manager/tests.rs) instrument live clients under contention, preserve one allowance across disable/re-enable, and attempt acquisition from inside client destruction. [Lifecycle tests](../mssql-py-core/src/pool/lifecycle/tests.rs) retain assigned-client capacity through off-lock retirement and shutdown. |
+| FIFO without newcomer or retry bypass | Manager tests resume waiters out of order and admit newcomers after assignment. [Session tests](../mssql-py-core/src/pool/session/tests.rs) force a failed reset to surrender its slot to an older waiter before retrying. |
+| Exact queued-only `max_waiting` | Manager tests distinguish assigned-but-unpolled grants from queued requests, enforce per-key limits, reclaim cancelled/expired entries, and exercise the actual `SlotGuard::retry` when a newcomer fills the queue during handoff. The retry returns `WaitQueueFull`; it cannot claim capacity ahead of the older grant. |
+| Cancellation and native publication | Manager/lifecycle tests cover queued, assigned and claimed owners, final publication, and generation closure. Session tests interrupt opening, reset and isolation drain, including dropping interrupted futures. |
+| One original acquisition deadline | [Control tests](../mssql-py-core/src/pool/control.rs) cover exact deadline/final-poll boundaries. Session tests spend one budget across caller preparation, failed reset, retry waiting, fresh open and isolation; publication and lazy pruning have their own original-deadline assertions in the manager/lifecycle tests. |
+| Destroy before slot reuse | Manager tests poll a waiter from inside a client's destructor. Session tests observe scripted-client destruction after interrupted login/reset, before another capacity owner proceeds. Bare lease Drop never caches the client. |
+
+These are instrumented Rust and scripted-token transport tests, not mock TCP,
+live SQL, Python result-delivery or performance evidence. Awaited return and its
+release-cancellation evidence remain with A4/AB#50052; this mapping does not close
+AB#50003 before those requirements are verified on the merged implementation.
+Logical ownership, close barriers and Python cancellation remain with
+AB#50008/AB#50053. Windows execution alone does not establish Linux/macOS parity.
+
 ### Upstream contracts reviewed
 
 - [Deadpool 0.13.1 manager hooks](https://docs.rs/deadpool/0.13.1/deadpool/managed/trait.Manager.html)
