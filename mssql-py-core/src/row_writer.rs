@@ -3,6 +3,7 @@
 
 use std::borrow::Cow;
 
+use mssql_tds::core::TdsResult;
 use mssql_tds::datatypes::column_values::{
     ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
     SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
@@ -12,6 +13,7 @@ use mssql_tds::datatypes::row_writer::RowWriter;
 use mssql_tds::datatypes::sql_json::SqlJson;
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 use mssql_tds::datatypes::sql_vector::SqlVector;
+use mssql_tds::error::Error;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use uuid::Uuid;
@@ -22,8 +24,8 @@ use crate::cursor::PyCoreCursor;
 /// a Python tuple when the GIL is available.
 ///
 /// During the async TDS decode (GIL released), values are stored as
-/// `ColumnValues`. After re-acquiring the GIL, `to_py_tuple()` converts
-/// everything to Python objects in a single pass.
+/// `ColumnValues`. Async materialization enforces Python's UTF-8 error contract;
+/// synchronous materialization retains the default TDS decoding policy.
 pub(crate) struct PyRowWriter {
     row: Vec<ColumnValues>,
 }
@@ -42,6 +44,45 @@ impl PyRowWriter {
             .map(|col_val| PyCoreCursor::column_value_to_python(py, col_val))
             .collect::<PyResult<Vec<_>>>()?;
         PyTuple::new(py, values)
+    }
+
+    pub fn to_async_py_tuple<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        let values = self
+            .row
+            .iter()
+            .enumerate()
+            .map(|(ordinal, col_val)| match col_val {
+                ColumnValues::String(value) => Ok(decode_async_string(value)
+                    .map_err(|error| {
+                        crate::async_errors::map_tds_error(
+                            &format!("Failed to decode string column {ordinal} (zero-based)"),
+                            error,
+                            Vec::new(),
+                        )
+                    })?
+                    .into_pyobject(py)?
+                    .into_any()),
+                _ => PyCoreCursor::column_value_to_python(py, col_val),
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        PyTuple::new(py, values)
+    }
+}
+
+fn decode_async_string(value: &SqlString) -> TdsResult<Cow<'_, str>> {
+    let encoding = match *value.encoding_type() {
+        EncodingType::LcidBased(collation) if collation.utf8() => EncodingType::Utf8,
+        encoding => encoding,
+    };
+    match encoding {
+        EncodingType::Utf8 => std::str::from_utf8(&value.bytes)
+            .map(Cow::Borrowed)
+            .map_err(|error| Error::TypeConversionError(format!("Invalid UTF-8: {error}"))),
+        // Inbound decoding resolves encodings today; reject unresolved values defensively.
+        EncodingType::DelayedSet => Err(Error::TypeConversionError(
+            "Cannot decode a string before its encoding is resolved".to_string(),
+        )),
+        _ => Ok(Cow::Owned(value.to_utf8_string())),
     }
 }
 

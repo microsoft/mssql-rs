@@ -439,7 +439,7 @@ async fn materialize_rows(output: FetchOutput, rows: Vec<PyRowWriter>) -> PyResu
     match output {
         FetchOutput::One => tokio::task::spawn_blocking(move || {
             Python::attach(|py| match rows.into_iter().next() {
-                Some(writer) => Ok(writer.to_py_tuple(py)?.into_any().unbind()),
+                Some(writer) => Ok(writer.to_async_py_tuple(py)?.into_any().unbind()),
                 None => Ok(py.None()),
             })
         })
@@ -464,7 +464,7 @@ async fn materialize_list_rows(rows: Vec<PyRowWriter>) -> PyResult<Py<PyAny>> {
                 Python::attach(|py| {
                     let converted = chunk
                         .into_iter()
-                        .map(|writer| writer.to_py_tuple(py).map(Bound::unbind))
+                        .map(|writer| writer.to_async_py_tuple(py).map(Bound::unbind))
                         .collect::<PyResult<Vec<_>>>()?;
                     let chunk = PyList::new(py, converted)?;
                     let list = match list {
@@ -1201,22 +1201,176 @@ fn next_buffered_set<'py>(
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::sync::Arc;
 
+    use mssql_tds::datatypes::row_writer::RowWriter;
+    use mssql_tds::datatypes::sql_string::EncodingType;
     use mssql_tds::error::Error;
+    use mssql_tds::token::tokens::SqlCollation;
+    use pyo3::Python;
+    use pyo3::types::PyAnyMethods;
 
     #[cfg(debug_assertions)]
     use super::{
         FetchCancellationGuard, arm_fetch_publication_pause, pause_fetch_publication_if_armed,
     };
     use super::{
-        FetchGuard, MaterializationGuard, map_fetch_error, map_materialization_join_error,
-        map_nextset_error,
+        FetchGuard, FetchOutput, LIST_MATERIALIZE_CHUNK_SIZE, MaterializationGuard,
+        map_fetch_error, map_materialization_join_error, map_nextset_error, materialize_rows,
     };
     use crate::async_fetch::BufferedResults;
     use crate::async_session::{
         AsyncConnectionState, ClaimError, ConnectionLifecycle, FetchCompletion,
     };
+    use crate::row_writer::PyRowWriter;
+
+    #[tokio::test]
+    async fn malformed_utf8_is_rejected_only_by_async_materialization() {
+        for output in [FetchOutput::One, FetchOutput::Many, FetchOutput::All] {
+            for encoding in [
+                EncodingType::Utf8,
+                EncodingType::LcidBased(SqlCollation {
+                    info: 0x0409,
+                    lcid_language_id: 0x0409,
+                    col_flags: 0x40,
+                    sort_id: 0,
+                }),
+            ] {
+                for (bytes, expected) in [
+                    (&b"\x80"[..], "\u{fffd}"),
+                    (&b"\xc0\xaf"[..], "\u{fffd}\u{fffd}"),
+                    (&b"\xe2\x82"[..], "\u{fffd}"),
+                    (&b"\xf0\x28\x8c\xbc"[..], "\u{fffd}(\u{fffd}\u{fffd}"),
+                ] {
+                    let mut writer = PyRowWriter::new(2);
+                    writer.write_i32(0, 42);
+                    writer.write_string(1, Cow::Borrowed(bytes), encoding);
+
+                    Python::attach(|py| {
+                        let row = writer
+                            .to_py_tuple(py)
+                            .unwrap()
+                            .extract::<(i32, String)>()
+                            .unwrap();
+                        assert_eq!(row, (42, expected.to_owned()));
+                    });
+
+                    let error = materialize_rows(output, vec![writer]).await.unwrap_err();
+                    Python::attach(|py| {
+                        assert!(error.is_instance_of::<crate::async_errors::DataError>(py));
+                    });
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("Failed to decode string column 1")
+                    );
+                    assert!(error.to_string().contains("Invalid UTF-8"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_utf8_in_later_chunk_rejects_entire_batch() {
+        for output in [FetchOutput::Many, FetchOutput::All] {
+            let mut rows = Vec::with_capacity(LIST_MATERIALIZE_CHUNK_SIZE + 1);
+            for _ in 0..LIST_MATERIALIZE_CHUNK_SIZE {
+                let mut writer = PyRowWriter::new(1);
+                writer.write_string(0, Cow::Borrowed(b"valid"), EncodingType::Utf8);
+                rows.push(writer);
+            }
+            let mut writer = PyRowWriter::new(1);
+            writer.write_string(0, Cow::Borrowed(b"\x80"), EncodingType::Utf8);
+            rows.push(writer);
+
+            let error = materialize_rows(output, rows).await.unwrap_err();
+            Python::attach(|py| {
+                assert!(error.is_instance_of::<crate::async_errors::DataError>(py));
+            });
+            assert!(error.to_string().contains("Invalid UTF-8"));
+        }
+    }
+
+    #[tokio::test]
+    async fn async_materialization_preserves_valid_text_and_other_values() {
+        type Row = (i32, String, String, Option<i32>);
+
+        for output in [FetchOutput::One, FetchOutput::Many, FetchOutput::All] {
+            let text = "valid:\u{6f22}\u{1f600}\0e\u{301}";
+            let mut writer = PyRowWriter::new(4);
+            writer.write_i32(0, 42);
+            writer.write_string(1, Cow::Borrowed(text.as_bytes()), EncodingType::Utf8);
+            writer.write_string(2, Cow::Borrowed(b"o\0k\0"), EncodingType::Utf16);
+            writer.write_null(3);
+
+            let result = materialize_rows(output, vec![writer]).await.unwrap();
+            Python::attach(|py| {
+                let expected = (42, text.to_string(), "ok".to_string(), None);
+                match output {
+                    FetchOutput::One => assert_eq!(result.extract::<Row>(py).unwrap(), expected),
+                    FetchOutput::Many | FetchOutput::All => {
+                        assert_eq!(result.extract::<Vec<Row>>(py).unwrap(), vec![expected]);
+                    }
+                }
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn async_materialization_preserves_non_utf8_replacement_decoding() {
+        for output in [FetchOutput::One, FetchOutput::Many, FetchOutput::All] {
+            let mut writer = PyRowWriter::new(2);
+            writer.write_string(0, Cow::Borrowed(b"A\0\0\xd8"), EncodingType::Utf16);
+            writer.write_string(
+                1,
+                Cow::Borrowed(b"\x82"),
+                EncodingType::LcidBased(SqlCollation {
+                    info: 0x0411,
+                    lcid_language_id: 0x0411,
+                    col_flags: 0,
+                    sort_id: 0,
+                }),
+            );
+            let result = materialize_rows(output, vec![writer]).await.unwrap();
+            Python::attach(|py| {
+                let expected = ("A\u{fffd}".to_owned(), "\u{fffd}".to_owned());
+                match output {
+                    FetchOutput::One => {
+                        assert_eq!(result.extract::<(String, String)>(py).unwrap(), expected);
+                    }
+                    FetchOutput::Many | FetchOutput::All => {
+                        assert_eq!(
+                            result.extract::<Vec<(String, String)>>(py).unwrap(),
+                            vec![expected]
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn async_materialization_rejects_unresolved_string_encoding() {
+        for output in [FetchOutput::One, FetchOutput::Many, FetchOutput::All] {
+            let mut writer = PyRowWriter::new(1);
+            writer.write_string(0, Cow::Borrowed(b"value"), EncodingType::DelayedSet);
+            let error = materialize_rows(output, vec![writer]).await.unwrap_err();
+            Python::attach(|py| {
+                assert!(error.is_instance_of::<crate::async_errors::DataError>(py));
+            });
+            assert!(
+                error
+                    .to_string()
+                    .contains("Failed to decode string column 0")
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("before its encoding is resolved")
+            );
+        }
+    }
 
     fn claimed_fetch() -> (Arc<AsyncConnectionState>, u64, u64) {
         let state = Arc::new(AsyncConnectionState::new());
