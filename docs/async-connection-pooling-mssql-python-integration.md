@@ -693,6 +693,13 @@ do not claim reset is free or piggybacks on the first user statement.
 
 ### 8.3 Developer ownership checklist
 
+The bounded SQL-auth key slice uses the real consumer parser/adaptation through
+a test-only callback in the Rust unit-test executable. It exports no preparation
+API and does not connect through a pool. The cross-platform key-contract CI legs
+and existing live-SQL direct-path regression jobs provide separate evidence;
+adding these jobs is not a claim that they passed. This slice does not complete
+B4's other authentication modes, B1/B2/B3 integration, or AB#50009.
+
 | Owner | Implementation responsibility |
 |---|---|
 | Rust pool developers | Effective-option validation/default resolution and the sole canonical HMAC key builder; key/factory spec consistency; Deadpool slot adapter, per-key lifecycle/generations, exact admission policy, deadline/cancellation guards, physical accounting, reset/isolation/ACK, idle timestamps and shutdown evidence |

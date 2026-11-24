@@ -79,24 +79,18 @@ other; the run fails at the end if either track failed.
 
 #### Released Rust crates
 
-`mssql-tds` and `mssql-mock-tds` are checked against crates.io independently. If
+`mssql-tds`, `mssql-mock-tds`, and `mssql-rs` are checked against crates.io independently. If
 a crate's exact `[package].version` exists among its published versions
 (including older or yanked releases), the pipeline bumps it to the next minor
 version: `0.1.7` becomes `0.2.0`. Unpublished source versions and crates that
 return HTTP 404 are left alone. Other registry errors fail the track rather than
 assuming a crate is unpublished. If the proposed next minor version is also
 published, the track fails and a maintainer must choose a new version. Before any
-bump is planned, the track also fails when the current `mssql-tds` and
-`mssql-mock-tds` source versions differ in either direction (`mssql-tds` and
-`mssql-mock-tds` must stay aligned for a release), because silently tolerating a
-drifted state can leave the repo in a release-invalid configuration. If the mock
-source version is ahead of the core target, the track also fails so a maintainer
-can choose the versions manually. A mock-only bump is deferred until the current
-`mssql-tds` version is published, because the mock crate's exact versioned
-dependency must resolve from the registry when it is packaged. When `mssql-tds`
-is bumped, the mock source version and the mock crate's versioned `mssql-tds`
-requirement are kept aligned with the core target because the release pipeline
-stamps the mock crate from the core version.
+bump is planned, the track also fails when either dependent crate's source version
+differs from `mssql-tds`, because the release pipeline stamps all three from the
+core version. A dependent-only bump is deferred until the current `mssql-tds`
+version is published. When `mssql-tds` is bumped, both dependent source versions
+and their versioned `mssql-tds` requirements are kept aligned with the core target.
 
 Local versions come from `cargo metadata`. `Cargo.lock` is not tracked, and
 `--no-deps` means no lockfile is resolved or committed.
@@ -475,6 +469,7 @@ against that build's source metadata, even when feed publishing is disabled.
 | `publishToFeed` | Collect, authenticate and `twine upload` the validated wheels to the Azure Artifacts PyPI feed after wheel validation. When false, these upload-only steps are omitted; wheel download and validation still run. |
 | `publishMssqlTds` | Select `mssql-tds` for crates.io publication through ESRP. |
 | `publishMssqlMockTds` | Select `mssql-mock-tds` for crates.io publication through ESRP. |
+| `publishMssqlRs` | Select `mssql-rs` for crates.io publication through ESRP. |
 | `validateCratesOnly` | Validate the crate artifact offline without ESRP publication or registry requests. |
 | `tagRelease` | Tag and branch the selected build's `mssql-py-core` version. This does not tag Rust crate versions. |
 
@@ -483,26 +478,27 @@ The crate stage downloads only crate artifacts and does not wait for wheel
 validation or feed publish. A failure in either wheel validation or feed publish does not block
 crates. OneBranch's per-job policy validation still applies.
 
-The Rust job graph is `ValidateCrates -> PublishCore -> PublishMock` when both
-crates are selected. Each ESRP task waits for its release to complete, so mock
-publication starts only after successful core release completion. Core-only
-stops after `PublishCore`; mock-only runs `ValidateCrates -> PublishMock`.
+The Rust job graph starts with `ValidateCrates`. When the core is selected,
+`PublishCore` follows before the selected mock and driver publication jobs, which
+can run independently. Each ESRP task waits for its release to complete. When
+only dependent crates are selected, they publish after `ValidateCrates`.
 Duplicate-version preflights are omitted; crates.io rejects attempts to overwrite
 a published version during publication. With `validateCratesOnly`, publication
-is omitted and every crate selection runs only offline checks.
+is omitted and validation is offline.
 
 Release agents make no direct crates.io requests: centrally enforced 1ES policies
 block public package feeds even on custom pools. Offline validation and ESRP
 publication remain governed, and ESRP release completion determines publication
 success. The pipeline does not independently confirm public index availability.
-For mock-only releases, the operator must ensure the required core version is
-already published. After a partial release, select only the unpublished crate
-rather than attempting to publish the core again.
+For releases that select a dependent crate without the core, the operator must
+ensure the required core version is already published. After a partial release,
+select only the unpublished crate rather than attempting to publish the core again.
 
 Every Rust job re-downloads `drop_Build_RustCrates` from the same immutable
 `resources.pipeline.officialBuild` run and checks the original manifest, archive
-hashes, and mock dependency. No crate job relies on another job's filesystem or
-job-local variables.
+hashes, and dependent crate requirements. Older two-crate artifacts remain valid
+unless `publishMssqlRs` is selected, which requires an artifact containing the driver.
+No crate job relies on another job's filesystem or job-local variables.
 
 Tagging always waits for successful wheel validation, plus feed publication when
 `publishToFeed` is selected. It never waits for Rust crate publication. Leaving all
@@ -524,8 +520,8 @@ the selected agent context, not runtime pool authorization or registry reachabil
 Once a live run is authorized, select a known successful Official Build and leave all switches
 off to exercise genuine artifacts in the governed container without publishing.
 For an authorized non-publishing crate validation run, set
-`validateCratesOnly: true`; crate selection does not change the offline checks.
-Leave `publishToFeed` and `tagRelease` false.
+`validateCratesOnly: true`; select `publishMssqlRs` if the artifact must contain
+the driver. Leave `publishToFeed` and `tagRelease` false.
 Local regression tests also cover missing wheels, incorrect names/versions,
 missing ODBC payloads, and exact-source metadata failures.
 

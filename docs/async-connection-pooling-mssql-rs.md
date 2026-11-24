@@ -861,46 +861,53 @@ supersedes the earlier Python-owned key scheme. Doc 2 defines the Python boundar
 and authentication integration, not a second key builder.
 
 Python keeps the existing connection-string parser and supported-option adaptation,
-including alias, escaping and duplicate-option semantics. The Rust preparation
-layer reuses backend validation and default resolution, including inherited
-`MultiSubnetFailover` policy, to produce an immutable effective `ConnectSpec` and
-authentication binding before lookup. Build the key once from that snapshot and
-use the same settings for physical opening; do not re-resolve defaults differently
-under an existing key. This layer is separate from Deadpool slot scheduling and
-does not move connection-string parsing or Python types into the pool core.
+including alias, escaping and duplicate-option semantics. Rust prepares one
+immutable effective spec and authentication binding before keying, using backend
+validation/default resolution, including inherited `MultiSubnetFailover`. The
+physical-open path must use that same snapshot without re-resolving defaults.
+This layer is separate from Deadpool slot scheduling and does not add Python
+types or a second connection-string parser to the pool core.
 
-The internal Rust pool receives an opaque `PoolKey` plus that effective spec; it
-must not infer identity by parsing labels such as `msi:` or `acct:`. The
-Python-facing native entry point accepts options and supported authentication
-inputs, not arbitrary customer-supplied pool keys. There is no need to return
-resolved settings to Python solely for fingerprinting.
+The internal Rust pool receives an opaque `PoolKey` and the matching effective
+`ConnectSpec`; it must not infer identity by parsing labels such as `msi:` or
+`acct:`. The Python-facing binding accepts supported options/authentication
+inputs, not arbitrary customer keys. No settings round trip to Python solely
+for fingerprinting is required.
 
 A key partitions all effective login/transport/security settings and the intended principal
 **and credential version**. Removing SQL username/password without an equivalent authentication
 discriminator is incorrect: a caller with a wrong password must not obtain a previous caller's
 authenticated SQL session.
 
-Use a versioned, unambiguous structured or length-delimited canonical serialization
-and a process-private randomly keyed HMAC fingerprint. Normalize only values whose
-semantics permit it; preserve passwords, database names, tokens and other
-case-sensitive values. No plaintext password/token belongs in key bytes, and no
-secret-bearing descriptor belongs in logs, Debug/repr, exceptions or diagnostics.
+Use versioned, structured or length-delimited canonical serialization and a
+process-private randomly keyed HMAC fingerprint. Preserve exact credential and
+case-sensitive value semantics. No plaintext credentials belong in key bytes;
+no secret-bearing descriptor belongs in logs, Debug/repr, exceptions or diagnostics.
 Do not use a sanitized logging string,
 delimiter concatenation of unescaped fields, or a public hash of a low-entropy password as the
 canonical scheme. The factory must not change endpoint, database, TLS policy, principal, or
 credential binding under the supplied key.
 
-Every accepted connection option needs explicit partition/equivalence/rejection
-coverage in Rust, with Python parser/adaptation parity tests at the boundary.
-Verify equivalent accepted spellings/orderings/defaults, physical/security and
-credential partitioning, unambiguous escaping/Unicode/empty/delimiter-like inputs,
-exact secret semantics, process-key isolation and diagnostic redaction. Include
-the effective login/session defaults; exclude lease settings only where reliable
-reapplication/reset and absence of physical effects are established.
+Every accepted option needs explicit partition/equivalence/rejection tests,
+including aliases/order/defaults, inherited MSF, Unicode/escaping/empty and
+delimiter-like inputs, credential rotation, process-key isolation and diagnostic
+redaction. Exclude lease settings only where reapplication/reset and absence of
+physical effects are established.
 
-This revision assigns design ownership; it does not claim that preparation or
-keying is already implemented, enable application-visible pooling, change sync
-pooling, or authorize a native dependency update.
+The private SQL-auth preparation in `connection_key.rs` implements this key
+authority without exporting a Python API or enabling pooled connect. It reuses
+the existing native context adaptation and TDS endpoint-policy preparation.
+Packet size follows Rust ODBC: zero/omission retains the TDS default (8000),
+nonzero values clamp to 512-32768, and invalid unsigned integers are rejected.
+Unknown IP preference follows Rust ODBC's IPv4First fallback. Existing direct
+async/sync context conversion is unchanged. Effective retry values partition
+keys; this does not enable nonzero recovery for pooled sessions.
+
+The direct PyCore adapter still defaults packet size to 4096 and falls back,
+rather than clamping out-of-range values. Reconcile or explicitly gate/document
+this application-visible default difference before enabling pooled connect.
+Factories must use the prepared context, not re-adapt the original options after
+fingerprinting.
 
 Stable identity keys require a trusted caller binding that is valid before lookup. A miss-only
 provider cannot detect an account change on a hit. On sign-out, account switch, or credential
@@ -967,10 +974,9 @@ or "refresh in place" of the socket, and no token string comparison optimization
 
 For **exact-token** binding, the prepared request carries that same token on a miss. A different
 token requires a different key. If a known-expiry token is already ineligible, fail with
-`TokenExpired`; do not call a rotating provider under the old key. The Python
-credential adapter resolves the current token once per logical connect as needed;
-Rust constructs the key from that captured token/binding and effective spec.
-Both steps remain within the total acquisition deadline.
+`TokenExpired`; do not call a rotating provider under the old key. Python
+credential adapters capture the current token once where needed, and Rust keys
+that token/binding with the effective spec, within the total acquisition deadline.
 
 Expiry is a conservative reuse policy, not a claim that SQL Server disconnects an established
 session exactly when its login token expires. An already published lease is not forcibly
@@ -1059,9 +1065,8 @@ response to a pool error.
 
 ### 9.1 Authoritative interface shape
 
-This is the internal Rust manager interface. A Rust preparation layer constructs
-its matching key/spec pair under section 7.1; the Python-facing binding does not
-accept caller-supplied keys.
+This is the internal Rust interface. Rust preparation constructs the matching
+key/spec pair; the Python-facing binding must not accept caller-supplied keys.
 
 ```rust
 impl AsyncPoolManager {
@@ -1232,9 +1237,9 @@ reject booleans, negative/non-finite values and conversion overflow.
 
 `PoolKey` and `AuthBinding` accept opaque fingerprints only. This foundation
 does not canonicalize connection strings, select a fingerprint algorithm,
-verify a real login principal or implement token refresh. The Rust preparation/key
-layer required by section 7.1 is separate work, not implemented by these opaque
-types; authentication adapters must supply verified login metadata.
+verify a real login principal or implement token refresh. The separate Rust
+SQL-auth key authority is `connection_key.rs` under section 7.1; authentication
+adapters must supply verified login metadata.
 `ConnectSpec` receives already-validated effective options, including the
 pooled recovery restriction. A3 adds the SQL-password physical factory below.
 

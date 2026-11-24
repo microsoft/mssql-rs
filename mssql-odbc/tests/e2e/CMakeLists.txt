@@ -327,7 +327,8 @@ add_odbc_test(cancel_test        tests/multithreaded_tests/cancel_test.cpp)
 if(WIN32)
     target_link_libraries(cancel_test PRIVATE ws2_32)
 endif()
-set_tests_properties(cancel_test PROPERTIES TIMEOUT 30)
+# This executable runs all cancellation scenarios under one CTest timeout.
+set_tests_properties(cancel_test PROPERTIES TIMEOUT 90)
 add_odbc_test(shared_connection_busy_test tests/multithreaded_tests/shared_connection_busy_test.cpp)
 add_odbc_test(concurrent_harness_test tests/multithreaded_tests/concurrent_harness_test.cpp)
 add_odbc_mt_only_test(handle_lifecycle_test tests/multithreaded_tests/handle_lifecycle_test.cpp)
@@ -358,7 +359,8 @@ add_executable(client_code_page_test
     lib/odbc_skip_aware_main.cpp
 )
 target_link_libraries(client_code_page_test PRIVATE odbc_test_lib)
-foreach(code_page IN ITEMS 1252 65001 932 1251)
+foreach(code_page IN ITEMS
+        437 850 874 932 936 949 950 1250 1251 1252 1253 1254 1255 1256 1257 1258 65001)
     set(test_name client_code_page_${code_page})
     if(ODBC_E2E_CONCURRENT)
         add_test(NAME ${test_name}

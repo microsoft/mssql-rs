@@ -133,6 +133,8 @@ stages:
       jobCondition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'))
   - job: Build_Windows
     displayName: Build Windows
+    # Driver tests push this job beyond the default 60-minute limit.
+    timeoutInMinutes: 90
     pool:
       name: ${{ parameters.poolName }}
       demands:
@@ -154,7 +156,7 @@ stages:
       # Packaging and artifact gates must be tested even when PR runs skip them.
       - pwsh: |
           python -m pip install --quiet pytest pyyaml packaging
-          python -m pytest scripts/test_inject_odbc.py scripts/test_verify_python_wheels.py scripts/test_release_pipeline.py scripts/test_validation_pipeline.py scripts/test_macos_deployment_target.py scripts/test_shared_sql_credentials.py scripts/test_repair_glibc_wheels.py scripts/test_bump_released_versions.py scripts/test_bump_mssql_python_release.py scripts/test_python_wheel_install.py scripts/test_coverage_report.py scripts/test_ghcr_parameters.py scripts/test_sync_pipeline.py scripts/test_benchmark_pipeline.py scripts/test_docker_cargo_run.py -q
+          python -m pytest scripts/test_inject_odbc.py scripts/test_verify_python_wheels.py scripts/test_release_pipeline.py scripts/test_validation_pipeline.py scripts/test_macos_deployment_target.py scripts/test_shared_sql_credentials.py scripts/test_repair_glibc_wheels.py scripts/test_bump_released_versions.py scripts/test_bump_mssql_python_release.py scripts/test_python_wheel_install.py scripts/test_coverage_report.py scripts/test_ghcr_parameters.py scripts/test_sync_pipeline.py scripts/test_benchmark_pipeline.py scripts/test_docker_cargo_run.py scripts/test_sql_pool_keys_runner.py -q
         displayName: 'Unit test packaging scripts and pipeline configuration'
       - template: build-template.yml
         parameters:
@@ -861,6 +863,53 @@ stages:
   condition: and(not(canceled()), eq(dependencies.InitializeValidation.result, 'Succeeded'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), or(ne(variables['Build.Reason'], 'PullRequest'), ne(dependencies.InitializeValidation.outputs['Initialize.SetDuplicateState.skipDuplicate'], 'true')))
   displayName: Build mssql-python
   jobs:
+  - job: Test_SQL_Pool_Keys
+    displayName: SQL-auth pool-key contracts
+    timeoutInMinutes: 90
+    strategy:
+      matrix:
+        Windows:
+          poolKeyImage: windows-latest
+        Linux:
+          poolKeyImage: ubuntu-latest
+        MacOS:
+          poolKeyImage: macOS-latest
+    pool:
+      name: Azure Pipelines
+      vmImage: $(poolKeyImage)
+    steps:
+      - task: UsePythonVersion@0
+        inputs:
+          versionSpec: '3.13'
+          addToPath: true
+        displayName: Use Python 3.13
+      - script: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+        condition: and(succeeded(), eq(variables['Agent.OS'], 'Linux'))
+        displayName: Install Linux native crypto dependencies
+      - pwsh: |
+          $cargoHome = $env:CARGO_HOME
+          if ([string]::IsNullOrWhiteSpace($cargoHome)) {
+            $cargoHome = Join-Path $HOME '.cargo'
+          }
+          $cargoBin = Join-Path $cargoHome 'bin'
+          Write-Host "##vso[task.prependpath]$cargoBin"
+        displayName: Add Rust tools to PATH
+      - script: cargo install cargo-nextest --version 0.9.99 --locked
+        displayName: Install nextest
+      - script: python -m pip install --upgrade -r mssql-py-core/tests/requirements-pool-key.txt
+        displayName: Install latest supported Python consumer
+      - script: python .pipeline/scripts/run-sql-pool-keys.py
+        displayName: Verify native and real-parser key contracts
+      - task: PublishTestResults@2
+        condition: succeededOrFailed()
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: '**/nextest/ci/junit.xml'
+          testRunTitle: SQL pool-key contracts $(Agent.OS)
+          failTaskOnFailedTests: true
+          failTaskOnMissingResultsFile: true
+        displayName: Publish key-contract test results
+
   - job: Build_mssql_python_MacOS
     displayName: Build mssql-python macOS (cross-repo)
     timeoutInMinutes: 120
@@ -1272,7 +1321,7 @@ stages:
               container: ghcr.io/microsoft/mssql-rs/import/redhat/ubi8:latest
               entry: odbc-e2e-rhel.sh
 
-# Merge the mssql-tds Rust coverage from every OS that runs the tests
+# Merge Rust workspace coverage from every OS that runs the tests
 # (Build_Windows, Build_Linux, Test_MacOS), the ODBC C++ e2e coverage
 # (Build_Linux x64 and Build_Windows), and the mssql-py-core coverage from the
 # Python tests (Build_Linux) into one Cobertura report. ADO does not merge
@@ -1301,14 +1350,14 @@ stages:
       - checkout: self
       - template: coverage-attempt-template.yml
       - task: DownloadPipelineArtifact@2
-        displayName: Download Rust (mssql-tds) Windows coverage
+        displayName: Download Rust workspace Windows coverage
         continueOnError: true
         inputs:
           buildType: 'current'
           artifactName: 'CoberturaCoverageRust_Windows_$(windowsCoverageAttempt)'
           targetPath: '$(Pipeline.Workspace)/cov-rust-windows'
       - task: DownloadPipelineArtifact@2
-        displayName: Download Rust (mssql-tds) Linux coverage
+        displayName: Download Rust workspace Linux coverage
         continueOnError: true
         inputs:
           buildType: 'current'
@@ -1329,7 +1378,7 @@ stages:
           artifactName: 'CoberturaCoverageOdbcE2E_Windows_$(windowsCoverageAttempt)'
           targetPath: '$(Pipeline.Workspace)/cov-odbc-e2e-windows'
       - task: DownloadPipelineArtifact@2
-        displayName: Download Rust (mssql-tds) macOS coverage
+        displayName: Download Rust workspace macOS coverage
         continueOnError: true
         inputs:
           buildType: 'current'
@@ -1353,7 +1402,7 @@ stages:
           set -euo pipefail
           mkdir -p "$(Build.SourcesDirectory)/target"
           inputs=()
-          # Each OS emits its mssql-tds + mssql-odbc report with repo-root-relative
+          # Each OS emits its Rust workspace report with repo-root-relative
           # paths, so the same source file lines up across reports and coverage is
           # unioned: a line covered on any OS counts as covered in the merged result.
           # The ODBC e2e reports (Linux x64 and Windows) are also repo-root-relative
