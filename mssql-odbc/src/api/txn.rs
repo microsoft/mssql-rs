@@ -381,8 +381,10 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
 /// its use of the statement's query timeout: `CheckOptions` passes
 /// `GetQueryTimeOut(lpstmt)` to `ExecTMRImmediate` so this implicit begin
 /// cannot outlast `SQL_ATTR_QUERY_TIMEOUT` any more than the statement it
-/// precedes. `timeout_secs` is that budget (already deducted for any elapsed
-/// time from earlier steps in the same call); `0` means unlimited. Running it
+/// precedes. `budget` is the original, undeducted `SQL_ATTR_QUERY_TIMEOUT`
+/// (`0` means unlimited); `started` is the call's fixed start, taken before any
+/// deferred unprepare. Each internal request is charged cumulatively from
+/// `started`, so callers must not pre-deduct elapsed time. Running it
 /// per statement — rather than only at the autocommit switch — is what
 /// recovers from a transaction the server aborted or the application rolled
 /// back with raw T-SQL.
