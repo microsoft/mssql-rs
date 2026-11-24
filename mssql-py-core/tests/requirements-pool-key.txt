@@ -1,0 +1,2 @@
+# Real consumer parser for the test-only Rust/Python key contract bridge.
+mssql-python>=1.18.0

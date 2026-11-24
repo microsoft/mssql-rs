@@ -70,12 +70,12 @@ pub(crate) const AES_BLOCK_LEN: usize = 16;
 pub(crate) const SHA256_LEN: usize = 32;
 
 /// Fills `buf` with cryptographically secure random bytes.
-pub(crate) fn fill_random(buf: &mut [u8]) -> TdsResult<()> {
+pub fn fill_random(buf: &mut [u8]) -> TdsResult<()> {
     imp::fill_random(buf)
 }
 
 /// Computes `HMAC-SHA256(key, data)`.
-pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> TdsResult<[u8; SHA256_LEN]> {
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> TdsResult<[u8; SHA256_LEN]> {
     imp::hmac_sha256(key, data)
 }
 
