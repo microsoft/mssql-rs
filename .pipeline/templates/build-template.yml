@@ -201,6 +201,28 @@ steps:
       testResultsFiles: $(Build.SourcesDirectory)/target/nextest/ci/junit.xml
       testRunTitle: $(System.PhaseName)
 
+  - script: cargo fetch && cargo nextest run --frozen --lib -E "test(pool::)" --profile ci --no-fail-fast && cargo nextest run --frozen --test pool_sql -E "test(live_)" --run-ignored only --profile pool-sql --no-fail-fast
+    workingDirectory: "$(Build.SourcesDirectory)/mssql-py-core"
+    displayName: Run pool contracts and live SQL tests (mssql-py-core)
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    env:
+      SQL_PASSWORD: $(SQL_PASSWORD)
+      DB_HOST: localhost
+      DB_PORT: '1433'
+      DB_USERNAME: sa
+      TRUST_SERVER_CERTIFICATE: 'true'
+
+  - task: PublishTestResults@2
+    displayName: Publish pool test results (mssql-py-core)
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    inputs:
+      testResultsFormat: JUnit
+      testResultsFiles: |
+        $(Build.SourcesDirectory)/mssql-py-core/target/nextest/ci/junit.xml
+        $(Build.SourcesDirectory)/mssql-py-core/target/nextest/pool-sql/junit.xml
+      testRunTitle: $(System.PhaseName)-PyCore-Pool
+      failTaskOnFailedTests: true
+
   - ${{ if eq(parameters.osType, 'Linux') }}:
     - bash: |
         echo "Running Python tests for mssql-py-core..."

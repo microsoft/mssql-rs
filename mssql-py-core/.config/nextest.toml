@@ -3,3 +3,6 @@
 # crate a `ci` profile that emits JUnit for the CI test-results tab.
 [profile.ci.junit]
 path = "junit.xml"
+
+[profile.pool-sql.junit]
+path = "junit.xml"

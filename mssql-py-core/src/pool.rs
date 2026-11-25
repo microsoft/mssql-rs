@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Internal pool lifecycle and SQL checkout. Safe return and AQE integration remain gated.
+//! Internal pool lifecycle, SQL checkout and safe return. AQE integration remains gated.
 
 pub(crate) mod config;
 pub(crate) mod connection;
