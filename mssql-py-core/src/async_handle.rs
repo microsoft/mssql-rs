@@ -158,14 +158,14 @@ impl LogicalConnection {
             } else {
                 let handle = connection.handle.lock().await.take();
                 match handle {
-                    None => Ok(()),
+                    None => Ok(None),
                     Some(handle) if connection.state.is_broken() => {
                         drop(handle);
                         match mode {
                             CloseMode::Commit => Err(OperationalError::new_err(
                                 "Cannot commit a broken connection; connection discarded",
                             )),
-                            CloseMode::Rollback => Ok(()),
+                            CloseMode::Rollback => Ok(None),
                         }
                     }
                     Some(handle) => {
@@ -183,9 +183,21 @@ impl LogicalConnection {
                     }
                 }
             };
-            connection
-                .state
-                .complete_close(mode, deadline, result, &completion.sender);
+            connection.state.complete_close(
+                mode,
+                deadline,
+                result,
+                |returned, discard| {
+                    if let Some((mut lease, deadline)) = returned {
+                        if discard {
+                            lease.mark_discard();
+                        }
+                        lease.finish_release(deadline).map_err(map_pool_error)?;
+                    }
+                    Ok(())
+                },
+                &completion.sender,
+            );
             completion.completed = true;
             tracing::info!(
                 discard = connection.state.must_discard(),
@@ -243,7 +255,7 @@ impl LogicalConnection {
         state: &AsyncConnectionState,
         mode: CloseMode,
         deadline: Instant,
-    ) -> PyResult<()> {
+    ) -> PyResult<Option<(Box<PoolLease>, Instant)>> {
         let client = handle.client_mut();
         let result = async {
             check_cleanup_deadline(deadline)?;
@@ -270,7 +282,7 @@ impl LogicalConnection {
                 CloseMode::Commit => Err(OperationalError::new_err(
                     "Cannot commit a broken connection; connection discarded",
                 )),
-                CloseMode::Rollback => Ok(()),
+                CloseMode::Rollback => Ok(None),
             };
         }
         let result = async {
@@ -299,22 +311,25 @@ impl LogicalConnection {
                         client.take_info_messages(),
                     )
                 })?;
-                check_cleanup_deadline(deadline).map_err(|error| {
-                    map_tds_error(
-                        "Connection cleanup failed",
-                        error,
-                        client.take_info_messages(),
-                    )
-                })
+                check_cleanup_deadline(deadline)
+                    .map(|()| None)
+                    .map_err(|error| {
+                        map_tds_error(
+                            "Connection cleanup failed",
+                            error,
+                            client.take_info_messages(),
+                        )
+                    })
             }
             ConnHandle::Pooled(mut lease) => {
                 if state.must_discard() {
                     lease.mark_discard();
                 }
-                lease
-                    .release_with_deadline(deadline)
+                let deadline = lease
+                    .prepare_release(deadline)
                     .await
-                    .map_err(map_pool_error)
+                    .map_err(map_pool_error)?;
+                Ok(Some((lease, deadline)))
             }
         }
     }
@@ -770,7 +785,7 @@ mod tests {
                 Ok(())
             };
             let (sender, receiver) = watch::channel(None);
-            state.complete_close(mode, deadline, result, &sender);
+            state.complete_close(mode, deadline, result, |(), _| Ok(()), &sender);
             assert_eq!(state.lifecycle(), ConnectionLifecycle::Closed);
             let outcome = receiver.borrow().clone().unwrap();
             if failed || expired || cancelled && matches!(mode, CloseMode::Commit) {
@@ -886,6 +901,7 @@ mod tests {
             deadline,
         )
         .await
+        .map(|_| ())
         .unwrap_err();
         assert!(error.to_string().contains("timed out"));
         assert_eq!(transport.lock().unwrap().len(), initial_bytes);

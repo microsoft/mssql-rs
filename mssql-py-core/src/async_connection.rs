@@ -359,12 +359,13 @@ impl PyAsyncConnection {
             py,
             with_optional_dispatch(future, future_dispatch),
         )?;
+        let public = delivery.bind(&future)?;
         if let Some(callback) = auth_cancellation_callback {
-            callback.borrow(py).bind_future(&future)?;
-            future.call_method1("add_done_callback", (callback,))?;
+            callback.borrow(py).bind_future(&public)?;
+            public.call_method1("add_done_callback", (callback,))?;
         }
 
-        delivery.bind(&future)
+        Ok(public)
     }
 
     /// Default query timeout (seconds) inherited by cursors created from this

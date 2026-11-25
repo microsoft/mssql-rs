@@ -415,6 +415,11 @@ native release passes its remaining budget rather than restarting a full cleanup
 budget. Use Doc 1 section 9.1's `release_with_deadline` with the original close
 deadline; plain `release` uses the configured default.
 
+The native adapter prepares release asynchronously, then performs its synchronous
+return with logical close publication under the operation-cancellation lock.
+Cancellation after native work finishes but before its waiter receives the result
+must still discard the lease if it wins that terminal close boundary.
+
 The slot stays checked out through the entire close/return sequence. On reuse,
 update the return timestamp and make the clean client available only after the
 generation/acceptance check. On discard, destroy the client before releasing the

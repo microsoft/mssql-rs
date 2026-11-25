@@ -90,12 +90,17 @@ impl PoolLease {
     }
 
     pub(crate) async fn release_with_deadline(mut self, deadline: Instant) -> PoolResult<()> {
+        let deadline = self.prepare_release(deadline).await?;
+        self.finish_release(deadline)
+    }
+
+    pub(crate) async fn prepare_release(&mut self, deadline: Instant) -> PoolResult<Instant> {
         let deadline = deadline.min(self.slot.cleanup_deadline()?);
         if Instant::now() >= deadline {
             return Err(PoolError::CleanupTimeout);
         }
         if self.discard {
-            return Ok(());
+            return Ok(deadline);
         }
         let runtime = tokio::runtime::Handle::current().id();
         {
@@ -142,6 +147,13 @@ impl PoolLease {
                     .map(|result| result.map_err(|_| PoolError::CleanupTimeout)?)
             })
             .await?;
+        }
+        Ok(deadline)
+    }
+
+    pub(crate) fn finish_release(self, deadline: Instant) -> PoolResult<()> {
+        if self.discard {
+            return Ok(());
         }
         self.slot.return_before(deadline)
     }

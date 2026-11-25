@@ -181,6 +181,98 @@ asyncio.run(run())
     runtime.block_on(manager.shutdown()).unwrap();
 }
 
+#[test]
+fn late_operation_waiter_cancellation_discards_before_pool_return() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Waker};
+    use tracing::{Subscriber, span::Attributes};
+    use tracing_subscriber::{Layer, layer::Context as LayerContext, prelude::*};
+
+    type Waiter = Pin<Box<dyn Future<Output = PyResult<()>> + Send>>;
+    struct CancelDuringRelease {
+        drains: AtomicUsize,
+        waiter: Mutex<Option<Waiter>>,
+    }
+    impl<S: Subscriber> Layer<S> for CancelDuringRelease {
+        fn on_new_span(
+            &self,
+            attributes: &Attributes<'_>,
+            _: &tracing::span::Id,
+            _: LayerContext<'_, S>,
+        ) {
+            if attributes.metadata().name() == "close_query"
+                && self.drains.fetch_add(1, Ordering::SeqCst) == 1
+            {
+                drop(self.waiter.lock().unwrap().take().unwrap());
+            }
+        }
+    }
+
+    pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+        for mode in [CloseMode::Commit, CloseMode::Rollback] {
+            let manager = manager();
+            let (client, transport) = tds_client_from_tokens_capturing(vec![
+                done_no_more(),
+                env_change_reset_connection(),
+                done_no_more(),
+            ]);
+            let (replacement, _) = tds_client_from_tokens_capturing(vec![done_no_more()]);
+            let factory = Factory {
+                clients: Mutex::new(
+                    [client, replacement]
+                        .into_iter()
+                        .map(|client| {
+                            OpenedConnection::new(
+                                client,
+                                AuthMetadata {
+                                    binding: spec().expected_auth().clone(),
+                                    expiry: TokenExpiry::NonToken,
+                                },
+                            )
+                        })
+                        .collect(),
+                ),
+                calls: AtomicUsize::new(0),
+            };
+            let lease = acquire(&manager, &factory).await;
+            let logical = Arc::new(LogicalConnection::from_handle(
+                ConnHandle::Pooled(Box::new(lease)),
+                CLOSE_TIMEOUT,
+            ));
+            let (finished, completion) = tokio::sync::oneshot::channel();
+            let mut waiter: Waiter = Box::pin(logical.state.clone().run_tracked(async move {
+                finished.send(()).unwrap();
+                Ok(())
+            }));
+            assert!(
+                waiter
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            completion.await.unwrap();
+            let subscriber = tracing_subscriber::Registry::default().with(CancelDuringRelease {
+                drains: AtomicUsize::new(0),
+                waiter: Mutex::new(Some(waiter)),
+            });
+            let result = LogicalConnection::wait_closed(logical.start_close(
+                mode,
+                CLOSE_TIMEOUT,
+                Some(tracing::Dispatch::new(subscriber)),
+            ))
+            .await;
+            assert!(logical.state.is_broken());
+            assert_eq!(result.is_err(), matches!(mode, CloseMode::Commit));
+            assert_eq!(Arc::strong_count(&transport), 1);
+            let next = acquire(&manager, &factory).await;
+            assert_eq!(factory.calls.load(Ordering::SeqCst), 2);
+            drop(next);
+            manager.shutdown().await.unwrap();
+        }
+    });
+}
+
 #[tokio::test]
 async fn close_waiters_preserve_pool_error_reason() {
     let error = map_pool_error(PoolError::CleanupTimeout);

@@ -680,15 +680,16 @@ impl AsyncConnectionState {
         state.active_operation = None;
     }
 
-    pub(crate) fn complete_close(
+    pub(crate) fn complete_close<T>(
         &self,
         mode: CloseMode,
         deadline: Instant,
-        result: PyResult<()>,
+        result: PyResult<T>,
+        finish: impl FnOnce(T, bool) -> PyResult<()>,
         sender: &watch::Sender<Option<CloseResult>>,
     ) {
         let mut state = self.lock();
-        let result = result.and_then(|()| {
+        let result = result.and_then(|value| {
             check_cleanup_deadline(deadline)
                 .map_err(|error| map_tds_error("Connection cleanup failed", error, Vec::new()))?;
             if matches!(mode, CloseMode::Commit) && state.broken {
@@ -696,7 +697,7 @@ impl AsyncConnectionState {
                     "Connection was interrupted during commit cleanup; outcome may be unknown; connection discarded",
                 ));
             }
-            Ok(())
+            finish(value, self.must_discard())
         });
         if result.is_err() {
             self.mark_for_discard();
@@ -704,13 +705,13 @@ impl AsyncConnectionState {
         }
         state.lifecycle = ConnectionLifecycle::Closed;
         state.active_operation = None;
-        // Publish under the cancellation lock so late poisoning cannot race success.
+        // Final return and publication share the cancellation lock.
         sender.send_replace(Some(result.map_err(Arc::new)));
     }
 
     pub(crate) fn mark_broken(&self) {
-        self.mark_for_discard();
         let mut state = self.lock();
+        self.mark_for_discard();
         state.broken = true;
         if state.lifecycle == ConnectionLifecycle::Open {
             state.lifecycle = ConnectionLifecycle::Broken;

@@ -36,7 +36,7 @@ For native SQL initialization and reuse, see
 | `Isolation` in [session.rs](session.rs) | Selects one concrete transaction isolation SET; rejects `NoChange` before checkout. |
 | `AsyncPoolManager::acquire` in [session.rs](session.rs) | Validates pooled options, reserves a Deadpool slot, initializes a fresh connection or resets a cached candidate, and publishes only after authentication checks and fully drained, quiescent initialization. |
 | `PoolLease` in [session.rs](session.rs) | Uniquely owns the client and capacity guard. Client access is borrowed from the lease; Drop discards rather than returning a reusable session. |
-| `PoolLease::release` / `release_with_deadline` in [session.rs](session.rs) | Drain before residual rollback under one capped cleanup deadline, then atomically return only a quiescent client to its accepting generation. Cancellation or failure discards before slot return. |
+| `PoolLease::release` / `release_with_deadline` in [session.rs](session.rs) | Drain before residual rollback under one capped cleanup deadline, then atomically return only a quiescent client to its accepting generation. AQE separates `prepare_release` from synchronous `finish_release` so logical cancellation, final return and close publication share one lock. Cancellation or failure discards before slot return. |
 | `PoolResult`, `PoolError` and `OpenError` in [error.rs](error.rs) | Typed outcomes, including preserved TDS/provider causes. Routine `Display`/`Debug` excludes source messages; the native adapter maps DB-API errors and pool reasons. |
 
 `max_waiting = None` means unlimited waiting; a configured limit is positive and
