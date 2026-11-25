@@ -3492,6 +3492,30 @@
       ]
     },
     {
+      "id": "diagnose.limitation.entra_token_failure_stage",
+      "message": "sqlcmd's driver reports that it could not get a Microsoft Entra token (FA004); its error does not tell acquiring the credential (a password, the Windows sign-in or a Kerberos ticket) apart from requesting the token.",
+      "translation": "sqlcmd's driver reports that it could not get a Microsoft Entra token (FA004); its error does not tell acquiring the credential (a password, the Windows sign-in or a Kerberos ticket) apart from requesting the token.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.integrated_choice_entra",
+      "message": "The diagnostic client (mssql-tds) found that the server requires Microsoft Entra on this encrypted connection; sqlcmd's driver, which decides the same way, logs in with Microsoft Entra.",
+      "translation": "The diagnostic client (mssql-tds) found that the server requires Microsoft Entra on this encrypted connection; sqlcmd's driver, which decides the same way, logs in with Microsoft Entra.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.integrated_choice_sspi",
+      "message": "The diagnostic client (mssql-tds) found that the server does not require Microsoft Entra on this connection, or the connection is not encrypted; sqlcmd's driver, which decides the same way, logs in with Windows authentication (Kerberos off Windows).",
+      "translation": "The diagnostic client (mssql-tds) found that the server does not require Microsoft Entra on this connection, or the connection is not encrypted; sqlcmd's driver, which decides the same way, logs in with Windows authentication (Kerberos off Windows).",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.integrated_choice_not_reported",
+      "message": "sqlcmd's driver does not report whether the ActiveDirectoryIntegrated login used Microsoft Entra or Windows authentication (Kerberos off Windows).",
+      "translation": "sqlcmd's driver does not report whether the ActiveDirectoryIntegrated login used Microsoft Entra or Windows authentication (Kerberos off Windows).",
+      "placeholders": []
+    },
+    {
       "id": "diagnose.detail.phases_then_skip",
       "message": "{phases}; {skip}",
       "translation": "{phases}; {skip}",

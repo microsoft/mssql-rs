@@ -341,6 +341,12 @@ pub struct ClientContext {
     pub replication: bool,
     /// Authentication method to use.
     pub tds_authentication_method: TdsAuthenticationMethod,
+    /// With [`TdsAuthenticationMethod::ActiveDirectoryIntegrated`], log in
+    /// with SSPI (Kerberos off Windows) instead of Microsoft Entra unless the
+    /// server's pre-login answer requires federated authentication and the
+    /// connection is encrypted, as the ODBC driver does. Off by default: the
+    /// login then always uses Microsoft Entra.
+    pub entra_integrated_sspi_fallback: bool,
     /// Connect to a user instance of SQL Server Express.
     pub user_instance: bool,
     /// Login user name for SQL Server authentication.
@@ -596,6 +602,7 @@ impl ClientContext {
             server_spn: None,
             login_server_name: None,
             tds_authentication_method: TdsAuthenticationMethod::Password,
+            entra_integrated_sspi_fallback: false,
             user_instance: false,
             user_name: "".to_string(),
             workstation_id: ClientContext::default_workstation_id(hostname::get),
@@ -661,6 +668,7 @@ impl ClientContext {
             pooling: false,
             replication: false,
             tds_authentication_method: TdsAuthenticationMethod::Password,
+            entra_integrated_sspi_fallback: false,
             user_instance: false,
             user_name: "".to_string(),
             workstation_id: ClientContext::default_workstation_id(hostname::get),
@@ -988,6 +996,7 @@ impl Clone for ClientContext {
             pooling: self.pooling,
             replication: self.replication,
             tds_authentication_method: self.tds_authentication_method.clone(),
+            entra_integrated_sspi_fallback: self.entra_integrated_sspi_fallback,
             user_instance: self.user_instance,
             user_name: self.user_name.clone(),
             workstation_id: self.workstation_id.clone(),

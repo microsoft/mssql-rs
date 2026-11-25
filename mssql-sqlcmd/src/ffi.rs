@@ -808,10 +808,12 @@ pub const MSSQL_SQLCMD_AUTH_ENTRA_PASSWORD: i32 = 2;
 /// A Microsoft Entra access token (`-G -P` without `-U`): `password` is the
 /// `-P` value, the file sqlcmd reads the token from; `user` is ignored.
 pub const MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN: i32 = 3;
-// Microsoft Entra integrated authentication (`-G` without `-U` or `-P`) has no
-// value yet: sqlcmd's driver logs in with it, or with Windows authentication
-// when the server's pre-login answer does not require Microsoft Entra, which
-// diagnose does not model.
+/// Microsoft Entra integrated authentication (`-G` without `-U` or `-P`,
+/// `ActiveDirectoryIntegrated`); `user` and `password` are ignored. sqlcmd's
+/// driver logs in with Microsoft Entra when the server's pre-login answer
+/// requires it on an encrypted connection, and with Windows authentication
+/// (Kerberos off Windows) otherwise.
+pub const MSSQL_SQLCMD_AUTH_ENTRA_INTEGRATED: i32 = 4;
 
 /// The `authentication` of a [`MssqlSqlcmdDiagnosticsRequest`], read once from
 /// its `MSSQL_SQLCMD_AUTH_*` value. Each use matches every kind, so a kind added
@@ -822,6 +824,7 @@ enum AuthKind {
     Integrated,
     EntraPassword,
     EntraAccessToken,
+    EntraIntegrated,
 }
 
 impl AuthKind {
@@ -833,6 +836,7 @@ impl AuthKind {
             MSSQL_SQLCMD_AUTH_INTEGRATED => Self::Integrated,
             MSSQL_SQLCMD_AUTH_ENTRA_PASSWORD => Self::EntraPassword,
             MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN => Self::EntraAccessToken,
+            MSSQL_SQLCMD_AUTH_ENTRA_INTEGRATED => Self::EntraIntegrated,
             _ => return None,
         })
     }
@@ -841,7 +845,7 @@ impl AuthKind {
     fn needs_user(self) -> bool {
         match self {
             Self::SqlPassword | Self::EntraPassword => true,
-            Self::Integrated | Self::EntraAccessToken => false,
+            Self::Integrated | Self::EntraAccessToken | Self::EntraIntegrated => false,
         }
     }
 
@@ -850,7 +854,7 @@ impl AuthKind {
     fn needs_password(self) -> bool {
         match self {
             Self::SqlPassword | Self::EntraPassword | Self::EntraAccessToken => true,
-            Self::Integrated => false,
+            Self::Integrated | Self::EntraIntegrated => false,
         }
     }
 
@@ -860,7 +864,7 @@ impl AuthKind {
         match self {
             Self::SqlPassword => "-U",
             Self::Integrated => "-E",
-            Self::EntraPassword | Self::EntraAccessToken => "-G",
+            Self::EntraPassword | Self::EntraAccessToken | Self::EntraIntegrated => "-G",
         }
     }
 }
@@ -1504,6 +1508,7 @@ fn diagnose(input: DiagnosticsInput) -> Option<(String, i32)> {
             AuthKind::EntraAccessToken => Authentication::EntraAccessToken {
                 file: input.password,
             },
+            AuthKind::EntraIntegrated => Authentication::EntraIntegrated,
         },
         encrypt: match input.encrypt {
             MSSQL_SQLCMD_ENCRYPT_OPTIONAL => Encrypt::Optional,
@@ -2623,6 +2628,10 @@ mod tests {
                 MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN,
                 "ActiveDirectoryAccessToken",
             ),
+            (
+                MSSQL_SQLCMD_AUTH_ENTRA_INTEGRATED,
+                "ActiveDirectoryIntegrated",
+            ),
         ] {
             let mut request = diagnostics_request(&server, &user, &password);
             request.depth = MSSQL_SQLCMD_DEPTH_CONNECTION_INPUT;
@@ -2631,6 +2640,10 @@ mod tests {
             if authentication == MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN {
                 request.user = NULL_TEXT;
                 request.password = text(&token_file);
+            }
+            if authentication == MSSQL_SQLCMD_AUTH_ENTRA_INTEGRATED {
+                request.user = NULL_TEXT;
+                request.password = NULL_TEXT;
             }
             let (status, rendered, exit_code) = run_diagnostics(&request, MSSQL_SQLCMD_REPORT_JSON);
             assert_eq!((status, exit_code), (MSSQL_SQLCMD_OK, 0), "{rendered}");
@@ -2891,7 +2904,7 @@ mod tests {
         bad.authentication = 7;
         cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_INVALID_ARGUMENT));
         let mut bad = diagnostics_request(&server, &user, &password);
-        bad.authentication = MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN + 1;
+        bad.authentication = MSSQL_SQLCMD_AUTH_ENTRA_INTEGRATED + 1;
         cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_INVALID_ARGUMENT));
         // An Entra password login needs its user, as a SQL login does; an
         // access token needs its file.
@@ -3160,6 +3173,10 @@ mod tests {
             (
                 "MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN",
                 MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN,
+            ),
+            (
+                "MSSQL_SQLCMD_AUTH_ENTRA_INTEGRATED",
+                MSSQL_SQLCMD_AUTH_ENTRA_INTEGRATED,
             ),
             (
                 "MSSQL_SQLCMD_ENCRYPT_OPTIONAL",

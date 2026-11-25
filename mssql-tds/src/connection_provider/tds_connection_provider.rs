@@ -1381,8 +1381,10 @@ mod tests {
 
     mod diagnostic {
         use super::*;
+        use crate::connection::client_context::TdsAuthenticationMethod;
         use crate::connection::connect_stage::{self as stage, tests::StageLog};
         use std::future::Future;
+        use std::sync::Arc;
 
         /// Runs `attempt` on a current-thread runtime, as connection
         /// diagnostics do, recording its connect stages.
@@ -1693,6 +1695,99 @@ mod tests {
                     .check_stop(DiagnosticStop::Transport)
                     .is_ok()
             );
+        }
+
+        /// Counts the SSPI contexts an attempt creates.
+        #[derive(Default)]
+        struct CountingSspi(std::sync::atomic::AtomicUsize);
+
+        impl crate::security::SecurityContextProvider for CountingSspi {
+            fn create_context(
+                &self,
+                _config: &crate::security::IntegratedAuthConfig,
+                _server: &str,
+                _port: u16,
+            ) -> Result<Box<dyn crate::security::SecurityContext>, crate::security::SecurityError>
+            {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(Box::new(
+                    crate::security::mock::MockSecurityContext::single_round(b"t".to_vec()),
+                ))
+            }
+        }
+
+        /// Counts the Microsoft Entra tokens an attempt asks for, and gives one.
+        #[derive(Clone, Default)]
+        struct CountingTokens(Arc<std::sync::atomic::AtomicUsize>);
+
+        #[async_trait::async_trait]
+        impl crate::connection::client_context::EntraIdTokenFactory for CountingTokens {
+            async fn create_token(
+                &self,
+                _spn: String,
+                _sts_url: String,
+                _method: TdsAuthenticationMethod,
+            ) -> TdsResult<Vec<u8>> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok("token".encode_utf16().flat_map(u16::to_le_bytes).collect())
+            }
+        }
+
+        /// An `ActiveDirectoryIntegrated` login that falls back as the ODBC
+        /// driver does logs in with SSPI over a connection that is not
+        /// encrypted, though the server's pre-login answer requires Microsoft
+        /// Entra, and records the choice; without the fallback it asks for a
+        /// Microsoft Entra token, as before.
+        #[test]
+        fn active_directory_integrated_falls_back_to_sspi_as_the_odbc_driver_does() {
+            for fallback in [true, false] {
+                let sspi = Arc::new(CountingSspi::default());
+                let tokens = CountingTokens::default();
+                let (attempt_sspi, attempt_tokens) = (sspi.clone(), tokens.clone());
+                let (result, log) = observe(|| async move {
+                    let server = mssql_mock_tds::MockTdsServer::new("127.0.0.1:0")
+                        .await
+                        .unwrap();
+                    let port = server.local_addr().port();
+                    let (stop, stopped) = tokio::sync::oneshot::channel();
+                    let running = tokio::spawn(async move {
+                        let _ = server.run_with_shutdown(stopped).await;
+                    });
+                    let mut context = context();
+                    let method = TdsAuthenticationMethod::ActiveDirectoryIntegrated;
+                    context.tds_authentication_method = method.clone();
+                    context.entra_integrated_sspi_fallback = fallback;
+                    context.security_context_provider = Some(attempt_sspi);
+                    context
+                        .auth_method_map
+                        .insert(method, Box::new(attempt_tokens));
+                    let result = TdsConnectionProvider::new()
+                        .create_client(context, &format!("tcp:127.0.0.1,{port}"), None)
+                        .await
+                        .map(drop);
+                    let _ = stop.send(());
+                    let _ = running.await;
+                    result
+                });
+                assert!(result.is_ok(), "{fallback}: {result:?}");
+                let prelogin = &log.named(stage::PRELOGIN)[0];
+                assert_eq!(prelogin.field(stage::FED_AUTH_REQUIRED), Some("true"));
+                let login = &log.named(stage::LOGIN)[0];
+                let (contexts, asked) = (
+                    sspi.0.load(Ordering::Relaxed),
+                    tokens.0.load(Ordering::Relaxed),
+                );
+                if fallback {
+                    assert_eq!((contexts, asked), (1, 0));
+                    assert_eq!(
+                        login.field(stage::AUTHENTICATION),
+                        Some(stage::AUTHENTICATION_SSPI)
+                    );
+                } else {
+                    assert_eq!((contexts, asked), (0, 1));
+                    assert_eq!(login.field(stage::AUTHENTICATION), None);
+                }
+            }
         }
     }
 
