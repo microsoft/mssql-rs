@@ -255,6 +255,13 @@ impl ExecuteFailure {
             break_connection: true,
         }
     }
+
+    fn breaks_session(&self, has_open_batch: bool, connection_dead: bool) -> bool {
+        // Provider cancellation leaves idle recovery retryable on the next request.
+        has_open_batch
+            || (!matches!(self.error, Error::TokenAcquisitionCancelled)
+                && (self.break_connection || connection_dead))
+    }
 }
 
 impl From<Error> for ExecuteFailure {
@@ -886,7 +893,7 @@ pub(crate) fn execute<'py>(
             }
             Err(error) => {
                 record_result_set_status("error");
-                operation_guard.settle(error.break_connection || has_open_batch || connection_dead);
+                operation_guard.settle(error.breaks_session(has_open_batch, connection_dead));
                 Err(map_execute_error(error.error, info_messages))
             }
         }
@@ -1136,8 +1143,9 @@ pub(crate) fn executemany<'py>(
                 }
                 Err(error) => {
                     record_result_set_status("error");
-                    let connection_marked_broken =
-                        error.failure.break_connection || has_open_batch || connection_dead;
+                    let connection_marked_broken = error
+                        .failure
+                        .breaks_session(has_open_batch, connection_dead);
                     operation_guard.settle(connection_marked_broken);
                     interruption_guard.complete();
                     let elapsed_ms = started.elapsed().as_millis();
@@ -1197,6 +1205,15 @@ mod tests {
     use crate::async_session::{
         AsyncConnectionState, ClaimError, ConnectionLifecycle, SessionOperationGuard,
     };
+
+    #[test]
+    fn provider_cancellation_preserves_idle_recovery_but_not_an_open_batch() {
+        let failure = ExecuteFailure::broken(Error::TokenAcquisitionCancelled);
+        assert!(!failure.breaks_session(false, true));
+        assert!(failure.breaks_session(true, true));
+        let failure = ExecuteFailure::from(Error::OperationCancelledError("cancelled".into()));
+        assert!(failure.breaks_session(false, true));
+    }
 
     fn prepared_state(sql: &str, signature: Vec<ParameterMetadata>) -> PreparedState {
         PreparedState {

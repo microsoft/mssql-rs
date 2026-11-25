@@ -60,6 +60,9 @@ For SDK authors integrating the native runtime:
   conversion while rows or later result sets remain. Cancellation can settle
   that batch without waiting for conversion. Fully exhausted batches release
   ownership before conversion, so blocked conversion does not delay reuse.
+  Credential-provider cancellation during idle session recovery propagates
+  `CancelledError` without permanently breaking the logical connection when no
+  batch is open; a later query can retry recovery.
 - Concurrent async connection closes await one teardown outcome. Cancelling a
   close waiter does not stop cleanup. Direct close uses one five-second budget
   to settle operations, drain results, finalize transactions and close the
