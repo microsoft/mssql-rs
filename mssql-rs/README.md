@@ -185,6 +185,27 @@ Requires the platform TLS dependencies and a working TCP stack.
 Requires the platform TLS dependencies. Supply the JWT yourself, typically via
 `azure_identity` or MSAL.
 
+### Challenge-time Entra authentication (`AuthMethod::entra_token_factory`)
+
+Implement `mssql_rs::EntraIdTokenFactory` with `#[async_trait::async_trait]`
+and pass your factory to `cfg.authentication(AuthMethod::entra_token_factory(factory))`.
+`Client::connect` calls `create_token` only after receiving a FedAuthInfo
+challenge, passing the server's SPN and STS URL. Check the SPN against your
+expected audience, and validate the STS URL if your credential implementation
+uses it, before acquiring a token. Return an error to abort login without sending
+a token, or return the JWT as UTF-16LE bytes without a BOM. The driver does not
+require a credential SDK. Keep TLS certificate validation enabled in production.
+
+### Connection timeouts and retries
+
+To set separate network and login budgets, use
+`cfg.connect_timeout(5).login_timeout(Some(20))`. The first value limits each
+TCP connect attempt; the second covers the entire login, including token
+acquisition. `login_timeout(None)` falls back to the connect timeout;
+`login_timeout(Some(0))` disables the overall deadline. The native retry
+settings are available through `connect_retry_count` and
+`connect_retry_interval` (seconds). Set the count to `0` to disable retries.
+
 ### Integrated authentication (`AuthMethod::Integrated`) — Linux / macOS
 
 Uses Kerberos via `libgssapi_krb5`, loaded at **runtime** with `dlopen`. The library is **not** linked at build time; binaries build without it, but calling `Client::connect` with `Integrated` auth will fail at runtime if it's missing.

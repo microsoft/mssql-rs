@@ -22,12 +22,27 @@
 //!    .trust_cert();
 //! ```
 
-use mssql_tds::connection::client_context::{
-    ClientContext, DriverVersion, TdsAuthenticationMethod,
-};
+use crate::{EntraIdTokenFactory, TdsAuthenticationMethod, TdsResult};
+use mssql_tds::connection::client_context::{ClientContext, DriverVersion};
 use mssql_tds::core::EncryptionSetting;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+#[derive(Clone)]
+struct SharedEntraFactory(Arc<dyn EntraIdTokenFactory>);
+
+#[async_trait::async_trait]
+impl EntraIdTokenFactory for SharedEntraFactory {
+    async fn create_token(
+        &self,
+        spn: String,
+        sts_url: String,
+        auth_method: TdsAuthenticationMethod,
+    ) -> TdsResult<Vec<u8>> {
+        self.0.create_token(spn, sts_url, auth_method).await
+    }
+}
 
 /// The driver name sent in the TDS Login7 packet and UserAgent feature extension.
 /// Follows the MS driver naming convention (e.g., `MS-TDS`, `MS-PYTHON`).
@@ -138,6 +153,12 @@ pub enum AuthMethod {
     /// pre-acquired access token (JWT). Acquire the token from MSAL /
     /// `azure_identity` / `oauth2`, scoped for `https://database.windows.net/.default`.
     AadToken { token: String },
+    /// Microsoft Entra ID authentication using a factory called on demand.
+    /// See [`Self::entra_token_factory`] for the challenge and validation contract.
+    EntraTokenFactory {
+        /// Factory shared by clones of the configuration.
+        factory: Arc<dyn EntraIdTokenFactory>,
+    },
 }
 
 impl fmt::Debug for AuthMethod {
@@ -153,6 +174,7 @@ impl fmt::Debug for AuthMethod {
                 .debug_struct("AadToken")
                 .field("token", &"<REDACTED>")
                 .finish(),
+            Self::EntraTokenFactory { .. } => formatter.write_str("EntraTokenFactory"),
         }
     }
 }
@@ -178,6 +200,24 @@ impl AuthMethod {
             token: token.into(),
         }
     }
+
+    /// Acquire an Entra ID token only when the server sends a FedAuthInfo challenge.
+    ///
+    /// The factory receives the server-provided SPN and STS URL, with auth
+    /// method [`TdsAuthenticationMethod::ActiveDirectoryTokenCredential`].
+    /// Validate the SPN and any STS URL you intend to use against trusted
+    /// configuration **before** acquiring a token. Returning an error aborts
+    /// login without sending a token. Return the access token as UTF-16LE bytes
+    /// without a BOM.
+    ///
+    /// Clones share the factory, which can be called again on a new login,
+    /// including after routing or session recovery. No credential SDK is required
+    /// by the driver. Keep TLS certificate validation enabled in production.
+    pub fn entra_token_factory(factory: impl EntraIdTokenFactory + 'static) -> Self {
+        Self::EntraTokenFactory {
+            factory: Arc::new(factory),
+        }
+    }
 }
 
 /// Fluent connection configuration builder, mirroring tiberius' `Config`.
@@ -194,6 +234,10 @@ impl AuthMethod {
 /// | Database | `master` |
 /// | Encryption | [`On`](EncryptionLevel::On) |
 /// | Trust cert | `false` |
+/// | Connect timeout | Native default (15 seconds) |
+/// | Login timeout | Falls back to connect timeout |
+/// | Connect retry count | Native default (1 retry) |
+/// | Connect retry interval | Native default (10 seconds) |
 #[derive(Debug, Clone)]
 pub struct Config {
     host: String,
@@ -211,6 +255,10 @@ pub struct Config {
     send_string_parameters_as_unicode: bool,
     multi_subnet_failover: bool,
     transport: Transport,
+    connect_timeout: Option<u32>,
+    login_timeout: Option<u32>,
+    connect_retry_count: Option<u32>,
+    connect_retry_interval: Option<u32>,
 }
 
 impl Config {
@@ -235,6 +283,10 @@ impl Config {
             send_string_parameters_as_unicode: true,
             multi_subnet_failover: false,
             transport: Transport::Tcp,
+            connect_timeout: None,
+            login_timeout: None,
+            connect_retry_count: None,
+            connect_retry_interval: None,
         }
     }
 
@@ -259,6 +311,40 @@ impl Config {
     /// Set the authentication method (see [`AuthMethod`]).
     pub fn authentication(&mut self, auth: AuthMethod) -> &mut Self {
         self.auth = auth;
+        self
+    }
+
+    /// Set the timeout for each TCP connect attempt, in seconds.
+    ///
+    /// A value of `0` uses the native per-attempt timeout (15 seconds).
+    /// If the login timeout is unset, `0` also disables the overall login deadline.
+    pub fn connect_timeout(&mut self, seconds: u32) -> &mut Self {
+        self.connect_timeout = Some(seconds);
+        self
+    }
+
+    /// Set the overall login timeout, in seconds, including network connect,
+    /// the TDS handshake, and token acquisition.
+    ///
+    /// `None` falls back to the connect timeout. `Some(0)` disables the overall
+    /// deadline without changing the per-attempt timeout.
+    pub fn login_timeout(&mut self, seconds: Option<u32>) -> &mut Self {
+        self.login_timeout = seconds;
+        self
+    }
+
+    /// Set the number of retries after a transient connection failure and the
+    /// number of reconnection attempts after an idle connection failure.
+    ///
+    /// `0` disables retries. Login retries are subject to the login deadline.
+    pub fn connect_retry_count(&mut self, count: u32) -> &mut Self {
+        self.connect_retry_count = Some(count);
+        self
+    }
+
+    /// Set the delay between connection retries, in seconds.
+    pub fn connect_retry_interval(&mut self, seconds: u32) -> &mut Self {
+        self.connect_retry_interval = Some(seconds);
         self
     }
 
@@ -516,7 +602,20 @@ impl Config {
                 ctx.tds_authentication_method = TdsAuthenticationMethod::AccessToken;
                 ctx.access_token = Some(token.clone());
             }
+            AuthMethod::EntraTokenFactory { factory } => {
+                let method = TdsAuthenticationMethod::ActiveDirectoryTokenCredential;
+                ctx.tds_authentication_method = method.clone();
+                ctx.auth_method_map
+                    .insert(method, Box::new(SharedEntraFactory(Arc::clone(factory))));
+            }
         }
+
+        ctx.connect_timeout = self.connect_timeout.unwrap_or(ctx.connect_timeout);
+        ctx.login_timeout = self.login_timeout;
+        ctx.connect_retry_count = self.connect_retry_count.unwrap_or(ctx.connect_retry_count);
+        ctx.connect_retry_interval = self
+            .connect_retry_interval
+            .unwrap_or(ctx.connect_retry_interval);
 
         ctx.encryption_options.trust_server_certificate = self.trust_cert;
         ctx.encryption_options.server_certificate = self.server_certificate.clone();
@@ -571,13 +670,36 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use crate::config::*;
-    use mssql_tds::connection::client_context::TdsAuthenticationMethod;
 
     #[test]
     fn default_config() {
         let cfg = Config::new();
         assert_eq!(cfg.get_addr(), "localhost:1433");
         assert_eq!(cfg.datasource_string(), "tcp:localhost,1433");
+    }
+
+    #[test]
+    fn connection_settings_preserve_native_defaults_and_explicit_values() {
+        let mut cfg = Config::new();
+        let native = ClientContext::default();
+        let ctx = cfg.to_client_context();
+        assert_eq!(ctx.connect_timeout, native.connect_timeout);
+        assert_eq!(ctx.login_timeout, native.login_timeout);
+        assert_eq!(ctx.connect_retry_count, native.connect_retry_count);
+        assert_eq!(ctx.connect_retry_interval, native.connect_retry_interval);
+
+        cfg.connect_timeout(3)
+            .login_timeout(Some(0))
+            .connect_retry_count(0)
+            .connect_retry_interval(2);
+        let ctx = cfg.to_client_context();
+        assert_eq!(ctx.connect_timeout, 3);
+        assert_eq!(ctx.login_timeout, Some(0));
+        assert_eq!(ctx.connect_retry_count, 0);
+        assert_eq!(ctx.connect_retry_interval, 2);
+
+        cfg.login_timeout(None);
+        assert_eq!(cfg.to_client_context().login_timeout, None);
     }
 
     #[test]
