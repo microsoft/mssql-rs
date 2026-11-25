@@ -2160,6 +2160,11 @@ impl Diagnosis {
         let dac_replaced = target.protocol == Protocol::Admin
             && target.instance.is_none()
             && lookup.is_some_and(|l| l.ok != Some(true));
+        // The lookup resolved the name port 1434's resolving did not: that
+        // failure is superseded too. When the lookup could not resolve it
+        // either, name resolution still reports it.
+        let dac_resolved_again =
+            dac_replaced && lookup.is_some_and(|l| l.detail(connect_stage::ADDRESSES).is_some());
         // The transport the attempt ended on, and the TCP path it tried (the
         // last one), which a later transport may have replaced.
         let primary_at = (groups.len() > looked_up_after).then(|| groups.len() - 1);
@@ -2198,7 +2203,7 @@ impl Diagnosis {
             lookup,
             not_tcp.clone(),
             timed_out,
-            tcp_superseded,
+            tcp_superseded || dac_resolved_again,
         );
         // Without a prefix the client tries a local named instance over
         // shared memory before it asks SQL Server Browser, and a stop after
@@ -2575,10 +2580,6 @@ impl Diagnosis {
         check.deadline_ms = Some(deadline_ms);
         check.duration_ms = Some(step.duration_ms);
         let error_text = step.detail(connect_stage::ERROR);
-        let no_addresses = match step.stage {
-            Stage::Dns => error_text.is_none() && step.os_error().is_none(),
-            _ => step.detail(connect_stage::RESULT) == Some("noAddresses"),
-        };
         let (code, from_text, message) = if step.abandoned() {
             (
                 "timedOut",
@@ -2604,20 +2605,8 @@ impl Diagnosis {
                     |text| LocalizedText::literal(text.trim_end_matches('.')),
                 ),
             )
-        } else if no_addresses {
-            (
-                "noAddresses",
-                false,
-                LocalizedText::new(
-                    "diagnose.error.name_no_addresses",
-                    "the name resolved to no address",
-                    vec![],
-                ),
-            )
         } else {
-            let text = error_text.unwrap_or_default();
-            let (code, from_text) = dns_result_from(step.os_error(), text);
-            (code, from_text, LocalizedText::literal(text))
+            resolver_failure(step)
         };
         check.fields.push(Field::plain("result", code));
         if from_cache {
@@ -3606,9 +3595,20 @@ impl Diagnosis {
     /// A default instance's dedicated administrator connection did not
     /// connect on port 1434 (`group`); as the client does, sqlcmd then asked
     /// SQL Server Browser for its DAC port and connected there, checked
-    /// below. Its connects' errors are kept, superseded: the driver reports
-    /// none of them.
+    /// below. Its errors, a name that did not resolve or connects that
+    /// failed, are kept, superseded: the driver reports none of them.
     fn dac_default_port_moved_past(&mut self, group: &Transport) {
+        let unresolved = group.dns.filter(|d| d.ok == Some(false)).map(|dns| {
+            let (code, from_text, message) = resolver_failure(dns);
+            let mut record = ErrorRecord::new("os", CheckId::NameResolution, "");
+            record.message = message.clone();
+            record.os_error = dns.os_error();
+            record.code = Some(code.to_string());
+            record.from_message_text = from_text;
+            record.superseded = true;
+            self.errors.push(record);
+            message
+        });
         let mut reason = None;
         for step in group.tcp.iter().filter(|s| s.ok != Some(true)) {
             let address = step.detail(connect_stage::ADDRESS).unwrap_or_default();
@@ -3625,7 +3625,9 @@ impl Diagnosis {
             self.errors.push(record);
             reason.get_or_insert(message);
         }
-        let reason = reason.unwrap_or_else(|| {
+        // A connect's failure when there is one (after a failed resolving the
+        // client may still try cached addresses), else the name's.
+        let reason = reason.or(unresolved).unwrap_or_else(|| {
             LocalizedText::new("diagnose.error.not_connected", "it did not connect", vec![])
         });
         let reason_english = reason.render("en-US");
@@ -5602,6 +5604,32 @@ fn aggregate(checks: &[Check]) -> DiagnosticOutcome {
 #[cfg(test)]
 fn dns_result(error: &std::io::Error) -> (&'static str, bool) {
     dns_result_from(error.raw_os_error(), &error.to_string())
+}
+
+/// A resolving that gave no address (a `dns` stage, or an instance lookup's
+/// own resolving): its result, whether that was read from the resolver's
+/// message, and the message.
+fn resolver_failure(step: &Step) -> (&'static str, bool, LocalizedText) {
+    let error = step.detail(connect_stage::ERROR);
+    let no_addresses = match step.stage {
+        Stage::Dns => error.is_none() && step.os_error().is_none(),
+        _ => step.detail(connect_stage::RESULT) == Some("noAddresses"),
+    };
+    if no_addresses {
+        (
+            "noAddresses",
+            false,
+            LocalizedText::new(
+                "diagnose.error.name_no_addresses",
+                "the name resolved to no address",
+                vec![],
+            ),
+        )
+    } else {
+        let text = error.unwrap_or_default();
+        let (code, from_text) = dns_result_from(step.os_error(), text);
+        (code, from_text, LocalizedText::literal(text))
+    }
 }
 
 /// [`dns_result`] from the operating-system code and the message, as the
@@ -9837,13 +9865,7 @@ pub(crate) mod tests {
     /// ended (`ok`) with `lookup`'s details. A lookup that resolved the name
     /// lists its addresses there (see [`RESOLVED`]).
     fn default_dac_stages(ok: Option<bool>, lookup: &[(&'static str, &'static str)]) -> Stages {
-        let mut details = vec![
-            (cs::SERVER, "db01"),
-            (cs::INSTANCE, "MSSQLServer"),
-            (cs::REQUEST, cs::REQUEST_DAC),
-        ];
-        details.extend_from_slice(lookup);
-        Stages::new()
+        let refused = Stages::new()
             .add(
                 Stage::Dns,
                 Some(true),
@@ -9863,8 +9885,46 @@ pub(crate) mod tests {
                     (cs::IO_KIND, "ConnectionRefused"),
                     (cs::ERROR, "refused"),
                 ],
-            )
-            .add(Stage::InstanceLookup, ok, 2, 5, &details)
+            );
+        then_default_dac_lookup(refused, 2, ok, lookup)
+    }
+
+    /// [`default_dac_stages`], with port 1434's name not resolving (it
+    /// resolves again for the lookup, which lists the addresses).
+    fn unresolved_default_dac_stages(
+        ok: Option<bool>,
+        lookup: &[(&'static str, &'static str)],
+    ) -> Stages {
+        let unresolved = Stages::new().add(
+            Stage::Dns,
+            Some(false),
+            0,
+            1,
+            &[
+                (cs::HOST, "db01"),
+                (cs::OS_ERROR, "11001"),
+                (cs::ERROR, "No such host is known. (os error 11001)"),
+            ],
+        );
+        then_default_dac_lookup(unresolved, 1, ok, lookup)
+    }
+
+    /// `stages`, then SQL Server Browser's DAC lookup for db01's
+    /// `MSSQLServer`, from `at` ms for 3 ms, ended (`ok`) with `lookup`'s
+    /// details.
+    fn then_default_dac_lookup(
+        stages: Stages,
+        at: u64,
+        ok: Option<bool>,
+        lookup: &[(&'static str, &'static str)],
+    ) -> Stages {
+        let mut details = vec![
+            (cs::SERVER, "db01"),
+            (cs::INSTANCE, "MSSQLServer"),
+            (cs::REQUEST, cs::REQUEST_DAC),
+        ];
+        details.extend_from_slice(lookup);
+        stages.add(Stage::InstanceLookup, ok, at, at + 3, &details)
     }
 
     /// The addresses a lookup that resolved db01 records.
@@ -10419,6 +10479,138 @@ pub(crate) mod tests {
             "{:#?}",
             report.errors
         );
+    }
+
+    /// Port 1434's name did not resolve, and SQL Server Browser gave another
+    /// DAC port, which connected: port 1434 was moved past, its resolver
+    /// error kept, superseded, and given as the reason.
+    #[test]
+    fn a_default_dac_port_1434_whose_name_did_not_resolve_is_moved_past_with_its_error() {
+        let stages = unresolved_default_dac_stages(Some(true), &[RESOLVED, (cs::PORT, "1500")])
+            .add(
+                Stage::Dns,
+                Some(true),
+                5,
+                6,
+                &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+            )
+            .add(
+                Stage::Tcp,
+                Some(true),
+                6,
+                7,
+                &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1500")],
+            );
+        let report = observed(
+            request("admin:db01", Depth::NetworkReachability),
+            stages,
+            Ended::Stopped,
+        );
+        assert!(
+            report.checks.iter().all(|c| !c.coverage.failed()),
+            "{report:#?}"
+        );
+        assert_eq!(
+            checked(&report, CheckId::TcpConnect).field("port"),
+            Some("1500")
+        );
+        let unresolved: Vec<&ErrorRecord> = report
+            .errors
+            .iter()
+            .filter(|e| e.check == CheckId::NameResolution)
+            .collect();
+        assert_eq!(unresolved.len(), 1, "{:#?}", report.errors);
+        assert!(unresolved[0].superseded && unresolved[0].text.is_none());
+        assert_eq!(unresolved[0].os_error, Some(11001));
+        assert_eq!(unresolved[0].code.as_deref(), Some("notFound"));
+        assert!(
+            report.findings.iter().any(|f| f.certainty == Certainty::Informational
+                && f.text.render("en-US")
+                    == "Port 1434, a default instance's dedicated administrator connection (DAC) \
+                        port, did not connect (No such host is known. (os error 11001)); as the \
+                        client does, sqlcmd then asked SQL Server Browser for the DAC port, \
+                        checked below."),
+            "{:#?}",
+            report.findings
+        );
+    }
+
+    /// Port 1434's name did not resolve, and SQL Server Browser gave 1434
+    /// again: SNI's error 42, with the resolver's code, not a TCP provider
+    /// line.
+    #[test]
+    fn a_default_dac_port_given_again_after_its_name_did_not_resolve_is_sni_error_42() {
+        let report = observed(
+            request("admin:db01", Depth::SessionValidation),
+            unresolved_default_dac_stages(Some(true), &[RESOLVED, (cs::PORT, "1434")]),
+            Ended::Failed(Error::ConnectionError(
+                "Could not establish dedicated administrator connection (DAC) on default port."
+                    .to_string(),
+            )),
+        );
+        assert_eq!(
+            checked(&report, CheckId::NameResolution).field("result"),
+            Some("notFound"),
+            "{report:#?}"
+        );
+        let text = report::text(&report);
+        let errors = error_lines(&text);
+        assert_eq!(errors.len(), 2, "{text}");
+        assert!(
+            errors[0].contains(
+                "SQL Server Network Interfaces: Could not establish dedicated administrator \
+                 connection (DAC) on default port. Make sure that DAC is enabled [11001]."
+            ),
+            "{text}"
+        );
+        assert!(errors[1].contains("A network-related"), "{text}");
+        assert!(!text.contains("TCP Provider"), "{text}");
+    }
+
+    /// Port 1434's name did not resolve, the DAC lookup resolved it again,
+    /// and SQL Server Browser gave no DAC port: SNI reports the lookup's
+    /// failure (error 43), with the time-limit line, and port 1434's resolver
+    /// error is kept, superseded.
+    #[test]
+    fn a_default_dac_lookup_that_resolved_the_name_again_is_reported_instead_of_it() {
+        const NOT_OBTAINED: &str = "SQL Server Network Interfaces: An error occurred while \
+             obtaining the dedicated administrator connection (DAC) port.";
+        let report = observed(
+            request("admin:db01", Depth::SessionValidation),
+            unresolved_default_dac_stages(Some(false), &[RESOLVED, (cs::RESULT, "noAnswer")]),
+            Ended::Failed(Error::ConnectionError("no answer".to_string())),
+        );
+        assert_eq!(
+            checked(&report, CheckId::InstanceResolution).field("result"),
+            Some("noAnswer"),
+            "{report:#?}"
+        );
+        let unresolved: Vec<&ErrorRecord> = report
+            .errors
+            .iter()
+            .filter(|e| e.check == CheckId::NameResolution)
+            .collect();
+        assert!(
+            !unresolved.is_empty() && unresolved.iter().all(|e| e.superseded),
+            "{:#?}",
+            report.errors
+        );
+        let text = report::text(&report);
+        let errors = error_lines(&text);
+        assert_eq!(errors.len(), 3, "{text}");
+        // `Login timeout expired` comes first outside Windows.
+        assert!(errors.iter().any(|l| l.contains(NOT_OBTAINED)), "{text}");
+        assert!(
+            errors.iter().any(|l| l.contains("Login timeout expired")),
+            "{text}"
+        );
+        assert!(
+            errors
+                .last()
+                .is_some_and(|l| l.contains("A network-related")),
+            "{text}"
+        );
+        assert!(!text.contains("TCP Provider"), "{text}");
     }
 
     /// The time limit ran out after SQL Server Browser gave another DAC port,

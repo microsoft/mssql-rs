@@ -181,8 +181,9 @@ fn apply_with(
         .iter()
         .any(|c| c.id == CheckId::ConnectionAttempt && c.field("failedPhase").is_some());
     // A default instance's dedicated administrator connection: port 1434 did
-    // not connect and SQL Server Browser gave 1434 again, so SNI reports
-    // port 1434's failure as its error 42.
+    // not connect (its connects failed, or its name did not resolve) and SQL
+    // Server Browser gave 1434 again, so SNI reports port 1434's failure, with
+    // its code, as its error 42.
     let dac_port_unchanged = protocol == Some(Protocol::Admin)
         && checks.iter().any(|c| {
             c.id == CheckId::InstanceResolution
@@ -200,6 +201,8 @@ fn apply_with(
             None
         } else if dac_port_unchanged && record.check == CheckId::TcpConnect {
             tcp_code(record, windows).map(dac_default_port_failed)
+        } else if dac_port_unchanged && record.check == CheckId::NameResolution {
+            dns_code(record, windows).map(dac_default_port_failed)
         } else {
             let opening = match record.check {
                 CheckId::TcpConnect => true,
@@ -1132,6 +1135,35 @@ mod tests {
                     .iter()
                     .any(|e| e.code.as_deref() == Some("loginTimeoutExpired")),
                 code == "timedOut"
+            );
+        }
+
+        // Port 1434's name did not resolve: error 42 gives the resolver's
+        // code, on every platform.
+        for (os_error, windows) in [(11001, true), (-2, false)] {
+            let mut errors = vec![os(
+                CheckId::NameResolution,
+                "notFound",
+                Some(os_error),
+                "not known",
+            )];
+            let checks = [lookup(None), failed(CheckId::NameResolution)];
+            apply_for(
+                &mut errors,
+                &checks,
+                Some(Protocol::Admin),
+                "admin:db01",
+                windows,
+            );
+            assert_eq!(
+                texts(&errors)[0],
+                "SQL Server Network Interfaces: Could not establish dedicated administrator \
+                 connection (DAC) on default port. Make sure that DAC is enabled [11001]. ",
+                "{windows}"
+            );
+            assert_eq!(
+                errors.last().and_then(|e| e.code.as_deref()),
+                Some("networkRelatedError")
             );
         }
 

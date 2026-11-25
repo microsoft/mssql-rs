@@ -153,10 +153,13 @@ Browser gives none (no answer, or an answer that is not a DAC port,
 `invalidResponse`); the checks after it are `blockedByPrerequisite`. A
 default instance's connects to port 1434 and, when that does not connect,
 asks the DAC request for `MSSQLServer` (reported without an `instance`):
-another port is the TCP path, with port 1434's errors kept, superseded; port
-1434 again ends the attempt, with a confirmed finding. Their errors read as
-the driver words them: a DAC request that gave no port as SNI's error 43, port
-1434 refused again as its error 42. A DAC refused away from the loopback
+another port is the TCP path, with port 1434's errors (its connects', or its
+name's when it did not resolve) kept, superseded; port 1434 again ends the
+attempt, with a confirmed finding. Their errors read as the driver words them:
+a DAC request that gave no port as SNI's error 43 (port 1434's failed
+resolving is then kept, superseded, when the request resolved the name), port
+1434's failure, refused or a name that did not resolve, as its error 42 with
+that failure's code. A DAC refused away from the loopback
 address adds a suspected finding: unless the server's `remote admin
 connections` option is on, it accepts the DAC on the loopback address alone.
 
