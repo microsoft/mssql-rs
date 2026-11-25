@@ -105,6 +105,8 @@ impl LogicalConnection {
                 drop(handle.take());
             }
             Err(error) => {
+                // Do not panic: publication guards also call this during Drop.
+                // Broken state prevents reuse; final-owner drop discards any retained handle.
                 tracing::error!(%error, "Undelivered connection unexpectedly has an active borrower")
             }
         }
