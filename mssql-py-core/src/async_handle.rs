@@ -192,7 +192,7 @@ impl LogicalConnection {
                         if discard {
                             lease.mark_discard();
                         }
-                        lease.finish_release(deadline).map_err(map_pool_error)?;
+                        lease.finish_release(deadline)?;
                     }
                     Ok(())
                 },

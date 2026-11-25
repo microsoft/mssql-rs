@@ -577,7 +577,11 @@ impl PoolAdapter {
                 let settled = self.settled.notified();
                 tokio::pin!(settled);
                 settled.as_mut().enable();
-                if self.lock()?.pending.is_empty() {
+                let complete = self.lock()?.pending.is_empty();
+                if Instant::now() >= deadline {
+                    return Err(map_pool_error(PoolError::ShutdownTimeout));
+                }
+                if complete {
                     return Ok(());
                 }
                 settled.await;

@@ -13,6 +13,8 @@ use tokio::time::Instant;
 
 use crate::async_errors::{OperationalError, map_connection_claim, map_tds_error};
 use crate::async_handle::{CloseMode, CloseResult, check_cleanup_deadline};
+use crate::async_pool::map_pool_error;
+use crate::pool::error::PoolResult;
 
 pub(crate) type CursorId = u64;
 pub(crate) type FetchId = u64;
@@ -685,7 +687,7 @@ impl AsyncConnectionState {
         mode: CloseMode,
         deadline: Instant,
         result: PyResult<T>,
-        finish: impl FnOnce(T, bool) -> PyResult<()>,
+        finish: impl FnOnce(T, bool) -> PoolResult<()>,
         sender: &watch::Sender<Option<CloseResult>>,
     ) {
         let mut state = self.lock();
@@ -697,15 +699,17 @@ impl AsyncConnectionState {
                     "Connection was interrupted during commit cleanup; outcome may be unknown; connection discarded",
                 ));
             }
-            finish(value, self.must_discard())
+            Ok(finish(value, self.must_discard()))
         });
-        if result.is_err() {
+        if !matches!(&result, Ok(Ok(()))) {
             self.mark_for_discard();
             state.broken = true;
         }
         state.lifecycle = ConnectionLifecycle::Closed;
         state.active_operation = None;
-        // Final return and publication share the cancellation lock.
+        // Python error normalization can re-enter the logical connection.
+        drop(state);
+        let result = result.and_then(|returned| returned.map_err(map_pool_error));
         sender.send_replace(Some(result.map_err(Arc::new)));
     }
 
@@ -741,6 +745,47 @@ mod tests {
         AsyncConnectionState, ClaimError, ConnectionLifecycle, FetchCompletion, OperationPhase,
         PreflightTask, SessionOperationGuard,
     };
+
+    #[test]
+    fn close_error_normalization_allows_session_reentry() {
+        use pyo3::prelude::*;
+        use pyo3::types::PyCFunction;
+
+        use crate::async_errors::OperationalError;
+        use crate::async_handle::CloseMode;
+        use crate::pool::error::PoolError;
+
+        let state = Arc::new(AsyncConnectionState::new());
+        let unlocked = Arc::new(AtomicBool::new(false));
+        let original = Python::attach(|py| {
+            let error_type = py.get_type::<OperationalError>();
+            let original = error_type.getattr("__init__").unwrap().unbind();
+            let state = state.clone();
+            let unlocked = unlocked.clone();
+            let initialize = PyCFunction::new_closure(py, None, None, move |_, _| {
+                unlocked.store(state.inner.try_lock().is_ok(), Ordering::SeqCst);
+                Ok::<(), PyErr>(())
+            })
+            .unwrap();
+            error_type.setattr("__init__", initialize).unwrap();
+            original
+        });
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        state.complete_close(
+            CloseMode::Rollback,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            Ok(()),
+            |(), _| Err(PoolError::CleanupTimeout),
+            &sender,
+        );
+        Python::attach(|py| {
+            py.get_type::<OperationalError>()
+                .setattr("__init__", original.bind(py))
+                .unwrap();
+        });
+        assert!(receiver.borrow().as_ref().unwrap().is_err());
+        assert!(unlocked.load(Ordering::SeqCst));
+    }
 
     #[tokio::test(start_paused = true)]
     #[allow(clippy::await_holding_lock)] // Expire the mock deadline while authorization is blocked.

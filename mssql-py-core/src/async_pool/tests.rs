@@ -49,6 +49,34 @@ fn manager() -> AsyncPoolManager {
     manager
 }
 
+#[tokio::test]
+async fn shutdown_rejects_an_expired_original_deadline_when_already_settled() {
+    let pool = PoolAdapter {
+        manager: manager(),
+        config: PoolConfig::new(CLOSE_TIMEOUT, CLOSE_TIMEOUT, CLOSE_TIMEOUT).unwrap(),
+        attempts: Mutex::new(Attempts {
+            closed: false,
+            next_id: 0,
+            pending: HashMap::new(),
+        }),
+        settled: Notify::new(),
+    };
+    pool.stop().unwrap();
+    let error = pool.shutdown(Instant::now()).await.unwrap_err();
+    Python::attach(|py| {
+        assert!(error.is_instance_of::<OperationalError>(py));
+        assert_eq!(
+            error
+                .value(py)
+                .getattr("pool_reason")
+                .unwrap()
+                .extract::<String>()
+                .unwrap(),
+            "ShutdownTimeout"
+        );
+    });
+}
+
 async fn acquire(manager: &AsyncPoolManager, factory: &Factory) -> crate::pool::session::PoolLease {
     manager
         .acquire(

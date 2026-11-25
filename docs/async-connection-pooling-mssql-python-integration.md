@@ -416,9 +416,11 @@ budget. Use Doc 1 section 9.1's `release_with_deadline` with the original close
 deadline; plain `release` uses the configured default.
 
 The native adapter prepares release asynchronously, then performs its synchronous
-return with logical close publication under the operation-cancellation lock.
+return and terminal logical-state transition under the operation-cancellation lock.
 Cancellation after native work finishes but before its waiter receives the result
 must still discard the lease if it wins that terminal close boundary.
+Python error normalization and waiter notification happen after unlocking; error
+construction can execute Python and re-enter the logical connection.
 
 The slot stays checked out through the entire close/return sequence. On reuse,
 update the return timestamp and make the clean client available only after the
@@ -769,6 +771,8 @@ it does not cancel application tasks. Caller cancellation remains cancellation.
 An exceptional pool context exit preserves the block exception and reports
 shutdown failure through a redacted diagnostic (and an exception note on Python
 versions supporting `add_note`). A clean exit propagates shutdown failure.
+Shutdown checks its original deadline before reporting completion, including when
+all work was already settled when the native future was first polled.
 
 `PyAsyncConnection.connect(context, python_logger=None, autocommit=False, *,
 token_provider=None, pool=None, acquire_timeout=None, isolation_level=None)`
