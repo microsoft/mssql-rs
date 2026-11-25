@@ -1305,6 +1305,104 @@ def test_fetch_cancellation_during_row_materialization_keeps_connection_reusable
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize(
+    "operation",
+    ["execute", "executemany", "fetchone", "fetchmany", "nextset", "exhausted-fetchall"],
+)
+@pytest.mark.parametrize("cancel_delivery", [True, False], ids=["cancel-wins", "delivery-wins"])
+def test_query_cancellation_after_native_completion(
+    client_context, monkeypatch, operation, cancel_delivery,
+):
+    """Pause event-loop delivery after native work finishes, not row conversion."""
+
+    async def run():
+        conn = await connect(client_context)
+        loop = asyncio.get_running_loop()
+        original = loop.call_soon_threadsafe
+        entered = threading.Event()
+        held = []
+        target = []
+
+        def hold_delivery(callback, *args, **kwargs):
+            if target and args and args[0] is target[0]:
+                held.append((callback, args, kwargs))
+                entered.set()
+                return None
+            return original(callback, *args, **kwargs)
+
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            if operation in ("fetchone", "fetchmany"):
+                await cursor.execute(
+                    "SELECT value FROM (VALUES (1), (2), (3)) AS source(value)",
+                    use_prepare=False,
+                )
+            elif operation == "nextset":
+                await cursor.execute("SELECT 1; SELECT 2", use_prepare=False)
+                await cursor.fetchall()
+            elif operation == "exhausted-fetchall":
+                await cursor.execute("SELECT 1", use_prepare=False)
+
+            monkeypatch.setattr(loop, "call_soon_threadsafe", hold_delivery)
+            if operation == "execute":
+                pending = cursor.execute("SELECT 1", use_prepare=False)
+            elif operation == "executemany":
+                pending = cursor.executemany("SELECT ?", [(1,)], use_prepare=False)
+            elif operation == "fetchmany":
+                pending = cursor.fetchmany(1)
+            elif operation == "exhausted-fetchall":
+                pending = cursor.fetchall()
+            else:
+                pending = getattr(cursor, operation)()
+            target.append(pending)
+            for _ in range(500):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("Native completion never scheduled result delivery")
+            assert not pending.done()
+            monkeypatch.setattr(loop, "call_soon_threadsafe", original)
+
+            if cancel_delivery:
+                assert pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+                await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), 2)
+                probe = conn.cursor()
+                await probe.execute("SELECT 99, @@SPID", use_prepare=False)
+                assert await probe.fetchall() == [(99, session_id)]
+                # The discarded result must not affect a newly owned batch.
+                await probe.execute("SELECT 100", use_prepare=False)
+                for callback, args, kwargs in held:
+                    original(callback, *args, **kwargs)
+                held.clear()
+                await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), 2)
+                assert await probe.fetchall() == [(100,)]
+            else:
+                for callback, args, kwargs in held:
+                    original(callback, *args, **kwargs)
+                held.clear()
+                await asyncio.wait_for(asyncio.shield(pending), 2)
+                if operation not in ("executemany", "exhausted-fetchall"):
+                    with pytest.raises(mssql_py_core.InterfaceError, match="busy"):
+                        conn.cursor().execute("SELECT 99", use_prepare=False)
+                await cursor.execute("SELECT 100", use_prepare=False)
+                await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), 2)
+                assert await cursor.fetchall() == [(100,)]
+        finally:
+            monkeypatch.setattr(loop, "call_soon_threadsafe", original)
+            for callback, args, kwargs in held:
+                original(callback, *args, **kwargs)
+            await asyncio.sleep(0)
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_nextset_keeps_event_loop_responsive_while_draining(client_context):
     async def run():
         conn = await connect(client_context)

@@ -5,6 +5,7 @@
 
 import asyncio
 import datetime
+import threading
 import uuid
 import warnings
 from decimal import Decimal
@@ -75,6 +76,72 @@ def test_cancelled_query_settles_before_connection_reuse(client_context, method,
                     await pending
             await conn.close()
             await observer.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("method", ["execute", "executemany"])
+@pytest.mark.parametrize("use_prepare", [False, True])
+def test_cancelled_settled_query_logging_cannot_break_replacement(
+    client_context, method, use_prepare,
+):
+    async def run():
+        entered = threading.Event()
+        release = threading.Event()
+
+        class Logger:
+            armed = False
+
+            def py_core_log(self, _level, message, _module, _line):
+                completed = (
+                    "query executed successfully" in message
+                    if method == "execute"
+                    else "PyAsyncCursor::executemany: completed" in message
+                )
+                if self.armed and completed:
+                    self.armed = False
+                    entered.set()
+                    release.wait(15)
+
+        logger = Logger()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            conn = await mssql_py_core.PyAsyncConnection.connect(
+                client_context, logger, autocommit=True
+            )
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            logger.armed = True
+            if method == "execute":
+                pending = cursor.execute("SET NOCOUNT ON", use_prepare=use_prepare)
+            else:
+                pending = cursor.executemany(
+                    "SET NOCOUNT ON", [()], use_prepare=use_prepare
+                )
+            for _ in range(500):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("Final query logging did not block")
+
+            replacement = conn.cursor()
+            await replacement.execute("SELECT 99, @@SPID", use_prepare=False)
+            assert pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), 6)
+            assert not release.is_set()
+            assert await replacement.fetchall() == [(99, session_id)]
+            await replacement.execute("SELECT 100", use_prepare=False)
+            await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), 1)
+            assert await replacement.fetchall() == [(100,)]
+        finally:
+            release.set()
+            await conn.close()
 
     asyncio.run(run())
 

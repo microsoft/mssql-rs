@@ -8,13 +8,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use mssql_tds::connection::tds_client::TdsClient;
+use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::async_cursor::map_claim_error;
+use crate::async_description::DescriptionState;
 use crate::async_errors::map_tds_error;
+use crate::async_fetch::{BufferedResults, FetchState, FetchStatus};
+use crate::async_handle::LogicalConnection;
 use crate::async_session::{AsyncConnectionState, FetchId, OperationId};
 
 pub(crate) const SETTLEMENT_TIMEOUT_SECONDS: u32 = 5;
@@ -26,9 +30,27 @@ enum Target {
     Fetch(OperationId, FetchId),
 }
 
+impl Target {
+    fn ids(self) -> (OperationId, Option<FetchId>) {
+        match self {
+            Self::Execute(operation_id) => (operation_id, None),
+            Self::Fetch(operation_id, fetch_id) => (operation_id, Some(fetch_id)),
+        }
+    }
+}
+
 struct State {
     target: Option<Target>,
     completed: bool,
+    delivered: bool,
+    cursor: Option<Py<PyAny>>,
+}
+
+struct DeliveryRecovery {
+    client: Arc<LogicalConnection>,
+    fetch_state: Arc<FetchState>,
+    description_state: Arc<DescriptionState>,
+    buffered_results: Arc<BufferedResults>,
 }
 
 pub(crate) struct QueryControl {
@@ -38,20 +60,57 @@ pub(crate) struct QueryControl {
     settled: watch::Sender<bool>,
     deadline: OnceLock<tokio::time::Instant>,
     operation: &'static str,
+    delivery_finished: CancellationToken,
+    recovery: Option<DeliveryRecovery>,
 }
 
 impl QueryControl {
     pub(crate) fn new(session: Arc<AsyncConnectionState>, operation: &'static str) -> Arc<Self> {
+        Self::create(session, operation, None, None)
+    }
+
+    pub(crate) fn for_delivery(
+        session: Arc<AsyncConnectionState>,
+        operation: &'static str,
+        client: Arc<LogicalConnection>,
+        fetch_state: Arc<FetchState>,
+        description_state: Arc<DescriptionState>,
+        buffered_results: Arc<BufferedResults>,
+        cursor: Py<PyAny>,
+    ) -> Arc<Self> {
+        Self::create(
+            session,
+            operation,
+            Some(DeliveryRecovery {
+                client,
+                fetch_state,
+                description_state,
+                buffered_results,
+            }),
+            Some(cursor),
+        )
+    }
+
+    fn create(
+        session: Arc<AsyncConnectionState>,
+        operation: &'static str,
+        recovery: Option<DeliveryRecovery>,
+        cursor: Option<Py<PyAny>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             session,
             state: Mutex::new(State {
                 target: None,
                 completed: false,
+                delivered: false,
+                cursor,
             }),
             cancelled: CancellationToken::new(),
             settled: watch::channel(false).0,
             deadline: OnceLock::new(),
             operation,
+            delivery_finished: CancellationToken::new(),
+            recovery,
         })
     }
 
@@ -66,6 +125,10 @@ impl QueryControl {
     fn register(&self, target: Target) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.target = Some(target);
+        if self.recovery.is_some() {
+            let (operation_id, fetch_id) = target.ids();
+            self.session.defer_query_delivery(operation_id, fetch_id);
+        }
         if self.cancelled.is_cancelled() {
             self.cancel_target(target);
         }
@@ -91,6 +154,9 @@ impl QueryControl {
 
     pub(crate) fn cancel(&self) {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.delivered {
+            return;
+        }
         if !state.completed {
             self.deadline
                 .get_or_init(|| tokio::time::Instant::now() + SETTLEMENT_TIMEOUT);
@@ -99,13 +165,62 @@ impl QueryControl {
             }
             self.cancelled.cancel();
         }
+        self.delivery_finished.cancel();
     }
 
     pub(crate) fn complete(&self) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        self.complete_locked(&mut state);
+    }
+
+    pub(crate) fn complete_if_released(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(target) = state.target {
+            let (operation_id, fetch_id) = target.ids();
+            if !self.session.owns_query(operation_id, fetch_id) {
+                self.complete_locked(&mut state);
+            }
+        }
+    }
+
+    fn complete_locked(&self, state: &mut State) {
         state.completed = true;
         state.target = None;
+        state.cursor = None;
         self.settled.send_replace(true);
+    }
+
+    async fn recover_undelivered(&self) -> PyResult<()> {
+        let target = self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .target;
+        let Some((target, recovery)) = target.zip(self.recovery.as_ref()) else {
+            return Ok(());
+        };
+        let (operation_id, fetch_id) = target.ids();
+        if !self.session.query_delivery_pending(operation_id, fetch_id) {
+            return Ok(());
+        }
+        let result = async {
+            let mut client = recovery
+                .client
+                .lock_operation(operation_id)
+                .await
+                .map_err(map_claim_error)?;
+            self.settle_open_batch(&mut client).await
+        }
+        .await;
+        if result.is_err() {
+            self.session.mark_broken();
+        }
+        self.session.release_operation(operation_id);
+        recovery.fetch_state.set(FetchStatus::NoResultSet);
+        recovery.description_state.replace(None);
+        recovery.buffered_results.replace(Default::default());
+        self.complete_if_released();
+        result
     }
 
     fn is_settled(&self) -> bool {
@@ -168,14 +283,22 @@ impl QueryControl {
         match tokio::time::timeout_at(deadline, wait).await {
             Ok(result) => result?,
             Err(_) => {
-                self.session.mark_broken();
-                tracing::error!(
-                    operation = self.operation,
-                    "Async query cancellation settlement timed out; connection marked broken"
-                );
-                return Err(PyRuntimeError::new_err(
-                    "Query cancellation settlement timed out; connection is broken",
-                ));
+                let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                if state.completed || state.delivered {
+                    return self.session.ensure_open().map_err(map_claim_error);
+                }
+                let retired = state.target.is_some_and(|target| {
+                    let (operation_id, fetch_id) = target.ids();
+                    self.session.mark_broken_if_owned(operation_id, fetch_id)
+                });
+                drop(state);
+                let message = if retired {
+                    "Query cancellation settlement timed out; connection is broken"
+                } else {
+                    "Query cancellation settlement timed out without owning the connection"
+                };
+                tracing::error!(operation = self.operation, retired, "{message}");
+                return Err(PyRuntimeError::new_err(message));
             }
         }
         self.session.ensure_open().map_err(map_claim_error)
@@ -185,6 +308,80 @@ impl QueryControl {
 #[pyclass]
 struct QuerySettlement {
     control: Arc<QueryControl>,
+}
+
+#[pyclass]
+struct QueryDelivery {
+    control: Arc<QueryControl>,
+}
+
+#[pymethods]
+impl QueryDelivery {
+    fn cancelled(&self, future: &Bound<'_, PyAny>) -> PyResult<()> {
+        if future.call_method0("cancelled")?.is_truthy()? {
+            self.control.cancel();
+        }
+        Ok(())
+    }
+
+    fn deliver(
+        &self,
+        future: &Bound<'_, PyAny>,
+        complete: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+        failed: bool,
+    ) -> PyResult<()> {
+        let mut state = self
+            .control
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if future.call_method0("done")?.is_truthy()? {
+            drop(state);
+            self.cancelled(future)?;
+            return Ok(());
+        }
+        if self.control.cancelled.is_cancelled() {
+            drop(state);
+            if failed {
+                complete.call1((value,))?;
+            } else {
+                future.call_method1(
+                    "set_exception",
+                    (map_tds_error(
+                        self.control.operation,
+                        mssql_tds::error::Error::OperationCancelledError(
+                            "Async query was cancelled before result delivery".to_owned(),
+                        ),
+                        Vec::new(),
+                    ),),
+                )?;
+            }
+            return Ok(());
+        }
+        if !failed && let Err(error) = self.control.session.ensure_open() {
+            future.call_method1("set_exception", (map_claim_error(error),))?;
+            state.delivered = true;
+            self.control.delivery_finished.cancel();
+            return Ok(());
+        }
+        // The event-loop callback arbitrates delivery and cancellation under the GIL.
+        if let Err(error) = complete.call1((value,)) {
+            drop(state);
+            self.control.session.mark_broken();
+            self.control.cancel();
+            return Err(error);
+        }
+        if let Some(target) = state.target {
+            let (operation_id, fetch_id) = target.ids();
+            self.control
+                .session
+                .publish_query_delivery(operation_id, fetch_id);
+        }
+        state.delivered = true;
+        self.control.delivery_finished.cancel();
+        Ok(())
+    }
 }
 
 #[pymethods]
@@ -262,7 +459,44 @@ where
         .map_err(|error| PyRuntimeError::new_err(format!("Async query worker failed: {error}")))?
 }
 
-/// The worker owns protocol futures; cancellation of its Python join only signals it.
+async fn schedule_delivery<T>(
+    event_loop: Py<PyAny>,
+    future: Py<PyAny>,
+    delivery: Py<QueryDelivery>,
+    result: PyResult<T>,
+) -> PyResult<()>
+where
+    T: for<'a> IntoPyObject<'a> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        Python::attach(move |py| {
+            let future = future.bind(py);
+            let (complete, value, failed) = match result.and_then(|value| value.into_py_any(py)) {
+                Ok(value) => (future.getattr("set_result")?, value, false),
+                Err(error) => (
+                    future.getattr("set_exception")?,
+                    error.into_py_any(py)?,
+                    true,
+                ),
+            };
+            event_loop.bind(py).call_method1(
+                "call_soon_threadsafe",
+                (
+                    delivery.bind(py).getattr("deliver")?,
+                    future,
+                    complete,
+                    value,
+                    failed,
+                ),
+            )?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| PyRuntimeError::new_err(format!("Query result delivery failed: {error}")))?
+}
+
+/// Registered workers retain recovery ownership until Python accepts their result.
 pub(crate) fn query_future_into_py<'py, F, T>(
     py: Python<'py>,
     future: F,
@@ -279,14 +513,65 @@ where
         },
     )?;
     let cancel_and_settle = settlement.bind(py).getattr("cancel_and_settle")?;
-    let future = run_query_in_background(future, Arc::clone(&control));
-    let awaitable = pyo3_async_runtimes::tokio::future_into_py(py, future)?;
+    let locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+    let event_loop = locals.event_loop(py).unbind();
+    let awaitable = event_loop.bind(py).call_method0("create_future")?;
+    let delivery = Py::new(
+        py,
+        QueryDelivery {
+            control: Arc::clone(&control),
+        },
+    )?;
+    awaitable.call_method1(
+        "add_done_callback",
+        (delivery.bind(py).getattr("cancelled")?,),
+    )?;
     if let Err(error) = awaitable.setattr("_cancel_and_settle", cancel_and_settle) {
         control.cancel();
         control.session.mark_broken();
         tracing::error!(%error, "Failed to attach async query settlement handle");
         return Err(error);
     }
+    let failure_loop = event_loop.clone_ref(py);
+    let failure_future = awaitable.clone().unbind();
+    let failure_delivery = delivery.clone_ref(py);
+    let python_future = awaitable.clone().unbind();
+    let worker_control = Arc::clone(&control);
+    let worker = async move {
+        let result = future.await;
+        schedule_delivery(event_loop, python_future, delivery, result).await?;
+        worker_control.delivery_finished.cancelled().await;
+        if worker_control.cancelled.is_cancelled() {
+            worker_control.recover_undelivered().await?;
+        }
+        Ok(())
+    };
+    pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+        let result = run_query_in_background(
+            pyo3_async_runtimes::tokio::scope(locals, worker),
+            Arc::clone(&control),
+        )
+        .await;
+        if let Err(error) = result {
+            if control.session.ensure_open().is_ok() {
+                control.session.mark_broken();
+            }
+            tracing::error!(%error, "Async query delivery or recovery failed");
+            if let Err(error) =
+                schedule_delivery::<()>(failure_loop, failure_future, failure_delivery, Err(error))
+                    .await
+            {
+                tracing::error!(%error, "Failed to report async query delivery error");
+            }
+        } else if let Err(error) = tokio::task::spawn_blocking(move || {
+            Python::attach(move |_| drop((failure_loop, failure_future, failure_delivery)));
+        })
+        .await
+        {
+            control.session.mark_broken();
+            tracing::error!(%error, "Failed to release async query delivery references");
+        }
+    });
     Ok(awaitable)
 }
 
@@ -298,6 +583,37 @@ mod tests {
 
     use super::*;
     use crate::async_session::{ClaimError, SessionOperationGuard};
+
+    #[test]
+    fn interrupted_worker_cannot_deliver_a_queued_success() {
+        let session = Arc::new(AsyncConnectionState::new());
+        let control = QueryControl::new(Arc::clone(&session), "execute");
+        session.mark_broken();
+        Python::attach(|py| {
+            let event_loop = py
+                .import("asyncio")
+                .unwrap()
+                .call_method0("new_event_loop")
+                .unwrap();
+            let future = event_loop.call_method0("create_future").unwrap();
+            QueryDelivery { control }
+                .deliver(
+                    &future,
+                    &future.getattr("set_result").unwrap(),
+                    &py.None().into_bound(py),
+                    false,
+                )
+                .unwrap();
+            assert!(
+                future
+                    .call_method0("result")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("broken")
+            );
+            event_loop.call_method0("close").unwrap();
+        });
+    }
 
     #[tokio::test]
     async fn dropping_the_python_join_keeps_the_worker_and_ownership_until_settled() {
@@ -393,6 +709,53 @@ mod tests {
         control.cancel();
 
         assert!(session.finish_execute(second.operation_id, false));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_settlement_timeouts_cannot_retire_replacement_generations() {
+        for fetching in [false, true] {
+            let session = Arc::new(AsyncConnectionState::new());
+            let original = session.claim_execute(1).unwrap();
+            let control = QueryControl::new(Arc::clone(&session), "execute");
+            let replacement_id = if fetching {
+                assert!(session.finish_execute(original.operation_id, true));
+                let fetch = session.claim_fetch(1).unwrap();
+                control.register_fetch(fetch.operation_id, fetch.fetch_id);
+                assert_eq!(
+                    session.finish_fetch(fetch.operation_id, fetch.fetch_id, false, true),
+                    crate::async_session::FetchCompletion::Published
+                );
+                session.claim_fetch(1).unwrap().operation_id
+            } else {
+                control.register_execute(original.operation_id);
+                session.release_operation(original.operation_id);
+                session.claim_execute(2).unwrap().operation_id
+            };
+            control.cancel();
+
+            let error = control.wait_for_settlement().await.unwrap_err();
+
+            assert!(error.to_string().contains("timed out"));
+            assert!(!session.is_broken());
+            assert!(!session.must_discard());
+            assert_eq!(session.validate_operation(replacement_id), Ok(()));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accepted_delivery_does_not_require_worker_completion_before_settlement() {
+        let session = Arc::new(AsyncConnectionState::new());
+        let claim = session.claim_execute(1).unwrap();
+        let control = QueryControl::new(Arc::clone(&session), "execute");
+        control.register_execute(claim.operation_id);
+        assert!(session.finish_execute(claim.operation_id, true));
+        control.state.lock().unwrap().delivered = true;
+        control.cancel();
+
+        control.wait_for_settlement().await.unwrap();
+
+        assert!(!session.is_broken());
+        assert!(session.claim_fetch(1).is_ok());
     }
 
     #[tokio::test(start_paused = true)]

@@ -60,6 +60,13 @@ For SDK authors integrating the native runtime:
   conversion while rows or later result sets remain. Cancellation can settle
   that batch without waiting for conversion. Fully exhausted batches release
   ownership before conversion, so blocked conversion does not delay reuse.
+  Native completion does not end cancellation recovery: while an undelivered
+  result retains a batch, its worker and operation generation remain active
+  until the Python event loop accepts the result or cancellation settles it.
+  A settlement hook cannot cancel later work after result delivery wins.
+  After cleanup and cursor-state publication release ownership, logging does
+  not delay settlement. Timeout retirement checks the originating operation
+  and fetch generation atomically, so stale waits cannot break newer work.
   Credential-provider cancellation during idle session recovery propagates
   `CancelledError` without permanently breaking the logical connection when no
   batch is open; a later query can retry recovery.

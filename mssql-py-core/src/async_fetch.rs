@@ -517,7 +517,7 @@ fn fetch<'py>(
         session_state,
         cursor_id,
         fetch_state,
-        description_state: _,
+        description_state,
         buffered_results,
         rowcount: _,
     } = resources;
@@ -554,7 +554,15 @@ fn fetch<'py>(
     let operation_id = claim.operation_id;
     let fetch_id = claim.fetch_id;
     let future_state = session_state.clone();
-    let query_control = QueryControl::new(session_state.clone(), operation);
+    let query_control = QueryControl::for_delivery(
+        session_state.clone(),
+        operation,
+        client.clone(),
+        fetch_state.clone(),
+        description_state.clone(),
+        buffered_results.clone(),
+        cursor.clone_ref(py).into_any(),
+    );
     query_control.register_fetch(operation_id, fetch_id);
     let worker_control = query_control.clone();
     let guard_dispatch = dispatch.clone();
@@ -642,6 +650,7 @@ fn fetch<'py>(
                         };
                         fetch_guard.fail(has_open_batch || connection_dead);
                         fetch_state.set(FetchStatus::NoResultSet);
+                        worker_control.complete_if_released();
                         return Err(map_fetch_error(
                             operation,
                             Error::OperationCancelledError("Fetch was cancelled".to_string()),
@@ -703,6 +712,7 @@ fn fetch<'py>(
                 record_result_set_status("error");
                 fetch_guard.fail(has_open_batch || connection_dead);
                 fetch_state.set(FetchStatus::NoResultSet);
+                worker_control.complete_if_released();
                 Err(map_fetch_error(
                     operation,
                     error,
@@ -909,7 +919,15 @@ pub(crate) fn nextset<'py>(
     let operation_id = claim.operation_id;
     let fetch_id = claim.fetch_id;
     let future_state = session_state.clone();
-    let query_control = QueryControl::new(session_state.clone(), "nextset");
+    let query_control = QueryControl::for_delivery(
+        session_state.clone(),
+        "nextset",
+        client.clone(),
+        fetch_state.clone(),
+        description_state.clone(),
+        buffered_results.clone(),
+        cursor.clone_ref(py).into_any(),
+    );
     query_control.register_fetch(operation_id, fetch_id);
     let worker_control = Arc::clone(&query_control);
     let previous_fetch_status = fetch_state.replace(FetchStatus::NoResultSet);
@@ -999,6 +1017,7 @@ pub(crate) fn nextset<'py>(
                                 fetch_guard.fail(true);
                                 future_fetch_state.set(FetchStatus::NoResultSet);
                                 future_description_state.replace(None);
+                                worker_control.complete_if_released();
                                 return Err(error);
                             }
                             (client.has_open_batch(), client.is_connection_dead())
@@ -1030,6 +1049,7 @@ pub(crate) fn nextset<'py>(
                         future_description_state.replace(description);
                         future_fetch_state.set(next_fetch_status);
                         rowcount.store(next_rowcount, Ordering::Release);
+                        worker_control.complete_if_released();
                         tracing::debug!(
                             "PyAsyncCursor::nextset: completed; has_result={has_result}; has_rows={has_rows}; column_count={column_count}; elapsed_ms={}; read_ms={read_ms}; materialization_ms={}",
                             started.elapsed().as_millis(),
@@ -1042,6 +1062,7 @@ pub(crate) fn nextset<'py>(
                     }
                     Err(error) => {
                         future_fetch_state.set(FetchStatus::NoResultSet);
+                        worker_control.complete_if_released();
                         tracing::error!(
                             "PyAsyncCursor::nextset: description materialization failed; column_count={column_count}; elapsed_ms={}; read_ms={read_ms}; materialization_ms={}; error={error}",
                             started.elapsed().as_millis(),
@@ -1057,6 +1078,7 @@ pub(crate) fn nextset<'py>(
                 record_result_set_status("error");
                 fetch_guard.fail(has_open_batch || connection_dead);
                 future_fetch_state.set(FetchStatus::NoResultSet);
+                worker_control.complete_if_released();
                 Err(map_nextset_error(error, info_messages, read_ms))
             }
         }

@@ -709,10 +709,13 @@ async fn settle_cancelled_execute(
         .await
         .map_err(|error| {
             guard.settle(false);
+            control.complete_if_released();
             map_claim_error(error)
         })?;
     let result = control.settle_open_batch(&mut client).await;
+    drop(client);
     guard.settle(result.is_err());
+    control.complete_if_released();
     result
 }
 
@@ -789,7 +792,15 @@ pub(crate) fn execute<'py>(
     let previous_rowcount = rowcount.swap(-1, Ordering::AcqRel);
     let previous_buffered_results = buffered_results.replace(VecDeque::new());
     let future_rowcount = rowcount.clone();
-    let query_control = QueryControl::new(session_state.clone(), "execute");
+    let query_control = QueryControl::for_delivery(
+        session_state.clone(),
+        "execute",
+        client.clone(),
+        fetch_state.clone(),
+        description_state.clone(),
+        buffered_results.clone(),
+        cursor.clone_ref(py).into_any(),
+    );
     query_control.register_execute(operation_id);
     let worker_control = query_control.clone();
 
@@ -863,6 +874,7 @@ pub(crate) fn execute<'py>(
                             .await?;
                             return Err(cancelled_execute_error());
                         }
+                        worker_control.complete_if_released();
                         tracing::error!(
                             "PyAsyncCursor::execute: cursor description materialization failed; column_count={column_count}; elapsed_ms={}; error={error}",
                             description_started.elapsed().as_millis()
@@ -886,6 +898,7 @@ pub(crate) fn execute<'py>(
                 future_rowcount.store(next_rowcount, Ordering::Release);
                 future_description_state.replace(description);
                 future_fetch_state.set(fetch_status);
+                worker_control.complete_if_released();
                 tracing::info!(
                     "PyAsyncCursor::execute: query executed successfully; has_result_set={has_result_set}; column_count={column_count}; description_materialization_ms={description_materialization_ms}; has_open_batch={has_open_batch}"
                 );
@@ -894,6 +907,7 @@ pub(crate) fn execute<'py>(
             Err(error) => {
                 record_result_set_status("error");
                 operation_guard.settle(error.breaks_session(has_open_batch, connection_dead));
+                worker_control.complete_if_released();
                 Err(map_execute_error(error.error, info_messages))
             }
         }
@@ -947,7 +961,15 @@ pub(crate) fn executemany<'py>(
     let seq_of_parameters = seq_of_parameters.clone().unbind();
     let trace_dispatch = dispatch.clone();
     let task_state = session_state.clone();
-    let query_control = QueryControl::new(session_state.clone(), "executemany");
+    let query_control = QueryControl::for_delivery(
+        session_state.clone(),
+        "executemany",
+        client.clone(),
+        fetch_state.clone(),
+        description_state.clone(),
+        buffered_results.clone(),
+        cursor.clone_ref(py).into_any(),
+    );
     let worker_control = Arc::clone(&query_control);
 
     let future = move |preflight_task: Arc<PreflightTask>| async move {
@@ -1028,6 +1050,7 @@ pub(crate) fn executemany<'py>(
                 let mut client = client.lock_operation(operation_id).await.map_err(|error| {
                     operation_guard.settle(false);
                     interruption_guard.complete();
+                    worker_control.complete_if_released();
                     map_claim_error(error)
                 })?;
                 let result =
@@ -1077,6 +1100,9 @@ pub(crate) fn executemany<'py>(
                             let description_materialization_ms =
                                 description_started.elapsed().as_millis();
                             record_result_set_status("error");
+                            operation_guard.settle(false);
+                            interruption_guard.complete();
+                            worker_control.complete_if_released();
                             tracing::error!(
                                 batch_count,
                                 result_set_count,
@@ -1087,8 +1113,6 @@ pub(crate) fn executemany<'py>(
                                 error = %error,
                                 "PyAsyncCursor::executemany: cursor description materialization failed; batch_count={batch_count}; result_set_count={result_set_count}; buffered_row_count={buffered_row_count}; preflight_ms={preflight_ms}; execution_ms={execution_ms}; description_materialization_ms={description_materialization_ms}; error={error}"
                             );
-                            operation_guard.settle(false);
-                            interruption_guard.complete();
                             return Err(InternalError::new_err(format!(
                                 "ExecuteMany completed but cursor description materialization failed: {error}"
                             )));
@@ -1121,6 +1145,7 @@ pub(crate) fn executemany<'py>(
                     if batch_count > 0 {
                         consume_input_sizes(&cursor, input_sizes_generation);
                     }
+                    worker_control.complete_if_released();
                     record_result_set_status(if produced_rows {
                         "rows_drained"
                     } else {
@@ -1148,6 +1173,11 @@ pub(crate) fn executemany<'py>(
                         .breaks_session(has_open_batch, connection_dead);
                     operation_guard.settle(connection_marked_broken);
                     interruption_guard.complete();
+                    fetch_state.set(FetchStatus::NoResultSet);
+                    description_state.replace(None);
+                    rowcount.store(-1, Ordering::Release);
+                    buffered_results.replace(VecDeque::new());
+                    worker_control.complete_if_released();
                     let elapsed_ms = started.elapsed().as_millis();
                     tracing::error!(
                         failed_row_index = error.row_index,
@@ -1168,10 +1198,6 @@ pub(crate) fn executemany<'py>(
                         error.failure.error,
                         info_messages,
                     );
-                    fetch_state.set(FetchStatus::NoResultSet);
-                    description_state.replace(None);
-                    rowcount.store(-1, Ordering::Release);
-                    buffered_results.replace(VecDeque::new());
                     Err(error)
                 }
             }
