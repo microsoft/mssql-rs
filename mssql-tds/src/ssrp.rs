@@ -176,6 +176,14 @@ pub(crate) async fn get_dac_port_ext(
     query_dac_port(server, instance, ssrp_port, timeout_ms, false, |_| {}).await
 }
 
+/// SQL Server Browser's answer to a DAC request, giving `port`, for tests.
+#[cfg(test)]
+pub(crate) fn dac_answer(port: u16) -> Vec<u8> {
+    let mut answer = vec![SVR_RESP, 6, 0, DAC_PROTOCOL_VERSION];
+    answer.extend_from_slice(&port.to_le_bytes());
+    answer
+}
+
 /// Why a SQL Server Browser lookup failed, with the operating system's error
 /// where there is one. The client's instance lookup records its
 /// [`code`](Self::code) on its connect stage
@@ -791,12 +799,6 @@ mod tests {
     fn a_dac_request_carries_its_version_and_the_instance() {
         assert_eq!(build_dac_request("SQLEXPRESS"), b"\x0F\x01SQLEXPRESS\x00");
         assert_eq!(build_dac_request("MSSQLServer"), b"\x0F\x01MSSQLServer\x00");
-    }
-
-    fn dac_answer(port: u16) -> Vec<u8> {
-        let mut answer = vec![SVR_RESP, 6, 0, DAC_PROTOCOL_VERSION];
-        answer.extend_from_slice(&port.to_le_bytes());
-        answer
     }
 
     /// A DAC answer is taken only as SNI takes it: exactly six bytes, its

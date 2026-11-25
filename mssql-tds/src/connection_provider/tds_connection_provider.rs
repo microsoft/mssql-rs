@@ -567,7 +567,7 @@ impl TdsConnectionProvider {
                     }
 
                     let attempted = if default_instance_dac {
-                        Self::connect_default_instance_dac(&context, transport_ctx, deadline, &mut redirect_count, diagnosis).await?
+                        Self::connect_default_instance_dac(&context, transport_ctx, ssrp::SSRP_PORT, deadline, &mut redirect_count, diagnosis).await?
                     } else {
                         Self::connect_and_login(&context, transport_ctx, deadline, &mut redirect_count, diagnosis).await
                     };
@@ -632,8 +632,14 @@ impl TdsConnectionProvider {
 
         let timeout_ms = Self::ssrp_timeout(ssrp_timeout_ms);
         if request == SsrpRequest::DacPort {
-            let port =
-                Self::look_up_dac_port(&server, &instance, timeout_ms, bound_resolution).await?;
+            let port = Self::look_up_dac_port(
+                &server,
+                &instance,
+                ssrp::SSRP_PORT,
+                timeout_ms,
+                bound_resolution,
+            )
+            .await?;
             exec_context.store_outcome(ActionOutcome::SsrpResolvedDac { port });
             return Ok(());
         }
@@ -773,13 +779,15 @@ impl TdsConnectionProvider {
             && chain.first_shared_memory_transport().is_some()
     }
 
-    /// Asks SQL Server Browser on `server` for the dedicated administrator
-    /// connection port of `instance` (SNI's `SSRP::GetAdminPort`) within
-    /// `timeout_ms`, recorded as an instance lookup stage with
-    /// [`connect_stage::REQUEST_DAC`]. Never the instance's own port.
+    /// Asks SQL Server Browser on `server` (at UDP `ssrp_port`) for the
+    /// dedicated administrator connection port of `instance` (SNI's
+    /// `SSRP::GetAdminPort`) within `timeout_ms`, recorded as an instance
+    /// lookup stage with [`connect_stage::REQUEST_DAC`]. Never the
+    /// instance's own port.
     async fn look_up_dac_port(
         server: &str,
         instance: &str,
+        ssrp_port: u16,
         timeout_ms: u64,
         bound_resolution: bool,
     ) -> TdsResult<u16> {
@@ -800,7 +808,7 @@ impl TdsConnectionProvider {
         let port = ssrp::query_dac_port(
             server,
             instance,
-            ssrp::SSRP_PORT,
+            ssrp_port,
             timeout_ms,
             bound_resolution,
             |addresses| {
@@ -841,13 +849,14 @@ impl TdsConnectionProvider {
 
     /// A default instance's dedicated administrator connection over
     /// `default` (TCP port 1434), as SNI makes it (open.cpp): when that port
-    /// does not open, it asks SQL Server Browser's DAC request for the port
-    /// and connects there instead. The outer error ends the connection
-    /// attempt: the Browser gave no port, or gave 1434 again. The inner
-    /// result is the login's, as for any transport.
+    /// does not open, it asks SQL Server Browser's DAC request (at UDP
+    /// `ssrp_port`) for the port and connects there instead. The outer error
+    /// ends the connection attempt: the Browser gave no port, or gave 1434
+    /// again. The inner result is the login's, as for any transport.
     async fn connect_default_instance_dac(
         context: &ClientContext,
         default: &TransportContext,
+        ssrp_port: u16,
         deadline: Option<Instant>,
         redirect_count: &mut u32,
         diagnosis: Option<&Diagnosis>,
@@ -889,6 +898,7 @@ impl TdsConnectionProvider {
         let port = Self::look_up_dac_port(
             host,
             DEFAULT_INSTANCE_NAME,
+            ssrp_port,
             Self::ssrp_timeout(context.ssrp_timeout_ms),
             diagnosis.is_some(),
         )
@@ -1889,14 +1899,12 @@ mod tests {
             );
         }
 
-        /// A default instance's dedicated administrator connection whose
-        /// port does not open asks SQL Server Browser for its DAC port, as
-        /// SNI does; with no Browser to answer, that ends the attempt.
-        #[test]
-        fn a_default_instance_dac_that_does_not_open_asks_the_browser() {
-            let (listener, port) = closing_listener();
-            drop(listener);
-            let (result, log) = observe(|| async move {
+        /// A default instance's dedicated administrator connection to
+        /// 127.0.0.1 whose port 1434 is `port`, SQL Server Browser asked at
+        /// UDP `ssrp_port`: the outer error ends the attempt, the inner
+        /// result is the login's.
+        fn default_instance_dac(port: u16, ssrp_port: u16) -> (TdsResult<TdsResult<()>>, StageLog) {
+            observe(|| async move {
                 let mut context = context();
                 let chain =
                     TdsConnectionProvider::action_chain(&mut context, "admin:127.0.0.1").unwrap();
@@ -1910,14 +1918,29 @@ mod tests {
                 TdsConnectionProvider::connect_default_instance_dac(
                     &context,
                     &default,
+                    ssrp_port,
                     Some(Instant::now() + Duration::from_secs(5)),
                     &mut redirects,
                     None,
                 )
                 .await
-                .err()
-            });
-            let error = result.expect("no port to connect to ends the attempt");
+                .map(|login| login.map(drop))
+            })
+        }
+
+        /// A default instance's dedicated administrator connection whose
+        /// port does not open asks SQL Server Browser for its DAC port, as
+        /// SNI does; with no Browser to answer, that ends the attempt.
+        #[test]
+        fn a_default_instance_dac_that_does_not_open_asks_the_browser() {
+            let (listener, port) = closing_listener();
+            drop(listener);
+            // A Browser that never answers, not one this computer may run.
+            let browser = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let ssrp_port = browser.local_addr().unwrap().port();
+            let (result, log) = default_instance_dac(port, ssrp_port);
+            drop(browser);
+            let error = result.expect_err("no port to connect to ends the attempt");
             let tcp = log.named(stage::TCP);
             assert_eq!(tcp.len(), 1, "{:#?}", log.stages());
             assert_eq!(tcp[0].field(stage::OK), Some("false"));
@@ -1934,6 +1957,45 @@ mod tests {
                 ),
                 "{error}"
             );
+        }
+
+        /// A default instance's dedicated administrator connection whose
+        /// port does not open connects to the port SQL Server Browser gives
+        /// for it, as SNI does.
+        #[test]
+        fn a_default_instance_dac_connects_where_the_browser_says() {
+            let (listener, port) = closing_listener();
+            drop(listener);
+            // The DAC: it takes the connection and closes it.
+            let dac = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let dac_port = dac.local_addr().unwrap().port();
+            std::thread::spawn(move || drop(dac.accept()));
+            let browser = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let ssrp_port = browser.local_addr().unwrap().port();
+            browser
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let answered = std::thread::spawn(move || {
+                let mut request = [0u8; 512];
+                let (_, client) = browser.recv_from(&mut request).unwrap();
+                browser
+                    .send_to(&ssrp::dac_answer(dac_port), client)
+                    .unwrap();
+            });
+            let (result, log) = default_instance_dac(port, ssrp_port);
+            answered.join().expect("SQL Server Browser is asked");
+            let login = result.expect("the port the Browser gives is connected to");
+            assert!(login.is_err(), "the DAC closed the connection");
+            let dac_port = dac_port.to_string();
+            let lookup = log.named(stage::INSTANCE_LOOKUP);
+            assert_eq!(lookup.len(), 1, "{:#?}", log.stages());
+            assert_eq!(lookup[0].field(stage::PORT), Some(dac_port.as_str()));
+            assert_eq!(lookup[0].field(stage::OK), Some("true"));
+            let tcp = log.named(stage::TCP);
+            assert_eq!(tcp.len(), 2, "{:#?}", log.stages());
+            assert_eq!(tcp[0].field(stage::OK), Some("false"));
+            assert_eq!(tcp[1].field(stage::PORT), Some(dac_port.as_str()));
+            assert_eq!(tcp[1].field(stage::OK), Some("true"), "{tcp:#?}");
         }
 
         /// SQL Server Browser giving port 1434 again for a default
