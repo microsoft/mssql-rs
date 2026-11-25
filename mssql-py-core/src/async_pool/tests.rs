@@ -152,7 +152,10 @@ fn failed_python_delivery_discards_even_if_a_python_object_retains_the_cell() {
             )
             .unwrap();
         let callback = PyCFunction::new_closure(py, None, None, move |args, _| {
-            delivery.bind(&args.get_item(0)?).map(Bound::unbind)
+            let future = pyo3_async_runtimes::tokio::into_future(args.get_item(0)?)?;
+            delivery
+                .bind(args.py(), Box::pin(future))
+                .map(Bound::unbind)
         })
         .unwrap();
         globals.set_item("bind", callback).unwrap();
@@ -161,9 +164,14 @@ fn failed_python_delivery_discards_even_if_a_python_object_retains_the_cell() {
 import asyncio
 async def run():
     future = asyncio.get_running_loop().create_future()
-    bind(future)
+    public = bind(future)
     future.cancel()
-    await asyncio.sleep(0)
+    try:
+        await public
+    except asyncio.CancelledError:
+        pass
+    else:
+        raise AssertionError('Cancelled native work was delivered')
     try:
         retained.cursor()
     except Exception as error:
@@ -179,6 +187,162 @@ asyncio.run(run())
     });
     assert_eq!(Arc::strong_count(&transport), 1);
     runtime.block_on(manager.shutdown()).unwrap();
+}
+
+#[test]
+fn failed_result_publication_settles_the_public_future() {
+    Python::attach(|py| {
+        let delivery = ConnectDelivery::new(None, None);
+        let bind = PyCFunction::new_closure(py, None, None, move |args, _| {
+            delivery
+                .bind(args.py(), Box::pin(async { Ok(()) }))
+                .map(Bound::unbind)
+        })
+        .unwrap();
+        let globals = PyDict::new(py);
+        globals.set_item("bind", bind).unwrap();
+        py.run(
+            cr"
+import asyncio
+
+class PublicationFailure(asyncio.Future):
+    def set_result(self, value):
+        raise ValueError('publication refused')
+
+async def run():
+    loop = asyncio.get_running_loop()
+    create_future = loop.create_future
+    first = True
+    def create():
+        nonlocal first
+        if first:
+            first = False
+            return PublicationFailure(loop=loop)
+        return create_future()
+    loop.create_future = create
+    try:
+        public = bind()
+    finally:
+        loop.create_future = create_future
+    try:
+        await asyncio.wait_for(public, 1)
+    except ValueError as error:
+        assert str(error) == 'publication refused'
+    else:
+        raise AssertionError('Publication failure was lost')
+asyncio.run(run())
+",
+            Some(&globals),
+            None,
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn closed_loop_discards_undelivered_connection_with_retained_public_future() {
+    let runtime = pyo3_async_runtimes::tokio::get_runtime();
+    for close_before_completion in [true, false] {
+        let pool = Arc::new(PoolAdapter {
+            manager: runtime.block_on(async { manager() }),
+            config: PoolConfig::new(CLOSE_TIMEOUT, CLOSE_TIMEOUT, CLOSE_TIMEOUT).unwrap(),
+            attempts: Mutex::new(Attempts {
+                closed: false,
+                next_id: 0,
+                pending: HashMap::new(),
+            }),
+            settled: Notify::new(),
+        });
+        let (logical, transport) = runtime.block_on(async {
+            let (client, transport) = tds_client_from_tokens_capturing(vec![done_no_more()]);
+            let factory = Factory {
+                clients: Mutex::new(VecDeque::from([OpenedConnection::new(
+                    client,
+                    AuthMetadata {
+                        binding: spec().expected_auth().clone(),
+                        expiry: TokenExpiry::NonToken,
+                    },
+                )])),
+                calls: AtomicUsize::new(0),
+            };
+            let lease = acquire(&pool.manager, &factory).await;
+            (
+                Arc::new(LogicalConnection::from_handle(
+                    ConnHandle::Pooled(Box::new(lease)),
+                    CLOSE_TIMEOUT,
+                )),
+                transport,
+            )
+        });
+        let delivery = ConnectDelivery::new(Some(pool.register().unwrap()), None);
+        let (release, wait) = tokio::sync::oneshot::channel();
+        Python::attach(|py| {
+            let globals = PyDict::new(py);
+            globals
+                .set_item("close_before_completion", close_before_completion)
+                .unwrap();
+            let wait = Mutex::new(Some(wait));
+            let start = PyCFunction::new_closure(py, None, None, move |args, _| {
+                let wait = wait.lock().unwrap().take().unwrap();
+                let connection = logical.clone();
+                let future_delivery = delivery.clone();
+                let future = async move {
+                    wait.await.unwrap();
+                    future_delivery.store(connection.clone())?;
+                    Python::attach(|py| {
+                        Py::new(py, PyAsyncConnection::from_logical(connection, None, false))
+                    })
+                };
+                delivery
+                    .bind(args.py(), Box::pin(future))
+                    .map(Bound::unbind)
+            })
+            .unwrap();
+            let release = Mutex::new(Some(release));
+            let release = PyCFunction::new_closure(py, None, None, move |_, _| {
+                release.lock().unwrap().take().unwrap().send(()).unwrap();
+                Ok::<(), PyErr>(())
+            })
+            .unwrap();
+            globals.set_item("start", start).unwrap();
+            globals.set_item("release", release).unwrap();
+            py.run(
+                cr"
+import asyncio
+import threading
+
+loop = asyncio.new_event_loop()
+publication_attempted = threading.Event()
+call_soon_threadsafe = loop.call_soon_threadsafe
+def publish(*args, **kwargs):
+    try:
+        return call_soon_threadsafe(*args, **kwargs)
+    finally:
+        publication_attempted.set()
+loop.call_soon_threadsafe = publish
+async def setup():
+    return start()
+retained_public = loop.run_until_complete(setup())
+if close_before_completion:
+    loop.close()
+release()
+assert publication_attempted.wait(5)
+if not close_before_completion:
+    loop.close()
+assert not retained_public.done()
+",
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+            py.detach(|| {
+                pool.stop().unwrap();
+                runtime.block_on(pool.shutdown(Instant::now() + CLOSE_TIMEOUT))
+            })
+            .unwrap();
+            assert_eq!(Arc::strong_count(&transport), 1);
+        });
+    }
 }
 
 #[test]
@@ -358,7 +522,10 @@ fn original_deadline_is_checked_before_public_python_delivery() {
             .set_item("OperationalError", py.get_type::<OperationalError>())
             .unwrap();
         let bind = PyCFunction::new_closure(py, None, None, move |args, _| {
-            delivery.bind(&args.get_item(0)?).map(Bound::unbind)
+            let future = pyo3_async_runtimes::tokio::into_future(args.get_item(0)?)?;
+            delivery
+                .bind(args.py(), Box::pin(future))
+                .map(Bound::unbind)
         })
         .unwrap();
         globals.set_item("bind", bind).unwrap();

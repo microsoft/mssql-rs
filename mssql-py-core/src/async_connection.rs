@@ -355,11 +355,10 @@ impl PyAsyncConnection {
                 connect.await
             }
         };
-        let future = pyo3_async_runtimes::tokio::future_into_py(
+        let public = delivery.bind(
             py,
-            with_optional_dispatch(future, future_dispatch),
+            Box::pin(with_optional_dispatch(future, future_dispatch)),
         )?;
-        let public = delivery.bind(&future)?;
         if let Some(callback) = auth_cancellation_callback {
             callback.borrow(py).bind_future(&public)?;
             public.call_method1("add_done_callback", (callback,))?;

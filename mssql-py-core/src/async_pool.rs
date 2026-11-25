@@ -4,9 +4,12 @@
 //! Internal Python adapter; scheduling and physical ownership stay in the Rust pool.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyCFunction, PyDict};
 use tokio::sync::Notify;
@@ -46,6 +49,103 @@ pub(crate) struct ConnectDelivery {
     pub(crate) cancel: CancellationToken,
     deadline: Option<Instant>,
     inner: Mutex<DeliveryState>,
+}
+
+struct PublicationGuard {
+    delivery: Arc<ConnectDelivery>,
+    armed: bool,
+}
+
+impl PublicationGuard {
+    fn finish(&mut self, failed: bool) -> PyResult<()> {
+        self.delivery.finish(failed)?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for PublicationGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = self.delivery.finish(true)
+        {
+            tracing::error!(%error, "Could not discard an unpublished connection");
+        }
+    }
+}
+
+#[pyclass]
+struct ConnectionPublication {
+    guard: PublicationGuard,
+    target: Py<PyAny>,
+    result: Option<PyResult<Py<PyAny>>>,
+}
+
+impl ConnectionPublication {
+    fn publish(&mut self, py: Python<'_>) -> PyResult<()> {
+        let target = self.target.bind(py);
+        let result = self
+            .result
+            .take()
+            .ok_or_else(|| InternalError::new_err("Connection was already published"))?;
+        if target.call_method0("cancelled")?.is_truthy()? {
+            return self.guard.finish(true);
+        }
+        if self.guard.delivery.cancel.is_cancelled() {
+            let closed = self.guard.delivery.pool_closed()?;
+            self.guard.finish(true)?;
+            if closed {
+                let error = map_pool_error(PoolError::Closed);
+                target.call_method1("set_exception", (error.value(py),))?;
+            } else {
+                target.call_method0("cancel")?;
+            }
+            return Ok(());
+        }
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.guard.finish(true)?;
+                target.call_method1("set_exception", (error.value(py),))?;
+                return Ok(());
+            }
+        };
+        if self
+            .guard
+            .delivery
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.guard.finish(true)?;
+            let error = map_pool_error(PoolError::AcquireTimeout {
+                stage: AcquireStage::Delivery,
+            });
+            target.call_method1("set_exception", (error.value(py),))?;
+            return Ok(());
+        }
+        target.call_method1("set_result", (result,))?;
+        self.guard.finish(false)
+    }
+}
+
+#[pymethods]
+impl ConnectionPublication {
+    fn __call__(&mut self, py: Python<'_>) -> PyResult<()> {
+        match self.publish(py) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if let Err(cleanup) = self.guard.finish(true) {
+                    tracing::error!(%cleanup, "Could not discard a failed connection publication");
+                }
+                let target = self.target.bind(py);
+                if target.call_method0("done")?.is_truthy()? {
+                    return Err(error);
+                }
+                target.call_method1("set_exception", (error.value(py),))?;
+                Ok(())
+            }
+        }
+    }
 }
 
 impl ConnectDelivery {
@@ -112,20 +212,50 @@ impl ConnectDelivery {
         }
     }
 
-    pub(crate) fn bind<'py>(
+    // Box before this adapter to keep native open futures out of its stack frame.
+    pub(crate) fn bind<'py, F, T>(
         self: &Arc<Self>,
-        future: &Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let py = future.py();
-        let result = py
-            .import("asyncio")?
-            .call_method0("get_running_loop")?
-            .call_method0("create_future")?;
+        py: Python<'py>,
+        future: Pin<Box<F>>,
+    ) -> PyResult<Bound<'py, PyAny>>
+    where
+        F: Future<Output = PyResult<T>> + Send + 'static,
+        T: for<'a> IntoPyObject<'a> + Send + 'static,
+    {
+        let guard = PublicationGuard {
+            delivery: self.clone(),
+            armed: true,
+        };
+        let event_loop = py.import("asyncio")?.call_method0("get_running_loop")?;
+        let result = event_loop.call_method0("create_future")?;
+        let target = result.clone().unbind();
+        let event_loop = event_loop.unbind();
+        let future = pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = future.await;
+            Python::attach(|py| {
+                let publication = Py::new(
+                    py,
+                    ConnectionPublication {
+                        guard,
+                        target,
+                        result: Some(result.and_then(|result| result.into_py_any(py))),
+                    },
+                )?;
+                if let Err(error) = event_loop
+                    .bind(py)
+                    .call_method1("call_soon_threadsafe", (publication.bind(py),))
+                {
+                    publication.borrow_mut(py).guard.finish(true)?;
+                    return Err(error);
+                }
+                Ok(())
+            })
+        })?;
         // Avoid a public-future -> native-future -> public-future reference cycle.
         let native = py
             .import("weakref")?
             .getattr("ref")?
-            .call1((future,))?
+            .call1((&future,))?
             .unbind();
         let delivery = self.clone();
         let cancellation = PyCFunction::new_closure(py, None, None, move |args, _| {
@@ -144,49 +274,19 @@ impl ConnectDelivery {
         let callback = PyCFunction::new_closure(py, None, None, move |args, _| {
             let future = args.get_item(0)?;
             let target = target.bind(args.py());
-            let native_cancelled = future.call_method0("cancelled")?.is_truthy()?;
-            // Observe the private exception even when public cancellation won.
-            let error = if native_cancelled {
-                None
-            } else {
-                Some(future.call_method0("exception")?)
-            };
-            if target.call_method0("cancelled")?.is_truthy()? {
-                return delivery.finish(true);
-            }
-            if native_cancelled || delivery.cancel.is_cancelled() {
-                let closed = delivery.pool_closed()?;
-                delivery.finish(true)?;
-                if closed {
-                    let error = map_pool_error(PoolError::Closed);
-                    target.call_method1("set_exception", (error.value(args.py()),))?;
-                } else {
+            if future.call_method0("cancelled")?.is_truthy()? {
+                if !target.call_method0("done")?.is_truthy()? {
                     target.call_method0("cancel")?;
                 }
                 return Ok(());
             }
-            if let Some(error) = error.filter(|error| !error.is_none()) {
+            // Observe bridge errors, including native task panics.
+            let error = future.call_method0("exception")?;
+            if !error.is_none() && !target.call_method0("done")?.is_truthy()? {
                 delivery.finish(true)?;
                 target.call_method1("set_exception", (error,))?;
-                return Ok(());
             }
-            if delivery
-                .deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                delivery.finish(true)?;
-                let error = map_pool_error(PoolError::AcquireTimeout {
-                    stage: AcquireStage::Delivery,
-                });
-                target.call_method1("set_exception", (error.value(args.py()),))?;
-                return Ok(());
-            }
-            if let Err(error) = target.call_method1("set_result", (future.call_method0("result")?,))
-            {
-                delivery.finish(true)?;
-                return Err(error);
-            }
-            delivery.finish(false)
+            Ok::<(), PyErr>(())
         })?;
         if let Err(error) = future.call_method1("add_done_callback", (callback,)) {
             self.finish(true)?;
@@ -330,11 +430,13 @@ pub(crate) fn connect<'py>(
             .map_err(map_pool_error)?;
         Ok(result)
     };
-    let future = pyo3_async_runtimes::tokio::future_into_py(
+    delivery.bind(
         py,
-        crate::async_connection::with_optional_dispatch(future, future_dispatch),
-    )?;
-    delivery.bind(&future)
+        Box::pin(crate::async_connection::with_optional_dispatch(
+            future,
+            future_dispatch,
+        )),
+    )
 }
 
 pub(crate) fn map_pool_error(error: PoolError) -> PyErr {

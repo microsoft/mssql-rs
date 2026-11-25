@@ -795,6 +795,9 @@ the existing tracked logical ownership barrier; close passes its original cleanu
 deadline to `release_with_deadline`, and last-owner destruction discards.
 The delivery bridge retains the attempt and lease until publication on the
 owning Python loop; cancelled or failed delivery revokes the undelivered handle.
+Publication owns a discard guard and checks scheduling failures itself, so a
+closed loop rejecting or dropping its queued callback settles the lease and
+attempt even if the application retains the pending public future.
 
 Configuration, lifecycle and closed-pool errors use `InterfaceError`; saturation
 and deadlines use `OperationalError`. Pool errors carry `pool_reason` such as
