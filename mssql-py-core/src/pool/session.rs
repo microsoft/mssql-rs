@@ -13,6 +13,7 @@ use super::lifecycle::SlotGuard;
 use super::manager::{AsyncPoolManager, check_runtime};
 
 /// A concrete isolation level; the protocol's NoChange is not valid at checkout.
+#[derive(Clone, Copy)]
 pub(crate) struct Isolation(&'static str);
 
 impl TryFrom<TransactionIsolationLevel> for Isolation {
@@ -40,6 +41,20 @@ impl TryFrom<TransactionIsolationLevel> for Isolation {
                 });
             }
         }))
+    }
+}
+
+impl Isolation {
+    pub(crate) async fn apply(&self, client: &mut TdsClient) -> PoolResult<()> {
+        let cancel = OperationCancel(CancelHandle::new());
+        client
+            .execute(self.0.to_owned(), ExecuteOptions::new().cancel(&cancel.0))
+            .await
+            .map_err(|error| PoolError::Initialize(Box::new(error)))?;
+        client
+            .close_query()
+            .await
+            .map_err(|error| PoolError::Initialize(Box::new(error)))
     }
 }
 
@@ -156,21 +171,10 @@ async fn initialize(
     if !quiescent(client) {
         return Err(PoolError::InvalidSession);
     }
-    let cancel = OperationCancel(CancelHandle::new());
     if reuse {
         client.prepare_reset_connection(false);
     }
-    client
-        .execute(
-            isolation.0.to_owned(),
-            ExecuteOptions::new().cancel(&cancel.0),
-        )
-        .await
-        .map_err(|error| PoolError::Initialize(Box::new(error)))?;
-    client
-        .close_query()
-        .await
-        .map_err(|error| PoolError::Initialize(Box::new(error)))?;
+    isolation.apply(client).await?;
     if !quiescent(client) {
         return Err(PoolError::InvalidSession);
     }

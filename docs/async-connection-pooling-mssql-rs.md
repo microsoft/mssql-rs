@@ -1434,8 +1434,9 @@ rollback, commit, detached cleanup or a graceful-logout guarantee.
 
 Callers must mark interrupted or indeterminate client I/O for discard before
 release; a later successful drain does not prove that operation safe.
-AQE close barriers, Python result delivery and DB-API mapping remain separate
-integration work and do not yet call these APIs.
+The native SQL-password integration now calls these APIs through the AQE close
+barrier, guarded Python delivery and DB-API mapping. See Doc 2 section 8.4 for
+the private adapter and the remaining consumer/release gates.
 
 Scripted tests cover multi-result drain before transaction discovery/rollback,
 delayed server and transport errors, missing rollback acknowledgement,

@@ -12,9 +12,13 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::async_pool::{self, ConnectDelivery, PyAsyncPool};
+use crate::pool::control::AcquireControl;
+use crate::pool::error::AcquireStage;
 use pyo3::exceptions::{PyFutureWarning, PyOverflowError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
+use tokio::time::Instant;
 use tracing::instrument::WithSubscriber;
 
 use mssql_tds::connection::client_context::TdsAuthenticationMethod;
@@ -25,7 +29,7 @@ use crate::async_cursor::PyAsyncCursor;
 use crate::async_entra_credentials::BuiltInEntraCredential;
 use crate::async_entra_token_factory::AsyncPythonEntraIdTokenFactory;
 use crate::async_errors::{InterfaceError, map_connection_claim};
-use crate::async_handle::{CLOSE_TIMEOUT, CloseMode, LogicalConnection};
+use crate::async_handle::{CloseMode, LogicalConnection};
 use crate::async_session::{AsyncConnectionState, ClaimError, OperationId};
 use crate::connection::PyCoreConnection;
 use crate::python_logger_adapter::python_logger_dispatch;
@@ -156,7 +160,10 @@ impl Drop for ConnectionOperationGuard {
     }
 }
 
-async fn with_optional_dispatch<F>(future: F, dispatch: Option<tracing::Dispatch>) -> F::Output
+pub(crate) async fn with_optional_dispatch<F>(
+    future: F,
+    dispatch: Option<tracing::Dispatch>,
+) -> F::Output
 where
     F: Future,
 {
@@ -210,14 +217,19 @@ impl PyAsyncConnection {
     /// TDS connect failures use DB-API exceptions regardless of authentication
     /// mode; async Entra cancellation raises asyncio.CancelledError.
     #[classmethod]
-    #[pyo3(signature = (client_context_dict, python_logger=None, autocommit=false, *, token_provider=None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (client_context_dict, python_logger=None, autocommit=false, *, token_provider=None, pool=None, acquire_timeout=None, isolation_level=None))]
     fn connect<'py>(
         cls: &Bound<'py, PyType>,
         client_context_dict: &Bound<'_, PyDict>,
         python_logger: Option<&Bound<'_, PyAny>>,
         autocommit: bool,
         token_provider: Option<Py<PyAny>>,
+        pool: Option<PyRef<'_, PyAsyncPool>>,
+        acquire_timeout: Option<&Bound<'_, PyAny>>,
+        isolation_level: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let started = Instant::now();
         let py = cls.py();
 
         let dispatch = python_logger
@@ -226,6 +238,34 @@ impl PyAsyncConnection {
 
         emit_preview_warning(py)?;
 
+        if let Some(pool) = pool {
+            return async_pool::connect(
+                py,
+                &pool,
+                client_context_dict,
+                acquire_timeout,
+                isolation_level.as_deref(),
+                token_provider.is_some(),
+                autocommit,
+                dispatch.clone(),
+                started,
+            );
+        }
+        let budget = acquire_timeout
+            .map(|value| async_pool::duration(value, "acquire_timeout", false))
+            .transpose()?;
+        let delivery =
+            ConnectDelivery::new(None, budget.and_then(|budget| started.checked_add(budget)));
+        let control = budget
+            .map(|budget| {
+                AcquireControl::from_timeout(started, budget, delivery.cancel.clone())
+                    .map_err(async_pool::map_pool_error)
+            })
+            .transpose()?;
+        let isolation = isolation_level
+            .as_deref()
+            .map(|value| async_pool::isolation(Some(value)))
+            .transpose()?;
         tracing::debug!("PyAsyncConnection::connect: extracting client context");
         let mut uses_async_auth = token_provider.is_some();
         if uses_async_auth {
@@ -271,40 +311,60 @@ impl PyAsyncConnection {
         );
 
         let future_dispatch = dispatch.clone();
+        let future_delivery = delivery.clone();
+        let connect = async move {
+            let provider = TdsConnectionProvider {};
+            let mut client = provider
+                .create_client(context, &datasource, None)
+                .await
+                .map_err(|error| map_connect_error(error, uses_async_auth))?;
+            if let Some(isolation) = isolation {
+                isolation
+                    .apply(&mut client)
+                    .await
+                    .map_err(async_pool::map_pool_error)?;
+            }
+
+            tracing::info!("PyAsyncConnection::connect: connection established");
+            let connection = Arc::new(LogicalConnection::new(client));
+            future_delivery.store(connection.clone())?;
+            Python::attach(|py| {
+                Py::new(
+                    py,
+                    PyAsyncConnection::from_logical(connection, dispatch, autocommit),
+                )
+            })
+        };
+        let future = async move {
+            if let Some(control) = control {
+                control
+                    .check(AcquireStage::Admission)
+                    .map_err(async_pool::map_pool_error)?;
+                let result = tokio::time::timeout_at(control.deadline(), connect)
+                    .await
+                    .map_err(|_| {
+                        async_pool::map_pool_error(crate::pool::error::PoolError::AcquireTimeout {
+                            stage: AcquireStage::Open,
+                        })
+                    })?;
+                control
+                    .check(AcquireStage::Delivery)
+                    .map_err(async_pool::map_pool_error)?;
+                result
+            } else {
+                connect.await
+            }
+        };
         let future = pyo3_async_runtimes::tokio::future_into_py(
             py,
-            with_optional_dispatch(
-                async move {
-                    let provider = TdsConnectionProvider {};
-                    let client = provider
-                        .create_client(context, &datasource, None)
-                        .await
-                        .map_err(|error| map_connect_error(error, uses_async_auth))?;
-
-                    tracing::info!("PyAsyncConnection::connect: connection established");
-                    let connection = Arc::new(LogicalConnection::new(client));
-                    Python::attach(|py| {
-                        Py::new(
-                            py,
-                            PyAsyncConnection {
-                                session_state: connection.state.clone(),
-                                tds_client: Some(connection),
-                                tracing_dispatch: dispatch,
-                                autocommit: Arc::new(AtomicBool::new(autocommit)),
-                                default_query_timeout: 0,
-                            },
-                        )
-                    })
-                },
-                future_dispatch,
-            ),
+            with_optional_dispatch(future, future_dispatch),
         )?;
         if let Some(callback) = auth_cancellation_callback {
             callback.borrow(py).bind_future(&future)?;
             future.call_method1("add_done_callback", (callback,))?;
         }
 
-        Ok(future)
+        delivery.bind(&future)
     }
 
     /// Default query timeout (seconds) inherited by cursors created from this
@@ -372,7 +432,8 @@ impl PyAsyncConnection {
 
     /// Close the connection, draining results before rolling back active work.
     /// Idempotent; concurrent callers await the same cleanup and outcome.
-    /// Cleanup has one five-second budget, even if a caller is cancelled.
+    /// Cleanup uses the pool's budget, or five seconds for direct connections,
+    /// even if a caller is cancelled.
     /// Returns an awaitable that resolves to `None`.
     fn close<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let dispatch = self.tracing_dispatch.clone();
@@ -443,6 +504,19 @@ impl PyAsyncConnection {
 }
 
 impl PyAsyncConnection {
+    pub(crate) fn from_logical(
+        connection: Arc<LogicalConnection>,
+        dispatch: Option<tracing::Dispatch>,
+        autocommit: bool,
+    ) -> Self {
+        Self {
+            session_state: connection.state.clone(),
+            tds_client: Some(connection),
+            tracing_dispatch: dispatch,
+            autocommit: Arc::new(AtomicBool::new(autocommit)),
+            default_query_timeout: 0,
+        }
+    }
     fn transaction_awaitable<'py>(
         &self,
         py: Python<'py>,
@@ -528,27 +602,15 @@ impl PyAsyncConnection {
             .as_ref()
             .ok_or_else(|| InterfaceError::new_err("Connection is closed"))?;
         // Start before constructing the awaitable: construction failure cannot strand cleanup.
-        let receiver = client.start_close(mode, CLOSE_TIMEOUT, self.tracing_dispatch.clone());
+        let receiver =
+            client.start_close(mode, client.cleanup_timeout, self.tracing_dispatch.clone());
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = LogicalConnection::wait_closed(receiver).await;
-            if let Some(block_error) = block_error {
-                if result.is_err() {
-                    tracing::warn!("Connection cleanup failed while preserving block exception");
-                    Python::attach(|py| {
-                        let error = block_error.bind(py);
-                        if error.hasattr("add_note")? {
-                            error.call_method1(
-                                "add_note",
-                                ("Connection cleanup failed; connection discarded",),
-                            )?;
-                        }
-                        Ok::<(), PyErr>(())
-                    })
-                    .unwrap_or_else(|_| tracing::warn!("Could not annotate block exception"));
-                }
-            } else {
-                result?;
-            }
+            crate::async_errors::finish_cleanup(
+                result,
+                block_error,
+                "Connection cleanup failed; connection discarded",
+            )?;
             Python::attach(|py| Ok(py.None()))
         })
     }
@@ -561,8 +623,9 @@ mod tests {
     use mssql_tds::error::{Error, SqlErrorInfo, SqlServerDiagnostics, TimeoutErrorType};
     use pyo3::prelude::*;
 
-    use super::{CLOSE_TIMEOUT, CloseMode, PyAsyncConnection, map_connect_error};
+    use super::{CloseMode, PyAsyncConnection, map_connect_error};
     use crate::async_errors::{DatabaseError, OperationalError};
+    use crate::async_handle::CLOSE_TIMEOUT;
     use crate::async_handle::LogicalConnection;
 
     #[test]

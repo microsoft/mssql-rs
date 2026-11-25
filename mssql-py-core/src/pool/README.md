@@ -1,8 +1,10 @@
 # Async pool foundation: contributor context
 
 Start here when reading the private Rust/Tokio pool manager and SQL checkout
-implementation. They are compiled in normal builds, but are not connected to AQE
-or exposed to Python. Explicit awaited release implements return-to-pool cleanup. The A1
+implementation. The internal Python adapter in
+[async_pool.rs](../async_pool.rs) connects them to AQE for opt-in SQL-password
+pooling. It exposes no Deadpool objects or caller-supplied keys.
+Explicit awaited release implements return-to-pool cleanup. The A1
 Deadpool experiment in [fit.rs](fit.rs) is test-only, not a production pool or
 evidence of live SQL reuse.
 
@@ -24,7 +26,7 @@ For native SQL initialization and reuse, see
 | `AcquireControl` in [control.rs](control.rs) | One caller-owned absolute deadline and cancellation token shared across acquisition stages. It drops interrupted work, but does not supervise detached work or cancel TDS/Python operations for their owners. |
 | `AcquireStage` in [error.rs](error.rs) | Identifies where acquisition timed out; changing stages does not start a new budget. |
 | `PoolKey` in [connection.rs](connection.rs) | Opaque fingerprint that partitions reuse. The Rust preparation adapter must supply a fingerprint, never a raw connection string or token; this type only rejects empty input, not noncanonical keys. |
-| `PreparedSqlConnection` in [connection_key.rs](../connection_key.rs) | Private Rust SQL-auth key authority above the scheduler. Validates Python-adapted options, freezes native endpoint policy, and derives a process-private HMAC key and authentication binding paired with the same immutable `ConnectSpec`. Not exported to Python or called by direct/pooled connect. |
+| `PreparedSqlConnection` in [connection_key.rs](../connection_key.rs) | Private Rust SQL-auth key authority above the scheduler. Validates Python-adapted options, freezes native endpoint policy, and derives a process-private HMAC key and authentication binding paired with the same immutable `ConnectSpec`. Consumed by native pooled connect, never exported as a Python key. |
 | `AuthBinding` in [connection.rs](connection.rs) | Separate opaque identity/credential-version fingerprint expected for a physical open. Equality is not proof of a real login principal. |
 | `TokenExpiry` and `AuthMetadata` in [connection.rs](connection.rs) | Distinguish non-token authentication, known UTC expiry and unknown raw-token expiry. Metadata carries the binding to compare with the expected one; it does not implement credential refresh or reuse policy. |
 | `ConnectSpec` in [connection.rs](connection.rs) | Immutable per-call effective options and expected authentication binding. Native checkout calls `validate_pool()` before reservation to validate the context and reject nonzero recovery counts, unsupported authentication and Always Encrypted. |
@@ -35,7 +37,7 @@ For native SQL initialization and reuse, see
 | `AsyncPoolManager::acquire` in [session.rs](session.rs) | Validates pooled options, reserves a Deadpool slot, initializes a fresh connection or resets a cached candidate, and publishes only after authentication checks and fully drained, quiescent initialization. |
 | `PoolLease` in [session.rs](session.rs) | Uniquely owns the client and capacity guard. Client access is borrowed from the lease; Drop discards rather than returning a reusable session. |
 | `PoolLease::release` / `release_with_deadline` in [session.rs](session.rs) | Drain before residual rollback under one capped cleanup deadline, then atomically return only a quiescent client to its accepting generation. Cancellation or failure discards before slot return. |
-| `PoolResult`, `PoolError` and `OpenError` in [error.rs](error.rs) | Typed outcomes, including preserved TDS/provider causes. Routine `Display`/`Debug` excludes source messages; Python error mapping is later integration work. |
+| `PoolResult`, `PoolError` and `OpenError` in [error.rs](error.rs) | Typed outcomes, including preserved TDS/provider causes. Routine `Display`/`Debug` excludes source messages; the native adapter maps DB-API errors and pool reasons. |
 
 `max_waiting = None` means unlimited waiting; a configured limit is positive and
 counts queued requests, not assigned grants. The timeout budgets are required
@@ -44,8 +46,9 @@ not a background cleanup task.
 
 ## How the contracts fit
 
-Native SQL checkout is implemented within the private manager. Production
-return is available through the lease; AQE/Python integration remains unwired:
+Native SQL checkout is implemented within the private manager. The native
+adapter stores its lease in `ConnHandle::Pooled` behind the existing revocable
+logical ownership barrier:
 
 ```text
 Caller adapter
@@ -94,18 +97,16 @@ random process key. Cryptography reuses TDS's approved native providers
 (Windows CNG, Apple native crypto and OpenSSL), not a new crypto implementation.
 Routine diagnostics redact both prepared objects and opaque fingerprints.
 
-No lease settings are accepted by this physical-spec seam. Future integration
-must prove their reset/reapplication contract before reusing a session across
-such settings. Recovery values remain in the fingerprint; native checkout rejects
-nonzero recovery counts before admission. Connecting this preparation to checkout,
-production check-in, public API and authentication beyond SQL password remain
-separate work. There is no change to the direct connection paths.
+No lease settings are accepted by this physical-spec seam. Native checkout
+applies requested isolation and creates fresh logical settings. Recovery values
+remain in the fingerprint; native checkout rejects nonzero recovery counts before
+admission. The internal adapter supplies zero when omitted. Public API rollout
+and authentication beyond SQL password remain separate work.
 
-The direct PyCore adapter still defaults packet size to 4096 and falls back for
-out-of-range values, unlike this private Rust-ODBC-aligned preparation. Reconcile
-or explicitly gate/document that application-visible difference before enabling
-pooling. A physical factory must consume the prepared context, never reconstruct
-it through direct adaptation after keying.
+The native async adapter resolves omitted/zero packet size to 4096 before this
+private Rust-ODBC-aligned preparation. It rejects out-of-range values rather than
+using the legacy direct adapter's fallback. A physical factory consumes the
+prepared context, never reconstructing it through direct adaptation after keying.
 
 Run the real consumer-parser contract with the active Python environment:
 
@@ -160,7 +161,7 @@ including on otherwise unrelated Rust PRs. There is no older-version fallback.
   Unfinished streamed parameter writes are not quiescent: release reports a
   cleanup error and discards before rollback or capacity return.
 - Rust's key authority constructs canonical keys and expected authentication
-  bindings; its integration with native checkout remains unwired.
+  bindings for native checkout.
   Native checkout owns pooled-context validation, including the zero-recovery
   restriction; it also checks returned metadata for binding equality and
   non-token authentication before using a client.
@@ -173,8 +174,9 @@ including on otherwise unrelated Rust PRs. There is no older-version fallback.
 - An acquisition cancellation token and a TDS `CancelHandle` serve different
   layers. SQL opening and initialization own operation guards that cancel TDS
   handles on interruption. Parallel TCP attempts are caller-owned and drop
-  synchronously before capacity is released. Python callback cancellation and
-  settlement remain future integration work.
+  synchronously before capacity is released. SQL-password result delivery is
+  guarded by the native adapter; Python authentication callback integration
+  remains outside this slice.
 - Treat fingerprints as opaque input and keep sensitive source messages out of
   routine diagnostics. Authentication adapters must supply verified metadata;
   these types do not authenticate a connection.

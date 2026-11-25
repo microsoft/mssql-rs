@@ -51,8 +51,7 @@ For SDK authors integrating the native runtime:
   mode; clean context exit commits only when autocommit is off. Cleanup failures
   are reported, without masking an existing block exception. A broken connection
   is discarded, and a clean exit requiring commit reports failure. Cursor
-  finalization racing close preserves the same transaction intent. This does not
-  enable connection pooling.
+  finalization racing close preserves the same transaction intent.
   Cleanup rechecks its original deadline after waiting for transaction
   authorization; an expired budget cannot start transaction finalization.
 - Cancelling `executemany` during parameter binding leaves the connection and
@@ -72,6 +71,13 @@ For SDK authors integrating the native runtime:
   without retrying the transaction request.
 - If creating a `commit()` or `rollback()` awaitable fails before native work
   starts, pending transactions and unread cursor results remain available.
+- Internal async SQL-password pooling uses a loop-bound native `_AsyncPool`
+  adapter with explicit acquisition, cleanup and shutdown budgets. It does not
+  enable a public pooling API or change the sync pool. Trusted/Entra pooling,
+  MARS and Always Encrypted remain unsupported; pooled transparent recovery is
+  disabled. See the
+  [native integration contract](https://github.com/microsoft/mssql-rs/blob/main/docs/async-connection-pooling-mssql-python-integration.md#84-native-sql-password-integration-ab50008)
+  for SDK integration and release gates.
 - [Connection settings](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md#connection-policy-and-migration)
   for native connection options and defaults.
 - [Bulk-copy behavior](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/docs/bulk-copy.md)
@@ -79,7 +85,7 @@ For SDK authors integrating the native runtime:
 
 For contributors, the
 [async pool context guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/src/pool/README.md)
-maps internal types and ownership; it does not describe an enabled pooling API.
+maps internal types and ownership.
 
 ## License
 

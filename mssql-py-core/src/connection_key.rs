@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Private SQL-authentication preparation. Not connected to pooled or direct connect.
+//! Private SQL-authentication preparation shared by keying and pooled physical opening.
 
 use std::{fmt, sync::OnceLock};
 
@@ -53,13 +53,6 @@ const INTEGER_OPTIONS: &[&str] = &[
 static PROCESS_KEY: OnceLock<Result<[u8; 32], &'static str>> = OnceLock::new();
 
 /// Key and physical-open specification derived together from one frozen context.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "SQL key preparation is not wired into pooled connect"
-    )
-)]
 pub(crate) struct PreparedSqlConnection {
     key: PoolKey,
     spec: ConnectSpec,
@@ -72,10 +65,6 @@ impl fmt::Debug for PreparedSqlConnection {
 }
 
 impl PreparedSqlConnection {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Consumed by a later pooled-connect integration")
-    )]
     pub(crate) fn into_parts(self) -> (PoolKey, ConnectSpec) {
         (self.key, self.spec)
     }
@@ -86,13 +75,6 @@ fn invalid_options() -> PyErr {
 }
 
 /// Consumes Python-adapted options, never customer-supplied pool fingerprints.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Internal SQL key slice; no Python API or pooled connect"
-    )
-)]
 pub(crate) fn prepare_sql_connection(
     options: &Bound<'_, PyDict>,
 ) -> PyResult<PreparedSqlConnection> {

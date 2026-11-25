@@ -15,7 +15,9 @@ use tokio::time::{Instant, timeout_at};
 use tracing::instrument::WithSubscriber;
 
 use crate::async_errors::{OperationalError, map_tds_error};
+use crate::async_pool::map_pool_error;
 use crate::async_session::{AsyncConnectionState, ClaimError, OperationId};
+use crate::pool::session::PoolLease;
 
 pub(crate) const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -56,9 +58,10 @@ impl Drop for CloseCompletion {
     }
 }
 
-/// Unique physical ownership; pooled handles are a separate implementation slice.
+/// Unique physical ownership behind one revocable logical cell.
 pub(crate) enum ConnHandle {
-    Direct(TdsClient),
+    Direct(Box<TdsClient>),
+    Pooled(Box<PoolLease>),
 }
 
 impl ConnHandle {
@@ -66,6 +69,7 @@ impl ConnHandle {
     pub(crate) fn client_mut(&mut self) -> &mut TdsClient {
         match self {
             Self::Direct(client) => client,
+            Self::Pooled(lease) => lease.client_mut(),
         }
     }
 }
@@ -75,15 +79,34 @@ pub(crate) struct LogicalConnection {
     handle: Mutex<Option<ConnHandle>>,
     pub(crate) state: Arc<AsyncConnectionState>,
     close: StdMutex<Option<CloseReceiver>>,
+    pub(crate) cleanup_timeout: Duration,
 }
 
 impl LogicalConnection {
     /// Create fresh logical state owning one direct client; no pool checkout occurs.
     pub(crate) fn new(client: TdsClient) -> Self {
+        Self::from_handle(ConnHandle::Direct(Box::new(client)), CLOSE_TIMEOUT)
+    }
+
+    pub(crate) fn from_handle(handle: ConnHandle, cleanup_timeout: Duration) -> Self {
         Self {
-            handle: Mutex::new(Some(ConnHandle::Direct(client))),
+            handle: Mutex::new(Some(handle)),
             state: Arc::new(AsyncConnectionState::new()),
             close: StdMutex::new(None),
+            cleanup_timeout,
+        }
+    }
+
+    /// Only used before Python delivery, when no application operation can hold access.
+    pub(crate) fn discard_undelivered(&self) {
+        self.state.mark_broken();
+        match self.handle.try_lock() {
+            Ok(mut handle) => {
+                drop(handle.take());
+            }
+            Err(error) => {
+                tracing::error!(%error, "Undelivered connection unexpectedly has an active borrower")
+            }
         }
     }
 
@@ -186,7 +209,7 @@ impl LogicalConnection {
                     Python::attach(|py| {
                         let original = error.value(py);
                         let value = original.get_type().call1((original.str()?,))?;
-                        for attribute in ["sql_errors", "info_messages"] {
+                        for attribute in ["sql_errors", "info_messages", "pool_reason"] {
                             if original.hasattr(attribute)? {
                                 value.setattr(attribute, original.getattr(attribute)?)?;
                             }
@@ -257,8 +280,6 @@ impl LogicalConnection {
                     CloseMode::Rollback => client.rollback_transaction(None, None).await?,
                 }
             }
-            check_cleanup_deadline(deadline)?;
-            client.close_connection().await?;
             check_cleanup_deadline(deadline)
         }
         .await;
@@ -268,7 +289,34 @@ impl LogicalConnection {
                 error,
                 client.take_info_messages(),
             )
-        })
+        })?;
+        match handle {
+            ConnHandle::Direct(mut client) => {
+                client.close_connection().await.map_err(|error| {
+                    map_tds_error(
+                        "Connection cleanup failed",
+                        error,
+                        client.take_info_messages(),
+                    )
+                })?;
+                check_cleanup_deadline(deadline).map_err(|error| {
+                    map_tds_error(
+                        "Connection cleanup failed",
+                        error,
+                        client.take_info_messages(),
+                    )
+                })
+            }
+            ConnHandle::Pooled(mut lease) => {
+                if state.must_discard() {
+                    lease.mark_discard();
+                }
+                lease
+                    .release_with_deadline(deadline)
+                    .await
+                    .map_err(map_pool_error)
+            }
+        }
     }
 
     #[cfg(test)]
@@ -832,7 +880,7 @@ mod tests {
         let initial_bytes = transport.lock().unwrap().len();
         tokio::time::advance(Duration::from_secs(2)).await;
         let error = LogicalConnection::finalize_handle(
-            ConnHandle::Direct(client),
+            ConnHandle::Direct(Box::new(client)),
             &AsyncConnectionState::new(),
             CloseMode::Commit,
             deadline,

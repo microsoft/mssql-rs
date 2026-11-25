@@ -32,6 +32,28 @@ pub(crate) fn map_connection_claim(error: ClaimError, busy_message: &str) -> PyE
     }
 }
 
+pub(crate) fn finish_cleanup(
+    result: PyResult<()>,
+    block_error: Option<Py<PyAny>>,
+    diagnostic: &'static str,
+) -> PyResult<()> {
+    let Some(block_error) = block_error else {
+        return result;
+    };
+    if result.is_err() {
+        tracing::warn!("{diagnostic}");
+        Python::attach(|py| {
+            let error = block_error.bind(py);
+            if error.hasattr("add_note")? {
+                error.call_method1("add_note", (diagnostic,))?;
+            }
+            Ok::<(), PyErr>(())
+        })
+        .unwrap_or_else(|_| tracing::warn!("Could not annotate block exception"));
+    }
+    Ok(())
+}
+
 pub(crate) fn add_exceptions(module: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = module.py();
     module.add("Error", py.get_type::<Error>())?;
