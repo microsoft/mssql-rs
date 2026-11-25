@@ -139,7 +139,11 @@ depth, the `instanceResolution` check reports the Browser's `result`, carries
 `-S <host>,<port>`. The checks that need the port (`tcpConnect` and the ones
 after it) are skipped with `"reason": "explicitPortRequired"` and
 `"blockedBy": "instanceResolution"`. A pipe instance (`np:`) has no port to
-give: the checks after it are `blockedByPrerequisite`. When the Browser gave
+give: the checks after it are `blockedByPrerequisite`. That includes an answer
+that lists no pipe (`"result": "noTcpPort"`, no usable endpoint): as SNI does,
+the client opens only the pipe the Browser listed, on the server as given (or
+`.` for this computer) rather than the machine name in the answer, and never
+falls back to the instance's standard pipe. When the Browser gave
 the port but the time limit was spent before the client tried it, `tcpConnect`
 is `inconclusive`, with `"result": "notAttempted"` and the time-limit error;
 likewise for the pipe the Browser's answer pointed to (`np:`, or without a

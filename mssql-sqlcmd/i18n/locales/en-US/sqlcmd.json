@@ -1431,29 +1431,6 @@
       ]
     },
     {
-      "id": "diagnose.finding.pipe_instance_tries_standard_pipe",
-      "message": "The {transport} transport did not open ({reason}); for a named instance over named pipes sqlcmd then tries the instance's standard pipe, checked below.",
-      "translation": "The {transport} transport did not open ({reason}); for a named instance over named pipes sqlcmd then tries the instance's standard pipe, checked below.",
-      "placeholders": [
-        {
-          "id": "transport",
-          "string": "%[1]s",
-          "type": "string",
-          "underlyingType": "string",
-          "argNum": 1,
-          "expr": "transport"
-        },
-        {
-          "id": "reason",
-          "string": "%[2]s",
-          "type": "string",
-          "underlyingType": "string",
-          "argNum": 2,
-          "expr": "reason"
-        }
-      ]
-    },
-    {
       "id": "diagnose.finding.pipe_did_not_open",
       "message": "The {transport} transport did not open ({reason}).",
       "translation": "The {transport} transport did not open ({reason}).",
@@ -2553,29 +2530,6 @@
           "underlyingType": "string",
           "argNum": 3,
           "expr": "next"
-        }
-      ]
-    },
-    {
-      "id": "diagnose.finding.pipe_instance_attempt_failed",
-      "message": "The {transport} transport opened, but the connection attempt over it failed ({reason}); for a named instance over named pipes sqlcmd then tries the instance's standard pipe, checked below.",
-      "translation": "The {transport} transport opened, but the connection attempt over it failed ({reason}); for a named instance over named pipes sqlcmd then tries the instance's standard pipe, checked below.",
-      "placeholders": [
-        {
-          "id": "transport",
-          "string": "%[1]s",
-          "type": "string",
-          "underlyingType": "string",
-          "argNum": 1,
-          "expr": "transport"
-        },
-        {
-          "id": "reason",
-          "string": "%[2]s",
-          "type": "string",
-          "underlyingType": "string",
-          "argNum": 2,
-          "expr": "reason"
         }
       ]
     },

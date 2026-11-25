@@ -3375,7 +3375,7 @@ Limitations:
         }
         let json = json(&report, "v").unwrap();
         assert!(
-            json.contains("\"coverageMatrixVersion\": \"1.6\""),
+            json.contains("\"coverageMatrixVersion\": \"1.7\""),
             "{json}"
         );
         assert!(
