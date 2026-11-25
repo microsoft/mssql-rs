@@ -240,8 +240,10 @@ fn late_operation_waiter_cancellation_discards_before_pool_return() {
                 ConnHandle::Pooled(Box::new(lease)),
                 CLOSE_TIMEOUT,
             ));
+            let (release, wait) = tokio::sync::oneshot::channel();
             let (finished, completion) = tokio::sync::oneshot::channel();
             let mut waiter: Waiter = Box::pin(logical.state.clone().run_tracked(async move {
+                wait.await.unwrap();
                 finished.send(()).unwrap();
                 Ok(())
             }));
@@ -251,6 +253,7 @@ fn late_operation_waiter_cancellation_discards_before_pool_return() {
                     .poll(&mut Context::from_waker(Waker::noop()))
                     .is_pending()
             );
+            release.send(()).unwrap();
             completion.await.unwrap();
             let subscriber = tracing_subscriber::Registry::default().with(CancelDuringRelease {
                 drains: AtomicUsize::new(0),
