@@ -18,6 +18,43 @@ use mssql_tds::security::SecurityError;
 use super::stages::Step;
 use super::{CheckId, Coverage, Domain, ErrorRecord, LocalizedText};
 
+#[cfg(unix)]
+mod ccache;
+mod credentials;
+#[cfg(windows)]
+mod lsa;
+
+pub(super) use credentials::{Credentials, not_checked_fields, not_checked_limitation};
+#[cfg(test)]
+pub(super) use credentials::{Failure, State, Store, Ticket};
+
+/// How the caller's own Kerberos credentials are read; tests read their own.
+#[derive(Clone, Copy)]
+pub(super) struct CredentialsLookup {
+    /// Whether they are a logon session's (Windows), not a cache's.
+    pub(super) logon_session: bool,
+    /// Reads them, finding the service ticket for the SPN given.
+    pub(super) read: fn(Option<String>) -> Credentials,
+}
+
+impl CredentialsLookup {
+    /// This platform's.
+    pub(super) fn platform() -> Option<Self> {
+        #[cfg(windows)]
+        return Some(Self {
+            logon_session: true,
+            read: lsa::read,
+        });
+        #[cfg(unix)]
+        return Some(Self {
+            logon_session: false,
+            read: ccache::read,
+        });
+        #[cfg(not(any(windows, unix)))]
+        None
+    }
+}
+
 /// The specialist domain of a Kerberos signal.
 const KERBEROS_DOMAIN: &str = "security.authentication.kerberos";
 
@@ -129,6 +166,7 @@ const KRB5_ERRORS: &[(i32, &str)] = &[
     (KRB5KRB_AP_ERR_NOKEY, "KRB5KRB_AP_ERR_NOKEY"),
     (KRB5KRB_AP_ERR_MUT_FAIL, "KRB5KRB_AP_ERR_MUT_FAIL"),
     (-1_765_328_324, "KRB5KRB_ERR_GENERIC"),
+    (-1_765_328_248, "KRB5_CONFIG_BADFORMAT"),
     (KRB5_CC_BADNAME, "KRB5_CC_BADNAME"),
     (KRB5_CC_UNKNOWN_TYPE, "KRB5_CC_UNKNOWN_TYPE"),
     (KRB5_CC_NOTFOUND, "KRB5_CC_NOTFOUND"),
@@ -142,6 +180,7 @@ const KRB5_ERRORS: &[(i32, &str)] = &[
     (KRB5_CC_IO, "KRB5_CC_IO"),
     (KRB5_FCC_PERM, "KRB5_FCC_PERM"),
     (KRB5_FCC_NOFILE, "KRB5_FCC_NOFILE"),
+    (-1_765_328_188, "KRB5_FCC_INTERNAL"),
     (-1_765_328_186, "KRB5_CC_NOMEM"),
     (KRB5_CC_FORMAT, "KRB5_CC_FORMAT"),
     (KRB5_CC_NOT_KTYPE, "KRB5_CC_NOT_KTYPE"),

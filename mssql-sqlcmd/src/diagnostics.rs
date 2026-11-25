@@ -456,7 +456,7 @@ impl Request {
 /// The version of the diagnostic coverage matrix this implementation follows
 /// (`docs/diagnose-coverage.md`): which phases are checked, with which signals,
 /// and which coverage states each can report.
-pub const COVERAGE_MATRIX_VERSION: &str = "1.6";
+pub const COVERAGE_MATRIX_VERSION: &str = "1.7";
 
 /// The link to driver-tracing guidance for `sqlcmd diagnose`, given when the
 /// client's own evidence cannot explain a failure. It is a Microsoft FWLink so
@@ -1662,9 +1662,11 @@ struct Diagnosis {
     /// alone takes LocalDB, named pipes and shared memory: this platform's,
     /// and either in tests.
     windows: bool,
-    /// How the client's Kerberos ticket cache is looked for: None on
-    /// Windows, which keeps tickets in the logon session; tests set either.
-    ticket_cache: Option<fn() -> (&'static str, String)>,
+    /// How the client's own Kerberos credentials are read: the platform's
+    /// credentials cache or logon session; tests read their own, or none.
+    credentials_lookup: Option<kerberos::CredentialsLookup>,
+    /// The credentials as the connection attempt's evidence last read them.
+    kerberos_credentials: Option<kerberos::Credentials>,
     recorder: StageRecorder,
     target: Option<Target>,
     checks: Vec<Check>,
@@ -1850,7 +1852,8 @@ impl Diagnosis {
         Self {
             request,
             windows: cfg!(windows),
-            ticket_cache: (!cfg!(windows)).then_some(kerberos_ticket_cache as fn() -> _),
+            credentials_lookup: kerberos::CredentialsLookup::platform(),
+            kerberos_credentials: None,
             recorder: StageRecorder::new(),
             target: None,
             checks: Vec::new(),
@@ -1979,6 +1982,18 @@ impl Diagnosis {
             text: text.into(),
             quotes_message: false,
         });
+    }
+
+    /// A finding, unless the same one was already made: evidence read again
+    /// for another attempt says the same.
+    fn finding_once(&mut self, certainty: Certainty, check: CheckId, text: LocalizedText) {
+        if !self
+            .findings
+            .iter()
+            .any(|f| f.certainty == certainty && f.check == check && f.text == text)
+        {
+            self.finding(certainty, check, text);
+        }
     }
 
     /// A finding whose text quotes a message from outside sqlcmd.
@@ -4083,7 +4098,27 @@ impl Diagnosis {
                 }
             }
         }
+        self.note_driver_credentials(&check, server_refused || refused_login || refused_database);
         self.checks[driver_check] = check;
+    }
+
+    /// sqlcmd's own driver runs in this process and uses the same Kerberos
+    /// credentials. When the server answered none of its login and the
+    /// evidence login failed at its own login, a cache without a valid
+    /// ticket-granting ticket explains the driver's failure too: a server
+    /// that answered was presented credentials, and a failure before the
+    /// login presented none.
+    fn note_driver_credentials(&mut self, check: &Check, server_answered: bool) {
+        if server_answered || check.field("failedPhase") != Some(Stage::Login.name()) {
+            return;
+        }
+        if let Some((certainty, text)) = self
+            .kerberos_credentials
+            .as_ref()
+            .and_then(kerberos::Credentials::missing_ticket_finding)
+        {
+            self.finding_once(certainty, CheckId::ConnectionAttempt, text);
+        }
     }
 
     async fn enrich_driver_check(&mut self, index: usize, endpoint: Option<&(String, u16)>) {
@@ -4098,7 +4133,8 @@ impl Diagnosis {
             self.spn = Some(platform_spn(&spn));
             self.spn_source = SPN_DERIVED;
         }
-        self.kerberos_evidence(&mut check, budget).await;
+        let records = self.kerberos_evidence(&mut check, budget).await;
+        self.errors.extend(records);
         self.checks[index] = check;
     }
 
@@ -4950,19 +4986,19 @@ impl Diagnosis {
                 vec![],
             ));
         }
-        // The ticket cache is looked for within what is left of the attempt's
-        // time limit, not a fresh one, and the time it takes is the check's.
-        let cache_location = if self.request.authentication == Authentication::Integrated {
+        // The credentials are read within what is left of the attempt's time
+        // limit, not a fresh one, and the time it takes is the check's.
+        let credential_records = if self.request.authentication == Authentication::Integrated {
             let budget = self
                 .request
                 .timeout()
                 .saturating_sub(Duration::from_millis(attempt_ms));
             let looking = Instant::now();
-            let location = self.kerberos_evidence(&mut check, budget).await;
+            let records = self.kerberos_evidence(&mut check, budget).await;
             check.duration_ms = Some(attempt_ms.saturating_add(millis(looking)));
-            location
+            records
         } else {
-            None
+            Vec::new()
         };
 
         match (ended, client) {
@@ -5001,27 +5037,24 @@ impl Diagnosis {
                         .fields
                         .push(Field::plain("entraStage", "serverRejection"));
                 }
-                let no_ticket_cache = check.field("kerberosTicketCache") == Some("notFound");
-                // A security failure whose codes explain it says more than
-                // where sqlcmd looked for a cache: it reached the KDC, or it
-                // says itself that there were no credentials.
-                let explained = matches!(
+                let missing_ticket = self
+                    .kerberos_credentials
+                    .as_ref()
+                    .and_then(kerberos::Credentials::missing_ticket_finding);
+                // Only the client's own security package failing, without a
+                // code that explains it, is explained by the credentials read
+                // after it: a code says more, and a server that answered the
+                // login was presented credentials.
+                let unexplained = matches!(
                     error,
-                    Error::Security(security) if kerberos::SecuritySignal::of(security).is_some()
+                    Error::Security(security) if kerberos::SecuritySignal::of(security).is_none()
                 );
                 self.checks.push(check);
-                // A database the server would not open (4060, 4064) comes
-                // after a login that succeeded: no ticket was missing.
-                if no_ticket_cache
-                    && !explained
+                if let Some((certainty, text)) = missing_ticket
+                    && unexplained
                     && failed_phase == Some(Stage::Login)
-                    && classified.auth == AuthOutcome::Failed
                 {
-                    self.finding(
-                        Certainty::Suspected,
-                        CheckId::ConnectionAttempt,
-                        no_ticket_cache_finding(cache_location.as_deref()),
-                    );
+                    self.finding_once(certainty, CheckId::ConnectionAttempt, text);
                 }
                 self.authentication = Some(classified.auth);
                 self.finding_quoting(
@@ -5081,6 +5114,8 @@ impl Diagnosis {
             // Stopped: below this depth, so not reached.
             (_, None) => self.checks.push(check),
         }
+        // After the attempt's own errors: reading the credentials came after it.
+        self.errors.extend(credential_records);
         if self.request.authentication == Authentication::Integrated {
             self.note_negotiation();
         }
@@ -5159,13 +5194,14 @@ impl Diagnosis {
         ));
     }
 
-    /// The client's side of Kerberos/SSPI: the SPN the attempt requested and,
-    /// off Windows, whether a ticket cache exists. Windows keeps tickets in
-    /// the logon session, which needs no cache. The cache may be on a slow
-    /// (network) path, so it is looked for on a thread of its own within
-    /// `budget`, what is left of the attempt's time limit. Where it looked
-    /// (`KRB5CCNAME`, `default`, or the cache type), when it did.
-    async fn kerberos_evidence(&mut self, check: &mut Check, budget: Duration) -> Option<String> {
+    /// The client's side of Kerberos/SSPI: the SPN the attempt requested and
+    /// the client's own Kerberos credentials, read where its Kerberos library
+    /// or Windows keeps them. A cache may be on a slow (network) path or a
+    /// daemon that does not answer, so the credentials are read on a thread
+    /// of their own within `budget`, what is left of the attempt's time
+    /// limit. The error-chain records of a read that failed, for the caller
+    /// to add after the attempt's own.
+    async fn kerberos_evidence(&mut self, check: &mut Check, budget: Duration) -> Vec<ErrorRecord> {
         if let Some(spn) = self.spn.clone() {
             check
                 .fields
@@ -5202,58 +5238,42 @@ impl Diagnosis {
                 check.fields.push(Field::plain("retriedWithoutSpn", "true"));
             }
         }
-        let mut looked_in = None;
-        let found = match self.ticket_cache {
-            Some(lookup) => Some(within(budget, lookup).await),
-            None => None,
-        };
-        match found {
-            None => {
-                check
-                    .fields
-                    .push(Field::plain("kerberosTicketCache", "notApplicable"));
-            }
-            Some(Some((state, location))) => {
-                check
-                    .fields
-                    .push(Field::plain("kerberosTicketCache", state));
-                if state == "unverified" {
-                    self.limitation_text(LocalizedText::new(
-                        "diagnose.limitation.kerberos_cache_unverified",
-                        format!(
-                            "The Kerberos ticket cache is a {location} cache, which sqlcmd does \
-                             not inspect."
-                        ),
-                        vec![("location", location.clone())],
-                    ));
-                } else if location == "default" {
-                    self.limitation_text(LocalizedText::new(
-                        "diagnose.limitation.kerberos_default_cache_only",
-                        "Only the default file ticket cache was looked for; a KCM or KEYRING \
-                         cache set in krb5.conf is not inspected.",
-                        vec![],
-                    ));
+        self.kerberos_credentials = None;
+        let mut records = Vec::new();
+        match self.credentials_lookup {
+            None => check
+                .fields
+                .push(Field::plain("kerberosTicketCache", "notApplicable")),
+            Some(lookup) => {
+                let spn = self.spn.clone();
+                match within(budget, move || (lookup.read)(spn)).await {
+                    Some(credentials) => {
+                        check.fields.extend(credentials.fields());
+                        for limitation in credentials.limitations() {
+                            self.limitation_text(limitation);
+                        }
+                        records = credentials.records(check.id);
+                        if let Some(finding) = credentials.deprecated_encryption_finding() {
+                            self.finding_once(Certainty::Informational, check.id, finding);
+                        }
+                        self.kerberos_credentials = Some(credentials);
+                    }
+                    None => {
+                        check
+                            .fields
+                            .extend(kerberos::not_checked_fields(lookup.logon_session));
+                        self.limitation_text(kerberos::not_checked_limitation());
+                    }
                 }
-                looked_in = Some(location);
-            }
-            Some(None) => {
-                check
-                    .fields
-                    .push(Field::plain("kerberosTicketCache", "notChecked"));
-                self.limitation_text(LocalizedText::new(
-                    "diagnose.limitation.kerberos_cache_not_checked",
-                    "The Kerberos ticket cache could not be looked for within the time limit.",
-                    vec![],
-                ));
             }
         }
         self.limitation_text(LocalizedText::new(
             "diagnose.limitation.kerberos_spn_not_proof",
-            "Kerberos encryption types and delegation are not inspected; the SPN is the one the \
-             client requests, not proof that it is registered.",
+            "Kerberos delegation is not inspected, and the SPN is the one the client requests, \
+             not proof that it is registered.",
             vec![],
         ));
-        looked_in
+        records
     }
 
     async fn session_validation(&mut self, client: &mut TdsClient) {
@@ -5654,67 +5674,6 @@ fn encryption_name(negotiated: &str) -> &str {
         "LoginOnly" => "loginOnly",
         "NoEncryption" => "off",
         other => other,
-    }
-}
-
-/// Whether the user has a Kerberos ticket cache, and where sqlcmd looked:
-/// `KRB5CCNAME`, or the default `/tmp/krb5cc_<uid>`. The path itself is never
-/// reported.
-#[cfg(unix)]
-fn kerberos_ticket_cache() -> (&'static str, String) {
-    let name = std::env::var("KRB5CCNAME").ok();
-    // SAFETY: getuid has no preconditions and cannot fail.
-    let uid = unsafe { libc::getuid() };
-    ticket_cache_state(name.as_deref(), uid, |path| {
-        std::path::Path::new(path).exists()
-    })
-}
-
-#[cfg(not(unix))]
-fn kerberos_ticket_cache() -> (&'static str, String) {
-    ("notApplicable", String::new())
-}
-
-/// The ticket cache's state from `KRB5CCNAME` (or its absence) and the user's
-/// id: `found` or `notFound` for a file cache, `unverified` for another type
-/// (KCM, KEYRING, ...), which sqlcmd cannot inspect. Also where it looked:
-/// `KRB5CCNAME`, `default`, or the cache type.
-#[cfg_attr(not(unix), allow(dead_code))]
-fn ticket_cache_state(
-    krb5ccname: Option<&str>,
-    uid: u32,
-    exists: impl Fn(&str) -> bool,
-) -> (&'static str, String) {
-    let state = |path: &str| if exists(path) { "found" } else { "notFound" };
-    match krb5ccname.filter(|name| !name.is_empty()) {
-        Some(name) => match name.split_once(':') {
-            Some(("FILE", path)) => (state(path), "KRB5CCNAME".to_string()),
-            Some((kind, _)) if !name.starts_with('/') => ("unverified", kind.to_string()),
-            _ => (state(name), "KRB5CCNAME".to_string()),
-        },
-        None => (state(&format!("/tmp/krb5cc_{uid}")), "default".to_string()),
-    }
-}
-
-/// The finding for a login refused with no ticket cache where sqlcmd looked
-/// (`location`, from [`ticket_cache_state`]). Without `KRB5CCNAME` only the
-/// default file cache was looked for: krb5.conf can select another, so no
-/// missing ticket is claimed beyond it.
-fn no_ticket_cache_finding(location: Option<&str>) -> LocalizedText {
-    match location {
-        Some("KRB5CCNAME") => LocalizedText::new(
-            "diagnose.finding.no_kerberos_ticket_cache_named",
-            "The Kerberos ticket cache KRB5CCNAME names was not found, so the integrated login \
-             had no ticket to present.",
-            vec![],
-        ),
-        _ => LocalizedText::new(
-            "diagnose.finding.no_default_kerberos_ticket_cache",
-            "The default file Kerberos ticket cache was not found for this user; unless \
-             krb5.conf selects another cache (KCM or KEYRING, which sqlcmd does not inspect), \
-             the integrated login had no ticket to present.",
-            vec![],
-        ),
     }
 }
 
@@ -8600,16 +8559,16 @@ pub(crate) mod tests {
 
     #[test]
     fn optional_kerberos_lookup_cannot_erase_completed_driver_results() {
-        fn delayed_cache() -> (&'static str, String) {
+        fn delayed(_: Option<String>) -> kerberos::Credentials {
             std::thread::sleep(Duration::from_millis(100));
-            ("missing", "default".to_string())
+            cache_credentials(kerberos::State::NoCache, false)
         }
         for connected in [false, true] {
             let mut input = request("tcp:127.0.0.1,1433", Depth::SessionValidation);
             input.authentication = Authentication::Integrated;
             let mut diagnosis = Diagnosis::new(input);
             let target = self::input(&mut diagnosis).unwrap();
-            diagnosis.ticket_cache = Some(delayed_cache);
+            diagnosis.credentials_lookup = Some(cache_lookup(delayed));
             let mut outcome = driver_failure("28000", 18456, "Login failed");
             if connected {
                 outcome.connected = true;
@@ -9950,35 +9909,6 @@ pub(crate) mod tests {
             Some(7)
         );
     }
-    #[test]
-    fn a_ticket_cache_is_looked_for_where_kerberos_keeps_it() {
-        let present = |path: &str| path == "/tmp/krb5cc_1000" || path == "/home/u/cc";
-        assert_eq!(
-            ticket_cache_state(None, 1000, present),
-            ("found", "default".to_string())
-        );
-        assert_eq!(
-            ticket_cache_state(Some(""), 1001, present),
-            ("notFound", "default".to_string())
-        );
-        assert_eq!(
-            ticket_cache_state(Some("FILE:/home/u/cc"), 0, present),
-            ("found", "KRB5CCNAME".to_string())
-        );
-        assert_eq!(
-            ticket_cache_state(Some("/home/u/other"), 0, present),
-            ("notFound", "KRB5CCNAME".to_string())
-        );
-        assert_eq!(
-            ticket_cache_state(Some("KCM:1000"), 0, present),
-            ("unverified", "KCM".to_string())
-        );
-        assert_eq!(
-            ticket_cache_state(Some("KEYRING:persistent:1000"), 0, present),
-            ("unverified", "KEYRING".to_string())
-        );
-    }
-
     /// A cancel while SQL Server Browser is asked for a named instance's DAC:
     /// the addresses the lookup already resolved still pass name resolution,
     /// and the DAC port stays unchecked. Without them, name resolution was
@@ -10217,6 +10147,8 @@ pub(crate) mod tests {
     ) -> Report {
         let mut diagnosis = Diagnosis::new(request);
         diagnosis.windows = true;
+        // A test reads the credentials it gives, never this computer's.
+        diagnosis.credentials_lookup = None;
         prepare(&mut diagnosis);
         observe_ended(diagnosis, stages, &ended, attempt_ms)
     }
@@ -10230,8 +10162,34 @@ pub(crate) mod tests {
     ) -> Report {
         let mut diagnosis = Diagnosis::new(request);
         diagnosis.windows = true;
+        diagnosis.credentials_lookup = None;
         let (_, ended) = diagnosis.attempt_ended(attempt);
         observe_ended(diagnosis, stages, &ended, 10)
+    }
+
+    /// A FILE credentials cache as MIT krb5's library reads it, in `state`;
+    /// `named` by `KRB5CCNAME` or the default.
+    fn cache_credentials(state: kerberos::State, named: bool) -> kerberos::Credentials {
+        let mut credentials = kerberos::Credentials::new(
+            kerberos::Store::Cache {
+                kind: Some("FILE".to_string()),
+                path: Some("/tmp/krb5cc_1000".to_string()),
+                named,
+            },
+            state,
+        );
+        credentials.lists_tickets = true;
+        credentials
+    }
+
+    /// Credentials read as a cache's, with `read`.
+    fn cache_lookup(
+        read: fn(Option<String>) -> kerberos::Credentials,
+    ) -> kerberos::CredentialsLookup {
+        kerberos::CredentialsLookup {
+            logon_session: false,
+            read,
+        }
     }
 
     /// [`Diagnosis::connection_input`], run to completion.
@@ -11792,11 +11750,12 @@ pub(crate) mod tests {
         assert_eq!(attempt.field("spn"), Some("MSSQLSvc/db01.contoso.com:1433"));
     }
 
-    /// The ticket cache is looked for within what is left of the attempt's
-    /// time limit: an attempt that used it all waits no longer for a slow
-    /// cache (on a network mount, say), and the lookup's time is the check's.
+    /// The credentials are read within what is left of the attempt's time
+    /// limit: an attempt that used it all waits no longer for a slow cache
+    /// (on a network mount, or a daemon that does not answer), and the read's
+    /// time is the check's.
     #[test]
-    fn the_ticket_cache_lookup_has_only_what_is_left_of_the_time_limit() {
+    fn the_credentials_are_read_within_what_is_left_of_the_time_limit() {
         let stages = || {
             Stages::new()
                 .add(
@@ -11816,62 +11775,78 @@ pub(crate) mod tests {
                 .add(Stage::Prelogin, Some(true), 2, 3, &[])
                 .add(Stage::Login, Some(false), 3, 4, &[])
         };
-        let slow: fn() -> (&'static str, String) = || {
+        let slow: fn(Option<String>) -> kerberos::Credentials = |_| {
             std::thread::sleep(Duration::from_millis(1500));
-            ("found", "KRB5CCNAME".to_string())
+            cache_credentials(kerberos::State::Valid, true)
         };
         let mut integrated = request("tcp:db01,1433", Depth::ConnectionAttempt);
         integrated.authentication = Authentication::Integrated;
         integrated.login_timeout_seconds = 1;
 
-        let started = Instant::now();
-        let report = observed_lasting_with(
-            integrated.clone(),
-            stages(),
-            Ended::Failed(server_error(18456, "Login failed.")),
-            1000,
-            |diagnosis| diagnosis.ticket_cache = Some(slow),
-        );
-        assert!(
-            started.elapsed() < Duration::from_millis(1000),
-            "{:?}",
-            started.elapsed()
-        );
-        let attempt = checked(&report, CheckId::ConnectionAttempt);
-        assert_eq!(attempt.field("kerberosTicketCache"), Some("notChecked"));
-        assert!(attempt.duration_ms.unwrap() < 1500, "{attempt:#?}");
+        for logon_session in [false, true] {
+            let started = Instant::now();
+            let report = observed_lasting_with(
+                integrated.clone(),
+                stages(),
+                Ended::Failed(server_error(18456, "Login failed.")),
+                1000,
+                |diagnosis| {
+                    diagnosis.credentials_lookup = Some(kerberos::CredentialsLookup {
+                        logon_session,
+                        read: slow,
+                    })
+                },
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(1000),
+                "{:?}",
+                started.elapsed()
+            );
+            let attempt = checked(&report, CheckId::ConnectionAttempt);
+            // Windows keeps no ticket cache to look for.
+            assert_eq!(
+                attempt.field("kerberosTicketCache"),
+                Some(if logon_session {
+                    "notApplicable"
+                } else {
+                    "notChecked"
+                })
+            );
+            assert_eq!(attempt.field("ticketGrantingTicket"), Some("notChecked"));
+            assert!(attempt.duration_ms.unwrap() < 1500, "{attempt:#?}");
+            assert!(
+                report
+                    .limitations
+                    .iter()
+                    .any(|l| l.id == Some("diagnose.limitation.kerberos_cache_not_checked")),
+                "{:#?}",
+                report.limitations
+            );
+        }
 
-        // With time left, the lookup finishes, and its time is counted.
-        let quick: fn() -> (&'static str, String) = || {
+        // With time left, the read finishes, and its time is counted.
+        let quick: fn(Option<String>) -> kerberos::Credentials = |_| {
             std::thread::sleep(Duration::from_millis(200));
-            ("found", "KRB5CCNAME".to_string())
+            cache_credentials(kerberos::State::Valid, true)
         };
         let report = observed_lasting_with(
             integrated,
             stages(),
             Ended::Failed(server_error(18456, "Login failed.")),
             10,
-            |diagnosis| diagnosis.ticket_cache = Some(quick),
+            |diagnosis| diagnosis.credentials_lookup = Some(cache_lookup(quick)),
         );
         let attempt = checked(&report, CheckId::ConnectionAttempt);
         assert_eq!(attempt.field("kerberosTicketCache"), Some("found"));
+        assert_eq!(attempt.field("ticketGrantingTicket"), Some("valid"));
         assert!(attempt.duration_ms.unwrap() >= 200, "{attempt:#?}");
     }
 
-    /// A login with integrated authentication that the server refused,
-    /// replayed with the ticket cache lookup giving `state` (looked for in
-    /// `KRB5CCNAME`), failing in `failed` (the login, or before it).
-    fn integrated_login_refused(state: &'static str, failed: Stage) -> Report {
-        integrated_login_ended(state, failed, 18456, "Login failed.")
-    }
-
-    /// As [`integrated_login_refused`], with the server's error `number`.
-    fn integrated_login_ended(
-        state: &'static str,
-        failed: Stage,
-        number: u32,
-        message: &str,
-    ) -> Report {
+    /// A login with integrated authentication that ended with `error`,
+    /// replayed with the credentials read giving no cache where `KRB5CCNAME`
+    /// names it (`state` `notFound`) or a valid ticket-granting ticket,
+    /// failing in `failed` (the login, or before it).
+    fn integrated_login_ended(state: &'static str, failed: Stage, error: Error) -> Report {
         let mut integrated = request("tcp:db01,1433", Depth::ConnectionAttempt);
         integrated.authentication = Authentication::Integrated;
         let mut stages = Stages::new()
@@ -11900,61 +11875,69 @@ pub(crate) mod tests {
         } else {
             stages.add(failed, Some(false), 2, 3, &[])
         };
-        let lookup: fn() -> (&'static str, String) = match state {
-            "notFound" => || ("notFound", "KRB5CCNAME".to_string()),
-            _ => || ("found", "KRB5CCNAME".to_string()),
+        let lookup: fn(Option<String>) -> kerberos::Credentials = match state {
+            "notFound" => |_| cache_credentials(kerberos::State::NoCache, true),
+            _ => |_| cache_credentials(kerberos::State::Valid, true),
         };
-        observed_with(
-            integrated,
-            stages,
-            Ended::Failed(server_error(number, message)),
-            |diagnosis| diagnosis.ticket_cache = Some(lookup),
-        )
+        observed_with(integrated, stages, Ended::Failed(error), |diagnosis| {
+            diagnosis.credentials_lookup = Some(cache_lookup(lookup))
+        })
     }
 
-    /// A login refused with integrated authentication, and no ticket cache
-    /// where sqlcmd looked: the connection attempt says so. With a cache, or
-    /// a failure before the login, it does not.
+    /// The client's own security package failing without a code that
+    /// explains it, while no credentials cache existed where `KRB5CCNAME`
+    /// names one: the login had no Kerberos credentials to present. With a
+    /// valid ticket, a failure before the login, or a server that answered
+    /// the login (it was presented credentials), it is not said.
     #[test]
-    fn a_refused_integrated_login_without_a_ticket_cache_is_suspected() {
-        let suspected = no_ticket_cache_finding(Some("KRB5CCNAME"));
+    fn a_client_login_failure_without_kerberos_credentials_is_a_finding() {
+        let (certainty, text) = cache_credentials(kerberos::State::NoCache, true)
+            .missing_ticket_finding()
+            .unwrap();
+        assert_eq!(certainty, Certainty::Confirmed);
+        assert!(text.contains("KRB5CCNAME names does not exist"), "{text:?}");
         let claims = |report: &Report| {
             report.findings.iter().any(|f| {
-                f.check == CheckId::ConnectionAttempt
-                    && f.certainty == Certainty::Suspected
-                    && f.text == suspected
+                f.check == CheckId::ConnectionAttempt && f.certainty == certainty && f.text == text
             })
         };
-        let report = integrated_login_refused("notFound", Stage::Login);
+        let generic = || {
+            Error::Security(mssql_tds::security::SecurityError::InternalError(
+                "unexpected".to_string(),
+            ))
+        };
+        let report = integrated_login_ended("notFound", Stage::Login, generic());
         let attempt = checked(&report, CheckId::ConnectionAttempt);
         assert_eq!(attempt.field("kerberosTicketCache"), Some("notFound"));
+        assert_eq!(attempt.field("ticketGrantingTicket"), Some("absent"));
         assert_eq!(attempt.field("failedPhase"), Some("login"));
         assert!(claims(&report), "{:#?}", report.findings);
 
-        let report = integrated_login_refused("found", Stage::Login);
+        let report = integrated_login_ended("found", Stage::Login, generic());
         assert_eq!(
             checked(&report, CheckId::ConnectionAttempt).field("kerberosTicketCache"),
             Some("found")
         );
         assert!(!claims(&report), "{:#?}", report.findings);
 
-        let report = integrated_login_refused("notFound", Stage::Prelogin);
+        let report = integrated_login_ended("notFound", Stage::Prelogin, generic());
         assert_ne!(
             checked(&report, CheckId::ConnectionAttempt).field("failedPhase"),
             Some("login")
         );
         assert!(!claims(&report), "{:#?}", report.findings);
 
-        // A database the server would not open comes after a login that
-        // succeeded: a cache sqlcmd did not find (a KCM or KEYRING one, say)
-        // served it, and no missing ticket is suggested.
-        for number in DATABASE_ERRORS {
-            let report =
-                integrated_login_ended("notFound", Stage::Login, number, "Cannot open database");
+        // The server answered the login: refused it, or opened no database
+        // after it succeeded.
+        for number in LOGIN_ERRORS.into_iter().chain(DATABASE_ERRORS) {
+            let report = integrated_login_ended(
+                "notFound",
+                Stage::Login,
+                server_error(number, "Login failed."),
+            );
             let attempt = checked(&report, CheckId::ConnectionAttempt);
             assert_eq!(attempt.field("kerberosTicketCache"), Some("notFound"));
             assert_eq!(attempt.field("failedPhase"), Some("login"));
-            assert_eq!(report.authentication, Some(AuthOutcome::Succeeded));
             assert!(!claims(&report), "{number}: {:#?}", report.findings);
         }
     }
@@ -12014,16 +11997,16 @@ pub(crate) mod tests {
     }
 
     /// An integrated login over TCP whose login stage recorded `details` and
-    /// ended as `ended`, without a ticket cache lookup.
+    /// ended as `ended`, without reading credentials.
     fn integrated_login(details: &[(&'static str, &str)], ended: Ended) -> Report {
         integrated_login_with_cache(details, ended, None)
     }
 
-    /// [`integrated_login`], looking for the ticket cache with `cache`.
+    /// [`integrated_login`], reading the credentials with `lookup`.
     fn integrated_login_with_cache(
         details: &[(&'static str, &str)],
         ended: Ended,
-        cache: Option<fn() -> (&'static str, String)>,
+        lookup: Option<kerberos::CredentialsLookup>,
     ) -> Report {
         let mut integrated = request("tcp:db01,1433", Depth::ConnectionAttempt);
         integrated.authentication = Authentication::Integrated;
@@ -12046,7 +12029,7 @@ pub(crate) mod tests {
             .add(Stage::Prelogin, Some(true), 2, 3, &[])
             .add(Stage::Login, Some(ok), 3, 4, details);
         observed_with(integrated, stages, ended, |diagnosis| {
-            diagnosis.ticket_cache = cache;
+            diagnosis.credentials_lookup = lookup;
         })
     }
 
@@ -12135,12 +12118,14 @@ pub(crate) mod tests {
             report.limitations
         );
 
-        // Where sqlcmd looked for a cache says less than the KDC's answer: a
-        // client that reached the KDC had a ticket, whatever cache held it.
+        // Credentials read after the login say less than the KDC's answer: a
+        // client that reached the KDC had a ticket to ask with.
         let report = integrated_login_with_cache(
             &[(cs::SPN, "MSSQLSvc/db01.contoso.com:1433")],
             Ended::Failed(spn_unknown_failure()),
-            Some(|| ("notFound", "default".to_string())),
+            Some(cache_lookup(|_| {
+                cache_credentials(kerberos::State::NoCache, false)
+            })),
         );
         assert_eq!(
             checked(&report, CheckId::ConnectionAttempt).field("kerberosTicketCache"),
@@ -12150,7 +12135,8 @@ pub(crate) mod tests {
             !report
                 .findings
                 .iter()
-                .any(|f| f.certainty == Certainty::Suspected),
+                .any(|f| f.certainty == Certainty::Suspected
+                    || f.text.id == Some("diagnose.finding.kerberos_cache_not_found")),
             "{:#?}",
             report.findings
         );
@@ -12455,7 +12441,7 @@ pub(crate) mod tests {
         ));
         integrated.driver = Some(hook.clone());
         let mut diagnosis = Diagnosis::new(integrated);
-        diagnosis.ticket_cache = None;
+        diagnosis.credentials_lookup = None;
         diagnosis.login_security = Some(kerberos::LoginSecurity {
             package: "Negotiate".to_string(),
             negotiated: Some(("Kerberos".to_string(), true)),
@@ -14585,28 +14571,238 @@ pub(crate) mod tests {
         }
     }
 
-    /// A login refused with no ticket cache claims no missing ticket beyond
-    /// the cache looked for: without `KRB5CCNAME`, only the default file
-    /// cache, as the limitation says.
+    /// A valid ticket-granting ticket for alice, and a service ticket with
+    /// RC4 for the SPN the attempt asked for.
+    fn alices_credentials(spn: Option<String>) -> kerberos::Credentials {
+        let mut credentials = cache_credentials(kerberos::State::Valid, false);
+        credentials.principal = Some("alice@CONTOSO.COM".to_string());
+        credentials.tgt = Some(kerberos::Ticket {
+            ends: Some(1_900_000_000),
+            encryption: Some(18),
+            session_key: Some(18),
+            ..kerberos::Ticket::default()
+        });
+        credentials.service_ticket = Some(
+            spn.filter(|spn| spn == "MSSQLSvc/db01.contoso.com:1433")
+                .map(|_| kerberos::Ticket {
+                    ends: Some(1_900_000_000),
+                    expired: false,
+                    encryption: Some(23),
+                    session_key: Some(23),
+                    key_version: Some(3),
+                }),
+        );
+        credentials
+    }
+
+    /// The credentials read after a login are the attempt's evidence: its
+    /// tickets with their encryption types, the service ticket found for the
+    /// SPN the attempt asked for, and a deprecated type noted, not blamed.
     #[test]
-    fn a_missing_ticket_cache_is_claimed_only_where_it_was_looked_for() {
-        let (state, location) = ticket_cache_state(None, 1000, |_| false);
-        assert_eq!((state, location.as_str()), ("notFound", "default"));
-        let default = no_ticket_cache_finding(Some(&location)).render("en-US");
-        assert!(
-            default.starts_with("The default file Kerberos ticket cache"),
-            "{default}"
+    fn the_credentials_read_after_a_login_are_its_evidence() {
+        let report = integrated_login_with_cache(
+            &[
+                (cs::SPN, "MSSQLSvc/db01.contoso.com:1433"),
+                (cs::PACKAGE, "Kerberos"),
+            ],
+            Ended::Connected,
+            Some(cache_lookup(alices_credentials)),
         );
-        assert!(
-            default.contains("unless krb5.conf selects another cache"),
-            "{default}"
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        for (key, value) in [
+            ("kerberosTicketCache", "found"),
+            ("kerberosCredentialsSource", "defaultCache"),
+            ("kerberosCacheType", "FILE"),
+            ("ticketGrantingTicket", "valid"),
+            ("kerberosPrincipal", "alice@CONTOSO.COM"),
+            ("tgtEndTime", "2030-03-17T17:46:40Z"),
+            ("tgtEncryptionType", "aes256-cts-hmac-sha1-96"),
+            ("serviceTicket", "found"),
+            ("serviceTicketEncryptionType", "rc4-hmac"),
+            ("serviceTicketKeyVersion", "3"),
+        ] {
+            assert_eq!(attempt.field(key), Some(value), "{key}: {attempt:#?}");
+        }
+        let noted = report
+            .findings
+            .iter()
+            .find(|f| f.text.contains("rc4-hmac"))
+            .expect("the deprecated type is noted");
+        assert_eq!(noted.certainty, Certainty::Informational);
+        assert!(report.errors.is_empty(), "{:#?}", report.errors);
+        for id in [
+            "diagnose.limitation.kerberos_etypes_of_tickets",
+            "diagnose.limitation.kerberos_spn_not_proof",
+        ] {
+            assert!(
+                report.limitations.iter().any(|l| l.id == Some(id)),
+                "{id}: {:#?}",
+                report.limitations
+            );
+        }
+    }
+
+    fn unreadable_credentials(_: Option<String>) -> kerberos::Credentials {
+        let mut credentials = cache_credentials(kerberos::State::Unreadable, false);
+        credentials.principal = Some("alice@CONTOSO.COM".to_string());
+        credentials.failure = Some(kerberos::Failure::Krb5 {
+            code: -1_765_328_190,
+            message: Some(
+                "Credentials cache permissions incorrect (filename: /tmp/krb5cc_1000) for \
+                 alice@CONTOSO.COM"
+                    .to_string(),
+            ),
+        });
+        credentials
+    }
+
+    /// Credentials that could not be read are not evidence of a missing
+    /// ticket: the read's own code is an error after the attempt's, and its
+    /// words get the labels the fields do, the same value the same label.
+    #[test]
+    fn unreadable_credentials_are_a_typed_error_after_the_attempts_own() {
+        let report = integrated_login_with_cache(
+            &[(cs::SPN, "MSSQLSvc/db01.contoso.com:1433")],
+            Ended::Failed(server_error(18456, "Login failed for user ''.")),
+            Some(cache_lookup(unreadable_credentials)),
         );
-        let (state, location) = ticket_cache_state(Some("FILE:/tmp/cc"), 1000, |_| false);
-        assert_eq!((state, location.as_str()), ("notFound", "KRB5CCNAME"));
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.field("kerberosTicketCache"), Some("unverified"));
+        assert_eq!(attempt.field("ticketGrantingTicket"), Some("unreadable"));
+        let sources: Vec<(&str, Option<&str>)> = report
+            .errors
+            .iter()
+            .map(|e| (e.source, e.code.as_deref()))
+            .collect();
         assert_eq!(
-            no_ticket_cache_finding(Some(&location)).render("en-US"),
-            "The Kerberos ticket cache KRB5CCNAME names was not found, so the integrated login \
-             had no ticket to present."
+            sources.first().map(|s| s.0),
+            Some("sqlServer"),
+            "{sources:?}"
+        );
+        assert_eq!(
+            sources.last(),
+            Some(&("kerberos", Some("KRB5_FCC_PERM"))),
+            "{sources:?}"
+        );
+        assert!(
+            report
+                .limitations
+                .iter()
+                .any(|l| l.contains("could not be read (KRB5_FCC_PERM)")),
+            "{:#?}",
+            report.limitations
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.text.contains("no Kerberos credentials to present")),
+            "{:#?}",
+            report.findings
+        );
+
+        let json = report::json(&report, "dev").unwrap();
+        let text = report::text(&report);
+        for shown in [&json, &text] {
+            assert!(!shown.contains("alice"), "{shown}");
+            assert!(!shown.contains("/tmp/krb5cc_1000"), "{shown}");
+        }
+        assert!(json.contains("\"kerberosPrincipal\": \"user-1\""), "{json}");
+        assert!(json.contains("\"kerberosCache\": \"path-1\""), "{json}");
+        assert!(
+            json.contains("(filename: path-1) for user-1"),
+            "the error's words get the fields' labels: {json}"
+        );
+
+        let mut revealed = report.clone();
+        revealed.request.local_detail = true;
+        let json = report::json(&revealed, "dev").unwrap();
+        assert!(
+            json.contains("\"kerberosCache\": \"/tmp/krb5cc_1000\""),
+            "{json}"
+        );
+    }
+
+    /// sqlcmd's own driver runs in this process and uses the same
+    /// credentials: when the server answered none of its login and the
+    /// evidence login failed at its own, a cache without a ticket-granting
+    /// ticket explains the driver's failure. A server that answered was
+    /// presented credentials, a failure before the login presented none, and
+    /// a Windows logon session gets tickets when needed.
+    #[test]
+    fn a_driver_login_the_cache_left_without_credentials_is_a_finding() {
+        let noted = |credentials: kerberos::Credentials,
+                     failed_phase: Option<&str>,
+                     server_answered: bool| {
+            let mut integrated = request("tcp:db01,1433", Depth::ConnectionAttempt);
+            integrated.authentication = Authentication::Integrated;
+            let mut diagnosis = Diagnosis::new(integrated);
+            diagnosis.kerberos_credentials = Some(credentials);
+            let mut check = Check::new(CheckId::ConnectionAttempt, Coverage::Inconclusive);
+            if let Some(phase) = failed_phase {
+                check.fields.push(Field::plain("failedPhase", phase));
+            }
+            diagnosis.note_driver_credentials(&check, server_answered);
+            diagnosis
+                .findings
+                .iter()
+                .map(|f| (f.certainty, f.text.id))
+                .collect::<Vec<_>>()
+        };
+        let no_tgt = || cache_credentials(kerberos::State::NoTicket, false);
+        assert_eq!(
+            noted(no_tgt(), Some("login"), false),
+            [(
+                Certainty::Confirmed,
+                Some("diagnose.finding.kerberos_no_tgt")
+            )]
+        );
+        assert!(noted(no_tgt(), Some("login"), true).is_empty());
+        assert!(noted(no_tgt(), Some("tls"), false).is_empty());
+        assert!(noted(no_tgt(), None, false).is_empty());
+        let logon_session = kerberos::Credentials::new(
+            kerberos::Store::LogonSession(None),
+            kerberos::State::NoTicket,
+        );
+        assert!(noted(logon_session, Some("login"), false).is_empty());
+
+        // A driver login the server refused gets the evidence, not the
+        // finding.
+        let mut integrated = request("tcp:db01.contoso.com,1433", Depth::ConnectionAttempt);
+        integrated.authentication = Authentication::Integrated;
+        let (hook, _) = fake_driver(driver_failure(
+            "28000",
+            18452,
+            "Login failed. The login is from an untrusted domain and cannot be used with \
+             Integrated authentication.",
+        ));
+        integrated.driver = Some(hook.clone());
+        let mut diagnosis = Diagnosis::new(integrated);
+        diagnosis.credentials_lookup = Some(cache_lookup(|_| {
+            cache_credentials(kerberos::State::NoTicket, false)
+        }));
+        let target = input(&mut diagnosis).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(diagnosis.driver_attempt(
+            hook,
+            &target,
+            Some(("db01.contoso.com".to_string(), 1433)),
+        ));
+        let report = diagnosis.finish(0, 0);
+        assert_eq!(
+            checked(&report, CheckId::ConnectionAttempt).field("ticketGrantingTicket"),
+            Some("absent")
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.text.id == Some("diagnose.finding.kerberos_no_tgt")),
+            "{:#?}",
+            report.findings
         );
     }
 
