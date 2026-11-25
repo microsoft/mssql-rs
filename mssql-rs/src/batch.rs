@@ -61,7 +61,7 @@ impl<'a> BatchStream<'a> {
         }
     }
 
-    /// Reads the next event, or `Ok(None)` after the batch ends.
+    /// Reads the next event, or `Ok(None)` after completion or a terminal error.
     ///
     /// The first call sends the batch. At most one decoded row is delivered at
     /// a time, but a single row (including any large values) is materialized
@@ -137,11 +137,12 @@ impl<'a> BatchStream<'a> {
         Err(Error::Tds(error))
     }
 
-    /// Discards the unread response and waits for native ATTENTION cleanup.
+    /// Discards the unread response, sending ATTENTION if it is still arriving.
     ///
     /// `timeout_secs` bounds cancellation settlement, separately from the
     /// request timeout. Zero uses the native default. An unstarted batch
-    /// sends nothing, and a fully read batch needs no cancellation.
+    /// sends nothing. If the final packet is already buffered, the unread
+    /// tail is discarded locally without sending ATTENTION.
     ///
     /// Await this call through completion. Failed or interrupted settlement
     /// retires the connection. Cancellation does not roll back SQL effects.
@@ -156,7 +157,7 @@ impl<'a> BatchStream<'a> {
         let mut operation = Operation::new(self.inner)?;
         // Only keep the connection if settlement completed successfully.
         operation
-            .cancel_query(timeout_secs)
+            .abandon_query(timeout_secs)
             .await
             .map_err(Error::Tds)?;
         operation.complete(Ok(()))

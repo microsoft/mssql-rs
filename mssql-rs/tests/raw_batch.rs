@@ -96,8 +96,13 @@ mod wire {
 
 use std::time::Duration;
 
-use mssql_mock_tds::protocol::{PacketType, build_attention_ack_packet, build_done_token};
-use mssql_rs::{AuthMethod, BatchItem, Client, Config, EncryptionLevel, Error, ExecuteOptions};
+use mssql_mock_tds::TerminalError;
+use mssql_mock_tds::protocol::{
+    PacketType, build_attention_ack_packet, build_done_token, build_terminal_error_tokens,
+};
+use mssql_rs::{
+    AuthMethod, BatchErrorMode, BatchItem, Client, Config, EncryptionLevel, Error, ExecuteOptions,
+};
 use mssql_tds::error::Error as TdsError;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -109,6 +114,7 @@ const FOLLOW_UP: &str = "SELECT 9 AS n";
 enum Tail {
     Complete,
     Cancel,
+    BufferedError,
     MissingAck,
     RequestTimeout,
 }
@@ -128,19 +134,29 @@ async fn exercise_batch(tail: Tail) {
         let (mut socket, _) = listener.accept().await.expect("accept client");
         wire::login(&mut socket).await;
         wire::expect_batch(&mut socket, BATCH).await;
-        wire::send(&mut socket, &wire::mixed_response(), 1, false).await;
-        if matches!(tail, Tail::Complete) {
-            wire::send(&mut socket, &build_done_token(0), 2, true).await;
+        let mut tokens = wire::mixed_response();
+        if matches!(tail, Tail::BufferedError) {
+            tokens.extend_from_slice(&build_terminal_error_tokens(&TerminalError::new(
+                50000,
+                16,
+                "unread statement error",
+            )));
+            wire::send(&mut socket, &tokens, 1, true).await;
         } else {
-            wire::read(&mut socket, PacketType::Attention).await;
-            if matches!(tail, Tail::MissingAck) {
-                assert_eq!(socket.read(&mut [0]).await.expect("client disconnect"), 0);
-                return;
+            wire::send(&mut socket, &tokens, 1, false).await;
+            if matches!(tail, Tail::Complete) {
+                wire::send(&mut socket, &build_done_token(0), 2, true).await;
+            } else {
+                wire::read(&mut socket, PacketType::Attention).await;
+                if matches!(tail, Tail::MissingAck) {
+                    assert_eq!(socket.read(&mut [0]).await.expect("client disconnect"), 0);
+                    return;
+                }
+                socket
+                    .write_all(&build_attention_ack_packet())
+                    .await
+                    .expect("send ATTENTION ACK");
             }
-            socket
-                .write_all(&build_attention_ack_packet())
-                .await
-                .expect("send ATTENTION ACK");
         }
         wire::expect_batch(&mut socket, FOLLOW_UP).await;
         wire::send(&mut socket, &wire::rowset("n", &[9]), 1, true).await;
@@ -156,14 +172,13 @@ async fn exercise_batch(tail: Tail) {
             .cancel(1)
             .await
             .expect("cancel unstarted batch");
-        let mut batch = client.simple_query_batch(
-            BATCH,
-            ExecuteOptions::new().timeout_secs(if matches!(tail, Tail::RequestTimeout) {
-                1
-            } else {
-                0
-            }),
-        );
+        let mut options = ExecuteOptions::new();
+        if matches!(tail, Tail::BufferedError) {
+            options.on_error = BatchErrorMode::Continue;
+        } else if matches!(tail, Tail::RequestTimeout) {
+            options = options.timeout_secs(1);
+        }
+        let mut batch = client.simple_query_batch(BATCH, options);
 
         assert!(matches!(
             batch.next_item().await.expect("read affected-row count"),
@@ -197,7 +212,9 @@ async fn exercise_batch(tail: Tail) {
                 assert!(batch.next_item().await.expect("finish batch").is_none());
                 batch.cancel(1).await.expect("cancel completed batch");
             }
-            Tail::Cancel => batch.cancel(1).await.expect("settle explicit cancellation"),
+            Tail::Cancel | Tail::BufferedError => {
+                batch.cancel(1).await.expect("settle explicit cancellation")
+            }
             Tail::MissingAck => {
                 assert!(batch.cancel(1).await.is_err());
                 assert!(client.is_connection_dead());
@@ -244,6 +261,11 @@ async fn streams_statement_counts_and_rowset_boundaries() {
 #[tokio::test]
 async fn row_limit_sends_attention_and_preserves_connection() {
     exercise_batch(Tail::Cancel).await;
+}
+
+#[tokio::test]
+async fn cancel_discards_buffered_statement_error_without_attention() {
+    exercise_batch(Tail::BufferedError).await;
 }
 
 #[tokio::test]
