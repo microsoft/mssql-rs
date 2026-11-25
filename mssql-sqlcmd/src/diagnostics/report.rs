@@ -855,6 +855,53 @@ fn check_text(check: &Check, protocol: Option<Protocol>, r: &mut Redactor, local
                     },
                 );
             }
+            if let Some(state) = check.field("spnLookup") {
+                let scope = check.field("spnLookupScope").unwrap_or_default();
+                let accounts = named(r, "spnAccounts");
+                let kind = check.field("spnAccountType").unwrap_or_default();
+                let types = named(r, "spnAccountEncryptionTypes");
+                let separator = tr(locale, "diagnose.list.separator", &[]);
+                let found = |id| {
+                    tr(
+                        locale,
+                        id,
+                        &[
+                            ("scope", &scope),
+                            ("account", &accounts.join("")),
+                            ("type", &kind),
+                            ("types", &types.join(&separator)),
+                        ],
+                    )
+                };
+                parts.push(match state {
+                    "notFound" => tr(
+                        locale,
+                        "diagnose.detail.spn_lookup_not_found",
+                        &[("scope", &scope)],
+                    ),
+                    "found" if types == ["notSet"] => {
+                        found("diagnose.detail.spn_lookup_found_unset")
+                    }
+                    "found" if !types.is_empty() => {
+                        found("diagnose.detail.spn_lookup_found_encryption")
+                    }
+                    "found" => found("diagnose.detail.spn_lookup_found"),
+                    "multiple" => tr(
+                        locale,
+                        "diagnose.detail.spn_lookup_multiple",
+                        &[("scope", &scope), ("accounts", &accounts.join(&separator))],
+                    ),
+                    _ => tr(locale, "diagnose.detail.spn_lookup", &[("state", &state)]),
+                });
+                let searched = named(r, "spnSearched");
+                if !searched.is_empty() {
+                    parts.push(tr(
+                        locale,
+                        "diagnose.detail.spn_searched",
+                        &[("spn", &searched.join(""))],
+                    ));
+                }
+            }
             parts.join(&tr(locale, "diagnose.list.semicolon_separator", &[]))
         }
         super::CheckId::SessionValidation => {
@@ -1874,7 +1921,8 @@ enum SkipView {
     },
 }
 
-/// A check's field: a list for `addresses`, a number for `port`,
+/// A check's field: a list for `addresses`, `spnAccounts` and
+/// `spnAccountEncryptionTypes`, a number for `port`,
 /// `engineEdition`, `clockOffsetMs`, `retries`, `osError` and
 /// `serviceTicketKeyVersion` when the value is one, a boolean for
 /// `loginCompleted`, `negotiationComplete` and `retriedWithoutSpn`,
@@ -1925,7 +1973,10 @@ impl CheckView {
                     None => f.value.clone(),
                 })
                 .collect();
-            let value = if field.key == "addresses" {
+            let value = if matches!(
+                field.key,
+                "addresses" | "spnAccounts" | "spnAccountEncryptionTypes"
+            ) {
                 FieldValue::List(values)
             } else if let (true, Ok(flag)) = (
                 matches!(
@@ -3506,7 +3557,7 @@ Limitations:
         }
         let json = json(&report, "v").unwrap();
         assert!(
-            json.contains("\"coverageMatrixVersion\": \"1.7\""),
+            json.contains("\"coverageMatrixVersion\": \"1.8\""),
             "{json}"
         );
         assert!(
