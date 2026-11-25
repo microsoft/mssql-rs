@@ -67,6 +67,9 @@ For SDK authors integrating the native runtime:
   After cleanup and cursor-state publication release ownership, logging does
   not delay settlement. Timeout retirement checks the originating operation
   and fetch generation atomically, so stale waits cannot break newer work.
+  Settled workers may outlive their event loop without retiring a connection
+  reused on another loop. Late results are not scheduled for already-cancelled
+  Futures.
   Credential-provider cancellation during idle session recovery propagates
   `CancelledError` without permanently breaking the logical connection when no
   batch is open; a later query can retry recovery.

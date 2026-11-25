@@ -1305,6 +1305,99 @@ def test_fetch_cancellation_during_row_materialization_keeps_connection_reusable
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("blocked_phase", ["logging", "exhausted-conversion"])
+def test_cancelled_worker_on_closed_loop_preserves_replacement(
+    client_context, blocked_phase,
+):
+    entered = threading.Event()
+    release = threading.Event()
+    finder = BlockingDecimalFinder(entered, release)
+    shared = {}
+    decimal_module = None
+
+    class Logger(RecordingLogger):
+        armed = False
+
+        def py_core_log(self, level, message, module_name, line):
+            super().py_core_log(level, message, module_name, line)
+            if self.armed and "query executed successfully" in message:
+                self.armed = False
+                entered.set()
+                release.wait(15)
+
+    logger = Logger()
+
+    async def original_loop():
+        nonlocal decimal_module
+        conn = await connect(client_context, logger)
+        shared["connection"] = conn
+        shared["loop"] = asyncio.get_running_loop()
+        cursor = conn.cursor()
+        await cursor.execute("SELECT @@SPID", use_prepare=False)
+        shared["session_id"] = (await cursor.fetchall())[0][0]
+        if blocked_phase == "logging":
+            logger.armed = True
+            pending = cursor.execute("SET NOCOUNT ON", use_prepare=False)
+        else:
+            await cursor.execute("SELECT CAST(1 AS decimal(10, 2))", use_prepare=False)
+            decimal_module = sys.modules.pop("decimal")
+            sys.meta_path.insert(0, finder)
+            pending = cursor.fetchall()
+        shared["pending"] = pending
+        for _ in range(500):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("The original worker did not block")
+        assert pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), 2)
+
+    async def replacement_loop():
+        conn = shared["connection"]
+        try:
+            replacement = conn.cursor()
+            await replacement.execute("SELECT 99, @@SPID", use_prepare=False)
+            release.set()
+            deadline = asyncio.get_running_loop().time() + 5
+            # Worker-held Future references disappear only after delivery handling finishes.
+            while sys.getrefcount(shared["pending"]) != 2:
+                if asyncio.get_running_loop().time() >= deadline:
+                    pytest.fail("The old worker still retains its cancelled Future")
+                await asyncio.wait_for(
+                    asyncio.shield(shared["pending"]._cancel_and_settle()), 2
+                )
+                await asyncio.sleep(0.01)
+            assert await replacement.fetchall() == [(99, shared["session_id"])]
+        finally:
+            release.set()
+            if finder in sys.meta_path:
+                sys.meta_path.remove(finder)
+            if decimal_module is not None:
+                await asyncio.to_thread(__import__, "decimal")
+                sys.modules["decimal"] = decimal_module
+            await conn.close()
+
+    try:
+        asyncio.run(original_loop())
+        assert shared["loop"].is_closed()
+        asyncio.run(replacement_loop())
+    finally:
+        release.set()
+        if finder in sys.meta_path:
+            sys.meta_path.remove(finder)
+        if decimal_module is not None:
+            sys.modules["decimal"] = decimal_module
+        if "connection" in shared and not shared["connection"].closed:
+            async def close_connection():
+                await shared["connection"].close()
+
+            asyncio.run(close_connection())
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "operation",
     ["execute", "executemany", "fetchone", "fetchmany", "nextset", "exhausted-fetchall"],

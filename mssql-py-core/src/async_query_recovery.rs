@@ -190,6 +190,20 @@ impl QueryControl {
         self.settled.send_replace(true);
     }
 
+    fn retire_if_unsettled(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        self.retire_unsettled_locked(&state)
+    }
+
+    fn retire_unsettled_locked(&self, state: &State) -> bool {
+        !state.completed
+            && !state.delivered
+            && state.target.is_some_and(|target| {
+                let (operation_id, fetch_id) = target.ids();
+                self.session.mark_broken_if_owned(operation_id, fetch_id)
+            })
+    }
+
     async fn recover_undelivered(&self) -> PyResult<()> {
         let target = self
             .state
@@ -213,7 +227,7 @@ impl QueryControl {
         }
         .await;
         if result.is_err() {
-            self.session.mark_broken();
+            self.retire_if_unsettled();
         }
         recovery.fetch_state.set(FetchStatus::NoResultSet);
         recovery.description_state.replace(None);
@@ -223,6 +237,7 @@ impl QueryControl {
         result
     }
 
+    #[cfg(test)]
     fn is_settled(&self) -> bool {
         *self.settled.borrow()
     }
@@ -287,10 +302,7 @@ impl QueryControl {
                 if state.completed || state.delivered {
                     return self.session.ensure_open().map_err(map_claim_error);
                 }
-                let retired = state.target.is_some_and(|target| {
-                    let (operation_id, fetch_id) = target.ids();
-                    self.session.mark_broken_if_owned(operation_id, fetch_id)
-                });
+                let retired = self.retire_unsettled_locked(&state);
                 drop(state);
                 let message = if retired {
                     "Query cancellation settlement timed out; connection is broken"
@@ -368,7 +380,7 @@ impl QueryDelivery {
         // The event-loop callback arbitrates delivery and cancellation under the GIL.
         if let Err(error) = complete.call1((value,)) {
             drop(state);
-            self.control.session.mark_broken();
+            self.control.retire_if_unsettled();
             self.control.cancel();
             return Err(error);
         }
@@ -415,8 +427,8 @@ struct CompletionGuard {
 
 impl Drop for CompletionGuard {
     fn drop(&mut self) {
-        if !self.completed && !self.control.is_settled() {
-            self.control.session.mark_broken();
+        if !self.completed {
+            self.control.retire_if_unsettled();
         }
         self.control.complete();
     }
@@ -442,6 +454,9 @@ where
             completed: false,
         };
         let result = future.await;
+        if result.is_err() {
+            completion.control.retire_if_unsettled();
+        }
         completion.completed = true;
         result
     };
@@ -471,6 +486,10 @@ where
     tokio::task::spawn_blocking(move || {
         Python::attach(move |py| {
             let future = future.bind(py);
+            if future.call_method0("cancelled")?.is_truthy()? {
+                delivery.borrow(py).control.cancel();
+                return Ok(());
+            }
             let (complete, value, failed) = match result.and_then(|value| value.into_py_any(py)) {
                 Ok(value) => (future.getattr("set_result")?, value, false),
                 Err(error) => (
@@ -528,7 +547,7 @@ where
     )?;
     if let Err(error) = awaitable.setattr("_cancel_and_settle", cancel_and_settle) {
         control.cancel();
-        control.session.mark_broken();
+        control.retire_if_unsettled();
         tracing::error!(%error, "Failed to attach async query settlement handle");
         return Err(error);
     }
@@ -553,9 +572,6 @@ where
         )
         .await;
         if let Err(error) = result {
-            if control.session.ensure_open().is_ok() {
-                control.session.mark_broken();
-            }
             tracing::error!(%error, "Async query delivery or recovery failed");
             if let Err(error) =
                 schedule_delivery::<()>(failure_loop, failure_future, failure_delivery, Err(error))
@@ -568,7 +584,7 @@ where
         })
         .await
         {
-            control.session.mark_broken();
+            control.retire_if_unsettled();
             tracing::error!(%error, "Failed to release async query delivery references");
         }
     });
@@ -613,6 +629,117 @@ mod tests {
             );
             event_loop.call_method0("close").unwrap();
         });
+    }
+
+    #[tokio::test]
+    async fn closed_loop_delivery_failure_retires_an_undelivered_batch() {
+        let session = Arc::new(AsyncConnectionState::new());
+        let claim = session.claim_execute(1).unwrap();
+        let control = QueryControl::new(Arc::clone(&session), "execute");
+        control.register_execute(claim.operation_id);
+        session.defer_query_delivery(claim.operation_id, None);
+        assert!(session.finish_execute(claim.operation_id, true));
+        let (event_loop, future, delivery) = Python::attach(|py| {
+            let event_loop = py
+                .import("asyncio")
+                .unwrap()
+                .call_method0("new_event_loop")
+                .unwrap();
+            let future = event_loop.call_method0("create_future").unwrap().unbind();
+            let delivery = Py::new(
+                py,
+                QueryDelivery {
+                    control: Arc::clone(&control),
+                },
+            )
+            .unwrap();
+            event_loop.call_method0("close").unwrap();
+            (event_loop.unbind(), future, delivery)
+        });
+
+        let error = run_query_in_background(
+            schedule_delivery(event_loop, future, delivery, Ok(())),
+            control,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Event loop is closed"));
+        assert_eq!(session.ensure_open(), Err(ClaimError::Broken));
+        assert!(session.must_discard());
+    }
+
+    #[tokio::test]
+    async fn worker_failure_only_retires_unsettled_matching_ownership() {
+        for phase in [
+            "unsettled",
+            "released",
+            "settled",
+            "delivered",
+            "fetch-replaced",
+        ] {
+            let session = Arc::new(AsyncConnectionState::new());
+            let original = session.claim_execute(1).unwrap();
+            let control = QueryControl::new(Arc::clone(&session), "execute");
+            control.register_execute(original.operation_id);
+            let current_id = match phase {
+                "released" | "settled" => {
+                    session.release_operation(original.operation_id);
+                    if phase == "settled" {
+                        control.complete();
+                    }
+                    session.claim_execute(2).unwrap().operation_id
+                }
+                "delivered" => {
+                    assert!(session.finish_execute(original.operation_id, true));
+                    control.state.lock().unwrap().delivered = true;
+                    original.operation_id
+                }
+                "fetch-replaced" => {
+                    assert!(session.finish_execute(original.operation_id, true));
+                    let fetch = session.claim_fetch(1).unwrap();
+                    control.register_fetch(fetch.operation_id, fetch.fetch_id);
+                    assert_eq!(
+                        session.finish_fetch(fetch.operation_id, fetch.fetch_id, false, true),
+                        crate::async_session::FetchCompletion::Published
+                    );
+                    session.claim_fetch(1).unwrap().operation_id
+                }
+                _ => original.operation_id,
+            };
+            let error = run_query_in_background(
+                async { Err::<(), _>(PyRuntimeError::new_err("Result delivery failed")) },
+                Arc::clone(&control),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(error.to_string().contains("Result delivery failed"));
+            assert_eq!(session.is_broken(), phase == "unsettled", "{phase}");
+            if phase != "unsettled" {
+                assert_eq!(session.validate_operation(current_id), Ok(()), "{phase}");
+                assert!(!session.must_discard(), "{phase}");
+            }
+        }
+    }
+
+    #[test]
+    fn interrupted_released_worker_cannot_retire_replacement() {
+        let session = Arc::new(AsyncConnectionState::new());
+        let original = session.claim_execute(1).unwrap();
+        let control = QueryControl::new(Arc::clone(&session), "execute");
+        control.register_execute(original.operation_id);
+        session.release_operation(original.operation_id);
+        let replacement = session.claim_execute(2).unwrap();
+
+        drop(CompletionGuard {
+            control,
+            completed: false,
+        });
+
+        assert!(!session.is_broken());
+        assert!(!session.must_discard());
+        assert_eq!(session.validate_operation(replacement.operation_id), Ok(()));
     }
 
     #[tokio::test]
