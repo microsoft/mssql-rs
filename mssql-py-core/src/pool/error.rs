@@ -17,6 +17,7 @@ pub(crate) enum AcquireStage {
     Reset,
     Isolation,
     Delivery,
+    Execute,
 }
 
 /// Physical-open failures with typed causes and redacted routine diagnostics.
@@ -59,6 +60,8 @@ pub(crate) enum PoolError {
     Initialize(#[source] Box<TdsError>),
     #[error("connection is not quiescent after initialization")]
     InvalidSession,
+    #[error("connection operation failed")]
+    Execute(#[source] Box<TdsError>),
     #[error("connection cleanup failed")]
     Cleanup(#[source] Box<TdsError>),
     #[error("connection cleanup timed out")]

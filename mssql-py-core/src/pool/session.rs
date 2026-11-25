@@ -1,12 +1,18 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
+
 use mssql_tds::connection::tds_client::{ExecuteOptions, TdsClient};
-use mssql_tds::core::CancelHandle;
+use mssql_tds::core::{CancelHandle, TdsResult};
 use mssql_tds::message::transaction_management::TransactionIsolationLevel;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
-use super::connection::{ConnectSpec, ConnectionFactory, OpenedConnection, PoolKey};
+use super::auth::OperationAuth;
+use super::connection::{AuthBinding, ConnectSpec, ConnectionFactory, OpenedConnection, PoolKey};
 use super::control::AcquireControl;
 use super::error::{AcquireStage, PoolError, PoolResult};
 use super::lifecycle::SlotGuard;
@@ -58,6 +64,27 @@ pub(crate) struct PoolLease {
 }
 
 impl PoolLease {
+    pub(crate) fn activate_auth(
+        &mut self,
+        factory: crate::async_entra_token_factory::AsyncPythonEntraIdTokenFactory,
+        current_binding: &AuthBinding,
+        margin: Duration,
+    ) -> PoolResult<OperationAuth> {
+        if self.discard {
+            return Err(PoolError::InvalidSession);
+        }
+        self.slot.runtime()?;
+        self.slot
+            .value_mut()
+            .expect("published client")
+            .recovery_auth()
+            .ok_or(PoolError::InvalidRequest {
+                field: "authentication",
+                reason: "this lease has no operation-scoped credential callback",
+            })?
+            .activate(factory, current_binding, margin)
+    }
+
     pub(crate) fn client_mut(&mut self) -> &mut TdsClient {
         self.slot
             .value_mut()
@@ -67,6 +94,154 @@ impl PoolLease {
 
     pub(crate) fn mark_discard(&mut self) {
         self.discard = true;
+    }
+
+    /// The binding reader must observe account/credential epoch changes, not JWT claims.
+    pub(crate) async fn run_authenticated<T>(
+        &mut self,
+        deadline: Option<Instant>,
+        cancellation: &CancellationToken,
+        auth: OperationAuth,
+        current_binding: impl Fn() -> PoolResult<AuthBinding>,
+        operation: impl for<'a> FnOnce(
+            &'a mut TdsClient,
+            &'a CancelHandle,
+        )
+            -> Pin<Box<dyn Future<Output = TdsResult<T>> + Send + 'a>>,
+    ) -> PoolResult<T> {
+        self.slot.runtime()?;
+        if !self
+            .slot
+            .value_mut()
+            .expect("published client")
+            .recovery_auth()
+            .is_some_and(|retained| retained.owns(&auth))
+        {
+            self.mark_discard();
+            self.client_mut().mark_connection_dead();
+            return Err(PoolError::IdentityMismatch);
+        }
+        if let Err(error) = current_binding().and_then(|binding| auth.check_binding(&binding)) {
+            self.mark_discard();
+            self.client_mut().mark_connection_dead();
+            return Err(error);
+        }
+        let result = self.run(deadline, cancellation, operation).await;
+        let metadata = current_binding().and_then(|binding| auth.complete(&binding));
+        match metadata {
+            Ok(Some(metadata)) => {
+                if let Err(error) = self
+                    .slot
+                    .value_mut()
+                    .expect("published client")
+                    .record_auth(metadata)
+                {
+                    self.mark_discard();
+                    self.client_mut().mark_connection_dead();
+                    return result.and(Err(error));
+                }
+            }
+            Ok(None) => {}
+            Err(PoolError::TokenExpired) => {
+                self.mark_discard();
+                self.client_mut().mark_connection_dead();
+                tracing::debug!("discarding authenticated pool session after token expiry");
+            }
+            Err(error) => {
+                self.mark_discard();
+                self.client_mut().mark_connection_dead();
+                return result.and(Err(error));
+            }
+        }
+        if cancellation.is_cancelled()
+            || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.mark_discard();
+            self.client_mut().mark_connection_dead();
+            return Err(if cancellation.is_cancelled() {
+                PoolError::Cancelled
+            } else {
+                PoolError::AcquireTimeout {
+                    stage: AcquireStage::Execute,
+                }
+            });
+        }
+        result
+    }
+
+    /// Retains capacity and marks interrupted work unusable before its first poll.
+    /// An optional command deadline covers recovery, execution and result delivery.
+    pub(crate) async fn run<T>(
+        &mut self,
+        deadline: Option<Instant>,
+        cancellation: &CancellationToken,
+        operation: impl for<'a> FnOnce(
+            &'a mut TdsClient,
+            &'a CancelHandle,
+        )
+            -> Pin<Box<dyn Future<Output = TdsResult<T>> + Send + 'a>>,
+    ) -> PoolResult<T> {
+        if self.discard {
+            return Err(PoolError::InvalidSession);
+        }
+        let check = || {
+            if cancellation.is_cancelled() {
+                return Err(PoolError::Cancelled);
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(PoolError::AcquireTimeout {
+                    stage: AcquireStage::Execute,
+                });
+            }
+            Ok(())
+        };
+        check()?;
+        let runtime = self.slot.runtime()?;
+        let guard = LeaseOperation(self);
+        guard.0.discard = true;
+        let cancel = OperationCancel(CancelHandle::new());
+        let result = {
+            let work = async {
+                let elapsed = async {
+                    if let Some(deadline) = deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => Err(PoolError::Cancelled),
+                    _ = elapsed => Err(PoolError::AcquireTimeout { stage: AcquireStage::Execute }),
+                    result = operation(guard.0.client_mut(), &cancel.0) => {
+                        check()?;
+                        result.map_err(|error| PoolError::Execute(Box::new(error)))
+                    }
+                }
+            };
+            tokio::pin!(work);
+            std::future::poll_fn(|cx| {
+                if let Err(error) = check_runtime(runtime) {
+                    return std::task::Poll::Ready(Err(error));
+                }
+                std::future::Future::poll(work.as_mut(), cx)
+            })
+            .await
+        };
+        let settled = match &result {
+            Ok(_) => true,
+            Err(PoolError::Execute(error)) => !matches!(
+                error.as_ref(),
+                mssql_tds::error::Error::OperationCancelledError(_)
+                    | mssql_tds::error::Error::TokenAcquisitionCancelled
+                    | mssql_tds::error::Error::TimeoutError(_)
+            ),
+            _ => false,
+        };
+        if settled && !guard.0.client_mut().is_connection_dead() {
+            guard.0.discard = false;
+        }
+        result
     }
 
     pub(crate) async fn release(self) -> PoolResult<()> {
@@ -86,7 +261,8 @@ impl PoolLease {
         {
             // The slot owns the client throughout cleanup, including future drop.
             let cleanup = tokio::time::timeout_at(deadline, async {
-                let client = self.client_mut();
+                let mut maintenance = self.client_mut().suspend_session_recovery();
+                let client = &mut *maintenance;
                 client
                     .close_query()
                     .await
@@ -137,12 +313,21 @@ impl PoolLease {
     }
 }
 
+struct LeaseOperation<'a>(&'a mut PoolLease);
+
+impl Drop for LeaseOperation<'_> {
+    fn drop(&mut self) {
+        if self.0.discard {
+            self.0.client_mut().mark_connection_dead();
+        }
+    }
+}
+
 fn quiescent(client: &TdsClient) -> bool {
     !client.is_connection_dead()
         && !client.reset_pending()
         && !client.command_is_busy()
         && !client.has_active_transaction()
-        && !client.is_session_recovery_enabled()
 }
 
 async fn initialize(
@@ -152,7 +337,8 @@ async fn initialize(
     reuse: bool,
 ) -> PoolResult<OpenedConnection> {
     connection.verify_auth(spec)?;
-    let client = connection.client_mut();
+    let mut maintenance = connection.client_mut().suspend_session_recovery();
+    let client = &mut *maintenance;
     if !quiescent(client) {
         return Err(PoolError::InvalidSession);
     }
@@ -174,6 +360,7 @@ async fn initialize(
     if !quiescent(client) {
         return Err(PoolError::InvalidSession);
     }
+    drop(maintenance);
     Ok(connection)
 }
 

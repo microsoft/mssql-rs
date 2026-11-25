@@ -7,6 +7,7 @@ import asyncio
 import contextvars
 import gc
 import threading
+import time
 import weakref
 from types import SimpleNamespace
 
@@ -16,6 +17,192 @@ import pytest
 
 invoke = mssql_py_core._invoke_async_entra_id_token_factory
 SPN = "https://database.windows.net/"
+STS = "https://login.microsoftonline.com/tenant/"
+
+
+@pytest.fixture
+def recovery_auth():
+    harness = getattr(mssql_py_core, "_EntraRecoveryAuth", None)
+    if harness is None:
+        pytest.skip("requires a debug build with recovery authentication test hooks")
+    return harness
+
+
+def test_recovery_scope_uses_each_operations_loop_context_and_releases_provider(recovery_auth):
+    retained = recovery_auth()
+    identity = contextvars.ContextVar("recovery_identity")
+    references = []
+    loops = []
+
+    async def run(label):
+        loop = asyncio.get_running_loop()
+        loops.append(weakref.ref(loop))
+        identity.set(label)
+        expiry = int(time.time()) + 3600
+
+        class Credential:
+            async def get_token(self, scope):
+                assert asyncio.get_running_loop() is loop
+                assert identity.get() == label
+                return SimpleNamespace(token=label, expires_on=expiry)
+
+            async def close(self):
+                pytest.fail("Recovery must not close caller-owned credentials")
+
+        credential = Credential()
+        references.append(weakref.ref(credential))
+        assert await retained.invoke(credential, SPN, STS) == (
+            label.encode("utf-16-le"),
+            expiry,
+        )
+        with pytest.raises(RuntimeError, match="No active"):
+            await retained.invoke_inactive()
+
+    for label in ["first", "second"]:
+        asyncio.run(run(label))
+        deadline = time.monotonic() + 2
+        # future_into_py publishes before its wrapper captures are destroyed.
+        # Reattachment drains PyO3's off-thread deferred decrefs; GC then collects
+        # the closed loop's cycles. A retained callback owner cannot pass this.
+        while True:
+            retained.collect_python_references()
+            gc.collect()
+            if references[-1]() is None and loops[-1]() is None:
+                break
+            assert time.monotonic() < deadline, "Native bridge references did not settle"
+        assert references[-1]() is None
+        assert loops[-1]() is None
+
+
+@pytest.mark.parametrize(
+    "expiry",
+    [Ellipsis, None, True, "123", 1.5, 10**30, 0, -1],
+)
+def test_recovery_rejects_missing_invalid_or_expired_metadata(expiry, recovery_auth):
+    async def run():
+        class Credential:
+            async def get_token(self, scope):
+                if expiry is Ellipsis:
+                    return SimpleNamespace(token="opaque")
+                return SimpleNamespace(token="opaque", expires_on=expiry)
+
+        retained = recovery_auth()
+        with pytest.raises(RuntimeError, match="recovery failed"):
+            await retained.invoke(Credential(), SPN, STS)
+        with pytest.raises(RuntimeError, match="No active"):
+            await retained.invoke_inactive()
+
+    asyncio.run(run())
+
+
+def test_recovery_rejects_refresh_margin(recovery_auth):
+    async def run():
+        class Credential:
+            async def get_token(self, scope):
+                return SimpleNamespace(token="opaque", expires_on=int(time.time()) + 30)
+
+        with pytest.raises(RuntimeError, match="recovery failed"):
+            await recovery_auth().invoke(
+                Credential(), SPN, STS, margin_secs=60
+            )
+
+    asyncio.run(run())
+
+
+def test_recovery_failed_attempt_does_not_supply_later_operations_expiry(recovery_auth):
+    async def run():
+        retained = recovery_auth()
+        expiry = int(time.time()) + 3600
+
+        class Credential:
+            async def get_token(self, scope):
+                return SimpleNamespace(token="opaque", expires_on=expiry)
+
+        assert (await retained.invoke(Credential(), SPN, STS))[1] == expiry
+        expiry = 0
+        with pytest.raises(RuntimeError, match="recovery failed"):
+            await retained.invoke(Credential(), SPN, STS)
+        expiry = int(time.time()) + 7200
+        assert (await retained.invoke(Credential(), SPN, STS))[1] == expiry
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "spn,sts",
+    [
+        ("https://evil.example/", STS),
+        (SPN, "http://login.microsoftonline.com/tenant/"),  # DevSkim: ignore DS137138 -- Verifies HTTP authority rejection.
+        (SPN, "https://evil.example/tenant/"),
+        (SPN, "https://login.microsoftonline.com/other-tenant/"),
+        (SPN, "https://login.microsoftonline.com/common/"),
+    ],
+)
+def test_recovery_validates_resource_authority_and_bound_tenant_before_provider(
+    spn, sts, recovery_auth
+):
+    async def run():
+        class Credential:
+            async def get_token(self, scope):
+                pytest.fail("Untrusted target reached credential")
+
+        with pytest.raises(RuntimeError, match="recovery failed"):
+            await recovery_auth().invoke(Credential(), spn, sts)
+
+    asyncio.run(run())
+
+
+def test_recovery_account_switch_during_token_acquisition_prevents_publication(recovery_auth):
+    async def run():
+        retained = recovery_auth()
+
+        class Credential:
+            async def get_token(self, scope):
+                retained.set_binding(2)
+                return SimpleNamespace(token="opaque", expires_on=int(time.time()) + 3600)
+
+        with pytest.raises(RuntimeError, match="binding or expiry changed"):
+            await retained.invoke(Credential(), SPN, STS)
+        with pytest.raises(RuntimeError, match="inactive or changed"):
+            retained.invoke(Credential(), SPN, STS)
+
+    asyncio.run(run())
+
+
+def test_recovery_cancellation_cancels_task_and_ignores_late_token(recovery_auth):
+    async def run():
+        retained = recovery_auth()
+        started = asyncio.Event()
+        settled = asyncio.Event()
+        credential_ref = None
+
+        class Credential:
+            async def get_token(self, scope):
+                started.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    return SimpleNamespace(token="late", expires_on=int(time.time()) + 3600)
+                finally:
+                    settled.set()
+
+        credential = Credential()
+        credential_ref = weakref.ref(credential)
+        future = retained.invoke(credential, SPN, STS)
+        del credential
+        await asyncio.wait_for(started.wait(), 2)
+        future.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await future
+        await asyncio.wait_for(settled.wait(), 2)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        gc.collect()
+        assert credential_ref() is None
+        with pytest.raises(RuntimeError, match="No active"):
+            await retained.invoke_inactive()
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize(

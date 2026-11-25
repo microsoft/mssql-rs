@@ -829,18 +829,34 @@ destruction is not a hard deadline guarantee.
 re-invoke an old credential callback, change token expiry or SPID, and recreate a session
 outside the pool's accounting.
 
-**V1 pooled physical sessions disable transparent session recovery**
-(`connect_retry_count = 0` in the effective pooled context). The opt-in API must document this
-difference; failures are returned, not retried as user statements. Reject an explicitly
-requested nonzero recovery count when pooling is selected; when omitted, the pooled adapter
-supplies zero rather than inheriting TDS's nonzero default. Login routing/redirect within a
-single physical-open attempt still uses the current attempt's factory and deadline.
-Direct/unpooled behavior retains its existing recovery policy for already-supported SQL/trusted
-flows.
+**Approved session-recovery revision (2026-11-25):** candidate replacement at checkout and
+transparent recovery of an eligible checked-out session coexist. Reuse the TDS recovery
+engine, not a second pool reconnect loop. Pool-owned initialization, reset and return suspend
+recovery: failed candidates are discarded, and return never reconnects merely to cache a client.
+Reset acknowledgement remains mandatory.
 
-Newly added credential-backed async Entra flows also disable recovery in v1, including direct
-opens: their per-open Python bridge cannot be reused after login (Doc 2 section 6.5). A future
-credential-aware recovery design is separate work.
+Application recovery occurs only before a request is sent, with negotiated recovery, no active
+transaction or unread batch, recoverable server state and valid authentication. Never replay
+uncertain execution, fetches or transaction completion. Restore protocol-supported session state;
+do not replace failed restoration with a plain login or reapply checkout defaults mid-lease.
+SPID may change; invalidate session-bound prepared handles and caches.
+
+Recovery retains the same exclusive lease and capacity slot. Abort the old local transport before
+opening its replacement. One operation deadline covers recovery and execution; absent a command
+timeout, recovery still has a finite connection-timeout budget. Cancellation stops retry/auth
+work. Interrupted or failed recovery makes the logical connection unusable and forces discard.
+Close/shutdown must settle the operation before releasing its client and capacity.
+
+Use the existing effective `ConnectRetryCount` and `ConnectRetryInterval`, including both in
+canonical keying. Zero disables recovery; the count is the total number of reconnection attempts,
+not retries in addition to an initial attempt. Reference: Microsoft's
+[ODBC connection-resiliency contract](https://learn.microsoft.com/en-us/sql/connect/odbc/connection-resiliency),
+source revision `b327fa345801101e505260268af60a60ca2ab4bb`.
+
+Delivery is split into AB#50758 (foundation and SQL-password pooling), AB#50759 (authentication)
+and AB#50757 (AQE/Python integration). Authentication includes operation-scoped credential bridges,
+identity/expiry validation and successful-login metadata. SQL-only implementation does not prove
+authentication parity, and neither native slice proves user-visible AQE parity.
 
 Reset invalidates prepared handles and per-handle Always Encrypted metadata, but the current
 `clear_session_bound_caches` does not clear every query metadata cache. Do not claim otherwise.
@@ -901,7 +917,7 @@ Packet size follows Rust ODBC: zero/omission retains the TDS default (8000),
 nonzero values clamp to 512-32768, and invalid unsigned integers are rejected.
 Unknown IP preference follows Rust ODBC's IPv4First fallback. Existing direct
 async/sync context conversion is unchanged. Effective retry values partition
-keys; this does not enable nonzero recovery for pooled sessions.
+keys; SQL-password recovery uses the same effective retry settings.
 
 The direct PyCore adapter still defaults packet size to 4096 and falls back,
 rather than clamping out-of-range values. Reconcile or explicitly gate/document
@@ -987,9 +1003,12 @@ identity or authoritative expiry.
 
 Idle clients must not retain strong Python callable, event-loop, or credential references
 through their cloned TDS contexts. Doc 2's factory adapter installs a Rust callback with a
-**weak per-open bridge reference**, keeps that bridge alive only during login, and disables
-pooled session recovery. Unexpected later callback invocation fails explicitly; it cannot target
-a closed Python loop.
+**weak operation-scoped bridge reference**, keeping the bridge alive only during the login or
+application operation that can recover. Recovery captures the active caller's loop/context,
+preserves the original identity/credential binding and records successful-login expiry.
+Outside an active operation, callback invocation fails explicitly; it cannot target a stale loop.
+Raw caller tokens are reused as supplied, with no automatic refresh guarantee. Trusted recovery
+is enabled only with verified stable identity and platform-specific evidence.
 
 The pool stores expiry/binding metadata, not duplicate raw tokens for comparison. The TDS client
 may retain authentication material internally; minimize lifetime and never derive Debug/log
@@ -1240,8 +1259,9 @@ does not canonicalize connection strings, select a fingerprint algorithm,
 verify a real login principal or implement token refresh. The separate Rust
 SQL-auth key authority is `connection_key.rs` under section 7.1; authentication
 adapters must supply verified login metadata.
-`ConnectSpec` receives already-validated effective options, including the
-pooled recovery restriction. A3 adds the SQL-password physical factory below.
+`ConnectSpec` receives already-validated effective options. A3 adds the
+SQL-password physical factory below; section 6.5 records the subsequent approved
+recovery revision.
 
 `AcquireControl::run` drops its caller-owned future on cancellation/timeout.
 It does not cancel a TDS `CancelHandle`, supervise detached transport work, or
@@ -1366,8 +1386,9 @@ without changing connection configuration. Explicitly awaited close remains
 graceful.
 No application SQL is replayed.
 
-This slice enables SQL-password login only, rejects nonzero session-recovery
-counts and Always Encrypted, and checks the caller/factory authentication binding.
+The original A3 slice enabled SQL-password login only, rejected nonzero session-recovery
+counts and Always Encrypted, and checked the caller/factory authentication binding.
+The recovery revision in section 6.5 supersedes the zero-retry restriction.
 It does not construct canonical keys or add token/trusted-auth pooling.
 `PoolLease` Drop discards; the unchecked quiescent-return seam remains test-only.
 Safe return is implemented in A4 below. There is no Python pool API or change to

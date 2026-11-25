@@ -247,6 +247,27 @@ before negotiating the TLS close. Drop abandons the connection instead and does
 not guarantee delivery of pending writes.
 Local cancellation does not guarantee immediate removal of a server-side session.
 
+## Idle session recovery
+
+`connect_retry_count` is the total number of reconnection attempts: zero disables
+recovery and one permits one attempt. `connect_retry_interval` applies between
+attempts, not before the first. Recovery is a pre-send check on an eligible idle
+session; it never replays an interrupted statement, result fetch or commit.
+Recovery and the subsequent request share the command timeout. Without one,
+recovery uses the connection timeout.
+
+The dead local transport is synchronously aborted before opening a replacement.
+Recovery uses the same transient-error classification as initial connection
+opening. Cancellation and permanent login, TLS or configuration errors propagate
+without further retries or retry-exhaustion wrapping. Successful recovery invalidates
+session-bound prepared handles and restores only protocol-supported state.
+
+Pool-owned initialization, reset and return cleanup do not reconnect instead of
+validating the existing session. A dead session or missing reset acknowledgement
+requires discard. Application recovery retains its original pool slot and
+exclusive ownership through completion or discard. Applications do not need a
+separate maintenance or recovery API.
+
 ## Execution stack usage
 
 Command execution keeps session-recovery state in a separately boxed future,

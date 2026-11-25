@@ -217,6 +217,348 @@ async fn fresh_then_cached_checkout_sends_isolation_and_only_reuse_arms_reset() 
     assert!(wire.windows(sql.len()).any(|bytes| bytes == sql));
 }
 
+#[tokio::test(start_paused = true)]
+async fn interrupted_lease_operations_are_irreversible_and_keep_capacity_until_discard() {
+    for mode in 0..3 {
+        let manager = manager(1);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let client =
+            tds_client_from_tokens_gated(vec![], Arc::new(Semaphore::new(0)), dropped.clone());
+        let mut first = lease(&manager, client).await;
+        let cancellation = CancellationToken::new();
+        let mut work = Box::pin(first.run(
+            Some(Instant::now() + Duration::from_secs(10)),
+            &cancellation,
+            |_, _| Box::pin(std::future::pending::<TdsResult<()>>()),
+        ));
+        assert!(poll(work.as_mut()).is_pending());
+        let mut waiting = Box::pin(
+            manager.reserve(
+                key(),
+                AcquireControl::from_timeout(
+                    Instant::now(),
+                    Duration::from_secs(30),
+                    CancellationToken::new(),
+                )
+                .unwrap(),
+            ),
+        );
+        assert!(poll(waiting.as_mut()).is_pending());
+        match mode {
+            0 => {
+                cancellation.cancel();
+                assert!(matches!(
+                    poll(work.as_mut()),
+                    Poll::Ready(Err(PoolError::Cancelled))
+                ));
+            }
+            1 => {
+                tokio::time::advance(Duration::from_secs(10)).await;
+                assert!(matches!(
+                    poll(work.as_mut()),
+                    Poll::Ready(Err(PoolError::AcquireTimeout {
+                        stage: AcquireStage::Execute
+                    }))
+                ));
+            }
+            _ => {}
+        }
+        drop(work);
+        assert!(first.discard);
+        assert!(first.client_mut().is_connection_dead());
+        assert!(poll(waiting.as_mut()).is_pending());
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            first
+                .run(None, &CancellationToken::new(), |_, _| Box::pin(async {
+                    Ok(())
+                }))
+                .await,
+            Err(PoolError::InvalidSession)
+        ));
+        first.release().await.unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        drop(waiting.await.unwrap().unwrap());
+    }
+}
+
+#[tokio::test]
+async fn completed_lease_operations_preserve_clean_sessions_but_dead_failures_discard() {
+    for dead in [false, true] {
+        let manager = manager(1);
+        let mut first = lease(&manager, tds_client_from_tokens(vec![done_no_more()])).await;
+        let result = first
+            .run(None, &CancellationToken::new(), move |client, cancel| {
+                Box::pin(async move {
+                    if dead {
+                        client.mark_connection_dead();
+                        return Err(mssql_tds::error::Error::ConnectionError(
+                            "private failure".into(),
+                        ));
+                    }
+                    client
+                        .execute("SELECT 1".into(), ExecuteOptions::new().cancel(cancel))
+                        .await?;
+                    client.close_query().await
+                })
+            })
+            .await;
+        assert_eq!(first.discard, dead);
+        if dead {
+            assert!(matches!(result, Err(PoolError::Execute(_))));
+        } else {
+            result.unwrap();
+        }
+        first.release().await.unwrap();
+        let mut slot = manager
+            .reserve(key(), control(CancellationToken::new()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(slot.take_value().is_none(), dead);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_command_deadline_does_not_limit_normal_execution() {
+    let manager = manager(1);
+    let mut first = lease(&manager, tds_client_from_tokens(vec![])).await;
+    first
+        .run(None, &CancellationToken::new(), |_, _| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(86_400)).await;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    assert!(!first.discard);
+    assert!(!first.client_mut().is_connection_dead());
+}
+
+#[tokio::test]
+async fn provider_cancellation_discards_the_lease_without_caching_its_client() {
+    let manager = manager(1);
+    let mut first = lease(&manager, tds_client_from_tokens(vec![])).await;
+    let result = first
+        .run(None, &CancellationToken::new(), |_, _| {
+            Box::pin(async { Err::<(), _>(mssql_tds::error::Error::TokenAcquisitionCancelled) })
+        })
+        .await;
+    assert!(matches!(
+        result,
+        Err(PoolError::Execute(error))
+            if matches!(error.as_ref(), mssql_tds::error::Error::TokenAcquisitionCancelled)
+    ));
+    assert!(first.discard);
+    assert!(first.client_mut().is_connection_dead());
+    first.release().await.unwrap();
+    let mut slot = manager
+        .reserve(key(), control(CancellationToken::new()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(slot.take_value().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn interruption_during_successful_operation_blocks_result_publication() {
+    for timeout in [false, true] {
+        let manager = manager(1);
+        let mut first = lease(&manager, tds_client_from_tokens(vec![])).await;
+        let cancellation = CancellationToken::new();
+        let signal = cancellation.clone();
+        let deadline = timeout.then(|| Instant::now() + Duration::from_secs(1));
+        let result = first
+            .run(deadline, &cancellation, move |_, _| {
+                Box::pin(async move {
+                    if timeout {
+                        tokio::time::advance(Duration::from_secs(2)).await;
+                    } else {
+                        signal.cancel();
+                    }
+                    Ok(())
+                })
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(PoolError::Cancelled | PoolError::AcquireTimeout { .. })
+        ));
+        assert!(first.discard);
+        assert!(first.client_mut().is_connection_dead());
+    }
+}
+
+async fn operation_auth_factory() -> (
+    crate::async_entra_token_factory::AsyncPythonEntraIdTokenFactory,
+    pyo3::Py<pyo3::PyAny>,
+) {
+    use pyo3::prelude::*;
+    use pyo3::types::PyAnyMethods;
+
+    let (locals, provider, event_loop) = Python::attach(|py| {
+        let event_loop = py
+            .import("asyncio")
+            .unwrap()
+            .call_method0("new_event_loop")
+            .unwrap();
+        let locals = pyo3_async_runtimes::TaskLocals::new(event_loop.clone())
+            .copy_context(py)
+            .unwrap();
+        let provider = py
+            .import("types")
+            .unwrap()
+            .getattr("SimpleNamespace")
+            .unwrap()
+            .call0()
+            .unwrap();
+        provider
+            .setattr(
+                "get_token",
+                py.import("builtins").unwrap().getattr("str").unwrap(),
+            )
+            .unwrap();
+        (locals, provider.unbind(), event_loop.unbind())
+    });
+    let factory = pyo3_async_runtimes::tokio::scope(locals, async {
+        Python::attach(|py| {
+            crate::async_entra_token_factory::AsyncPythonEntraIdTokenFactory::new(py, provider)
+        })
+    })
+    .await
+    .unwrap();
+    (factory, event_loop)
+}
+
+#[tokio::test]
+async fn authenticated_operation_rechecks_binding_before_work_and_publication() {
+    for mode in 0..3 {
+        let switch_before_work = mode == 1;
+        let (factory, event_loop) = operation_auth_factory().await;
+        let retained = super::super::auth::RecoveryAuth::new(binding(), "tenant".into()).unwrap();
+        let manager = manager(1);
+        let mut first = lease(&manager, tds_client_from_tokens(vec![])).await;
+        *first.slot.value_mut().unwrap() = OpenedConnection::with_recovery(
+            tds_client_from_tokens(vec![]),
+            AuthMetadata {
+                binding: binding(),
+                expiry: TokenExpiry::NonToken,
+            },
+            retained,
+        );
+        let scope = if mode == 2 {
+            super::super::auth::RecoveryAuth::new(binding(), "tenant".into())
+                .unwrap()
+                .activate(factory, &binding(), Duration::ZERO)
+                .unwrap()
+        } else {
+            first
+                .activate_auth(factory, &binding(), Duration::ZERO)
+                .unwrap()
+        };
+        let switched = Arc::new(std::sync::atomic::AtomicBool::new(switch_before_work));
+        let reader = switched.clone();
+        let result = first
+            .run_authenticated(
+                None,
+                &CancellationToken::new(),
+                scope,
+                move || {
+                    Ok(if reader.load(Ordering::Acquire) {
+                        AuthBinding::new(vec![2].into_boxed_slice()).unwrap()
+                    } else {
+                        binding()
+                    })
+                },
+                move |_, _| {
+                    Box::pin(async move {
+                        assert!(
+                            !switch_before_work && mode != 2,
+                            "mismatched binding reached application work"
+                        );
+                        switched.store(true, Ordering::Release);
+                        Ok(())
+                    })
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(PoolError::IdentityMismatch)));
+        assert!(first.discard);
+        assert!(first.client_mut().is_connection_dead());
+        pyo3::Python::attach(|py| event_loop.call_method0(py, "close").unwrap());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn post_operation_expiry_discards_without_replacing_completed_results() {
+    for mode in 0..3 {
+        let (factory, event_loop) = operation_auth_factory().await;
+        let retained = super::super::auth::RecoveryAuth::new(binding(), "tenant".into()).unwrap();
+        let manager = manager(1);
+        let mut first = lease(&manager, tds_client_from_tokens(vec![])).await;
+        *first.slot.value_mut().unwrap() = OpenedConnection::with_recovery(
+            tds_client_from_tokens(vec![]),
+            AuthMetadata {
+                binding: binding(),
+                expiry: TokenExpiry::NonToken,
+            },
+            retained,
+        );
+        let scope = first
+            .activate_auth(factory, &binding(), Duration::from_secs(5))
+            .unwrap();
+        scope
+            .record_test_login(chrono::Utc::now() + chrono::Duration::seconds(60))
+            .unwrap();
+        let switched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = switched.clone();
+        let result = first
+            .run_authenticated(
+                None,
+                &CancellationToken::new(),
+                scope,
+                move || {
+                    Ok(if reader.load(Ordering::Acquire) {
+                        AuthBinding::new(vec![2].into_boxed_slice()).unwrap()
+                    } else {
+                        binding()
+                    })
+                },
+                move |_, _| {
+                    Box::pin(async move {
+                        tokio::time::advance(Duration::from_secs(56)).await;
+                        switched.store(mode == 2, Ordering::Release);
+                        if mode == 1 {
+                            return Err(mssql_tds::error::Error::ConnectionError(
+                                "operation sentinel".into(),
+                            ));
+                        }
+                        Ok(42)
+                    })
+                },
+            )
+            .await;
+        match mode {
+            0 => assert_eq!(result.unwrap(), 42),
+            1 => assert!(matches!(result, Err(PoolError::Execute(error))
+                if matches!(error.as_ref(), mssql_tds::error::Error::ConnectionError(message)
+                    if message == "operation sentinel"))),
+            _ => assert!(matches!(result, Err(PoolError::IdentityMismatch))),
+        }
+        assert!(first.discard);
+        assert!(first.client_mut().is_connection_dead());
+        first.release().await.unwrap();
+        let mut slot = manager
+            .reserve(key(), control(CancellationToken::new()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(slot.take_value().is_none());
+        pyo3::Python::attach(|py| event_loop.call_method0(py, "close").unwrap());
+    }
+}
+
 #[tokio::test]
 async fn missing_ack_and_delayed_errors_discard_candidates_before_one_fresh_open() {
     for tokens in [
@@ -282,14 +624,12 @@ async fn invalid_pooled_options_fail_before_reserving_or_calling_the_factory() {
     let manager = manager(1);
     let factory = Factory::new(vec![]);
     for (field, change) in [
-        ("connect_retry_count", 0),
         ("authentication", 1),
         ("authentication", 2),
         ("column_encryption", 3),
     ] {
         let mut context = spec().context().clone();
         match change {
-            0 => context.connect_retry_count = 1,
             1 => context.tds_authentication_method = TdsAuthenticationMethod::SSPI,
             2 => context.access_token = Some("test-token".into()),
             _ => context.column_encryption_setting = ColumnEncryptionSetting::Enabled,

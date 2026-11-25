@@ -637,6 +637,11 @@ pub(crate) struct SlotGuard<C: Send + 'static> {
 }
 
 impl<C: Send + 'static> SlotGuard<C> {
+    pub(super) fn runtime(&self) -> PoolResult<Id> {
+        self.pool.check_runtime()?;
+        Ok(self.pool.runtime)
+    }
+
     fn load(&mut self) -> PoolResult<()> {
         self.cached = lock(&self.slot.as_ref().expect("owned slot").cached)?.take();
         if self.cached.as_ref().is_some_and(|entry| {

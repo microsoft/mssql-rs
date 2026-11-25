@@ -881,6 +881,26 @@ mod data_classification_tests {
         server.stop().await;
     }
 
+    #[tokio::test]
+    async fn maintenance_does_not_replace_reset_acknowledgement_with_recovery() {
+        let server = Server::start_recoverable(DataClassificationVersion::Version2).await;
+        let mut client = server.connect(None).await;
+        assert!(client.is_session_recovery_enabled());
+        client.mark_connection_dead();
+        {
+            let mut maintenance = client.suspend_session_recovery();
+            maintenance.prepare_reset_connection(false);
+            assert!(matches!(
+                maintenance.execute(UNCLASSIFIED.into(), ()).await,
+                Err(Error::ConnectionClosed(_))
+            ));
+        }
+        assert!(client.is_connection_dead());
+        assert_eq!(client.connection_recovery_count(), 0);
+        assert!(server.recovery_login_requests().await.is_empty());
+        server.stop().await;
+    }
+
     /// A recovered session that enables a lower version must parse `0xA3` with
     /// it. V1 bytes read with the old V2 layout would take ranks from the
     /// column data and fail or misreport.

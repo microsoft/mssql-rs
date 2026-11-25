@@ -5,6 +5,7 @@
 #[allow(dead_code)]
 #[path = "../src/pool"]
 mod pool {
+    pub(crate) mod auth;
     pub(crate) mod config;
     pub(crate) mod connection;
     pub(crate) mod control;
@@ -13,6 +14,21 @@ mod pool {
     pub(crate) mod manager;
     pub(crate) mod session;
 }
+#[allow(dead_code)]
+#[path = "../src/async_entra_credentials.rs"]
+mod async_entra_credentials;
+#[allow(dead_code)]
+#[path = "../src/async_entra_token_factory.rs"]
+mod async_entra_token_factory;
+#[allow(dead_code)]
+#[path = "../src/async_errors.rs"]
+mod async_errors;
+#[allow(dead_code)]
+#[path = "../src/async_handle.rs"]
+mod async_handle;
+#[allow(dead_code)]
+#[path = "../src/async_session.rs"]
+mod async_session;
 #[allow(dead_code)]
 #[path = "../../mssql-tds/tests/common/mod.rs"]
 mod common;
@@ -92,6 +108,207 @@ async fn scalar(client: &mut TdsClient, sql: &str) -> i32 {
 async fn exec(client: &mut TdsClient, sql: &str) {
     client.execute(sql.into(), ()).await.unwrap();
     client.close_query().await.unwrap();
+}
+
+#[tokio::test]
+async fn mock_recovery_keeps_the_lease_and_sends_the_application_batch_once() {
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    use mssql_mock_tds::{MockTdsServer, QueryResponse};
+    use mssql_tds::connection::client_context::ClientContext;
+    use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
+
+    let server = MockTdsServer::new(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).to_string())
+        .await
+        .unwrap();
+    let address = server.local_addr();
+    let connections = server.connection_store();
+    {
+        let registry = server.query_registry();
+        let mut registry = registry.lock().await;
+        registry.set_session_recovery(true);
+        registry.register("SELECT 1", QueryResponse::select_one());
+    }
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(server.run_with_shutdown(shutdown_rx));
+    let mut context =
+        ClientContext::with_data_source(&format!("tcp:{},{}", address.ip(), address.port()));
+    context.user_name = "test-user".into();
+    context.password = address.to_string();
+    context.connect_retry_count = 1;
+    context.encryption_options = EncryptionOptions {
+        mode: EncryptionSetting::PreferOff,
+        trust_server_certificate: true,
+        ..Default::default()
+    };
+    let spec = ConnectSpec::new(
+        context,
+        AuthBinding::new(vec![1].into_boxed_slice()).unwrap(),
+    );
+    let manager = manager();
+    let mut first = acquire(
+        &manager,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    assert!(first.client_mut().is_session_recovery_enabled());
+    let old_id = first.client_mut().client_connection_id();
+    first.client_mut().mark_connection_dead();
+    let mut waiting = Box::pin(acquire(
+        &manager,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    ));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(std::future::Future::poll(waiting.as_mut(), &mut cx).is_pending());
+    first
+        .run(
+            Some(Instant::now() + Duration::from_secs(10)),
+            &CancellationToken::new(),
+            |client, cancel| {
+                Box::pin(async move {
+                    client
+                        .execute(
+                            "SELECT 1".into(),
+                            mssql_tds::connection::tds_client::ExecuteOptions::new().cancel(cancel),
+                        )
+                        .await?;
+                    client.close_query().await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    let recovered_id = first.client_mut().client_connection_id();
+    assert_ne!(old_id, recovered_id);
+    assert_eq!(first.client_mut().connection_recovery_count(), 1);
+    assert!(std::future::Future::poll(waiting.as_mut(), &mut cx).is_pending());
+    {
+        let store = connections.lock().await;
+        assert_eq!(store.count(), 2);
+        assert_eq!(
+            store
+                .all()
+                .first_key_value()
+                .unwrap()
+                .1
+                .transaction_descriptor_headers
+                .len(),
+            1,
+        );
+        let (&id, info) = store.all().last_key_value().unwrap();
+        assert!(store.login_details(id).unwrap().recovery_login);
+        assert_eq!(info.transaction_descriptor_headers.len(), 1);
+    }
+    drop(waiting);
+    first.release().await.unwrap();
+    let mut next = acquire(
+        &manager,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    // The mock omits RESETCONNECTION ACK: checkout must replace, not recover.
+    assert_ne!(next.client_mut().client_connection_id(), recovered_id);
+    {
+        let store = connections.lock().await;
+        assert_eq!(store.count(), 3);
+        assert!(
+            !store
+                .login_details(*store.all().last_key_value().unwrap().0)
+                .unwrap()
+                .recovery_login
+        );
+    }
+    drop(next);
+    drop(manager);
+    shutdown.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires live SQL Server and DB_HOST/DB_USERNAME/SQL_PASSWORD"]
+async fn live_recovery_retains_capacity_and_session_settings_then_allows_reuse() {
+    let manager = manager();
+    let mut context = spec().context().clone();
+    context.connect_retry_count = 1;
+    let spec = ConnectSpec::new(
+        context,
+        AuthBinding::new(vec![1].into_boxed_slice()).unwrap(),
+    );
+    let mut first = acquire(
+        &manager,
+        &spec,
+        TransactionIsolationLevel::Serializable.try_into().unwrap(),
+    )
+    .await;
+    assert!(first.client_mut().is_session_recovery_enabled());
+    let old_id = first.client_mut().client_connection_id();
+    exec(first.client_mut(), "SET LOCK_TIMEOUT 1234").await;
+    first.client_mut().mark_connection_dead();
+    let mut waiting = Box::pin(acquire(
+        &manager,
+        &spec,
+        TransactionIsolationLevel::Serializable.try_into().unwrap(),
+    ));
+    assert!(
+        std::future::Future::poll(
+            waiting.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        )
+        .is_pending()
+    );
+    first
+        .run(
+            Some(Instant::now() + Duration::from_secs(30)),
+            &CancellationToken::new(),
+            |client, cancel| {
+                Box::pin(async move {
+                    client
+                        .execute(
+                            "SELECT 1".into(),
+                            mssql_tds::connection::tds_client::ExecuteOptions::new().cancel(cancel),
+                        )
+                        .await?;
+                    client.close_query().await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert_ne!(first.client_mut().client_connection_id(), old_id);
+    assert_eq!(first.client_mut().connection_recovery_count(), 1);
+    assert!(
+        std::future::Future::poll(
+            waiting.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        )
+        .is_pending()
+    );
+    drop(waiting);
+    assert_eq!(
+        scalar(first.client_mut(), "SELECT @@LOCK_TIMEOUT").await,
+        1234
+    );
+    assert_eq!(scalar(first.client_mut(),
+        "SELECT CAST(transaction_isolation_level AS int) FROM sys.dm_exec_sessions WHERE session_id = @@SPID",
+    ).await, 4);
+    let recovered_id = first.client_mut().client_connection_id();
+    first.release().await.unwrap();
+    let mut reused = acquire(
+        &manager,
+        &spec,
+        TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+    )
+    .await;
+    assert_eq!(reused.client_mut().client_connection_id(), recovered_id);
+    reused.release().await.unwrap();
+    manager.shutdown().await.unwrap();
 }
 
 #[tokio::test]

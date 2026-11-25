@@ -85,6 +85,114 @@ mod mock_server_fedauth_tests {
         }
     }
 
+    #[tokio::test]
+    async fn recovery_preserves_terminal_credential_errors_without_retrying() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use mssql_tds::error::{Error, SqlErrorInfo};
+        use mssql_tds::security::SecurityError;
+
+        #[derive(Clone)]
+        struct RefuseRecovery {
+            calls: Arc<AtomicUsize>,
+            failure: u8,
+        }
+
+        #[async_trait::async_trait]
+        impl EntraIdTokenFactory for RefuseRecovery {
+            async fn create_token(
+                &self,
+                _: String,
+                _: String,
+                _: TdsAuthenticationMethod,
+            ) -> TdsResult<Vec<u8>> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Ok("mock-token"
+                        .encode_utf16()
+                        .flat_map(u16::to_le_bytes)
+                        .collect());
+                }
+                Err(match self.failure {
+                    0 => {
+                        Error::Security(SecurityError::AuthenticationDenied("test refusal".into()))
+                    }
+                    1 => Error::UsageError("test credential configuration".into()),
+                    2 => Error::from_sql_errors(vec![SqlErrorInfo {
+                        message: "test login refusal".into(),
+                        state: 1,
+                        class: 14,
+                        number: 18456,
+                        ..Default::default()
+                    }]),
+                    _ => Error::CertificateMismatch,
+                })
+            }
+        }
+
+        for failure in 0..4 {
+            let server = MockTdsServer::new(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).to_string())
+                .await
+                .unwrap();
+            let address = server.local_addr();
+            server
+                .query_registry()
+                .lock()
+                .await
+                .set_session_recovery(true);
+            let (shutdown, shutdown_rx) = oneshot::channel();
+            let task = tokio::spawn(server.run_with_shutdown(shutdown_rx));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let datasource = format!("tcp:{},{}", address.ip(), address.port());
+            let mut context = ClientContext::with_data_source(&datasource);
+            context.connect_retry_count = 3;
+            context.connect_retry_interval = 1;
+            context.tds_authentication_method =
+                TdsAuthenticationMethod::ActiveDirectoryServicePrincipal;
+            context.encryption_options = EncryptionOptions {
+                mode: EncryptionSetting::PreferOff,
+                trust_server_certificate: true,
+                ..Default::default()
+            };
+            context.auth_method_map.insert(
+                TdsAuthenticationMethod::ActiveDirectoryServicePrincipal,
+                Box::new(RefuseRecovery {
+                    calls: calls.clone(),
+                    failure,
+                }),
+            );
+            let mut client = TdsConnectionProvider {}
+                .create_client(context, &datasource, None)
+                .await
+                .unwrap();
+            assert!(client.is_session_recovery_enabled());
+            client.mark_connection_dead();
+            let error = client.execute("SELECT 1".into(), ()).await.unwrap_err();
+            assert!(
+                match (&error, failure) {
+                    (Error::Security(_), 0)
+                    | (Error::UsageError(_), 1)
+                    | (Error::CertificateMismatch, 3) => true,
+                    (Error::SqlServerError { diagnostics }, 2) => {
+                        diagnostics.errors[0].number == 18456
+                    }
+                    _ => false,
+                },
+                "terminal credential error was replaced: {error:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert!(client.is_connection_dead());
+            assert_eq!(client.connection_recovery_count(), 0);
+            drop(client);
+            shutdown.send(()).unwrap();
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+    }
+
     /// Test basic connectivity to mock server using access token authentication
     /// and verify the exact token received by the server matches what was sent.
     #[tokio::test]
