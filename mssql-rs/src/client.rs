@@ -39,11 +39,13 @@ use crate::query::{ExecuteResult, QueryResult, ToSql, build_params_with_string_e
 /// sends, including response collection and cleanup. Unpolled futures and
 /// unused bulk builders do not affect the connection. [`ping`](Self::ping) only
 /// checks cached health and completes on its first poll. For wire streams, dropping
-/// between fully yielded rows remains safe: the next operation drains the unread
-/// results. Dropping a stream while its I/O is pending marks the connection dead.
-/// Dropping only a pending `next()` future leaves the stream's internal future
-/// intact; the retained stream can be resumed. Buffered [`QueryResult`] streams
-/// do not perform I/O and are unaffected.
+/// between reads remains safe: the next operation drains unread results.
+/// Dropping a stream while its I/O is pending marks the connection dead.
+/// With the `Stream`-based APIs, dropping only a pending `next()` future leaves
+/// the stream's internal future intact; the retained stream can be resumed.
+/// Dropping a pending [`BatchStream::next_item`](crate::BatchStream::next_item)
+/// instead retires the connection. Buffered [`QueryResult`] streams do not
+/// perform I/O and are unaffected.
 ///
 /// Cancellation does **not** guarantee that SQL Server stopped the request or
 /// rolled back its effects. No SQL is retried, and no async cleanup is run from
@@ -433,6 +435,25 @@ impl Client {
     ) -> std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<crate::row::Row>> + Send + 'a>>
     {
         self.query_streamed(sql, &[])
+    }
+
+    /// Stream a raw SQL batch with rowset boundaries and affected-row counts.
+    ///
+    /// The batch is sent once, on the first
+    /// [`next_item`](crate::BatchStream::next_item) call. Statements that report
+    /// neither rows, metadata, an affected-row count nor a message may be
+    /// skipped, as in native statement navigation (for example, with
+    /// `SET NOCOUNT ON`). SELECT row totals are not DML affected-row counts.
+    ///
+    /// Pass [`ExecuteOptions`](crate::ExecuteOptions) to set a native request
+    /// timeout. Use [`BatchStream::cancel`](crate::BatchStream::cancel) to stop
+    /// early and wait for bounded ATTENTION cleanup.
+    pub fn simple_query_batch<'a>(
+        &'a mut self,
+        sql: impl Into<String>,
+        options: impl Into<crate::ExecuteOptions<'a>>,
+    ) -> crate::BatchStream<'a> {
+        crate::BatchStream::new(&mut self.inner, sql.into(), options.into())
     }
 
     /// Begin a bulk insert into `table`.

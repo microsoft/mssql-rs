@@ -128,7 +128,8 @@ on checkout.
 
 Wire streams remain reusable when dropped between fully yielded rows; dropping
 a stream while its I/O is pending marks the connection dead. Cancelling only
-`stream.next()` retains the internal future if you keep the stream and resume it.
+`stream.next()` on the `Stream`-based APIs retains the internal future if you keep
+the stream and resume it.
 Unpolled futures, unused bulk builders, and buffered result streams do not poison
 the connection. Completed SQL errors retain the native driver's liveness outcome.
 A failed or cancelled session reset always retires the connection.
@@ -139,6 +140,40 @@ polling through cleanup; an external timeout that drops the operation is differe
 Direct calls through `inner_mut()` bypass the driver's guards: after abandoning
 native I/O, mark the native client dead and discard it instead of returning it
 to a pool as healthy. See the `Client` rustdoc for the full contract.
+
+### Raw batch streaming
+
+`Client::simple_query_batch` streams rowsets and affected-row counts from a single
+raw SQL execution. Empty rowsets still emit start and end events.
+`NoRows { rows_affected: None }` means the server did not report a count, not
+that it affected zero rows. `ResultSetEnd { row_count }` carries the optional
+DONE count for a rowset, which can be a SELECT row total.
+
+```rust
+use mssql_rs::{BatchItem, ExecuteOptions};
+
+let mut batch = client.simple_query_batch(sql, ExecuteOptions::new().timeout_secs(30));
+let mut rows_seen = 0;
+while let Some(item) = batch.next_item().await? {
+    match item {
+        BatchItem::Row(_row) => {
+            rows_seen += 1;
+            if rows_seen == 100 {
+                batch.cancel(5).await?;
+                break;
+            }
+        }
+        BatchItem::NoRows { rows_affected } => println!("Affected rows: {rows_affected:?}"),
+        _ => {}
+    }
+}
+```
+
+The request timeout and the ATTENTION cleanup timeout are separate. Await
+`cancel` to stop reading and settle the connection; dropping the batch between
+reads does not send ATTENTION. Cancellation does not roll back SQL effects.
+Rows are decoded one at a time, so a caller can cap how much it retains, but a
+single large row is materialized before it is delivered.
 
 ## Spatial values
 

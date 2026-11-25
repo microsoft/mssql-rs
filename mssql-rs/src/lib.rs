@@ -82,6 +82,7 @@
 //! - `row.get::<&str, _>("col")` works (strings are pre-decoded from UTF-16)
 //! - Connection pooling via [`TdsManager`] + [`deadpool`] with native session resets
 
+mod batch;
 pub mod bulk;
 #[cfg(feature = "arrow")]
 pub mod bulk_arrow;
@@ -99,6 +100,7 @@ pub mod row;
 pub mod serde_de;
 
 // Re-exports for ergonomic top-level access.
+pub use batch::{BatchItem, BatchStream};
 pub use bulk::{
     BulkInsert, BulkLoadRequest, BulkLoadRow, ColumnMapping, ColumnMappingSource, IntoRow, TokenRow,
 };
@@ -118,6 +120,7 @@ pub use row::{ColumnIndex, FromSql, Row};
 /// The underlying mssql-tds client type, exposed for advanced operations
 /// via [`Client::inner_mut()`].
 pub use mssql_tds::connection::tds_client::TdsClient;
+pub use mssql_tds::connection::tds_client::{BatchErrorMode, ExecuteOptions};
 /// Raw column values from mssql-tds, exposed for low-level access
 /// via [`Row::raw_value()`].
 /// Spatial values remain `ColumnValues::Bytes`; their identity is exposed
