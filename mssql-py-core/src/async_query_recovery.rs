@@ -215,10 +215,10 @@ impl QueryControl {
         if result.is_err() {
             self.session.mark_broken();
         }
-        self.session.release_operation(operation_id);
         recovery.fetch_state.set(FetchStatus::NoResultSet);
         recovery.description_state.replace(None);
         recovery.buffered_results.replace(Default::default());
+        self.session.release_operation(operation_id);
         self.complete_if_released();
         result
     }
