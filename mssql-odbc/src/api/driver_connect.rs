@@ -492,6 +492,10 @@ fn do_connect(
             return SQL_ERROR;
         }
     };
+    debug!(
+        json_version = ?client.negotiated_json_version(),
+        "SQLDriverConnectW: JSON feature negotiation completed"
+    );
     let info_messages = client.take_info_messages();
 
     // Write output connection string
@@ -2196,5 +2200,208 @@ mod tests {
         let _ = shutdown_tx.send(());
         let _ = server_runtime
             .block_on(async { tokio::time::timeout(Duration::from_secs(2), server_handle).await });
+    }
+
+    fn connect_to_json_mock(h: &TestHandles, addr: std::net::SocketAddr) -> SqlReturn {
+        let conn_str: Vec<u16> = cs(&format!(
+            "Server=tcp:{},{};UID=sa;<PW>=unused;Database=master;Encrypt=no;\
+             TrustServerCertificate=yes;ConnectRetryCount=0",
+            addr.ip(),
+            addr.port()
+        ))
+        .encode_utf16()
+        .collect();
+        unsafe {
+            crate::api::exports::SQLDriverConnectW(
+                h.dbc,
+                std::ptr::null_mut(),
+                conn_str.as_ptr(),
+                SqlSmallInt::try_from(conn_str.len()).unwrap(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                SQL_DRIVER_NOPROMPT,
+            )
+        }
+    }
+
+    #[test]
+    fn json_feature_is_negotiated_again_on_each_odbc_connect() {
+        use crate::api::disconnect::sql_disconnect;
+        use crate::api::odbc_types::{SQL_OV_ODBC3, SQL_OV_ODBC3_80};
+        use mssql_mock_tds::MockTdsServer;
+        use mssql_mock_tds::protocol::FEATURE_EXT_JSON;
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (addr, registry, store, shutdown, task) = runtime.block_on(async {
+            let server = MockTdsServer::new("127.0.0.1:0").await.unwrap();
+            let addr = server.local_addr();
+            let registry = server.query_registry();
+            let store = server.connection_store();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(server.run_with_shutdown(rx));
+            (addr, registry, store, tx, task)
+        });
+
+        for odbc_version in [SQL_OV_ODBC3, SQL_OV_ODBC3_80] {
+            let h = TestHandles::with_env_dbc_version(odbc_version);
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let other = TestHandles::with_env_dbc_version(odbc_version);
+            let other_dbc = unsafe { handle_from_raw::<DbcHandle>(other.dbc) };
+            runtime.block_on(async { registry.lock().await.set_json_ack(Some(vec![1])) });
+            let ret = connect_to_json_mock(&other, addr);
+            assert!(matches!(ret, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO), "{ret}");
+            for (ack, expected) in [
+                (Some(vec![1]), Some(1)),
+                (None, None),
+                (Some(vec![1]), Some(1)),
+                (Some(vec![0]), None),
+            ] {
+                runtime.block_on(async { registry.lock().await.set_json_ack(ack) });
+                let ret = connect_to_json_mock(&h, addr);
+                assert!(matches!(ret, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO), "{ret}");
+                assert_eq!(
+                    dbc.inner
+                        .lock()
+                        .unwrap()
+                        .wire
+                        .client()
+                        .unwrap()
+                        .negotiated_json_version(),
+                    expected
+                );
+                runtime.block_on(async {
+                    let store = store.lock().await;
+                    let login = store.all().values().last().unwrap();
+                    assert_eq!(
+                        login
+                            .requested_feature_ids
+                            .iter()
+                            .filter(|id| **id == FEATURE_EXT_JSON)
+                            .count(),
+                        1
+                    );
+                });
+                assert_eq!(unsafe { sql_disconnect(h.dbc) }, SQL_SUCCESS);
+                assert!(dbc.inner.lock().unwrap().wire.client().is_none());
+                assert_eq!(
+                    other_dbc
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .wire
+                        .client()
+                        .unwrap()
+                        .negotiated_json_version(),
+                    Some(1),
+                    "another connection's login must not change this session"
+                );
+            }
+            assert_eq!(unsafe { sql_disconnect(other.dbc) }, SQL_SUCCESS);
+        }
+        shutdown.send(()).unwrap();
+        runtime.block_on(task).unwrap().unwrap();
+    }
+
+    #[test]
+    fn malformed_json_ack_fails_odbc_login_without_poisoning_reconnect() {
+        use crate::api::disconnect::sql_disconnect;
+        use mssql_mock_tds::MockTdsServer;
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (addr, registry, shutdown, task) = runtime.block_on(async {
+            let server = MockTdsServer::new("127.0.0.1:0").await.unwrap();
+            let addr = server.local_addr();
+            let registry = server.query_registry();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(server.run_with_shutdown(rx));
+            (addr, registry, tx, task)
+        });
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        for payload in [vec![], vec![2], vec![255], vec![1, 0]] {
+            runtime.block_on(async { registry.lock().await.set_json_ack(Some(payload)) });
+            assert_eq!(connect_to_json_mock(&h, addr), SQL_ERROR);
+            {
+                let state = dbc.inner.lock().unwrap();
+                assert_eq!(state.connection_state, ConnectionState::Disconnected);
+                assert!(state.wire.client().is_none());
+                let diag = state.diag_records.last().unwrap();
+                assert_eq!(diag.sql_state, SQLSTATE_08001);
+                assert!(diag.message.contains("JSON"), "{}", diag.message);
+            }
+            runtime.block_on(async { registry.lock().await.set_json_ack(Some(vec![1])) });
+            let ret = connect_to_json_mock(&h, addr);
+            assert!(matches!(ret, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO), "{ret}");
+            assert_eq!(
+                dbc.inner
+                    .lock()
+                    .unwrap()
+                    .wire
+                    .client()
+                    .unwrap()
+                    .negotiated_json_version(),
+                Some(1)
+            );
+            assert_eq!(unsafe { sql_disconnect(h.dbc) }, SQL_SUCCESS);
+        }
+        shutdown.send(()).unwrap();
+        runtime.block_on(task).unwrap().unwrap();
+    }
+
+    #[test]
+    fn json_feature_uses_the_redirect_targets_acknowledgement() {
+        use crate::api::disconnect::sql_disconnect;
+        use mssql_mock_tds::{MockTdsServer, RedirectionConfig};
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for enhanced in [false, true] {
+            let (addr, registry, shutdowns, tasks) = runtime.block_on(async {
+                let target = MockTdsServer::new("127.0.0.1:0").await.unwrap();
+                let target_addr = target.local_addr();
+                let registry = target.query_registry();
+                let redirection = if enhanced {
+                    RedirectionConfig::enhanced("127.0.0.1", target_addr.port(), "master")
+                } else {
+                    RedirectionConfig::new("127.0.0.1", target_addr.port())
+                };
+                let gateway =
+                    MockTdsServer::new_with_redirection_config("127.0.0.1:0", redirection)
+                        .await
+                        .unwrap();
+                let addr = gateway.local_addr();
+                let (target_tx, target_rx) = tokio::sync::oneshot::channel();
+                let (gateway_tx, gateway_rx) = tokio::sync::oneshot::channel();
+                let tasks = [
+                    tokio::spawn(target.run_with_shutdown(target_rx)),
+                    tokio::spawn(gateway.run_with_shutdown(gateway_rx)),
+                ];
+                (addr, registry, [target_tx, gateway_tx], tasks)
+            });
+            let h = TestHandles::with_env_dbc();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            for (ack, expected) in [(Some(vec![1]), Some(1)), (None, None)] {
+                runtime.block_on(async { registry.lock().await.set_json_ack(ack) });
+                let ret = connect_to_json_mock(&h, addr);
+                assert!(matches!(ret, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO), "{ret}");
+                assert_eq!(
+                    dbc.inner
+                        .lock()
+                        .unwrap()
+                        .wire
+                        .client()
+                        .unwrap()
+                        .negotiated_json_version(),
+                    expected
+                );
+                assert_eq!(unsafe { sql_disconnect(h.dbc) }, SQL_SUCCESS);
+            }
+            for shutdown in shutdowns {
+                shutdown.send(()).unwrap();
+            }
+            for task in tasks {
+                runtime.block_on(task).unwrap().unwrap();
+            }
+        }
     }
 }

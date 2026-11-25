@@ -1595,6 +1595,13 @@ impl TdsClient {
             .data_classification_version()
     }
 
+    /// Native JSON version enabled for the current physical session.
+    /// `None` means the server omitted the acknowledgement or returned version
+    /// zero. Routing and session recovery replace this with the new login's value.
+    pub fn negotiated_json_version(&self) -> Option<u8> {
+        self.negotiated_settings.session_settings.json_version()
+    }
+
     /// Rows affected by the most recently executed statement.
     ///
     /// Returns the row count from the last DONE token that carried the
@@ -11285,6 +11292,47 @@ mod tests {
             .unwrap();
         assert_eq!(client.client_connection_id(), second);
         assert_eq!(trace.client_connection_id(), Some(second));
+    }
+
+    #[test]
+    fn json_negotiation_is_replaced_on_session_recovery() {
+        use crate::message::features::jsonfeature::JsonFeature;
+        use crate::message::login::Feature;
+
+        let mut client = create_test_client();
+        assert_eq!(client.negotiated_json_version(), None);
+        for payload in [Some(1), None, Some(1), Some(0)] {
+            let mut settings =
+                crate::handler::handler_factory::create_test_negotiated_settings_internal();
+            if let Some(version) = payload {
+                let mut feature = JsonFeature::default();
+                feature.deserialize(&[version]).unwrap();
+                feature.set_acknowledged(true);
+                settings
+                    .session_settings
+                    .supported_features
+                    .push(Box::new(feature));
+            }
+            client
+                .adopt_recovered_session(
+                    AnyTransport::dynamic(TestTransport::new()),
+                    settings,
+                    ExecutionContext::new(),
+                    Vec::new(),
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(
+                client.negotiated_json_version(),
+                payload.filter(|version| *version != 0)
+            );
+            client.prepare_reset_connection(false);
+            assert_eq!(
+                client.negotiated_json_version(),
+                payload.filter(|version| *version != 0),
+                "a pool reset does not renegotiate the physical session"
+            );
+        }
     }
 
     #[test]

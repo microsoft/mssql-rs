@@ -11,6 +11,7 @@ use crate::message::login::{Feature, FeatureExtension};
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct JsonFeature {
     acknowledged: bool,
+    negotiated_version: u8,
 }
 
 impl JsonFeature {
@@ -58,7 +59,16 @@ impl Feature for JsonFeature {
                 Self::VERSION
             )));
         }
+        self.negotiated_version = server_supported_version;
         Ok(())
+    }
+
+    fn negotiated_version(&self) -> u8 {
+        if self.acknowledged {
+            self.negotiated_version
+        } else {
+            0
+        }
     }
 
     fn is_acknowledged(&self) -> bool {
@@ -109,12 +119,18 @@ mod tests {
     fn test_deserialize_valid_version() {
         let mut feature = JsonFeature::default();
         feature.deserialize(&[JsonFeature::VERSION]).unwrap();
+        assert_eq!(feature.negotiated_version(), 0);
+        feature.set_acknowledged(true);
+        assert_eq!(feature.negotiated_version(), 1);
     }
 
     #[test]
     fn test_deserialize_version_zero() {
         let mut feature = JsonFeature::default();
+        feature.set_acknowledged(true);
+        feature.deserialize(&[1]).unwrap();
         feature.deserialize(&[0u8]).unwrap();
+        assert_eq!(feature.negotiated_version(), 0);
     }
 
     #[test]
@@ -159,9 +175,11 @@ mod tests {
     #[test]
     fn test_clone_box() {
         let mut feature = JsonFeature::default();
+        feature.deserialize(&[1]).unwrap();
         feature.set_acknowledged(true);
         let cloned = feature.clone_box();
         assert!(cloned.is_acknowledged());
+        assert_eq!(cloned.negotiated_version(), 1);
         assert_eq!(cloned.feature_identifier(), FeatureExtension::Json);
     }
 }

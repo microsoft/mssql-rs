@@ -1971,6 +1971,18 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn json_login7_request_is_version_one_on_initial_and_recovery_logins() {
+        let recovery = SessionStateTable::new().snapshot(Some("other_db"), None, None);
+        for recovery_data in [None, Some(recovery.as_ref())] {
+            let blocks = login7_feature_blocks(&ClientContext::default(), recovery_data);
+            let json: Vec<_> = blocks.iter().filter(|(id, _)| *id == 0x0D).collect();
+            assert_eq!(json.len(), 1);
+            assert_eq!(json[0].1, [1]);
+            assert_eq!(blocks.first().map(|(id, _)| *id), Some(USER_AGENT_ID));
+        }
+    }
+
     fn by_feature_id(blocks: Vec<(u8, Vec<u8>)>) -> BTreeMap<u8, Vec<u8>> {
         let count = blocks.len();
         let map: BTreeMap<_, _> = blocks.into_iter().collect();
