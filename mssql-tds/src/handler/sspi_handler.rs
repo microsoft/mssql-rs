@@ -26,7 +26,8 @@
 //!
 //! ```rust,ignore
 //! let config = context.integrated_auth_config();
-//! let mut handler = SspiAuthHandler::new(&config, "server.domain.com", 1433, None)?;
+//! let mut handler =
+//!     SspiAuthHandler::new(&config, "server.domain.com", 1433, None, tracing::Span::none())?;
 //!
 //! // Get initial token for Login7
 //! let initial_token = handler.get_initial_token()?;

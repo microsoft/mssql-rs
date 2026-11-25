@@ -210,7 +210,10 @@ unknown or unreachable, clock skew, no common encryption type, credentials that
 are missing, expired, unreadable or of a type the client's configuration does
 not allow, an unreachable KDC (area `undetermined` between Kerberos and the
 network) or a realm with no KDC are `diagnosed`; a key mismatch, whose causes
-the client cannot tell apart, and a failure without a specific code are
+the client cannot tell apart, SSPI's `SEC_E_NO_AUTHENTICATING_AUTHORITY` (a
+domain controller not reached, a wrong domain name or a failed trust, which the
+status does not tell apart; area `undetermined` between Windows authentication
+and the network), and a failure without a specific code are
 `inconclusive`. SQL Server's 18452 is reported with a limitation that it alone
 does not establish one cause.
 Session validation of an integrated login reads `authScheme`, the scheme SQL

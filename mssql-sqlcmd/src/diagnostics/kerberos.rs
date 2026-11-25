@@ -303,6 +303,10 @@ pub(super) enum SecuritySignal {
     CacheUnreadable,
     /// No KDC for the realm could be reached.
     KdcUnreachable,
+    /// Windows found no authority to authenticate the login: no domain
+    /// controller could be reached, the domain name is wrong, or a trust
+    /// relationship failed.
+    NoAuthenticatingAuthority,
     /// The client's configuration names no KDC or realm for the request.
     RealmUnknown,
     /// A key did not match: the service could not read the ticket, or the
@@ -368,7 +372,7 @@ impl SecuritySignal {
             SEC_E_TIME_SKEW => Self::ClockSkew,
             SEC_E_KDC_UNKNOWN_ETYPE => Self::NoCommonEncryptionType,
             SEC_E_NO_CREDENTIALS => Self::NoCredentials,
-            SEC_E_NO_AUTHENTICATING_AUTHORITY => Self::KdcUnreachable,
+            SEC_E_NO_AUTHENTICATING_AUTHORITY => Self::NoAuthenticatingAuthority,
             SEC_E_WRONG_PRINCIPAL => Self::KeyMismatch,
             _ => return None,
         })
@@ -394,6 +398,10 @@ impl SecuritySignal {
             Self::KdcUnreachable => (
                 Coverage::Diagnosed,
                 Domain::undetermined(&[KERBEROS_DOMAIN, "connectivity.network"]),
+            ),
+            Self::NoAuthenticatingAuthority => (
+                Coverage::Inconclusive,
+                Domain::undetermined(&[auth_domain, "connectivity.network"]),
             ),
             Self::KeyMismatch => (Coverage::Inconclusive, Domain::specific(KERBEROS_DOMAIN)),
             Self::LibraryMissing => (Coverage::Diagnosed, Domain::specific("client.driver")),
@@ -467,6 +475,14 @@ impl SecuritySignal {
             Self::KdcUnreachable => (
                 "diagnose.finding.kerberos_kdc_unreachable",
                 format!("The client could not reach a KDC for the realm ({code})."),
+            ),
+            Self::NoAuthenticatingAuthority => (
+                "diagnose.finding.sspi_no_authenticating_authority",
+                format!(
+                    "Windows found no authority that could authenticate the login ({code}): a \
+                     domain controller could not be reached, the domain name is wrong, or a \
+                     trust relationship failed; this signal alone does not establish which."
+                ),
             ),
             Self::RealmUnknown => (
                 "diagnose.finding.kerberos_realm_unknown",
@@ -798,7 +814,10 @@ mod tests {
             Some(SecuritySignal::NoCommonEncryptionType)
         );
         assert_eq!(signal(0x8009_030E), Some(SecuritySignal::NoCredentials));
-        assert_eq!(signal(0x8009_0311), Some(SecuritySignal::KdcUnreachable));
+        assert_eq!(
+            signal(0x8009_0311),
+            Some(SecuritySignal::NoAuthenticatingAuthority)
+        );
         assert_eq!(signal(0x8009_0322), Some(SecuritySignal::KeyMismatch));
         // Generic: internal error, logon denied, invalid token.
         for generic in [0x8009_0304, 0x8009_030C, 0x8009_0308] {
@@ -821,6 +840,14 @@ mod tests {
         assert_eq!(
             domain,
             Domain::undetermined(&[KERBEROS_DOMAIN, "connectivity.network"])
+        );
+        // Windows's "no authenticating authority" may also be a wrong domain
+        // name or a failed trust, not only an unreachable domain controller.
+        let (coverage, domain) = SecuritySignal::NoAuthenticatingAuthority.coverage(none, windows);
+        assert_eq!(coverage, Coverage::Inconclusive);
+        assert_eq!(
+            domain,
+            Domain::undetermined(&[windows, "connectivity.network"])
         );
         let (coverage, domain) = SecuritySignal::ServicePrincipalUnknown.coverage(none, windows);
         assert_eq!(coverage, Coverage::Diagnosed);
@@ -856,6 +883,12 @@ mod tests {
             text.contains("which clock is off is not established"),
             "{text}"
         );
+        let text = SecuritySignal::NoAuthenticatingAuthority
+            .finding("SEC_E_NO_AUTHENTICATING_AUTHORITY")
+            .render("en-US");
+        assert!(text.contains("domain controller"), "{text}");
+        assert!(text.contains("trust relationship"), "{text}");
+        assert!(text.contains("does not establish which"), "{text}");
     }
 
     #[test]

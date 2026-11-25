@@ -3635,6 +3635,21 @@
       ]
     },
     {
+      "id": "diagnose.finding.sspi_no_authenticating_authority",
+      "message": "Windows found no authority that could authenticate the login ({code}): a domain controller could not be reached, the domain name is wrong, or a trust relationship failed; this signal alone does not establish which.",
+      "translation": "Windows found no authority that could authenticate the login ({code}): a domain controller could not be reached, the domain name is wrong, or a trust relationship failed; this signal alone does not establish which.",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
       "id": "diagnose.finding.kerberos_realm_unknown",
       "message": "The client's Kerberos configuration names no KDC or realm for the request ({code}).",
       "translation": "The client's Kerberos configuration names no KDC or realm for the request ({code}).",
