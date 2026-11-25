@@ -77,12 +77,18 @@ impl Drop for PublicationGuard {
 #[pyclass]
 struct ConnectionPublication {
     guard: PublicationGuard,
+    native: Py<PyAny>,
     target: Py<PyAny>,
     result: Option<PyResult<Py<PyAny>>>,
 }
 
 impl ConnectionPublication {
     fn publish(&mut self, py: Python<'_>) -> PyResult<()> {
+        // Stop bridge bookkeeping before public completion can close its loop.
+        let native = self.native.bind(py).call0()?;
+        if !native.is_none() {
+            native.call_method0("cancel")?;
+        }
         let target = self.target.bind(py);
         let result = self
             .result
@@ -230,13 +236,18 @@ impl ConnectDelivery {
         let result = event_loop.call_method0("create_future")?;
         let target = result.clone().unbind();
         let event_loop = event_loop.unbind();
+        let (native_sender, native_receiver) = tokio::sync::oneshot::channel::<Py<PyAny>>();
         let future = pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let native = native_receiver.await.map_err(|_| {
+                InternalError::new_err("Connection delivery initialization was abandoned")
+            })?;
             let result = future.await;
             Python::attach(|py| {
                 let publication = Py::new(
                     py,
                     ConnectionPublication {
                         guard,
+                        native,
                         target,
                         result: Some(result.and_then(|result| result.into_py_any(py))),
                     },
@@ -257,6 +268,7 @@ impl ConnectDelivery {
             .getattr("ref")?
             .call1((&future,))?
             .unbind();
+        let publication_native = native.clone_ref(py);
         let delivery = self.clone();
         let cancellation = PyCFunction::new_closure(py, None, None, move |args, _| {
             if args.get_item(0)?.call_method0("cancelled")?.is_truthy()? {
@@ -293,6 +305,9 @@ impl ConnectDelivery {
             future.call_method0("cancel")?;
             return Err(error);
         }
+        native_sender
+            .send(publication_native)
+            .map_err(|_| InternalError::new_err("Native connection delivery was abandoned"))?;
         Ok(result)
     }
 }
@@ -543,6 +558,7 @@ impl PoolAdapter {
     pub(crate) fn register(self: &Arc<Self>) -> PyResult<ConnectAttempt> {
         let mut attempts = self.lock()?;
         if attempts.closed {
+            drop(attempts);
             return Err(map_pool_error(PoolError::Closed));
         }
         let id = attempts.next_id;
@@ -647,8 +663,8 @@ impl PyAsyncPool {
         block_error: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         self.check_owner(py)?;
-        self.inner.stop()?;
         let deadline = Instant::now() + self.inner.config.shutdown_timeout();
+        self.inner.stop()?;
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = inner.shutdown(deadline).await;

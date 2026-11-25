@@ -773,6 +773,9 @@ shutdown failure through a redacted diagnostic (and an exception note on Python
 versions supporting `add_note`). A clean exit propagates shutdown failure.
 Shutdown checks its original deadline before reporting completion, including when
 all work was already settled when the native future was first polled.
+The budget starts before synchronous admission stop. Closed-pool error
+normalization also runs after releasing attempt tracking, so Python exception
+construction cannot re-enter a held pool mutex.
 
 `PyAsyncConnection.connect(context, python_logger=None, autocommit=False, *,
 token_provider=None, pool=None, acquire_timeout=None, isolation_level=None)`
@@ -795,13 +798,16 @@ out-of-range values are rejected rather than silently defaulted.
 Only disabled-at-admission acquisition opens directly, using the same prepared
 specification, requested isolation and original deadline. Queue saturation,
 closure and failures after admission never bypass the pool. Acquired handles use
-the existing tracked logical ownership barrier; close passes its original cleanup
-deadline to `release_with_deadline`, and last-owner destruction discards.
+the existing tracked logical ownership barrier; close preserves its original
+cleanup deadline through native release, and last-owner destruction discards.
 The delivery bridge retains the attempt and lease until publication on the
 owning Python loop; cancelled or failed delivery revokes the undelivered handle.
 Publication owns a discard guard and checks scheduling failures itself, so a
 closed loop rejecting or dropping its queued callback settles the lease and
 attempt even if the application retains the pending public future.
+Native work starts after the delivery callbacks are installed. Publication cancels
+the private bridge bookkeeping future before completing the public future, so
+normal loop teardown need not deliver another bookkeeping result.
 
 Configuration, lifecycle and closed-pool errors use `InterfaceError`; saturation
 and deadlines use `OperationalError`. Pool errors carry `pool_reason` such as

@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::*;
 use crate::async_handle::{CLOSE_TIMEOUT, CloseMode};
@@ -47,6 +47,160 @@ fn manager() -> AsyncPoolManager {
     let manager = AsyncPoolManager::new(config.clone()).unwrap();
     manager.enable(config).unwrap();
     manager
+}
+
+#[test]
+fn publication_cancels_private_bridge_before_completing_public_future() {
+    Python::attach(|py| {
+        let start = PyCFunction::new_closure(py, None, None, move |args, _| {
+            ConnectDelivery::new(None, None)
+                .bind(args.py(), Box::pin(async { Ok(7_u32) }))
+                .map(Bound::unbind)
+        })
+        .unwrap();
+        let globals = PyDict::new(py);
+        globals.set_item("start", start).unwrap();
+        py.run(
+            pyo3::ffi::c_str!(
+                r#"
+import asyncio
+
+async def run():
+    loop = asyncio.get_running_loop()
+    create_future = loop.create_future
+    created = []
+    def track_future():
+        future = create_future()
+        created.append(future)
+        return future
+    loop.create_future = track_future
+    try:
+        completion = start()
+    finally:
+        loop.create_future = create_future
+    assert await asyncio.wait_for(completion, 5) == 7
+    assert created[1].cancelled()
+
+asyncio.run(run())
+"#
+            ),
+            Some(&globals),
+            None,
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn closed_pool_error_normalization_allows_attempt_reentry() {
+    let runtime = pyo3_async_runtimes::tokio::get_runtime();
+    let pool = Arc::new(PoolAdapter {
+        manager: runtime.block_on(async { manager() }),
+        config: PoolConfig::new(CLOSE_TIMEOUT, CLOSE_TIMEOUT, CLOSE_TIMEOUT).unwrap(),
+        attempts: Mutex::new(Attempts {
+            closed: false,
+            next_id: 0,
+            pending: HashMap::new(),
+        }),
+        settled: Notify::new(),
+    });
+    pool.stop().unwrap();
+    let unlocked = Arc::new(AtomicBool::new(false));
+    let original = Python::attach(|py| {
+        let error_type = py.get_type::<InterfaceError>();
+        let original = error_type.getattr("__init__").unwrap().unbind();
+        let pool = pool.clone();
+        let unlocked = unlocked.clone();
+        let initialize = PyCFunction::new_closure(py, None, None, move |_, _| {
+            unlocked.store(pool.attempts.try_lock().is_ok(), Ordering::SeqCst);
+            Ok::<(), PyErr>(())
+        })
+        .unwrap();
+        error_type.setattr("__init__", initialize).unwrap();
+        original
+    });
+    let error = pool.register().err().unwrap();
+    Python::attach(|py| {
+        py.get_type::<InterfaceError>()
+            .setattr("__init__", original.bind(py))
+            .unwrap();
+        assert_eq!(
+            error
+                .value(py)
+                .getattr("pool_reason")
+                .unwrap()
+                .extract::<String>()
+                .unwrap(),
+            "Closed"
+        );
+    });
+    assert!(unlocked.load(Ordering::SeqCst));
+}
+
+#[test]
+fn shutdown_budget_includes_synchronous_admission_stop() {
+    struct SlowCancellation;
+
+    impl std::task::Wake for SlowCancellation {
+        fn wake(self: Arc<Self>) {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    pyo3_async_runtimes::tokio::get_runtime().block_on(async {});
+    Python::attach(|py| {
+        let pending = Arc::new(Mutex::new(None));
+        let held = pending.clone();
+        let arm = PyCFunction::new_closure(py, None, None, move |args, _| {
+            let pool = args.get_item(0)?.extract::<PyRef<'_, PyAsyncPool>>()?;
+            let attempt = pool.inner.register()?;
+            let mut cancelled = Box::pin(attempt.cancel.clone().cancelled_owned());
+            let waker = std::task::Waker::from(Arc::new(SlowCancellation));
+            let mut context = std::task::Context::from_waker(&waker);
+            assert!(cancelled.as_mut().poll(&mut context).is_pending());
+            *held.lock().unwrap() = Some((attempt, cancelled));
+            Ok::<(), PyErr>(())
+        })
+        .unwrap();
+        let settle = PyCFunction::new_closure(py, None, None, move |_, _| {
+            drop(pending.lock().unwrap().take());
+            Ok::<(), PyErr>(())
+        })
+        .unwrap();
+        let globals = PyDict::new(py);
+        globals
+            .set_item("_AsyncPool", py.get_type::<PyAsyncPool>())
+            .unwrap();
+        globals
+            .set_item("OperationalError", py.get_type::<OperationalError>())
+            .unwrap();
+        globals.set_item("arm", arm).unwrap();
+        globals.set_item("settle", settle).unwrap();
+        py.run(
+            pyo3::ffi::c_str!(
+                r#"
+import asyncio
+
+async def run():
+    pool = _AsyncPool(acquire_timeout=1, cleanup_timeout=1, shutdown_timeout=1)
+    arm(pool)
+    completion = pool.aclose()
+    settle()
+    try:
+        await completion
+    except OperationalError as error:
+        assert error.pool_reason == "ShutdownTimeout"
+    else:
+        raise AssertionError("Shutdown excluded synchronous stop from its budget")
+
+asyncio.run(run())
+"#
+            ),
+            Some(&globals),
+            None,
+        )
+        .unwrap();
+    });
 }
 
 #[tokio::test]
