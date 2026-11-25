@@ -623,6 +623,83 @@ async fn surrendered_candidate_retry_queues_behind_older_waiters() {
     assert_eq!(factory.calls.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test(start_paused = true)]
+async fn preparation_reset_retry_wait_open_and_isolation_share_the_original_deadline() {
+    let manager = manager(2);
+    let mut first = manager
+        .reserve(key(), control(CancellationToken::new()))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut second = manager
+        .reserve(key(), control(CancellationToken::new()))
+        .await
+        .unwrap()
+        .unwrap();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let reset_gate = Arc::new(Semaphore::new(0));
+    first
+        .install(opened(tds_client_from_tokens_gated(
+            vec![done_no_more()],
+            reset_gate.clone(),
+            dropped.clone(),
+        )))
+        .unwrap();
+    second
+        .install(opened(tds_client_from_tokens(vec![])))
+        .unwrap();
+    first.return_quiescent().unwrap();
+    second.return_quiescent().unwrap();
+    let mut factory = Factory::new(vec![opened(tds_client_from_tokens_gated(
+        vec![done_no_more()],
+        Arc::new(Semaphore::new(0)),
+        dropped.clone(),
+    ))]);
+    factory.delay = Duration::from_secs(3);
+    let spec = spec();
+    let acquire_control = control(CancellationToken::new());
+    let deadline = acquire_control.deadline();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let mut acquire =
+        Box::pin(manager.acquire(key(), &spec, &factory, isolation(), acquire_control));
+    assert!(poll(acquire.as_mut()).is_pending());
+    let held = manager
+        .reserve(key(), control(CancellationToken::new()))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut older = Box::pin(manager.reserve(key(), control(CancellationToken::new())));
+    assert!(poll(older.as_mut()).is_pending());
+
+    tokio::time::advance(Duration::from_secs(3)).await;
+    reset_gate.add_permits(1);
+    assert!(poll(acquire.as_mut()).is_pending());
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    let assigned = match poll(older.as_mut()) {
+        Poll::Ready(Ok(Some(slot))) => slot,
+        _ => panic!("older waiter must receive surrendered capacity"),
+    };
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(poll(acquire.as_mut()).is_pending());
+    assert_eq!(factory.calls.load(Ordering::SeqCst), 0);
+    drop(assigned);
+    assert!(poll(acquire.as_mut()).is_pending());
+    tokio::time::advance(Duration::from_secs(3)).await;
+    assert!(poll(acquire.as_mut()).is_pending());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(matches!(
+        poll(acquire.as_mut()),
+        Poll::Ready(Err(PoolError::AcquireTimeout {
+            stage: AcquireStage::Isolation
+        }))
+    ));
+    assert_eq!(Instant::now(), deadline);
+    assert_eq!(factory.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    drop(held);
+    manager.shutdown().await.unwrap();
+}
+
 async fn lease(manager: &AsyncPoolManager, client: TdsClient) -> PoolLease {
     let mut slot = manager
         .reserve(key(), control(CancellationToken::new()))

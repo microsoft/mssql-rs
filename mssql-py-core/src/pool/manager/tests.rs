@@ -177,6 +177,65 @@ async fn retries_reenter_at_the_tail_and_are_subject_to_the_same_limit() {
 }
 
 #[tokio::test]
+async fn surrendered_slot_retry_fails_when_a_newcomer_fills_the_queue_at_handoff() {
+    struct EnqueueOnWake {
+        newcomer: Mutex<Option<Request>>,
+        queued: Mutex<Option<Request>>,
+        observations: Arc<Mutex<Observations>>,
+    }
+
+    impl Wake for EnqueueOnWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let Some(mut newcomer) = self.newcomer.lock().unwrap().take() else {
+                return;
+            };
+            assert_eq!(self.observations.lock().unwrap().destroyed, [1]);
+            assert!(poll(newcomer.as_mut()).is_pending());
+            *self.queued.lock().unwrap() = Some(newcomer);
+        }
+    }
+
+    let manager = manager(config(1, Some(1), 10));
+    let observations: Arc<Mutex<Observations>> = Arc::default();
+    let mut held = ready(&mut request(&manager, 1));
+    held.install(Client::new(1, &observations)).unwrap();
+    let handoff = Arc::new(EnqueueOnWake {
+        newcomer: Mutex::new(Some(request(&manager, 1))),
+        queued: Mutex::new(None),
+        observations: observations.clone(),
+    });
+    let waker = Waker::from(handoff.clone());
+    let mut older = request(&manager, 1);
+    assert!(
+        older
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+
+    let mut retry = Box::pin(held.retry());
+    assert!(matches!(
+        poll(retry.as_mut()),
+        Poll::Ready(Err(PoolError::WaitQueueFull))
+    ));
+    let mut newcomer = handoff.queued.lock().unwrap().take().unwrap();
+    assert!(poll(newcomer.as_mut()).is_pending());
+    let mut assigned = ready(&mut older);
+    assert!(assigned.value_mut().is_none());
+    assigned.install(Client::new(2, &observations)).unwrap();
+    assert!(poll(newcomer.as_mut()).is_pending());
+    drop(assigned);
+    drop(ready(&mut newcomer));
+    assert_eq!(observations.lock().unwrap().peak, 1);
+    assert_eq!(pool(&manager, 1).counts(), (0, 0, 0));
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn unlimited_queue_is_per_key_and_dropped_waiters_release_demand() {
     let manager = manager(config(1, None, 10));
     let held = ready(&mut request(&manager, 1));
@@ -205,18 +264,24 @@ async fn cancellation_reclaims_queued_and_unpolled_assigned_gets_before_new_admi
             AcquireControl::new(control().deadline(), cancel.clone()),
         );
         assert!(poll(cancelled.as_mut()).is_pending());
-        if after_assignment {
+        let held = if after_assignment {
             drop(held);
+            None
         } else {
             let mut later = request(&manager, 1);
             assert!(matches!(
                 poll(later.as_mut()),
                 Poll::Ready(Err(PoolError::WaitQueueFull))
             ));
+            Some(held)
+        };
+        cancel.cancel();
+        let mut next = request(&manager, 1);
+        if let Some(held) = held {
+            assert!(poll(next.as_mut()).is_pending());
             drop(held);
         }
-        cancel.cancel();
-        drop(ready(&mut request(&manager, 1)));
+        drop(ready(&mut next));
         assert!(matches!(
             poll(cancelled.as_mut()),
             Poll::Ready(Err(PoolError::Cancelled))
