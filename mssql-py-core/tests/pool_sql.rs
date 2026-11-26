@@ -36,7 +36,7 @@ mod common;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use mssql_tds::connection::tds_client::TdsClient;
+use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
 use mssql_tds::core::CancelHandle;
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::message::transaction_management::TransactionIsolationLevel;
@@ -221,7 +221,9 @@ async fn mock_recovery_keeps_the_lease_and_sends_the_application_batch_once() {
                 .recovery_login
         );
     }
-    drop(next);
+    next.client_mut().mark_connection_dead();
+    assert!(matches!(next.release().await, Err(PoolError::Cleanup(_))));
+    assert_eq!(connections.lock().await.count(), 3);
     drop(manager);
     shutdown.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), task)
@@ -229,6 +231,95 @@ async fn mock_recovery_keeps_the_lease_and_sends_the_application_batch_once() {
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires live SQL Server and DB_HOST/DB_USERNAME/SQL_PASSWORD"]
+async fn live_completed_execute_preserves_delayed_results_for_fetch_and_release() {
+    for drain_on_release in [false, true] {
+        let owner = manager();
+        let observer_pool = manager();
+        let spec = spec();
+        let mut first = acquire(
+            &owner,
+            &spec,
+            TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+        )
+        .await;
+        let spid = scalar(first.client_mut(), "SELECT @@SPID").await;
+        let mut observer = acquire(
+            &observer_pool,
+            &spec,
+            TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+        )
+        .await;
+        let resource = format!("pool_fetch_{}", uuid::Uuid::new_v4().simple());
+        assert!(
+            scalar(
+                observer.client_mut(),
+                &format!(
+                    "DECLARE @result int; EXEC @result = sys.sp_getapplock \
+             @Resource='{resource}', @LockMode='Exclusive', @LockOwner='Session', \
+             @LockTimeout=0; SELECT @result"
+                )
+            )
+            .await
+                >= 0
+        );
+        let query = format!(
+            "SELECT 1; RAISERROR('result gate', 0, 1) WITH NOWAIT; \
+                 BEGIN TRANSACTION; EXEC sys.sp_getapplock @Resource='{resource}', \
+                 @LockMode='Shared', @LockOwner='Transaction', @LockTimeout=10000; \
+                 SELECT 2; ROLLBACK TRANSACTION"
+        );
+        first
+            .run(None, &CancellationToken::new(), move |client, cancel| {
+                Box::pin(async move {
+                    client
+                        .execute(
+                            query,
+                            mssql_tds::connection::tds_client::ExecuteOptions::new().cancel(cancel),
+                        )
+                        .await
+                })
+            })
+            .await
+            .unwrap();
+        let unlock =
+            format!("EXEC sys.sp_releaseapplock @Resource='{resource}', @LockOwner='Session'");
+        let cancellation = CancellationToken::new();
+        if drain_on_release {
+            let mut release = Box::pin(first.release());
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(std::future::Future::poll(release.as_mut(), &mut cx).is_pending());
+            exec(observer.client_mut(), &unlock).await;
+            release.await.unwrap();
+        } else {
+            let mut fetch = Box::pin(first.run(None, &cancellation, |client, _| {
+                Box::pin(async move {
+                    assert_eq!(client.next_row().await?.unwrap()[0], ColumnValues::Int(1));
+                    client.advance().await?;
+                    common::get_scalar_value(client).await
+                })
+            }));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(std::future::Future::poll(fetch.as_mut(), &mut cx).is_pending());
+            exec(observer.client_mut(), &unlock).await;
+            assert_eq!(fetch.await.unwrap(), Some(ColumnValues::Int(2)));
+            first.release().await.unwrap();
+        }
+        let mut reused = acquire(
+            &owner,
+            &spec,
+            TransactionIsolationLevel::ReadCommitted.try_into().unwrap(),
+        )
+        .await;
+        assert_eq!(scalar(reused.client_mut(), "SELECT @@SPID").await, spid);
+        reused.release().await.unwrap();
+        observer.release().await.unwrap();
+        owner.shutdown().await.unwrap();
+        observer_pool.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]

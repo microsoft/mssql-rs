@@ -113,22 +113,7 @@ fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
 }
 
 #[test]
-fn isolation_sql_is_closed_and_no_change_is_rejected() {
-    for (level, suffix) in [
-        (
-            TransactionIsolationLevel::ReadUncommitted,
-            "READ UNCOMMITTED",
-        ),
-        (TransactionIsolationLevel::ReadCommitted, "READ COMMITTED"),
-        (TransactionIsolationLevel::RepeatableRead, "REPEATABLE READ"),
-        (TransactionIsolationLevel::Serializable, "SERIALIZABLE"),
-        (TransactionIsolationLevel::Snapshot, "SNAPSHOT"),
-    ] {
-        assert_eq!(
-            Isolation::try_from(level).unwrap().0,
-            format!("SET TRANSACTION ISOLATION LEVEL {suffix}")
-        );
-    }
+fn isolation_no_change_is_rejected() {
     assert!(matches!(
         Isolation::try_from(TransactionIsolationLevel::NoChange),
         Err(PoolError::InvalidRequest {
@@ -431,6 +416,155 @@ async fn operation_auth_factory() -> (
     (factory, event_loop)
 }
 
+#[test]
+fn recovery_binding_change_during_token_acquisition_sends_no_application_batch() {
+    use pyo3::prelude::*;
+    use pyo3::types::PyModule;
+
+    Python::attach(|py| {
+        let event_loop = py
+            .import("asyncio")
+            .unwrap()
+            .call_method0("new_event_loop")
+            .unwrap();
+        let locals = pyo3_async_runtimes::TaskLocals::new(event_loop.clone())
+            .copy_context(py)
+            .unwrap();
+        let provider = PyModule::from_code(
+            py,
+            c"import time\nfrom types import SimpleNamespace\nclass Credential:\n    def __init__(self):\n        self.calls = 0\n        self.epoch = 1\n    async def get_token(self, scope):\n        self.calls += 1\n        if self.calls == 2:\n            self.epoch = 2\n        return SimpleNamespace(token='opaque', expires_on=int(time.time()) + 3600)\n",
+            c"pool_recovery_credential.py",
+            c"pool_recovery_credential",
+        )
+        .unwrap()
+        .getattr("Credential").unwrap().call0().unwrap().unbind();
+        let future =
+            pyo3_async_runtimes::tokio::future_into_py_with_locals(py, locals, async move {
+                use mssql_mock_tds::{MockTdsServer, QueryResponse};
+                use mssql_tds::connection::client_context::TdsAuthenticationMethod;
+                use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
+
+                let server = MockTdsServer::new(
+                    &std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0).to_string(),
+                )
+                .await
+                .unwrap();
+                let address = server.local_addr();
+                let connections = server.connection_store();
+                {
+                    let registry = server.query_registry();
+                    let mut registry = registry.lock().await;
+                    registry.set_session_recovery(true);
+                    registry.register("SELECT 1", QueryResponse::select_one());
+                }
+                let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+                let task = tokio::spawn(server.run_with_shutdown(shutdown_rx));
+                let factory = || {
+                    Python::attach(|py| {
+                        crate::async_entra_token_factory::AsyncPythonEntraIdTokenFactory::new(
+                            py,
+                            provider.clone_ref(py),
+                        )
+                        .unwrap()
+                    })
+                };
+                let retained =
+                    super::super::auth::RecoveryAuth::new(binding(), "test-tenant".into()).unwrap();
+                let reader = || {
+                    let provider = Python::attach(|py| provider.clone_ref(py));
+                    move || {
+                        Python::attach(|py| {
+                            let epoch = provider
+                                .getattr(py, "epoch")
+                                .unwrap()
+                                .extract::<u8>(py)
+                                .unwrap();
+                            Ok(AuthBinding::new(vec![epoch].into_boxed_slice()).unwrap())
+                        })
+                    }
+                };
+                let initial = retained
+                    .activate(factory(), reader(), Duration::ZERO)
+                    .unwrap();
+                let mut context = ClientContext::with_data_source(&format!(
+                    "tcp:{},{}",
+                    address.ip(),
+                    address.port()
+                ));
+                context.connect_retry_count = 1;
+                context.tds_authentication_method =
+                    TdsAuthenticationMethod::ActiveDirectoryServicePrincipal;
+                context.encryption_options = EncryptionOptions {
+                    mode: EncryptionSetting::PreferOff,
+                    trust_server_certificate: true,
+                    ..Default::default()
+                };
+                let spec = ConnectSpec::new(context, binding());
+                let opened = initial.open(&spec, &CancelHandle::new()).await.unwrap();
+                initial.complete().unwrap();
+                let manager = manager(1);
+                let mut first = lease(&manager, tds_client_from_tokens(vec![])).await;
+                *first.slot.value_mut().unwrap() = opened;
+                assert!(first.client_mut().is_session_recovery_enabled());
+                first.client_mut().mark_connection_dead();
+                let scope = first
+                    .activate_auth(factory(), reader(), Duration::ZERO)
+                    .unwrap();
+                let result = first
+                    .run_authenticated(None, &CancellationToken::new(), scope, |client, cancel| {
+                        Box::pin(async move {
+                            client
+                                .execute("SELECT 1".into(), ExecuteOptions::new().cancel(cancel))
+                                .await
+                        })
+                    })
+                    .await;
+                assert!(result.is_err());
+                assert!(first.discard);
+                assert!(first.client_mut().is_connection_dead());
+                assert_eq!(first.client_mut().connection_recovery_count(), 0);
+                first.release().await.unwrap();
+                manager.shutdown().await.unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        {
+                            let store = connections.lock().await;
+                            if store.is_transport_closed(0) && store.is_transport_closed(1) {
+                                break;
+                            }
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                {
+                    let store = connections.lock().await;
+                    assert_eq!(store.count(), 2);
+                    assert!(
+                        store
+                            .all()
+                            .values()
+                            .all(|info| { info.transaction_descriptor_headers.is_empty() }),
+                        "account switch sent an application batch"
+                    );
+                }
+                shutdown.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        event_loop
+            .call_method1("run_until_complete", (future,))
+            .unwrap();
+        event_loop.call_method0("close").unwrap();
+    });
+}
+
 #[tokio::test]
 async fn authenticated_operation_rechecks_binding_before_work_and_publication() {
     for mode in 0..3 {
@@ -447,41 +581,40 @@ async fn authenticated_operation_rechecks_binding_before_work_and_publication() 
             },
             retained,
         );
+        let switched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = switched.clone();
         let scope = if mode == 2 {
             super::super::auth::RecoveryAuth::new(binding(), "tenant".into())
                 .unwrap()
-                .activate(factory, &binding(), Duration::ZERO)
+                .activate(factory, || Ok(binding()), Duration::ZERO)
                 .unwrap()
         } else {
             first
-                .activate_auth(factory, &binding(), Duration::ZERO)
+                .activate_auth(
+                    factory,
+                    move || {
+                        Ok(if reader.load(Ordering::Acquire) {
+                            AuthBinding::new(vec![2].into_boxed_slice()).unwrap()
+                        } else {
+                            binding()
+                        })
+                    },
+                    Duration::ZERO,
+                )
                 .unwrap()
         };
-        let switched = Arc::new(std::sync::atomic::AtomicBool::new(switch_before_work));
-        let reader = switched.clone();
+        switched.store(switch_before_work, Ordering::Release);
         let result = first
-            .run_authenticated(
-                None,
-                &CancellationToken::new(),
-                scope,
-                move || {
-                    Ok(if reader.load(Ordering::Acquire) {
-                        AuthBinding::new(vec![2].into_boxed_slice()).unwrap()
-                    } else {
-                        binding()
-                    })
-                },
-                move |_, _| {
-                    Box::pin(async move {
-                        assert!(
-                            !switch_before_work && mode != 2,
-                            "mismatched binding reached application work"
-                        );
-                        switched.store(true, Ordering::Release);
-                        Ok(())
-                    })
-                },
-            )
+            .run_authenticated(None, &CancellationToken::new(), scope, move |_, _| {
+                Box::pin(async move {
+                    assert!(
+                        !switch_before_work && mode != 2,
+                        "mismatched binding reached application work"
+                    );
+                    switched.store(true, Ordering::Release);
+                    Ok(())
+                })
+            })
             .await;
         assert!(matches!(result, Err(PoolError::IdentityMismatch)));
         assert!(first.discard);
@@ -490,9 +623,72 @@ async fn authenticated_operation_rechecks_binding_before_work_and_publication() 
     }
 }
 
+#[tokio::test]
+async fn authenticated_binding_change_before_resumption_sends_no_batch() {
+    let (factory, event_loop) = operation_auth_factory().await;
+    let retained = super::super::auth::RecoveryAuth::new(binding(), "tenant".into()).unwrap();
+    let manager = manager(1);
+    let (client, sent) = tds_client_from_tokens_capturing(vec![done_no_more()]);
+    let mut first = lease(&manager, tds_client_from_tokens(vec![])).await;
+    *first.slot.value_mut().unwrap() = OpenedConnection::with_recovery(
+        client,
+        AuthMetadata {
+            binding: binding(),
+            expiry: TokenExpiry::NonToken,
+        },
+        retained,
+    );
+    let switched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = switched.clone();
+    let scope = first
+        .activate_auth(
+            factory,
+            move || {
+                Ok(if reader.load(Ordering::Acquire) {
+                    AuthBinding::new(vec![2].into_boxed_slice()).unwrap()
+                } else {
+                    binding()
+                })
+            },
+            Duration::ZERO,
+        )
+        .unwrap();
+    scope
+        .record_test_login(chrono::Utc::now() + chrono::Duration::seconds(3600))
+        .unwrap();
+    let gate = Arc::new(Semaphore::new(0));
+    let signal = gate.clone();
+    let cancellation = CancellationToken::new();
+    let mut work =
+        Box::pin(
+            first.run_authenticated(None, &cancellation, scope, move |client, cancel| {
+                Box::pin(async move {
+                    gate.acquire().await.unwrap().forget();
+                    client
+                        .execute("SELECT 1".into(), ExecuteOptions::new().cancel(cancel))
+                        .await
+                })
+            }),
+        );
+    assert!(poll(work.as_mut()).is_pending());
+    switched.store(true, Ordering::Release);
+    signal.add_permits(1);
+    assert!(matches!(
+        poll(work.as_mut()),
+        Poll::Ready(Err(PoolError::IdentityMismatch))
+    ));
+    drop(work);
+    assert!(sent.lock().unwrap().is_empty());
+    assert!(first.discard);
+    assert!(first.client_mut().is_connection_dead());
+    first.release().await.unwrap();
+    manager.shutdown().await.unwrap();
+    pyo3::Python::attach(|py| event_loop.call_method0(py, "close").unwrap());
+}
+
 #[tokio::test(start_paused = true)]
 async fn post_operation_expiry_discards_without_replacing_completed_results() {
-    for mode in 0..3 {
+    for mode in 0..4 {
         let (factory, event_loop) = operation_auth_factory().await;
         let retained = super::super::auth::RecoveryAuth::new(binding(), "tenant".into()).unwrap();
         let manager = manager(1);
@@ -505,19 +701,11 @@ async fn post_operation_expiry_discards_without_replacing_completed_results() {
             },
             retained,
         );
-        let scope = first
-            .activate_auth(factory, &binding(), Duration::from_secs(5))
-            .unwrap();
-        scope
-            .record_test_login(chrono::Utc::now() + chrono::Duration::seconds(60))
-            .unwrap();
         let switched = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader = switched.clone();
-        let result = first
-            .run_authenticated(
-                None,
-                &CancellationToken::new(),
-                scope,
+        let scope = first
+            .activate_auth(
+                factory,
                 move || {
                     Ok(if reader.load(Ordering::Acquire) {
                         AuthBinding::new(vec![2].into_boxed_slice()).unwrap()
@@ -525,23 +713,29 @@ async fn post_operation_expiry_discards_without_replacing_completed_results() {
                         binding()
                     })
                 },
-                move |_, _| {
-                    Box::pin(async move {
-                        tokio::time::advance(Duration::from_secs(56)).await;
-                        switched.store(mode == 2, Ordering::Release);
-                        if mode == 1 {
-                            return Err(mssql_tds::error::Error::ConnectionError(
-                                "operation sentinel".into(),
-                            ));
-                        }
-                        Ok(42)
-                    })
-                },
+                Duration::from_secs(5),
             )
+            .unwrap();
+        scope
+            .record_test_login(chrono::Utc::now() + chrono::Duration::seconds(60))
+            .unwrap();
+        let result = first
+            .run_authenticated(None, &CancellationToken::new(), scope, move |_, _| {
+                Box::pin(async move {
+                    tokio::time::advance(Duration::from_secs(56)).await;
+                    switched.store(mode >= 2, Ordering::Release);
+                    if mode == 1 || mode == 3 {
+                        return Err(mssql_tds::error::Error::ConnectionError(
+                            "operation sentinel".into(),
+                        ));
+                    }
+                    Ok(42)
+                })
+            })
             .await;
         match mode {
             0 => assert_eq!(result.unwrap(), 42),
-            1 => assert!(matches!(result, Err(PoolError::Execute(error))
+            1 | 3 => assert!(matches!(result, Err(PoolError::Execute(error))
                 if matches!(error.as_ref(), mssql_tds::error::Error::ConnectionError(message)
                     if message == "operation sentinel"))),
             _ => assert!(matches!(result, Err(PoolError::IdentityMismatch))),

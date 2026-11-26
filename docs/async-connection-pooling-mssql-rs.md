@@ -748,11 +748,12 @@ For a reusable candidate, while holding exclusive client access:
 
 2. Call `prepare_reset_connection(false)`.
 
-3. Execute `SET TRANSACTION ISOLATION LEVEL <validated level>` with an operation
-   `CancelHandle` and remaining timeout.
+3. Call `initialize_session` with the validated isolation level, an operation
+   `CancelHandle` and remaining timeout. It issues the fixed isolation SET without
+   reconnecting.
 
-4. Call `close_query().await` to consume the complete carrier response. An
-   `execute()` result alone is not proof that all tokens/results were consumed.
+4. The operation fully drains the carrier response through `close_query().await`.
+   An initial `execute()` result alone is not proof that all tokens/results were consumed.
 
 5. Require success, `!reset_pending()`, `!is_connection_dead()`, no open batch,
    and `!has_active_transaction()` before publication.
@@ -831,8 +832,10 @@ outside the pool's accounting.
 
 **Approved session-recovery revision (2026-11-25):** candidate replacement at checkout and
 transparent recovery of an eligible checked-out session coexist. Reuse the TDS recovery
-engine, not a second pool reconnect loop. Pool-owned initialization, reset and return suspend
-recovery: failed candidates are discarded, and return never reconnects merely to cache a client.
+engine, not a second pool reconnect loop. Pool-owned initialization and reset use the fixed
+TDS `initialize_session` operation, whose private per-operation path never reconnects or changes
+the client's application recovery policy. Return drains and rolls back without reconnecting:
+failed candidates are discarded, and return never reconnects merely to cache a client.
 Reset acknowledgement remains mandatory.
 
 Application recovery occurs only before a request is sent, with negotiated recovery, no active
@@ -1006,6 +1009,9 @@ through their cloned TDS contexts. Doc 2's factory adapter installs a Rust callb
 **weak operation-scoped bridge reference**, keeping the bridge alive only during the login or
 application operation that can recover. Recovery captures the active caller's loop/context,
 preserves the original identity/credential binding and records successful-login expiry.
+The active scope owns a trusted binding reader, checked before and after token
+acquisition and before each tracked application-work poll. A binding change
+blocks resumption; completion-only detection is insufficient.
 Outside an active operation, callback invocation fails explicitly; it cannot target a stale loop.
 Raw caller tokens are reused as supplied, with no automatic refresh guarantee. Trusted recovery
 is enabled only with verified stable identity and platform-specific evidence.
@@ -1028,6 +1034,9 @@ dependency where needed; a transitive dependency is not an import contract.
 be awaited externally. A per-operation guard owns the root, passes children to TDS, and calls
 `cancel()` on timeout/cancellation. Do not claim that receiving `CancelHandle` alone cancels a
 FIFO handoff wait.
+Normally settled application work disarms this guard because TDS retains its
+child for later result reads and return-time draining. Abandonment still cancels
+and discards.
 
 Race all acquisition stages against the **same** deadline and cancellation signals. On
 cancellation, stop retrying immediately. Drop/abort and join any supervised Rust I/O task before

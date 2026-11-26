@@ -20,6 +20,7 @@ mod data_classification_tests {
     use mssql_tds::core::{CancelHandle, EncryptionOptions, EncryptionSetting};
     use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::error::Error;
+    use mssql_tds::message::transaction_management::TransactionIsolationLevel;
     use mssql_tds::token::data_classification::{
         DataClassificationMetadata, DataClassificationVersion, InformationTypeReference,
         SensitivityLabelReference, SensitivityRank,
@@ -884,20 +885,31 @@ mod data_classification_tests {
     #[tokio::test]
     async fn maintenance_does_not_replace_reset_acknowledgement_with_recovery() {
         let server = Server::start_recoverable(DataClassificationVersion::Version2).await;
-        let mut client = server.connect(None).await;
-        assert!(client.is_session_recovery_enabled());
-        client.mark_connection_dead();
-        {
-            let mut maintenance = client.suspend_session_recovery();
-            maintenance.prepare_reset_connection(false);
+        for reuse in [false, true] {
+            let mut client = server.connect(None).await;
+            assert!(client.is_session_recovery_enabled());
+            client.mark_connection_dead();
+            if reuse {
+                client.prepare_reset_connection(false);
+            }
+            let logins = server.connections.lock().await.count();
             assert!(matches!(
-                maintenance.execute(UNCLASSIFIED.into(), ()).await,
+                client
+                    .initialize_session(TransactionIsolationLevel::ReadCommitted, ())
+                    .await,
                 Err(Error::ConnectionClosed(_))
             ));
+            assert!(client.is_session_recovery_enabled());
+            assert!(client.is_connection_dead());
+            assert_eq!(client.connection_recovery_count(), 0);
+            assert_eq!(server.connections.lock().await.count(), logins);
+            client.execute(UNCLASSIFIED.into(), ()).await.unwrap();
+            client.close_query().await.unwrap();
+            assert_eq!(client.connection_recovery_count(), 1);
+            assert_eq!(server.connections.lock().await.count(), logins + 1);
+            client.close_connection().await.unwrap();
         }
-        assert!(client.is_connection_dead());
-        assert_eq!(client.connection_recovery_count(), 0);
-        assert!(server.recovery_login_requests().await.is_empty());
+        assert_eq!(server.recovery_login_requests().await.len(), 2);
         server.stop().await;
     }
 

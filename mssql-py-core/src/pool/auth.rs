@@ -61,10 +61,10 @@ impl RecoveryAuth {
     pub(crate) fn activate(
         &self,
         factory: AsyncPythonEntraIdTokenFactory,
-        current_binding: &AuthBinding,
+        current_binding: impl Fn() -> PoolResult<AuthBinding> + Send + Sync + 'static,
         margin: Duration,
     ) -> PoolResult<OperationAuth> {
-        self.verify_binding(current_binding)?;
+        self.verify_binding(&current_binding()?)?;
         let mut active = self.active.lock().unwrap();
         if active.upgrade().is_some() {
             return Err(PoolError::InvalidRequest {
@@ -77,6 +77,7 @@ impl RecoveryAuth {
             enabled: AtomicBool::new(true),
             login: Mutex::new(None),
             margin,
+            current_binding: Box::new(current_binding),
         });
         *active = Arc::downgrade(&inner);
         Ok(OperationAuth {
@@ -91,6 +92,10 @@ impl RecoveryAuth {
         }
         Ok(())
     }
+
+    fn verify_active_binding(&self, active: &ActiveAuth) -> PoolResult<()> {
+        self.verify_binding(&(active.current_binding)()?)
+    }
 }
 
 struct ActiveAuth {
@@ -98,6 +103,7 @@ struct ActiveAuth {
     enabled: AtomicBool,
     login: Mutex<Option<LoginExpiry>>,
     margin: Duration,
+    current_binding: Box<dyn Fn() -> PoolResult<AuthBinding> + Send + Sync>,
 }
 
 struct LoginExpiry {
@@ -142,22 +148,19 @@ impl OperationAuth {
         Ok(())
     }
 
-    pub(super) fn check_binding(&self, current_binding: &AuthBinding) -> PoolResult<()> {
-        self.retained.verify_binding(current_binding)
+    pub(super) fn check_binding(&self) -> PoolResult<()> {
+        self.retained.verify_active_binding(&self.inner)
     }
 
     /// Call only after successful login/recovery, before publishing its result.
     /// Re-read the trusted binding epoch; a miss-only identity check is insufficient.
     /// Expired metadata disallows reuse, not delivery of already-completed application work.
-    pub(crate) fn complete(
-        self,
-        current_binding: &AuthBinding,
-    ) -> PoolResult<Option<AuthMetadata>> {
-        self.metadata(current_binding)
+    pub(crate) fn complete(self) -> PoolResult<Option<AuthMetadata>> {
+        self.metadata()
     }
 
-    fn metadata(&self, current_binding: &AuthBinding) -> PoolResult<Option<AuthMetadata>> {
-        self.retained.verify_binding(current_binding)?;
+    fn metadata(&self) -> PoolResult<Option<AuthMetadata>> {
+        self.check_binding()?;
         let login = self.inner.login.lock().unwrap();
         login
             .as_ref()
@@ -181,6 +184,8 @@ impl ConnectionFactory for OperationAuth {
     ) -> Result<OpenedConnection, OpenError> {
         self.retained
             .verify_binding(spec.expected_auth())
+            .map_err(|error| OpenError::Provider(Box::new(error)))?;
+        self.check_binding()
             .map_err(|error| OpenError::Provider(Box::new(error)))?;
         let mut context = spec.context().clone();
         if !context.auth_method_map.is_empty()
@@ -208,7 +213,7 @@ impl ConnectionFactory for OperationAuth {
             .await
             .map_err(|error| OpenError::Tds(Box::new(error)))?;
         let auth = self
-            .metadata(spec.expected_auth())
+            .metadata()
             .map_err(|error| OpenError::Provider(Box::new(error)))?
             .ok_or_else(|| OpenError::Tds(Box::new(inactive())))?;
         Ok(OpenedConnection::with_recovery(
@@ -244,6 +249,8 @@ impl EntraIdTokenFactory for RecoveryAuth {
         if !active.enabled.load(Ordering::Acquire) {
             return Err(inactive());
         }
+        self.verify_active_binding(&active)
+            .map_err(|_| binding_changed())?;
         // A routed/retried login must not inherit a previous attempt's expiry.
         active.login.lock().unwrap().take();
         let token = active
@@ -254,6 +261,8 @@ impl EntraIdTokenFactory for RecoveryAuth {
         if !active.enabled.load(Ordering::Acquire) {
             return Err(inactive());
         }
+        self.verify_active_binding(&active)
+            .map_err(|_| binding_changed())?;
         let expiry = LoginExpiry::new(token.expires_on.ok_or_else(inactive)?, active.margin)
             .map_err(|_| {
                 Error::Security(SecurityError::AuthenticationDenied(
@@ -263,6 +272,12 @@ impl EntraIdTokenFactory for RecoveryAuth {
         *active.login.lock().unwrap() = Some(expiry);
         Ok(token.bytes)
     }
+}
+
+fn binding_changed() -> Error {
+    Error::Security(SecurityError::AuthenticationDenied(
+        "Entra credential binding changed".into(),
+    ))
 }
 
 /// Exercises the production callback/operation seam without a SQL endpoint.
@@ -313,7 +328,7 @@ impl RecoveryAuthHarness {
             .detach(|| {
                 self.retained.activate(
                     factory,
-                    &harness_binding(binding.load(Ordering::Acquire)),
+                    move || Ok(harness_binding(binding.load(Ordering::Acquire))),
                     Duration::from_secs(margin_secs),
                 )
             })
@@ -335,7 +350,7 @@ impl RecoveryAuthHarness {
                     pyo3::exceptions::PyRuntimeError::new_err("Credential recovery failed")
                 })?;
             let metadata = operation
-                .complete(&harness_binding(binding.load(Ordering::Acquire)))
+                .complete()
                 .map_err(|_| {
                     pyo3::exceptions::PyRuntimeError::new_err(
                         "Credential binding or expiry changed",

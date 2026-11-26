@@ -589,9 +589,13 @@ TDS context. The opened connection retains the Rust callback handle (no Python
 references); `PoolLease::activate_auth` activates that same handle on a cache hit
 or subsequent operation. `run_authenticated` rejects a scope belonging to a
 different physical context and retains the operation scope through
-tracked execution and re-reads the trusted identity/credential binding before
-work and result publication. Callers must supply a real binding-epoch reader,
+tracked execution. The scope owns the trusted identity/credential binding reader
+and checks it before/after token acquisition, before each work poll and at result
+publication. Callers must supply a real binding-epoch reader,
 not decoded JWT claims or a constant standing in for account-switch detection.
+The reader runs synchronously on the native polling path and must read cheap,
+nonblocking identity/epoch metadata. Production integration must not invoke
+Python or credential/network I/O from this reader on each poll.
 Authority, concrete tenant and Azure Public SQL resource are validated before
 credential use. Credential-backed results require integer UTC `expires_on`;
 invalid/near-expiry results fail closed. Both UTC and conservative monotonic

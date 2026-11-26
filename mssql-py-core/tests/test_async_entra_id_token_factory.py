@@ -161,7 +161,7 @@ def test_recovery_account_switch_during_token_acquisition_prevents_publication(r
                 retained.set_binding(2)
                 return SimpleNamespace(token="opaque", expires_on=int(time.time()) + 3600)
 
-        with pytest.raises(RuntimeError, match="binding or expiry changed"):
+        with pytest.raises(RuntimeError, match="recovery failed"):
             await retained.invoke(Credential(), SPN, STS)
         with pytest.raises(RuntimeError, match="inactive or changed"):
             retained.invoke(Credential(), SPN, STS)

@@ -71,6 +71,10 @@ Idle session recovery uses `connect_retry_count` as the total attempt limit
 [recovery behavior](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md#idle-session-recovery)
 for eligibility, timeouts and pool maintenance.
 
+Low-level pool implementers use `TdsClient::initialize_session` for the fixed
+isolation SET and complete response drain without reconnecting. It does not
+expose a recovery switch or change recovery for later application commands.
+
 ## Feature flags
 
 | Feature | Default | Purpose |
