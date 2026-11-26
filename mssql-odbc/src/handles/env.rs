@@ -4,6 +4,7 @@
 use std::ffi::c_void;
 use std::io;
 use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Runtime;
@@ -212,11 +213,20 @@ impl Drop for SharedRuntime {
 /// Thread-safety: The `inner` mutex protects mutable state. msodbcsql serializes
 /// via an environment-level critical section (Unix) or relies on the Driver
 /// Manager (Windows). We always protect with a mutex for safety regardless of platform.
-/// `object_type` is set once at construction and never mutated; `inner` protects all mutable state.
+/// `object_type` is set once at construction and never mutated; `inner` protects
+/// all mutable state other than the atomic `odbc_version`.
 #[derive(Debug)]
 pub(crate) struct EnvHandle {
     pub(crate) object_type: HandleType,
     pub(crate) inner: Mutex<EnvState>,
+    /// `SQL_ATTR_ODBC_VERSION`, read on every fetch, execute and parameter
+    /// bind to resolve `SQL_C_DEFAULT`. Atomic so those reads take no lock:
+    /// every connection pooled under this ENV would otherwise contend on
+    /// `inner` for one value. Read live rather than snapshotted on each DBC,
+    /// because without a Driver Manager `SQLSetEnvAttr` can still change it
+    /// after a connection exists, and msodbcsql reads the ENV's current value
+    /// (`IS2xAPPE`, `sqlcprot.h:1546`).
+    odbc_version: AtomicU32,
     /// Shared Tokio runtime for all connections on this ENV, in an `Arc` so
     /// DBCs can hold a reference without lifetime issues. Shutdown is handled
     /// by `SharedRuntime`'s own `Drop`, so this handle needs no `Drop` of its
@@ -228,7 +238,6 @@ pub(crate) struct EnvHandle {
 #[derive(Debug)]
 pub(crate) struct EnvState {
     pub(crate) diag_records: DiagRecords,
-    pub(crate) odbc_version: OdbcVersion,
     #[allow(dead_code)]
     pub(crate) output_nts: bool,
     /// Active child DBC handles
@@ -263,12 +272,22 @@ impl EnvHandle {
             object_type: HandleType::Env,
             inner: Mutex::new(EnvState {
                 diag_records: Default::default(),
-                odbc_version: OdbcVersion::Unset,
                 output_nts: true, // SQL_ATTR_OUTPUT_NTS defaults to SQL_TRUE
                 connections: Vec::new(),
             }),
+            odbc_version: AtomicU32::new(OdbcVersion::Unset as u32),
             runtime: Arc::new(SharedRuntime::new(runtime)),
         })
+    }
+
+    pub(crate) fn odbc_version(&self) -> OdbcVersion {
+        // Only `set_odbc_version` writes it, so any other value is unreachable.
+        OdbcVersion::try_from(self.odbc_version.load(Ordering::Relaxed))
+            .unwrap_or(OdbcVersion::Unset)
+    }
+
+    pub(crate) fn set_odbc_version(&self, version: OdbcVersion) {
+        self.odbc_version.store(version as u32, Ordering::Relaxed);
     }
 }
 

@@ -22,7 +22,7 @@ use crate::api::sqlstate::DiagMsg;
 use crate::error::DiagRecord;
 use crate::handles::dbc::ConnectionState;
 use crate::handles::wire::{ClaimPolicy, WireLease, WireOwner};
-use crate::handles::{DbcHandle, handle_from_raw};
+use crate::handles::{DbcHandle, EnvHandle, handle_from_raw};
 
 /// Asserts the last record's SQLSTATE and message text (the driver prefixes the
 /// message, so the text is matched as a substring).
@@ -179,6 +179,43 @@ impl TestHandles {
             .client_encoding = crate::conversion::client_encoding::ClientEncoding::UTF8;
         h.dbc = dbc;
         h
+    }
+
+    /// Declares `SQL_ATTR_ODBC_VERSION` through `SQLSetEnvAttr`. Legal after a
+    /// DBC exists when no Driver Manager stands in front of the driver, as with
+    /// mssql-python.
+    pub(crate) fn declare_odbc_version(&self, version: u32) {
+        assert_eq!(
+            unsafe {
+                sql_set_env_attr(
+                    self.env,
+                    SQL_ATTR_ODBC_VERSION,
+                    version as usize as *mut c_void,
+                    0,
+                )
+            },
+            SQL_SUCCESS,
+            "SQL_OV version {version} must be accepted"
+        );
+    }
+
+    /// Runs `f` on another thread while this thread holds the ENV state mutex,
+    /// returning `None` if `f` has not finished within 10 seconds. The mutex is
+    /// released before joining, so an `f` blocked on it still completes.
+    pub(crate) fn run_while_env_locked(
+        &self,
+        f: impl FnOnce() -> SqlReturn + Send + 'static,
+    ) -> Option<SqlReturn> {
+        let env = unsafe { handle_from_raw::<EnvHandle>(self.env) };
+        let env_guard = env.inner.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        let rc = rx.recv_timeout(std::time::Duration::from_secs(10)).ok();
+        drop(env_guard);
+        worker.join().unwrap();
+        rc
     }
 
     /// Allocate ENV + DBC + STMT.

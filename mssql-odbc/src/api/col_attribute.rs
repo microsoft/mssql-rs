@@ -163,18 +163,13 @@ fn sql_col_attribute_w_safe(
         None
     };
 
-    // The declared ODBC version selects the temporal sql_variant C types. Read
-    // it before the stmt lock to preserve parent-before-child lock ordering.
-    let variant_uses_3_80_types = if field_identifier == SQL_CA_SS_VARIANT_TYPE {
-        let env = stmt.parent_dbc().parent_env();
-        let Ok(env_state) = env.inner.lock() else {
-            error!("SQLColAttributeW: env mutex poisoned");
-            return SQL_ERROR;
-        };
-        env_state.odbc_version.uses_3_80_types()
-    } else {
-        false
-    };
+    // The declared ODBC version selects the temporal sql_variant C types.
+    let variant_uses_3_80_types = field_identifier == SQL_CA_SS_VARIANT_TYPE
+        && stmt
+            .parent_dbc()
+            .parent_env()
+            .odbc_version()
+            .uses_3_80_types();
 
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLColAttributeW: stmt mutex poisoned");
@@ -1478,7 +1473,7 @@ mod tests {
             // Directly mutating the ENV after DBC allocation is test-only; a
             // Driver Manager rejects this state transition.
             let env_handle = unsafe { handle_from_raw::<crate::handles::EnvHandle>(h.env) };
-            env_handle.inner.lock().unwrap().odbc_version = OdbcVersion::Odbc3;
+            env_handle.set_odbc_version(OdbcVersion::Odbc3);
         }
         assert_eq!(
             numeric(&h, 1, SQL_CA_SS_VARIANT_TYPE),

@@ -1055,16 +1055,7 @@ pub(super) fn snapshot_bound_params(stmt: &StmtHandle) -> Result<BoundParamSet, 
         };
         state.long_as_max() == crate::api::odbc_types::SQL_XL_ON
     };
-    // Read before the STMT lock below, matching bind_param.rs's own
-    // parent-before-child lock ordering for the same lookup.
-    let odbc_version = {
-        let env = stmt.parent_dbc().parent_env();
-        let Ok(env_state) = env.inner.lock() else {
-            error!("snapshotting parameters: env mutex poisoned");
-            return Err(SQL_ERROR);
-        };
-        env_state.odbc_version
-    };
+    let odbc_version = stmt.parent_dbc().parent_env().odbc_version();
 
     let (apd, ipd) = {
         let Ok(stmt_state) = stmt.inner.lock() else {

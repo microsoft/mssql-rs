@@ -248,12 +248,11 @@ fn sql_set_desc_rec_safe(
         if may_route {
             let requested_c_type = canonical_c_type(field_type);
             let odbc_version = if requested_c_type == SQL_C_DEFAULT {
-                current_odbc_version(desc).ok()
+                current_odbc_version(desc)
             } else {
-                Some(OdbcVersion::Unset)
+                OdbcVersion::Unset
             };
             let validation_diagnostic = std::cell::Cell::new(None);
-            let internal_error = std::cell::Cell::new(false);
             let focused_type = std::cell::Cell::new(None);
             let initial_binding = focused_tvp_initial_binding();
             let updated = desc.update_focused_tvp_bindings(
@@ -263,10 +262,6 @@ fn sql_set_desc_rec_safe(
                 |binding| {
                     if !is_valid_c_type(requested_c_type) {
                         validation_diagnostic.set(Some(ERR_INVALID_C_DATA_TYPE));
-                        return false;
-                    }
-                    if requested_c_type == SQL_C_DEFAULT && odbc_version.is_none() {
-                        internal_error.set(true);
                         return false;
                     }
                     if let Some(resolved_type) = focused_tvp_desc_rec_type(
@@ -293,11 +288,8 @@ fn sql_set_desc_rec_safe(
                     let (requested_type, datetime_interval_code) =
                         focused_type.get().unwrap_or((requested_c_type, 0));
                     let resolved_type = if requested_c_type == SQL_C_DEFAULT {
-                        resolve_default_c_type(
-                            binding.sql_type,
-                            odbc_version.unwrap_or(OdbcVersion::Unset),
-                        )
-                        .unwrap_or(SQL_C_DEFAULT)
+                        resolve_default_c_type(binding.sql_type, odbc_version)
+                            .unwrap_or(SQL_C_DEFAULT)
                     } else {
                         requested_type
                     };
@@ -324,12 +316,6 @@ fn sql_set_desc_rec_safe(
                     };
                     free_errors(&mut state);
                     return SQL_SUCCESS;
-                }
-                Ok(Some(false)) if internal_error.get() => {
-                    return post_focused_tvp_internal_error(
-                        desc,
-                        "Internal error resolving focused TVP C type",
-                    );
                 }
                 Ok(Some(false)) => {
                     return post_focused_tvp_diag(
@@ -438,13 +424,9 @@ fn post_focused_tvp_record_diag(
     SQL_ERROR
 }
 
-pub(super) fn current_odbc_version(desc: &DescHandle) -> Result<OdbcVersion, ()> {
+pub(super) fn current_odbc_version(desc: &DescHandle) -> OdbcVersion {
     let dbc = unsafe { handle_from_raw::<DbcHandle>(desc.parent_dbc) };
-    let Ok(state) = dbc.parent_env().inner.lock() else {
-        error!("descriptor update: env mutex poisoned reading ODBC version");
-        return Err(());
-    };
-    Ok(state.odbc_version)
+    dbc.parent_env().odbc_version()
 }
 
 pub(super) fn focused_tvp_initial_binding() -> crate::params::BoundParam {

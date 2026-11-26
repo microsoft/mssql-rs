@@ -144,16 +144,8 @@ fn sql_bind_parameter_safe(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    // The declared ODBC version selects the SQL_C_DEFAULT table. Read it before
-    // the stmt lock to preserve parent-before-child lock ordering.
-    let odbc_version = {
-        let env = stmt.parent_dbc().parent_env();
-        let Ok(env_state) = env.inner.lock() else {
-            error!("SQLBindParameter: env mutex poisoned");
-            return SQL_ERROR;
-        };
-        env_state.odbc_version
-    };
+    // The declared ODBC version selects the SQL_C_DEFAULT table.
+    let odbc_version = stmt.parent_dbc().parent_env().odbc_version();
 
     let Ok(param_focus_guard) = stmt.param_focus_gate.lock() else {
         error!("SQLBindParameter: parameter-focus mutex poisoned");
@@ -1188,6 +1180,53 @@ mod tests {
         let binding = bound_params(&h);
         let bound = binding[0].as_ref().expect("parameter 1 should be bound");
         assert_eq!(bound.param.c_type, SQL_C_BINARY);
+    }
+
+    /// The default C type follows the ENV's current version, declared here
+    /// after a 3.0 DBC exists, and is resolved without waiting on the ENV mutex.
+    #[test]
+    fn a_default_bind_reads_the_current_odbc_version_without_the_env_lock() {
+        use crate::api::odbc_types::{
+            SQL_C_SS_TIME2, SQL_HANDLE_STMT, SQL_OV_ODBC3, SQL_OV_ODBC3_80, SQL_SS_TIME2,
+        };
+
+        let mut h = TestHandles::with_env_dbc_version(SQL_OV_ODBC3);
+        let mut stmt: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe {
+                crate::api::alloc_handle::sql_alloc_handle(SQL_HANDLE_STMT, h.dbc, &mut stmt)
+            },
+            SQL_SUCCESS
+        );
+        h.stmt = stmt;
+        h.declare_odbc_version(SQL_OV_ODBC3_80);
+
+        let stmt = h.stmt as usize;
+        let ret = h.run_while_env_locked(move || unsafe {
+            sql_bind_parameter(
+                stmt as SqlHandle,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_DEFAULT,
+                SQL_SS_TIME2,
+                16,
+                7,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+            )
+        });
+        assert_eq!(
+            ret,
+            Some(SQL_SUCCESS),
+            "None means SQLBindParameter blocked on the ENV mutex"
+        );
+        let binding = bound_params(&h);
+        let bound = binding[0].as_ref().expect("parameter 1 should be bound");
+        assert_eq!(
+            bound.param.c_type, SQL_C_SS_TIME2,
+            "3.8 resolves SQL_SS_TIME2 to SQL_C_SS_TIME2"
+        );
     }
 
     /// A table-valued parameter is input-only; any other direction is rejected

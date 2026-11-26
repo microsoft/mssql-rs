@@ -252,17 +252,10 @@ fn sql_set_desc_field_w_safe(
             }
         };
         if may_route {
-            let odbc_version = if matches!(field, SQL_DESC_CONCISE_TYPE | SQL_DESC_TYPE)
+            let odbc_version = (matches!(field, SQL_DESC_CONCISE_TYPE | SQL_DESC_TYPE)
                 && desc.kind.is_application()
-                && value_ptr as SqlSmallInt == SQL_C_DEFAULT
-            {
-                match super::set_desc_rec::current_odbc_version(desc) {
-                    Ok(version) => Some(version),
-                    Err(()) => return post_focused_tvp_internal_error(desc),
-                }
-            } else {
-                None
-            };
+                && value_ptr as SqlSmallInt == SQL_C_DEFAULT)
+                .then(|| super::set_desc_rec::current_odbc_version(desc));
             let focused_type = std::cell::Cell::new(None);
             let validation_diagnostic = std::cell::Cell::new(None);
             let focused_value = match field {
@@ -3129,10 +3122,7 @@ mod tests {
         ] {
             let h = TestHandles::with_env_dbc_stmt();
             unsafe { handle_from_raw::<crate::handles::EnvHandle>(h.env) }
-                .inner
-                .lock()
-                .unwrap()
-                .odbc_version = odbc_version;
+                .set_odbc_version(odbc_version);
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             {
                 let mut state = stmt.inner.lock().unwrap();
