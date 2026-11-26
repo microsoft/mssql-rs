@@ -192,28 +192,36 @@ impl BulkLoadRow for TokenRow<'_> {
                 .clone()
                 .into_column_value()
                 .map_err(|error| mssql_tds::error::Error::UsageError(error.to_string()))?;
-            write_adapter_value(writer, *column_index, value).await?;
+            write_adapter_value(writer, *column_index, value, DecimalScaleReduction::Exact).await?;
             *column_index += 1;
         }
         Ok(())
     }
 }
 
+pub(crate) enum DecimalScaleReduction {
+    Exact,
+    #[cfg(feature = "arrow")]
+    RoundHalfAwayFromZero,
+}
+
 pub(crate) async fn write_adapter_value(
     writer: &mut StreamingBulkLoadWriter<'_>,
     column_index: usize,
     mut value: ColumnValues,
+    decimal_scale_reduction: DecimalScaleReduction,
 ) -> TdsResult<()> {
     let Some(metadata) = writer.column_metadata(column_index) else {
         return writer.write_column_value(column_index, &value).await;
     };
-    normalize_adapter_value(&mut value, metadata)?;
+    normalize_adapter_value(&mut value, metadata, decimal_scale_reduction)?;
     writer.write_column_value(column_index, &value).await
 }
 
 fn normalize_adapter_value(
     value: &mut ColumnValues,
     metadata: &BulkCopyColumnMetadata,
+    decimal_scale_reduction: DecimalScaleReduction,
 ) -> TdsResult<()> {
     let widened = match (&*value, metadata.sql_type) {
         (ColumnValues::TinyInt(v), SqlDbType::SmallInt) => {
@@ -308,10 +316,14 @@ fn normalize_adapter_value(
                     .ok_or_else(|| {
                         TdsError::UsageError("Bulk decimal scale is out of range".into())
                     })?;
-                if magnitude % factor != 0 {
+                let remainder = magnitude % factor;
+                if remainder != 0 && matches!(decimal_scale_reduction, DecimalScaleReduction::Exact)
+                {
                     return Err(TdsError::UsageError("Bulk decimal cannot be represented at destination scale without truncation".into()));
                 }
+                // Round the unsigned magnitude so signed ties move away from zero.
                 magnitude /= factor;
+                magnitude += u128::from(remainder >= factor / 2);
             } else if parts.scale < metadata.scale {
                 let factor = 10_u128
                     .checked_pow(u32::from(metadata.scale - parts.scale))
@@ -639,7 +651,10 @@ mod tests {
             (ColumnValues::Real(1.0), &integer),
             (ColumnValues::Int(1), &real),
         ] {
-            assert!(normalize_adapter_value(&mut value, metadata).is_err());
+            assert!(
+                normalize_adapter_value(&mut value, metadata, DecimalScaleReduction::Exact)
+                    .is_err()
+            );
         }
         for (mut value, metadata) in [
             (ColumnValues::Int(1), &integer),
@@ -648,7 +663,8 @@ mod tests {
             (ColumnValues::Real(1.0), &variant),
             (ColumnValues::Int(1), &variant),
         ] {
-            normalize_adapter_value(&mut value, metadata).expect("compatible value");
+            normalize_adapter_value(&mut value, metadata, DecimalScaleReduction::Exact)
+                .expect("compatible value");
         }
     }
 
@@ -660,7 +676,8 @@ mod tests {
         {
             let mut value =
                 ColumnValues::Numeric(DecimalParts::new(false, 10, source_scale, magnitude));
-            normalize_adapter_value(&mut value, &metadata).expect("exact conversion");
+            normalize_adapter_value(&mut value, &metadata, DecimalScaleReduction::Exact)
+                .expect("exact conversion");
             assert_eq!(
                 value,
                 ColumnValues::Numeric(DecimalParts::new(false, 5, 2, expected))
@@ -669,11 +686,67 @@ mod tests {
         for (magnitude, source_scale) in [(123401, 3), (100000, 2), (u128::MAX, 1)] {
             let mut value =
                 ColumnValues::Decimal(DecimalParts::new(true, 38, source_scale, magnitude));
-            assert!(normalize_adapter_value(&mut value, &metadata).is_err());
+            assert!(
+                normalize_adapter_value(&mut value, &metadata, DecimalScaleReduction::Exact)
+                    .is_err()
+            );
         }
         let mut null = ColumnValues::Null;
-        normalize_adapter_value(&mut null, &metadata).expect("null");
+        normalize_adapter_value(&mut null, &metadata, DecimalScaleReduction::Exact).expect("null");
         assert_eq!(null, ColumnValues::Null);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn arrow_decimal_rounds_magnitude_before_checking_precision() {
+        for is_positive in [true, false] {
+            for sql_type in [SqlDbType::Decimal, SqlDbType::Numeric] {
+                for (magnitude, source_scale, precision, scale, expected) in [
+                    (123445, 3, 5, 2, Some(12345)),
+                    (123444, 3, 5, 2, Some(12344)),
+                    (123446, 3, 5, 2, Some(12345)),
+                    (1234500, 4, 5, 2, Some(12345)),
+                    (995, 1, 3, 0, Some(100)),
+                    (0, 38, 1, 0, Some(0)),
+                    (5 * 10_u128.pow(37), 38, 1, 0, Some(1)),
+                    (10_u128.pow(38) - 1, 0, 38, 0, Some(10_u128.pow(38) - 1)),
+                    (9995, 3, 3, 2, None),
+                    (9995, 1, 3, 0, None),
+                    (10_u128.pow(38) - 5, 38, 38, 38, Some(10_u128.pow(38) - 5)),
+                    (10_u128.pow(38) - 5, 38, 37, 37, None),
+                    (10_u128.pow(38) - 1, 0, 38, 1, None),
+                    (1, 0, 38, 38, None),
+                ] {
+                    let metadata = BulkCopyColumnMetadata::new("n", sql_type, 0x6a)
+                        .with_precision_scale(precision, scale);
+                    let mut value = ColumnValues::Decimal(DecimalParts::new(
+                        is_positive,
+                        38,
+                        source_scale,
+                        magnitude,
+                    ));
+                    let result = normalize_adapter_value(
+                        &mut value,
+                        &metadata,
+                        DecimalScaleReduction::RoundHalfAwayFromZero,
+                    );
+                    if let Some(expected) = expected {
+                        result.expect("rounded conversion");
+                        assert_eq!(
+                            value,
+                            ColumnValues::Decimal(DecimalParts::new(
+                                is_positive,
+                                precision,
+                                scale,
+                                expected,
+                            )),
+                        );
+                    } else {
+                        assert!(matches!(result, Err(TdsError::UsageError(_))));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -685,7 +758,8 @@ mod tests {
                 time_nanoseconds: 123_456_789,
                 scale: 7,
             });
-            normalize_adapter_value(&mut value, &metadata).expect("time");
+            normalize_adapter_value(&mut value, &metadata, DecimalScaleReduction::Exact)
+                .expect("time");
             assert_eq!(
                 value,
                 ColumnValues::Time(mssql_tds::datatypes::column_values::SqlTime {

@@ -353,6 +353,190 @@ async fn bulk_insert_send_arrow_batches() {
     assert_eq!(result.rows_affected, 300);
 }
 
+fn decimal_batch(values: Vec<Option<i128>>, precision: u8, scale: i8) -> RecordBatch {
+    let values = Decimal128Array::from(values)
+        .with_precision_and_scale(precision, scale)
+        .expect("decimal metadata");
+    RecordBatch::try_from_iter([("v", Arc::new(values) as _)]).expect("decimal batch")
+}
+
+#[tokio::test]
+async fn bulk_arrow_decimal_destination_rounding() {
+    let cfg = common::live_config_or_exit();
+    let mut client = Client::connect(&cfg).await.expect("connect");
+    for sql_type in ["DECIMAL", "NUMERIC"] {
+        for (precision, scale, source_scale, values, expected) in [
+            (
+                10,
+                4,
+                2,
+                vec![Some(12345), Some(-12345), None],
+                vec![Some("123.4500"), Some("-123.4500"), None],
+            ),
+            (
+                10,
+                2,
+                2,
+                vec![Some(12345), Some(-12345), Some(0)],
+                vec![Some("123.45"), Some("-123.45"), Some("0.00")],
+            ),
+            (
+                10,
+                2,
+                3,
+                vec![
+                    Some(123455),
+                    Some(-123455),
+                    Some(123454),
+                    Some(-123456),
+                    Some(5),
+                    Some(-5),
+                    Some(4),
+                    Some(-4),
+                    None,
+                ],
+                vec![
+                    Some("123.46"),
+                    Some("-123.46"),
+                    Some("123.45"),
+                    Some("-123.46"),
+                    Some("0.01"),
+                    Some("-0.01"),
+                    Some("0.00"),
+                    Some("0.00"),
+                    None,
+                ],
+            ),
+            (
+                10,
+                0,
+                1,
+                vec![Some(15), Some(-15), Some(14), Some(-14), Some(995)],
+                vec![Some("2"), Some("-2"), Some("1"), Some("-1"), Some("100")],
+            ),
+            (
+                38,
+                0,
+                0,
+                vec![Some(10_i128.pow(38) - 1), Some(1_i128 << 96)],
+                vec![
+                    Some("99999999999999999999999999999999999999"),
+                    Some("79228162514264337593543950336"),
+                ],
+            ),
+            (
+                38,
+                37,
+                38,
+                vec![Some(10_i128.pow(38) - 5), Some(-(10_i128.pow(38) - 5))],
+                vec![
+                    Some("1.0000000000000000000000000000000000000"),
+                    Some("-1.0000000000000000000000000000000000000"),
+                ],
+            ),
+            (
+                38,
+                38,
+                37,
+                vec![Some(1), Some(-1)],
+                vec![
+                    Some("0.00000000000000000000000000000000000010"),
+                    Some("-0.00000000000000000000000000000000000010"),
+                ],
+            ),
+        ] {
+            client
+                .simple_query(format!("CREATE TABLE #ArrowDecimal917 (id INT IDENTITY, v {sql_type}({precision},{scale}))"))
+                .await
+                .expect("create table");
+            let result = client
+                .bulk_insert("#ArrowDecimal917")
+                .keep_nulls(true)
+                .batch_size(2)
+                .send_arrow(decimal_batch(values, 38, source_scale))
+                .await
+                .expect("decimal insert");
+            assert_eq!(
+                result.rows_affected,
+                u64::try_from(expected.len()).expect("row count")
+            );
+            let rows = client
+                .simple_query(
+                    "SELECT CONVERT(VARCHAR(80), v) AS v FROM #ArrowDecimal917 ORDER BY id",
+                )
+                .await
+                .expect("numeric readback")
+                .into_first_result();
+            let actual: Vec<_> = rows.iter().map(|row| row.get::<&str, _>("v")).collect();
+            assert_eq!(
+                actual, expected,
+                "{sql_type}({precision},{scale}), source scale {source_scale}"
+            );
+            client
+                .simple_query("DROP TABLE #ArrowDecimal917")
+                .await
+                .expect("drop table");
+        }
+    }
+}
+
+#[tokio::test]
+async fn bulk_arrow_decimal_overflow_recovers_at_batch_boundary() {
+    let cfg = common::live_config_or_exit();
+    let mut client = Client::connect(&cfg).await.expect("connect");
+    for (precision, scale, source_scale, valid, overflow) in [
+        (3, 2, 3, 1230, 9995),
+        (3, 0, 1, -10, -9995),
+        (3, 2, 2, 100, 1000),
+        (38, 38, 0, 0, 1),
+    ] {
+        client
+            .simple_query(format!(
+                "CREATE TABLE #ArrowOverflow917 (v DECIMAL({precision},{scale}))"
+            ))
+            .await
+            .expect("create table");
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&consumed);
+        let batches = [
+            decimal_batch(vec![Some(valid), Some(valid)], 38, source_scale),
+            decimal_batch(vec![Some(valid), Some(overflow)], 38, source_scale),
+            decimal_batch(vec![Some(valid)], 38, source_scale),
+        ]
+        .into_iter()
+        .inspect(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let error = client
+            .bulk_insert("#ArrowOverflow917")
+            .batch_size(2)
+            .use_internal_transaction(true)
+            .send_arrow_batches(batches)
+            .await
+            .expect_err("destination precision overflow");
+        assert!(
+            error.to_string().contains("precision") || error.to_string().contains("overflow"),
+            "{error}"
+        );
+        assert_eq!(consumed.load(Ordering::SeqCst), 2);
+        let rows = client
+            .simple_query("SELECT COUNT(*) AS n FROM #ArrowOverflow917")
+            .await
+            .expect("connection recovered")
+            .into_first_result();
+        assert_eq!(rows.first().expect("count").get::<i32, _>("n"), Some(2));
+        client
+            .bulk_insert("#ArrowOverflow917")
+            .send_arrow(decimal_batch(vec![Some(valid)], 38, source_scale))
+            .await
+            .expect("subsequent bulk insert");
+        client
+            .simple_query("DROP TABLE #ArrowOverflow917")
+            .await
+            .expect("drop table");
+    }
+}
+
 #[tokio::test]
 async fn bulk_arrow_stops_consuming_batches_after_row_error() {
     let cfg = common::live_config_or_exit();
