@@ -34,82 +34,106 @@ const FETCH_YIELD_INTERVAL: usize = 256;
 const LIST_MATERIALIZE_CHUNK_SIZE: usize = 256;
 
 #[cfg(debug_assertions)]
-struct FetchPublicationPause {
+struct PublicationPause {
     entered: oneshot::Sender<()>,
     release: oneshot::Receiver<()>,
 }
 
 #[cfg(debug_assertions)]
-struct FetchPublicationHook {
-    pause: Option<FetchPublicationPause>,
+struct PublicationState {
+    pause: Option<PublicationPause>,
     release: Option<oneshot::Sender<()>>,
 }
 
 #[cfg(debug_assertions)]
 // Process-global test seam: callers must ensure no unrelated fetch can reach
 // publication while it is armed.
-static FETCH_PUBLICATION_HOOK: StdMutex<FetchPublicationHook> =
-    StdMutex::new(FetchPublicationHook {
-        pause: None,
-        release: None,
-    });
+static FETCH_PUBLICATION_HOOK: PublicationHook = PublicationHook::new();
 
 #[cfg(debug_assertions)]
-fn lock_fetch_publication_hook() -> StdMutexGuard<'static, FetchPublicationHook> {
-    FETCH_PUBLICATION_HOOK
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-}
+pub(crate) struct PublicationHook(StdMutex<PublicationState>);
 
 #[cfg(debug_assertions)]
-fn arm_fetch_publication_pause() -> PyResult<oneshot::Receiver<()>> {
-    let mut hook = lock_fetch_publication_hook();
-    if hook.pause.is_some() || hook.release.is_some() {
-        return Err(PyRuntimeError::new_err(
-            "Fetch publication pause is already armed",
-        ));
+impl PublicationHook {
+    pub(crate) const fn new() -> Self {
+        Self(StdMutex::new(PublicationState {
+            pause: None,
+            release: None,
+        }))
     }
 
-    let (entered_tx, entered_rx) = oneshot::channel();
-    let (release_tx, release_rx) = oneshot::channel();
-    hook.pause = Some(FetchPublicationPause {
-        entered: entered_tx,
-        release: release_rx,
-    });
-    hook.release = Some(release_tx);
-    Ok(entered_rx)
+    fn lock(&self) -> StdMutexGuard<'_, PublicationState> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub(crate) fn arm(&self) -> PyResult<oneshot::Receiver<()>> {
+        let mut hook = self.lock();
+        if hook.pause.is_some() || hook.release.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "Query publication pause is already armed",
+            ));
+        }
+
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        hook.pause = Some(PublicationPause {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        hook.release = Some(release_tx);
+        Ok(entered_rx)
+    }
+
+    pub(crate) fn arm_python<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let entered = self.arm()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            entered.await.map_err(|_| {
+                PyRuntimeError::new_err(
+                    "Query publication pause was released before it was reached",
+                )
+            })
+        })
+    }
+
+    pub(crate) async fn pause_if_armed(&self) {
+        let pause = self.lock().pause.take();
+        if let Some(PublicationPause { entered, release }) = pause {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        let (pending_pause, release) = {
+            let mut hook = self.lock();
+            (hook.pause.take(), hook.release.take())
+        };
+        drop(pending_pause);
+        if let Some(release) = release {
+            let _ = release.send(());
+        }
+    }
+}
+
+#[cfg(all(debug_assertions, test))]
+fn arm_fetch_publication_pause() -> PyResult<oneshot::Receiver<()>> {
+    FETCH_PUBLICATION_HOOK.arm()
 }
 
 #[cfg(debug_assertions)]
 async fn pause_fetch_publication_if_armed() {
-    let pause = lock_fetch_publication_hook().pause.take();
-    if let Some(FetchPublicationPause { entered, release }) = pause {
-        let _ = entered.send(());
-        let _ = release.await;
-    }
+    FETCH_PUBLICATION_HOOK.pause_if_armed().await;
 }
 
 #[cfg(debug_assertions)]
 pub(crate) fn release_fetch_publication_pause() {
-    let (pending_pause, release) = {
-        let mut hook = lock_fetch_publication_hook();
-        (hook.pause.take(), hook.release.take())
-    };
-    drop(pending_pause);
-    if let Some(release) = release {
-        let _ = release.send(());
-    }
+    FETCH_PUBLICATION_HOOK.release();
 }
 
 #[cfg(debug_assertions)]
 #[pyfunction]
 pub(crate) fn _arm_fetch_publication_pause<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-    let entered = arm_fetch_publication_pause()?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        entered.await.map_err(|_| {
-            PyRuntimeError::new_err("Fetch publication pause was released before it was reached")
-        })
-    })
+    FETCH_PUBLICATION_HOOK.arm_python(py)
 }
 
 #[cfg(debug_assertions)]
@@ -631,8 +655,12 @@ fn fetch<'py>(
                 } else {
                     None
                 };
-                match fetch_guard.complete(batch.exhausted, has_open_batch) {
-                    FetchCompletion::Published | FetchCompletion::NoLongerActive => {}
+                let (materialized, cancelled) = match fetch_guard
+                    .complete(batch.exhausted, has_open_batch)
+                {
+                    FetchCompletion::Published | FetchCompletion::NoLongerActive => {
+                        (materialized, false)
+                    }
                     FetchCompletion::CancellationRequested => {
                         let (has_open_batch, connection_dead) = {
                             let mut client =
@@ -651,21 +679,21 @@ fn fetch<'py>(
                         fetch_guard.fail(has_open_batch || connection_dead);
                         fetch_state.set(FetchStatus::NoResultSet);
                         worker_control.complete_if_released();
-                        return Err(map_fetch_error(
-                            operation,
-                            Error::OperationCancelledError("Fetch was cancelled".to_string()),
-                            Vec::new(),
-                            started.elapsed().as_millis(),
-                        ));
+                        (None, true)
                     }
-                }
-                fetch_state.set(fetch_status);
-                if !retains_ownership {
-                    worker_control.complete();
+                };
+                if !cancelled {
+                    fetch_state.set(fetch_status);
+                    if !retains_ownership {
+                        worker_control.complete();
+                    }
                 }
                 let mut materialization_guard =
                     MaterializationGuard::new(operation, materialization_dispatch);
-                let materialized = if retains_ownership {
+                if cancelled {
+                    materialization_guard.complete();
+                }
+                let materialized = if retains_ownership || cancelled {
                     materialized.ok_or_else(|| {
                         map_fetch_error(
                             operation,
@@ -1003,8 +1031,8 @@ pub(crate) fn nextset<'py>(
                 };
                 // Description conversion does not consume a row result. Keep
                 // cursor ownership so a later nextset can drain those rows.
-                match fetch_guard.complete(!has_rows, has_open_batch) {
-                    FetchCompletion::Published | FetchCompletion::NoLongerActive => {}
+                let materialized = match fetch_guard.complete(!has_rows, has_open_batch) {
+                    FetchCompletion::Published | FetchCompletion::NoLongerActive => materialized,
                     FetchCompletion::CancellationRequested => {
                         let (has_open_batch, connection_dead) = {
                             let mut client =
@@ -1025,15 +1053,9 @@ pub(crate) fn nextset<'py>(
                         fetch_guard.fail(has_open_batch || connection_dead);
                         future_fetch_state.set(FetchStatus::NoResultSet);
                         future_description_state.replace(None);
-                        return Err(map_nextset_error(
-                            Error::OperationCancelledError(
-                                "Result-set advance was cancelled".to_string(),
-                            ),
-                            Vec::new(),
-                            started.elapsed().as_millis(),
-                        ));
+                        None
                     }
-                }
+                };
 
                 let materialized = materialized.ok_or_else(|| {
                     map_nextset_error(

@@ -141,7 +141,10 @@ impl QueryControl {
     fn cancel_target(&self, target: Target) {
         match target {
             Target::Execute(operation_id) => {
-                self.session.cancel_execute(operation_id);
+                if self.session.cancel_execute(operation_id) {
+                    #[cfg(debug_assertions)]
+                    crate::async_execute::release_execute_publication_pause();
+                }
             }
             Target::Fetch(operation_id, fetch_id) => {
                 if self.session.cancel_fetch(operation_id, fetch_id) {

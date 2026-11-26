@@ -42,6 +42,28 @@ const EXECUTEMANY_PREFLIGHT_CHUNK_SIZE: usize = 256;
 const EXECUTEMANY_EXECUTION_YIELD_INTERVAL: usize = 256;
 const EXECUTEMANY_BUFFER_YIELD_INTERVAL: usize = 256;
 
+#[cfg(debug_assertions)]
+// Process-global test seam: no unrelated execute may publish while it is armed.
+static EXECUTE_PUBLICATION_HOOK: crate::async_fetch::PublicationHook =
+    crate::async_fetch::PublicationHook::new();
+
+#[cfg(debug_assertions)]
+#[pyfunction]
+pub(crate) fn _arm_execute_publication_pause<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    EXECUTE_PUBLICATION_HOOK.arm_python(py)
+}
+
+#[cfg(debug_assertions)]
+#[pyfunction]
+pub(crate) fn _release_execute_publication_pause() {
+    release_execute_publication_pause();
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn release_execute_publication_pause() {
+    EXECUTE_PUBLICATION_HOOK.release();
+}
+
 async fn yield_at_interval(completed: usize, interval: usize, phase: &'static str) {
     if completed.is_multiple_of(interval) {
         tracing::trace!(
@@ -861,6 +883,8 @@ pub(crate) fn execute<'py>(
                         return Err(cancelled_execute_error());
                     }
                 };
+                #[cfg(debug_assertions)]
+                EXECUTE_PUBLICATION_HOOK.pause_if_armed().await;
                 let description = match description {
                     Ok(description) => description,
                     Err(error) => {
@@ -1094,6 +1118,8 @@ pub(crate) fn executemany<'py>(
                             return Err(cancelled_execute_error());
                         }
                     };
+                    #[cfg(debug_assertions)]
+                    EXECUTE_PUBLICATION_HOOK.pause_if_armed().await;
                     let description = match materialized {
                         Ok(description) => description,
                         Err(error) => {
@@ -1222,12 +1248,16 @@ mod tests {
 
     use mssql_tds::connection::tds_client::PreparedStatement;
     use mssql_tds::error::Error;
+    use mssql_tds::test_client_support::tds_client_from_tokens_capturing;
 
     use super::{
         EXECUTEMANY_BUFFER_YIELD_INTERVAL, EXECUTEMANY_EXECUTION_YIELD_INTERVAL, ExecuteFailure,
         ParameterMetadata, PreparedState, accumulate_rowcount, get_or_create_binding_plan,
-        rowcount_from_rows_affected, should_replace_prepared_statement, yield_at_interval,
+        rowcount_from_rows_affected, settle_cancelled_execute, should_replace_prepared_statement,
+        yield_at_interval,
     };
+    use crate::async_handle::LogicalConnection;
+    use crate::async_query_recovery::QueryControl;
     use crate::async_session::{
         AsyncConnectionState, ClaimError, ConnectionLifecycle, SessionOperationGuard,
     };
@@ -1239,6 +1269,39 @@ mod tests {
         assert!(failure.breaks_session(true, true));
         let failure = ExecuteFailure::from(Error::OperationCancelledError("cancelled".into()));
         assert!(failure.breaks_session(false, true));
+    }
+
+    #[tokio::test]
+    async fn cancelled_execute_settlement_rejects_stale_claim_without_breaking_replacement() {
+        let (client, _) = tds_client_from_tokens_capturing(Vec::new());
+        let connection = LogicalConnection::new(client);
+        let state = Arc::clone(&connection.state);
+        let original = state.claim_execute(1).unwrap();
+        let mut guard = SessionOperationGuard::new(Arc::clone(&state), original.operation_id);
+        let control = QueryControl::new(Arc::clone(&state), "execute");
+        control.register_execute(original.operation_id);
+        state.release_operation(original.operation_id);
+        let replacement = state.claim_execute(2).unwrap();
+
+        let error =
+            settle_cancelled_execute(&connection, original.operation_id, &mut guard, &control)
+                .await
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Connection is busy with another cursor operation")
+        );
+        drop(guard);
+        control.cancel();
+        assert!(!state.is_broken());
+        assert!(
+            connection
+                .lock_operation(replacement.operation_id)
+                .await
+                .is_ok()
+        );
+        assert!(state.finish_execute(replacement.operation_id, false));
     }
 
     fn prepared_state(sql: &str, signature: Vec<ParameterMetadata>) -> PreparedState {

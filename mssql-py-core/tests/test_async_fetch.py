@@ -1172,6 +1172,230 @@ def test_nextset_logs_result_transitions(client_context):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize(
+    "method, description_error",
+    [
+        pytest.param("execute", False, id="execute"),
+        pytest.param("execute", True, id="execute-description-error"),
+        pytest.param("executemany", False, id="executemany"),
+    ],
+)
+@pytest.mark.parametrize("use_prepare", [False, True], ids=["direct", "prepared"])
+def test_execute_cancellation_before_publication_keeps_connection_reusable(
+    client_context, method, description_error, use_prepare,
+):
+    if not hasattr(mssql_py_core, "_arm_execute_publication_pause"):
+        pytest.skip("requires a debug build with execute publication test hooks")
+
+    async def run():
+        conn = await connect(client_context)
+        pending = None
+        decimal_module = sys.modules["decimal"]
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            if description_error:
+                sys.modules["decimal"] = None
+            paused = mssql_py_core._arm_execute_publication_pause()
+            if method == "execute":
+                sql_type = "decimal(10, 2)" if description_error else "int"
+                pending = cursor.execute(
+                    f"SELECT CAST(? AS {sql_type}); SELECT 99",
+                    1,
+                    use_prepare=use_prepare,
+                )
+            else:
+                pending = cursor.executemany(
+                    "SELECT CAST(? AS int)", [(1,), (2,)], use_prepare=use_prepare
+                )
+            await asyncio.wait_for(paused, timeout=5)
+            assert not pending.done()
+            assert cursor.description is None
+            probe = conn.cursor()
+            with pytest.raises(
+                mssql_py_core.InterfaceError, match="busy with another cursor operation"
+            ):
+                await probe.execute("SELECT 2", use_prepare=False)
+
+            # Keep delivery alive so cancellation must also win the native result.
+            await asyncio.wait_for(
+                asyncio.shield(pending._cancel_and_settle()), timeout=6
+            )
+            with pytest.raises(mssql_py_core.OperationalError, match="cancel"):
+                await pending
+            assert cursor.description is None
+            await probe.execute("SELECT 2, @@SPID", use_prepare=False)
+            assert await probe.fetchall() == [(2, session_id)]
+            await cursor.execute("SELECT 3", use_prepare=use_prepare)
+            assert await cursor.fetchall() == [(3,)]
+        finally:
+            sys.modules["decimal"] = decimal_module
+            mssql_py_core._release_execute_publication_pause()
+            if pending is not None and not pending.done():
+                pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("operation", ["fetchmany", "nextset"])
+@pytest.mark.parametrize("terminate_session", [False, True], ids=["recover", "terminate"])
+def test_materialization_cancellation_reports_recovery_outcome(
+    client_context, operation, terminate_session,
+):
+    async def run():
+        conn = await connect(client_context)
+        actor = await connect(client_context)
+        entered = threading.Event()
+        release = threading.Event()
+        finder = BlockingDecimalFinder(entered, release)
+        decimal_module = None
+        pending = None
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            if operation == "fetchmany":
+                await cursor.execute(
+                    "SELECT CAST(value AS decimal(10, 2)) "
+                    "FROM (VALUES (1), (2)) AS source(value); SELECT 99",
+                    use_prepare=False,
+                )
+            else:
+                await cursor.execute(
+                    "SELECT 1; SELECT CAST(2 AS decimal(10, 2)); SELECT 99",
+                    use_prepare=False,
+                )
+                assert await cursor.fetchall() == [(1,)]
+            decimal_module = sys.modules.pop("decimal")
+            sys.meta_path.insert(0, finder)
+            pending = cursor.fetchmany(1) if operation == "fetchmany" else cursor.nextset()
+            for _ in range(200):
+                if entered.is_set():
+                    break
+                assert not pending.done(), "Fetch ended before materialization blocked"
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("Materialization did not start")
+
+            if terminate_session:
+                await actor.cursor().execute(f"KILL {session_id}", use_prepare=False)
+                with pytest.raises(mssql_py_core.InterfaceError, match="Connection is broken"):
+                    await asyncio.wait_for(
+                        asyncio.shield(pending._cancel_and_settle()), timeout=6
+                    )
+                with pytest.raises((mssql_py_core.DatabaseError, RuntimeError)) as failure:
+                    await pending
+                assert "was cancelled" not in str(failure.value)
+                with pytest.raises(mssql_py_core.InterfaceError, match="Connection is broken"):
+                    await conn.cursor().execute("SELECT 3", use_prepare=False)
+                if operation == "nextset":
+                    assert cursor.description is None
+            else:
+                await asyncio.wait_for(
+                    asyncio.shield(pending._cancel_and_settle()), timeout=6
+                )
+                message = (
+                    "Fetch was cancelled"
+                    if operation == "fetchmany"
+                    else "Result-set advance was cancelled"
+                )
+                with pytest.raises(mssql_py_core.OperationalError, match=message):
+                    await pending
+                probe = conn.cursor()
+                await probe.execute("SELECT 3, @@SPID", use_prepare=False)
+                assert await probe.fetchall() == [(3, session_id)]
+            assert not release.is_set()
+        finally:
+            release.set()
+            if finder in sys.meta_path:
+                sys.meta_path.remove(finder)
+            await asyncio.to_thread(__import__, "decimal")
+            if decimal_module is not None:
+                sys.modules["decimal"] = decimal_module
+            if pending is not None and not pending.done():
+                pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+            await conn.close()
+            await actor.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("method", ["execute", "executemany"])
+@pytest.mark.parametrize("use_prepare", [False, True], ids=["direct", "prepared"])
+def test_execute_cancellation_during_description_materialization_keeps_connection_reusable(
+    client_context, method, use_prepare,
+):
+    async def run():
+        conn = await connect(client_context)
+        entered = threading.Event()
+        release = threading.Event()
+        finder = BlockingDecimalFinder(entered, release)
+        decimal_module = None
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            decimal_module = sys.modules.pop("decimal")
+            sys.meta_path.insert(0, finder)
+
+            if method == "execute":
+                pending = cursor.execute(
+                    "SELECT CAST(? AS decimal(10, 2)); SELECT 99",
+                    1,
+                    use_prepare=use_prepare,
+                )
+            else:
+                pending = cursor.executemany(
+                    "SELECT CAST(? AS decimal(10, 2))",
+                    [(1,), (2,)],
+                    use_prepare=use_prepare,
+                )
+            for _ in range(200):
+                if entered.is_set():
+                    break
+                assert not pending.done(), "Execute ended before description conversion"
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("Description materialization did not start")
+
+            assert pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            await asyncio.wait_for(
+                asyncio.shield(pending._cancel_and_settle()), timeout=6
+            )
+            assert not release.is_set()
+            assert cursor.description is None
+
+            probe = conn.cursor()
+            await probe.execute("SELECT 2, @@SPID", use_prepare=False)
+            assert await probe.fetchall() == [(2, session_id)]
+            release.set()
+            await asyncio.to_thread(__import__, "decimal")
+            assert cursor.description is None
+            await cursor.execute("SELECT 3", use_prepare=use_prepare)
+            assert await cursor.fetchall() == [(3,)]
+        finally:
+            release.set()
+            if finder in sys.meta_path:
+                sys.meta_path.remove(finder)
+            await asyncio.to_thread(__import__, "decimal")
+            if decimal_module is not None:
+                sys.modules["decimal"] = decimal_module
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_nextset_cancellation_during_description_materialization_does_not_publish_rows(
     client_context,
 ):
