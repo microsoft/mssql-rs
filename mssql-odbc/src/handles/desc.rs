@@ -33,6 +33,8 @@
 //! (`api::col_attribute`) alone, deliberately not duplicated into descriptor
 //! storage, since nothing above needs them to close the ARD/APD/IRD/IPD
 //! binding-and-metadata gap this module used to describe.
+//! Native JSON's fixed descriptive fields are shared with SQLColAttribute
+//! and answered directly by SQLGetDescField without per-record storage.
 //!
 //! The header fields ODBC defines as *aliases* of statement attributes are the
 //! only storage for those attributes (AB#48943, AB#49060):

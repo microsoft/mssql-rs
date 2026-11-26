@@ -14,18 +14,19 @@ use std::mem::size_of;
 
 use tracing::{debug, error};
 
+use crate::api::col_attribute::{Attr, json_attribute};
 use crate::api::odbc_types::{
     SQL_CA_SS_CATALOG_NAME, SQL_CA_SS_DATA_CLASSIFICATION, SQL_CA_SS_DATA_CLASSIFICATION_VERSION,
     SQL_CA_SS_SCHEMA_NAME, SQL_CA_SS_TYPE_NAME, SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME,
     SQL_CA_SS_UDT_CATALOG_NAME, SQL_CA_SS_UDT_SCHEMA_NAME, SQL_CA_SS_UDT_TYPE_NAME,
     SQL_DESC_ALLOC_TYPE, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR,
     SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATA_PTR,
-    SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH, SQL_DESC_NAME,
-    SQL_DESC_NULLABLE, SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE,
-    SQL_DESC_PRECISION, SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE,
-    SQL_DESC_UNNAMED, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlReturn, SqlSmallInt,
-    SqlULen, SqlUSmallInt, SqlWChar,
+    SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_DISPLAY_SIZE, SQL_DESC_INDICATOR_PTR,
+    SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_NULLABLE, SQL_DESC_OCTET_LENGTH,
+    SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE, SQL_DESC_PRECISION,
+    SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE, SQL_DESC_UNNAMED, SQL_ERROR,
+    SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SS_JSON, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
+    SqlInteger, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_INVALID_DESCRIPTOR_FIELD, ERR_INVALID_DESCRIPTOR_INDEX, WARN_STRING_TRUNCATION, post_diag,
@@ -33,7 +34,9 @@ use crate::api::sqlstate::{
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::post_sql_error;
 use crate::error::{HasDiagnostics, free_errors};
-use crate::handles::desc::{DescHeader, DescRecord, DescState, FieldScope, classify_field};
+use crate::handles::desc::{
+    DescHeader, DescKind, DescRecord, DescState, FieldScope, classify_field,
+};
 use crate::handles::{DbcHandle, DescHandle, HandleType, handle_from_raw};
 
 /// Implementation of [`SQLGetDescFieldW`](super::exports::SQLGetDescFieldW).
@@ -220,6 +223,32 @@ fn sql_get_desc_field_w_safe(
         return SQL_ERROR;
     };
 
+    if desc.kind == DescKind::ImpRow
+        && let Some(attr) = json_attribute(field)
+    {
+        let Some(record) = state.record(record_number) else {
+            post_diag(&mut state, ERR_INVALID_DESCRIPTOR_INDEX);
+            return SQL_ERROR;
+        };
+        if record.concise_type == SQL_SS_JSON {
+            let value = match attr {
+                Attr::Text(text) => FieldValue::Text(text),
+                Attr::Numeric(value) if field == SQL_DESC_DISPLAY_SIZE => FieldValue::Len(value),
+                Attr::Numeric(value) => match SqlSmallInt::try_from(value) {
+                    Ok(value) => FieldValue::SmallInt(value),
+                    Err(_) => {
+                        error!(
+                            field,
+                            value, "SQLGetDescFieldW: JSON attribute exceeds field width"
+                        );
+                        post_diag(&mut state, ERR_INVALID_DESCRIPTOR_FIELD);
+                        return SQL_ERROR;
+                    }
+                },
+            };
+            return value.write(value_ptr, buffer_length, string_length_ptr, &mut *state);
+        }
+    }
     let Some(access) = classify_field(desc.kind, field) else {
         error!(
             field,

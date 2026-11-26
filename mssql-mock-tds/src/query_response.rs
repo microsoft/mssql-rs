@@ -26,6 +26,8 @@ pub enum SqlDataType {
     VarCharMax,
     /// VarBinary(MAX) with caller-chosen PLP chunk boundaries.
     VarBinaryMax,
+    /// Native JSON with UTF-8 PLP chunks and no collation in TYPE_INFO.
+    Json,
 }
 
 impl SqlDataType {
@@ -39,6 +41,7 @@ impl SqlDataType {
             SqlDataType::NVarChar | SqlDataType::NVarCharMax => 0xE7, // NVarCharType
             SqlDataType::VarCharMax => 0xA7,
             SqlDataType::VarBinaryMax => 0xA5,
+            SqlDataType::Json => 0xF4,
         }
     }
 
@@ -50,7 +53,7 @@ impl SqlDataType {
             SqlDataType::Int => 4,
             SqlDataType::BigInt => 8,
             SqlDataType::NVarChar | SqlDataType::NVarCharMax => 255, // Handled specially
-            SqlDataType::VarCharMax | SqlDataType::VarBinaryMax => 255,
+            SqlDataType::VarCharMax | SqlDataType::VarBinaryMax | SqlDataType::Json => 255,
         }
     }
 }
@@ -71,6 +74,9 @@ pub enum ColumnValue {
     VarCharMax(Vec<Vec<u8>>),
     /// Nonempty chunks of opaque bytes.
     VarBinaryMax(Vec<Vec<u8>>),
+    /// Native JSON UTF-8 bytes with caller-chosen PLP boundaries.
+    Json(Vec<Vec<u8>>),
+    JsonNull,
     Null,
 }
 
@@ -86,6 +92,7 @@ impl ColumnValue {
             ColumnValue::NVarCharMax(_) | ColumnValue::NVarCharMaxNull => SqlDataType::NVarCharMax,
             ColumnValue::VarCharMax(_) => SqlDataType::VarCharMax,
             ColumnValue::VarBinaryMax(_) => SqlDataType::VarBinaryMax,
+            ColumnValue::Json(_) | ColumnValue::JsonNull => SqlDataType::Json,
             ColumnValue::Null => SqlDataType::Int, // Default to Int for NULL
         }
     }
@@ -129,8 +136,10 @@ impl ColumnValue {
                 }
                 buf.put_u32_le(0);
             }
-            ColumnValue::NVarCharMaxNull => buf.put_u64_le(u64::MAX),
-            ColumnValue::VarCharMax(chunks) | ColumnValue::VarBinaryMax(chunks) => {
+            ColumnValue::NVarCharMaxNull | ColumnValue::JsonNull => buf.put_u64_le(u64::MAX),
+            ColumnValue::VarCharMax(chunks)
+            | ColumnValue::VarBinaryMax(chunks)
+            | ColumnValue::Json(chunks) => {
                 let total: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
                 buf.put_u64_le(total);
                 for chunk in chunks {

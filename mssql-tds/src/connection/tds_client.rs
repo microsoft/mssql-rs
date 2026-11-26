@@ -6382,6 +6382,19 @@ impl TdsClient {
             Ok(token) => token,
             Err(error) => return Err(self.fail_read(error)),
         };
+        if let Tokens::ColMetadata(metadata) = &token
+            && self.negotiated_json_version().is_none()
+            && metadata
+                .columns
+                .iter()
+                .any(|column| column.data_type == TdsDataType::Json)
+        {
+            return Err(
+                self.end_walk_on_read_error(crate::error::Error::ProtocolError(
+                    "Native JSON result received without JSON feature negotiation".to_string(),
+                )),
+            );
+        }
         if let Err(error) = self
             .observe_response_token(&token)
             .and_then(|()| self.observe_prepared_batch_done(&token))
@@ -11332,6 +11345,40 @@ mod tests {
                 payload.filter(|version| *version != 0),
                 "a pool reset does not renegotiate the physical session"
             );
+        }
+    }
+
+    #[test]
+    fn native_json_results_require_the_current_sessions_acknowledgement() {
+        use crate::message::features::jsonfeature::JsonFeature;
+        use crate::message::login::Feature;
+
+        for version in [None, Some(0), Some(1)] {
+            let mut client = create_test_client();
+            if let Some(version) = version {
+                let mut feature = JsonFeature::default();
+                feature.deserialize(&[version]).unwrap();
+                feature.set_acknowledged(true);
+                client
+                    .negotiated_settings
+                    .session_settings
+                    .supported_features
+                    .push(Box::new(feature));
+            }
+            let mut columns = crate::test_client_support::int_columns(1);
+            columns[0].data_type = TdsDataType::Json;
+            let result = client.accept_response_token(
+                None,
+                Ok(Tokens::ColMetadata(ColMetadataToken {
+                    columns,
+                    ..Default::default()
+                })),
+            );
+            if version == Some(1) {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(crate::error::Error::ProtocolError(_))));
+            }
         }
     }
 

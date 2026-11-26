@@ -289,6 +289,7 @@ add_odbc_test(set_env_attr_test  tests/set_env_attr_test.cpp)
 add_odbc_test(get_diag_rec_test  tests/get_diag_rec_test.cpp)
 add_odbc_test(describe_col_test  tests/describe_col_test.cpp)
 add_odbc_test(col_attribute_test tests/col_attribute_test.cpp)
+add_odbc_test(json_result_test tests/json_result_test.cpp)
 # Alias-type name lookups can deadlock with other suites' schema changes.
 foreach(entry col_attribute_test col_attribute_test_mt)
     if(TEST ${entry})

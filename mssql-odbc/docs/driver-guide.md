@@ -50,9 +50,17 @@ not an independently cached ODBC flag. A new login after routing, reconnect,
 or session recovery supplies a fresh value. A connection-pool reset does not
 renegotiate it. Connection tracing includes `json_version`.
 
-Negotiation does not yet expose the native `SQL_SS_JSON` ODBC type or enable
-JSON-specific parameter bindings. Existing JSON result columns retain their
-character metadata and retrieval paths.
+Native JSON result columns report `SQL_SS_JSON` (`-157`) with type name `json`,
+unlimited length (`0`), quoted literals, and `SQL_PRED_NONE` searchability.
+`SQL_C_DEFAULT` resolves to `SQL_C_WCHAR` at both supported ODBC versions.
+`SQLGetData` and bound fetch accept narrow text, wide text, and raw UTF-8 binary
+delivery, including PLP chunking and NULL indicators; other C targets report
+`07006` without consuming the row or value. A native JSON result without a
+current-session JSON acknowledgement is a protocol error.
+
+JSON-specific parameter bindings are separate from result support. Native
+parity testing requires a JSON-enabled msodbcsql build and a JSON-capable server;
+the installed retail ODBC18 driver is not a substitute for that build.
 
 ## Connection-operation timeouts
 

@@ -46,6 +46,7 @@ use mssql_tds::datatypes::decoder::DECIMAL_STR_LEN;
 use mssql_tds::datatypes::sql_string::{
     EncodingType, ResolvedDecoder, ResolvedEncoding, SqlString,
 };
+use mssql_tds::datatypes::sqldatatypes::TdsDataType;
 use mssql_tds::query::metadata::PlpEncoding;
 use mssql_tds::token::tokens::SqlCollation;
 
@@ -257,6 +258,25 @@ fn sql_get_data_operation(
         Some(version) => resolve_default_target(&stmt_state, col_index, version, buffer_length),
         None => target_type,
     };
+
+    if stmt_state.row_positioned
+        && (col_index > stmt_state.current_row_last_col
+            || stmt_state
+                .active_plp
+                .as_ref()
+                .is_some_and(|stream| stream.column == col_index))
+        && stmt_state
+            .column_metadata
+            .get(col_index - 1)
+            .is_some_and(|meta| meta.data_type == TdsDataType::Json)
+        && !matches!(target_type, SQL_C_CHAR | SQL_C_WCHAR | SQL_C_BINARY)
+    {
+        post_diag(
+            &mut stmt_state,
+            crate::api::sqlstate::ERR_RESTRICTED_DATA_TYPE,
+        );
+        return SQL_ERROR;
+    }
 
     // Continuation: app is calling SQLGetData again on the same PLP column to
     // get the next chunk from the active wire stream.
@@ -12620,6 +12640,367 @@ mod tests {
             )
         };
         (rc, indicator)
+    }
+
+    fn open_json_mock(
+        value: mssql_mock_tds::ColumnValue,
+    ) -> (TestHandles, crate::test_support::MockServer) {
+        open_json_mock_rows(vec![value])
+    }
+
+    fn open_json_mock_rows(
+        values: Vec<mssql_mock_tds::ColumnValue>,
+    ) -> (TestHandles, crate::test_support::MockServer) {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let response = QueryResponse::new(
+            vec![
+                ColumnDefinition::new("j", SqlDataType::Json),
+                ColumnDefinition::new("following", SqlDataType::Int),
+            ],
+            values
+                .into_iter()
+                .map(|value| Row::new(vec![value, ColumnValue::Int(42)]))
+                .collect(),
+        );
+        let server = crate::test_support::connect_mock_server_with_json_ack(
+            dbc,
+            "SELECT json_result",
+            response,
+            Some(vec![1]),
+        );
+        let sql: Vec<u16> = "SELECT json_result\0".encode_utf16().collect();
+        assert_eq!(
+            unsafe { crate::api::exports::SQLExecDirectW(h.stmt, sql.as_ptr(), SQL_NTS.into()) },
+            SQL_SUCCESS
+        );
+        (h, server)
+    }
+
+    #[test]
+    fn json_wire_chunks_default_lengths_and_null_preserve_the_following_column() {
+        use mssql_mock_tds::ColumnValue;
+        let text = "{\"k\":\"\u{00fc}\u{20ac}\u{1f600}\"}";
+        for target in [SQL_C_CHAR, SQL_C_WCHAR, SQL_C_BINARY, SQL_C_DEFAULT] {
+            let chunks = text.as_bytes().chunks(1).map(<[u8]>::to_vec).collect();
+            let (h, _server) = open_json_mock(ColumnValue::Json(chunks));
+            assert_eq!(
+                unsafe { crate::api::exports::SQLFetch(h.stmt) },
+                SQL_SUCCESS
+            );
+            let mut delivered = Vec::new();
+            let wide = matches!(target, SQL_C_WCHAR | SQL_C_DEFAULT);
+            for _ in 0..2 {
+                let mut length = -99;
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLGetData(
+                            h.stmt,
+                            1,
+                            target,
+                            std::ptr::null_mut(),
+                            0,
+                            &mut length,
+                        )
+                    },
+                    SQL_SUCCESS_WITH_INFO
+                );
+                if length != SQL_NO_TOTAL {
+                    let expected = if wide {
+                        text.encode_utf16().count() * 2
+                    } else {
+                        text.len()
+                    };
+                    assert_eq!(usize::try_from(length).unwrap(), expected);
+                }
+            }
+            let mut complete = false;
+            for _ in 0..100 {
+                let mut output = [0xcc; 12];
+                let (rc, ind) = read_plp_test_chunk(&h, target, &mut output);
+                assert!(matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO), "{rc}");
+                let capacity = if wide {
+                    10
+                } else if target == SQL_C_CHAR {
+                    11
+                } else {
+                    12
+                };
+                let count = if rc == SQL_SUCCESS {
+                    usize::try_from(ind).unwrap()
+                } else if wide {
+                    output
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .position(|unit| *unit == [0, 0])
+                        .unwrap()
+                        * 2
+                } else if target == SQL_C_CHAR {
+                    output.iter().position(|byte| *byte == 0).unwrap()
+                } else {
+                    capacity
+                };
+                assert!(count <= capacity);
+                delivered.extend_from_slice(&output[..count]);
+                if rc == SQL_SUCCESS {
+                    complete = true;
+                    break;
+                }
+            }
+            assert!(complete);
+            let expected = if wide {
+                utf16le(text)
+            } else {
+                text.as_bytes().to_vec()
+            };
+            assert_eq!(delivered, expected);
+            assert_eq!(
+                read_plp_test_chunk(&h, target, &mut [0xcc; 12]),
+                (SQL_NO_DATA, -999)
+            );
+            let mut next = 0;
+            let mut ind = 0;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        h.stmt,
+                        2,
+                        SQL_C_SLONG,
+                        (&raw mut next).cast(),
+                        4,
+                        &mut ind,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(next, 42);
+
+            let (h, _server) = open_json_mock(ColumnValue::JsonNull);
+            assert_eq!(
+                unsafe { crate::api::exports::SQLFetch(h.stmt) },
+                SQL_SUCCESS
+            );
+            let mut output = [0xcc; 12];
+            assert_eq!(
+                read_plp_test_chunk(&h, target, &mut output),
+                (SQL_SUCCESS, SQL_NULL_DATA)
+            );
+            assert_eq!(output, [0xcc; 12]);
+        }
+    }
+
+    #[test]
+    fn json_restricted_targets_leave_the_row_available_for_retry() {
+        let (h, _server) = open_json_mock(mssql_mock_tds::ColumnValue::Json(vec![b"{}".to_vec()]));
+        let mut value = -123_i32;
+        let mut ind = -99;
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLBindCol(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&raw mut value).cast(),
+                    4,
+                    &mut ind,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(unsafe { crate::api::exports::SQLFetch(h.stmt) }, SQL_ERROR);
+        assert_eq!((value, ind), (-123, -99));
+        assert_eq!(
+            unsafe { crate::api::exports::SQLFreeStmt(h.stmt, crate::api::odbc_types::SQL_UNBIND) },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { crate::api::exports::SQLFetch(h.stmt) },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetData(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&raw mut value).cast(),
+                    4,
+                    &mut ind,
+                )
+            },
+            SQL_ERROR
+        );
+        assert_eq!((value, ind), (-123, -99));
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_eq!(
+            stmt.inner.lock().unwrap().diag_records[0].sql_state,
+            *b"07006"
+        );
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_CHAR, &mut [0xcc; 8]),
+            (SQL_SUCCESS, 2)
+        );
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetData(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&raw mut value).cast(),
+                    4,
+                    &mut ind,
+                )
+            },
+            SQL_NO_DATA
+        );
+    }
+
+    #[test]
+    fn json_bound_truncation_and_null_preserve_the_next_row_and_column() {
+        use mssql_mock_tds::ColumnValue;
+        for target in [SQL_C_CHAR, SQL_C_WCHAR, SQL_C_BINARY, SQL_C_DEFAULT] {
+            let (h, _server) = open_json_mock_rows(vec![
+                ColumnValue::Json(vec![b"{\"a\":1234567890}".to_vec()]),
+                ColumnValue::JsonNull,
+            ]);
+            let mut output = [0xcc; 8];
+            let mut indicator = -99;
+            let mut following = 0_i32;
+            let mut following_indicator = -99;
+            for (column, target, ptr, length, indicator) in [
+                (1, target, output.as_mut_ptr().cast(), 8, &mut indicator),
+                (
+                    2,
+                    SQL_C_SLONG,
+                    (&raw mut following).cast(),
+                    4,
+                    &mut following_indicator,
+                ),
+            ] {
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLBindCol(
+                            h.stmt, column, target, ptr, length, indicator,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+            }
+            assert_eq!(
+                unsafe { crate::api::exports::SQLFetch(h.stmt) },
+                SQL_SUCCESS_WITH_INFO
+            );
+            assert_eq!(following, 42);
+            assert!(indicator > 8 || indicator == SQL_NO_TOTAL);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            assert_eq!(
+                stmt.inner.lock().unwrap().diag_records[0].sql_state,
+                *b"01004"
+            );
+            output.fill(0xcc);
+            following = 0;
+            assert_eq!(
+                unsafe { crate::api::exports::SQLFetch(h.stmt) },
+                SQL_SUCCESS
+            );
+            assert_eq!((indicator, following), (SQL_NULL_DATA, 42));
+            assert_eq!(output, [0xcc; 8]);
+            assert_eq!(
+                unsafe { crate::api::exports::SQLFetch(h.stmt) },
+                SQL_NO_DATA
+            );
+        }
+    }
+
+    #[test]
+    fn json_active_value_can_switch_character_wide_and_binary_targets() {
+        let text = "[\"\u{00fc}\u{20ac}\u{1f600}\"]";
+        let chunks = text.as_bytes().chunks(1).map(<[u8]>::to_vec).collect();
+        let (h, _server) = open_json_mock(mssql_mock_tds::ColumnValue::Json(chunks));
+        assert_eq!(
+            unsafe { crate::api::exports::SQLFetch(h.stmt) },
+            SQL_SUCCESS
+        );
+        let mut narrow = [0xcc; 5];
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_CHAR, &mut narrow).0,
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(&narrow, b"[\"\xc3\xbc\0");
+        let mut wide = [0xcc; 8];
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_WCHAR, &mut wide).0,
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(&wide[..6], utf16le("\u{20ac}\u{1f600}"));
+        assert_eq!(&wide[6..], [0, 0]);
+        let mut binary = [0xcc; 8];
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_BINARY, &mut binary),
+            (SQL_SUCCESS, 2)
+        );
+        assert_eq!(&binary[..2], b"\"]");
+    }
+
+    #[test]
+    fn unnegotiated_json_result_fails_exported_execution() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _server = crate::test_support::connect_mock_server_with_json_ack(
+            dbc,
+            "SELECT json_result",
+            QueryResponse::new(
+                vec![ColumnDefinition::new("j", SqlDataType::Json)],
+                vec![Row::new(vec![ColumnValue::Json(vec![b"{}".to_vec()])])],
+            ),
+            None,
+        );
+        let sql: Vec<u16> = "SELECT json_result\0".encode_utf16().collect();
+        assert_eq!(
+            unsafe { crate::api::exports::SQLExecDirectW(h.stmt, sql.as_ptr(), SQL_NTS.into()) },
+            SQL_ERROR
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_eq!(
+            stmt.inner.lock().unwrap().diag_records[0].sql_state,
+            *b"HY000"
+        );
+    }
+
+    #[test]
+    fn closing_a_partial_json_value_does_not_leak_into_reexecution() {
+        let text = b"[123456789]";
+        let (h, _server) = open_json_mock(mssql_mock_tds::ColumnValue::Json(vec![text.to_vec()]));
+        assert_eq!(
+            unsafe { crate::api::exports::SQLFetch(h.stmt) },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_BINARY, &mut [0; 3]).0,
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(
+            unsafe { crate::api::exports::SQLCloseCursor(h.stmt) },
+            SQL_SUCCESS
+        );
+        let sql: Vec<u16> = "SELECT json_result\0".encode_utf16().collect();
+        assert_eq!(
+            unsafe { crate::api::exports::SQLExecDirectW(h.stmt, sql.as_ptr(), SQL_NTS.into()) },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { crate::api::exports::SQLFetch(h.stmt) },
+            SQL_SUCCESS
+        );
+        let mut output = [0xcc; 32];
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_BINARY, &mut output),
+            (SQL_SUCCESS, SqlLen::try_from(text.len()).unwrap())
+        );
+        assert_eq!(&output[..text.len()], text);
     }
 
     #[test]

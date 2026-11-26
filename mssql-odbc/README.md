@@ -97,7 +97,7 @@ The [driver guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-odbc/do
 covers connection defaults, timeouts, parameter streaming, descriptors, data
 classification, character encoding, migration notes, and tracing. Its
 [JSON section](https://github.com/microsoft/mssql-rs/blob/main/mssql-odbc/docs/driver-guide.md#json-feature-negotiation)
-distinguishes negotiated capability from native ODBC type support. See the
+covers native result types, default conversions, and session negotiation. See the
 [parity registry](https://github.com/microsoft/mssql-rs/blob/main/mssql-odbc/docs/parity-deviations.md)
 for deliberate differences from Microsoft ODBC Driver for SQL Server.
 
