@@ -845,7 +845,10 @@ do not replace failed restoration with a plain login or reapply checkout default
 SPID may change; invalidate session-bound prepared handles and caches.
 
 Recovery retains the same exclusive lease and capacity slot. Abort the old local transport before
-opening its replacement. One operation deadline covers recovery and execution; absent a command
+opening its replacement. The lease supplies TDS options with the remaining command budget,
+rounded up to whole seconds while retaining the original absolute outer timer. A
+`ConnectionClosed` result forces discard even if the cached dead flag is not set.
+One operation deadline covers recovery and execution; absent a command
 timeout, recovery still has a finite connection-timeout budget. Cancellation stops retry/auth
 work. Interrupted or failed recovery makes the logical connection unusable and forces discard.
 Close/shutdown must settle the operation before releasing its client and capacity.

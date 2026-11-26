@@ -166,14 +166,9 @@ async fn mock_recovery_keeps_the_lease_and_sends_the_application_batch_once() {
         .run(
             Some(Instant::now() + Duration::from_secs(10)),
             &CancellationToken::new(),
-            |client, cancel| {
+            |client, options| {
                 Box::pin(async move {
-                    client
-                        .execute(
-                            "SELECT 1".into(),
-                            mssql_tds::connection::tds_client::ExecuteOptions::new().cancel(cancel),
-                        )
-                        .await?;
+                    client.execute("SELECT 1".into(), options).await?;
                     client.close_query().await
                 })
             },
@@ -273,15 +268,8 @@ async fn live_completed_execute_preserves_delayed_results_for_fetch_and_release(
                  SELECT 2; ROLLBACK TRANSACTION"
         );
         first
-            .run(None, &CancellationToken::new(), move |client, cancel| {
-                Box::pin(async move {
-                    client
-                        .execute(
-                            query,
-                            mssql_tds::connection::tds_client::ExecuteOptions::new().cancel(cancel),
-                        )
-                        .await
-                })
+            .run(None, &CancellationToken::new(), move |client, options| {
+                Box::pin(async move { client.execute(query, options).await })
             })
             .await
             .unwrap();
@@ -358,14 +346,9 @@ async fn live_recovery_retains_capacity_and_session_settings_then_allows_reuse()
         .run(
             Some(Instant::now() + Duration::from_secs(30)),
             &CancellationToken::new(),
-            |client, cancel| {
+            |client, options| {
                 Box::pin(async move {
-                    client
-                        .execute(
-                            "SELECT 1".into(),
-                            mssql_tds::connection::tds_client::ExecuteOptions::new().cancel(cancel),
-                        )
-                        .await?;
+                    client.execute("SELECT 1".into(), options).await?;
                     client.close_query().await
                 })
             },

@@ -108,7 +108,7 @@ impl PoolLease {
         auth: OperationAuth,
         operation: impl for<'a> FnOnce(
             &'a mut TdsClient,
-            &'a CancelHandle,
+            ExecuteOptions<'a>,
         )
             -> Pin<Box<dyn Future<Output = TdsResult<T>> + Send + 'a>>,
     ) -> PoolResult<T> {
@@ -182,7 +182,7 @@ impl PoolLease {
         cancellation: &CancellationToken,
         operation: impl for<'a> FnOnce(
             &'a mut TdsClient,
-            &'a CancelHandle,
+            ExecuteOptions<'a>,
         )
             -> Pin<Box<dyn Future<Output = TdsResult<T>> + Send + 'a>>,
     ) -> PoolResult<T> {
@@ -197,7 +197,7 @@ impl PoolLease {
         validate: impl Fn() -> PoolResult<()>,
         operation: impl for<'a> FnOnce(
             &'a mut TdsClient,
-            &'a CancelHandle,
+            ExecuteOptions<'a>,
         )
             -> Pin<Box<dyn Future<Output = TdsResult<T>> + Send + 'a>>,
     ) -> PoolResult<T> {
@@ -222,6 +222,19 @@ impl PoolLease {
         let mut cancel = OperationCancel::new();
         let result = {
             let work = async {
+                let options = ExecuteOptions {
+                    // Round up for TDS seconds; the absolute timer remains authoritative.
+                    timeout: deadline.map(|deadline| {
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .as_nanos()
+                            .div_ceil(1_000_000_000)
+                            .max(1)
+                            .min(u128::from(u32::MAX)) as u32
+                    }),
+                    cancel: Some(&cancel.handle),
+                    ..Default::default()
+                };
                 let elapsed = async {
                     if let Some(deadline) = deadline {
                         tokio::time::sleep_until(deadline).await;
@@ -233,7 +246,7 @@ impl PoolLease {
                     biased;
                     _ = cancellation.cancelled() => Err(PoolError::Cancelled),
                     _ = elapsed => Err(PoolError::AcquireTimeout { stage: AcquireStage::Execute }),
-                    result = operation(guard.0.client_mut(), &cancel.handle) => {
+                    result = operation(guard.0.client_mut(), options) => {
                         check()?;
                         result.map_err(|error| PoolError::Execute(Box::new(error)))
                     }
@@ -258,6 +271,7 @@ impl PoolLease {
                 mssql_tds::error::Error::OperationCancelledError(_)
                     | mssql_tds::error::Error::TokenAcquisitionCancelled
                     | mssql_tds::error::Error::TimeoutError(_)
+                    | mssql_tds::error::Error::ConnectionClosed(_)
             ),
             _ => false,
         };

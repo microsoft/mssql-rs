@@ -257,6 +257,9 @@ Recovery and the subsequent request share the command timeout. Without one,
 recovery uses the connection timeout.
 
 The dead local transport is synchronously aborted before opening a replacement.
+Failed recovery logins also abort their replacement transport without awaiting
+graceful shutdown, so cleanup cannot consume the budget and replace a terminal
+authentication/configuration error or provider cancellation with a timeout.
 Recovery uses the same transient-error classification as initial connection
 opening. Cancellation and permanent login, TLS or configuration errors propagate
 without further retries or retry-exhaustion wrapping. Successful recovery invalidates

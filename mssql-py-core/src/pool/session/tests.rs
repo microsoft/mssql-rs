@@ -273,7 +273,7 @@ async fn completed_lease_operations_preserve_clean_sessions_but_dead_failures_di
         let manager = manager(1);
         let mut first = lease(&manager, tds_client_from_tokens(vec![done_no_more()])).await;
         let result = first
-            .run(None, &CancellationToken::new(), move |client, cancel| {
+            .run(None, &CancellationToken::new(), move |client, options| {
                 Box::pin(async move {
                     if dead {
                         client.mark_connection_dead();
@@ -281,9 +281,7 @@ async fn completed_lease_operations_preserve_clean_sessions_but_dead_failures_di
                             "private failure".into(),
                         ));
                     }
-                    client
-                        .execute("SELECT 1".into(), ExecuteOptions::new().cancel(cancel))
-                        .await?;
+                    client.execute("SELECT 1".into(), options).await?;
                     client.close_query().await
                 })
             })
@@ -319,6 +317,137 @@ async fn no_command_deadline_does_not_limit_normal_execution() {
         .unwrap();
     assert!(!first.discard);
     assert!(!first.client_mut().is_connection_dead());
+}
+
+#[tokio::test]
+async fn connection_closed_discards_even_without_a_cached_dead_flag() {
+    let manager = manager(1);
+    let mut first = lease(&manager, tds_client_from_tokens(vec![])).await;
+    let result = first
+        .run(None, &CancellationToken::new(), |client, _| {
+            Box::pin(async move {
+                assert!(!client.is_connection_dead());
+                Err::<(), _>(mssql_tds::error::Error::ConnectionClosed(
+                    "idle probe found a closed connection".into(),
+                ))
+            })
+        })
+        .await;
+    assert!(matches!(result, Err(PoolError::Execute(_))));
+    assert!(first.discard);
+    assert!(first.client_mut().is_connection_dead());
+    first.release().await.unwrap();
+    let mut slot = manager
+        .reserve(key(), control(CancellationToken::new()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(slot.take_value().is_none());
+}
+
+#[tokio::test]
+async fn command_budget_longer_than_login_timeout_allows_slow_recovery() {
+    use mssql_mock_tds::{MockTdsServer, QueryResponse};
+    use mssql_tds::connection::client_context::{EntraIdTokenFactory, TdsAuthenticationMethod};
+    use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
+    use mssql_tds::core::EncryptionSetting;
+
+    #[derive(Clone)]
+    struct SlowRecoveryCredential(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl EntraIdTokenFactory for SlowRecoveryCredential {
+        async fn create_token(
+            &self,
+            _: String,
+            _: String,
+            _: TdsAuthenticationMethod,
+        ) -> TdsResult<Vec<u8>> {
+            if self.0.fetch_add(1, Ordering::SeqCst) > 0 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Ok("opaque-test-token"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect())
+        }
+    }
+
+    let server = MockTdsServer::new(
+        &std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0).to_string(),
+    )
+    .await
+    .unwrap();
+    let address = server.local_addr();
+    {
+        let registry = server.query_registry();
+        let mut registry = registry.lock().await;
+        registry.set_session_recovery(true);
+        registry.register("SELECT 1", QueryResponse::select_one());
+    }
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(server.run_with_shutdown(shutdown_rx));
+    let mut context = ClientContext::default();
+    context.connect_timeout = 1;
+    context.connect_retry_count = 1;
+    context.encryption_options.mode = EncryptionSetting::PreferOff;
+    context.tds_authentication_method = TdsAuthenticationMethod::ActiveDirectoryTokenCredential;
+    context.auth_method_map.insert(
+        TdsAuthenticationMethod::ActiveDirectoryTokenCredential,
+        Box::new(SlowRecoveryCredential(Arc::new(AtomicUsize::new(0)))),
+    );
+    let client = TdsConnectionProvider
+        .create_client(
+            context,
+            &format!("tcp:{},{}", address.ip(), address.port()),
+            None,
+        )
+        .await
+        .unwrap();
+    let manager = manager(1);
+    let mut first = lease(&manager, client).await;
+    first.client_mut().mark_connection_dead();
+    first
+        .run(
+            Some(Instant::now() + Duration::from_secs(4)),
+            &CancellationToken::new(),
+            |client, options| {
+                Box::pin(async move {
+                    client.execute("SELECT 1".into(), options).await?;
+                    client.close_query().await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.client_mut().connection_recovery_count(), 1);
+    first.release().await.unwrap();
+    manager.shutdown().await.unwrap();
+    shutdown.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn operation_options_preserve_remaining_and_subsecond_deadlines() {
+    for (budget, expected) in [
+        (None, None),
+        (Some(Duration::from_secs(60)), Some(59)),
+        (Some(Duration::from_millis(500)), Some(1)),
+    ] {
+        let manager = manager(1);
+        let mut first = lease(&manager, tds_client_from_tokens(vec![])).await;
+        let deadline = budget.map(|budget| Instant::now() + budget);
+        let cancellation = CancellationToken::new();
+        let work = first.run(deadline, &cancellation, |_, options| {
+            assert_eq!(options.timeout, expected);
+            assert!(options.cancel.is_some());
+            Box::pin(async { Ok(()) })
+        });
+        if budget == Some(Duration::from_secs(60)) {
+            tokio::time::advance(Duration::from_millis(1100)).await;
+        }
+        work.await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -511,12 +640,8 @@ fn recovery_binding_change_during_token_acquisition_sends_no_application_batch()
                     .activate_auth(factory(), reader(), Duration::ZERO)
                     .unwrap();
                 let result = first
-                    .run_authenticated(None, &CancellationToken::new(), scope, |client, cancel| {
-                        Box::pin(async move {
-                            client
-                                .execute("SELECT 1".into(), ExecuteOptions::new().cancel(cancel))
-                                .await
-                        })
+                    .run_authenticated(None, &CancellationToken::new(), scope, |client, options| {
+                        Box::pin(async move { client.execute("SELECT 1".into(), options).await })
                     })
                     .await;
                 assert!(result.is_err());
@@ -661,12 +786,10 @@ async fn authenticated_binding_change_before_resumption_sends_no_batch() {
     let cancellation = CancellationToken::new();
     let mut work =
         Box::pin(
-            first.run_authenticated(None, &cancellation, scope, move |client, cancel| {
+            first.run_authenticated(None, &cancellation, scope, move |client, options| {
                 Box::pin(async move {
                     gate.acquire().await.unwrap().forget();
-                    client
-                        .execute("SELECT 1".into(), ExecuteOptions::new().cancel(cancel))
-                        .await
+                    client.execute("SELECT 1".into(), options).await
                 })
             }),
         );
