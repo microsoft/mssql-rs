@@ -48,9 +48,9 @@ use crate::api::odbc_types::{
     SqlSsVectorLayout, SqlULen,
 };
 use crate::api::sqlstate::{
-    DiagMsg, ERR_DATA_AT_EXEC_NOT_STAGED, ERR_DATETIME_FIELD_OVERFLOW, ERR_INTERNAL_CONVERSION,
-    ERR_INVALID_ATTRIBUTE_VALUE, ERR_INVALID_CHARACTER_VALUE, ERR_INVALID_DATETIME_FORMAT,
-    ERR_INVALID_NULL_POINTER, ERR_INVALID_PARAM_PRECISION_OR_SCALE,
+    DiagMsg, ERR_DAE_LENGTH_MISMATCH, ERR_DATA_AT_EXEC_NOT_STAGED, ERR_DATETIME_FIELD_OVERFLOW,
+    ERR_INTERNAL_CONVERSION, ERR_INVALID_ATTRIBUTE_VALUE, ERR_INVALID_CHARACTER_VALUE,
+    ERR_INVALID_DATETIME_FORMAT, ERR_INVALID_NULL_POINTER, ERR_INVALID_PARAM_PRECISION_OR_SCALE,
     ERR_INVALID_STRING_OR_BUFFER_LENGTH, ERR_INVALID_USE_OF_DEFAULT_PARAM, ERR_MEMORY_ALLOCATION,
     ERR_MISSING_TVP_TYPE_NAME, ERR_MISSING_UDT_TYPE_NAME, ERR_NUMERIC_OUT_OF_RANGE,
     ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
@@ -106,6 +106,8 @@ pub(crate) enum ParamBuildError {
     /// A null `ParameterValuePtr` paired with a length that is not zero, or
     /// with a fixed-width C type. msodbcsql answers `HY090` here.
     InvalidBufferLength,
+    /// A completed TVP C_CHAR DAE value ends inside a client-encoded character.
+    IncompleteTvpDaeCharacter,
     /// Character data longer than the declared length, in more than trailing
     /// blanks.
     StringTruncation,
@@ -159,6 +161,7 @@ impl ParamBuildError {
             Self::InvalidLength(_) => ERR_INVALID_STRING_OR_BUFFER_LENGTH,
             Self::NullValuePointer => ERR_INVALID_NULL_POINTER,
             Self::InvalidBufferLength => ERR_INVALID_STRING_OR_BUFFER_LENGTH,
+            Self::IncompleteTvpDaeCharacter => ERR_DAE_LENGTH_MISMATCH,
             Self::StringTruncation => ERR_PARAM_STRING_TRUNCATION,
             Self::MemoryAllocation => ERR_MEMORY_ALLOCATION,
             Self::InvalidDateTime => ERR_INVALID_DATETIME_FORMAT,
@@ -896,13 +899,18 @@ pub(crate) fn buffered_dae_to_value(
         if is_null {
             return Ok((SqlType::NVarcharMax(None), ConvOk::Exact));
         }
-        if binding.c_type == SQL_C_CHAR
-            && client_encoding
-                .prefix_len(buffer, buffer.len())
-                .map_err(ParamBuildError::Value)?
-                != buffer.len()
-        {
-            return Err(ParamBuildError::Value(ConvError::InvalidCharacterValue));
+        if binding.c_type == SQL_C_CHAR {
+            let complete = if client_encoding.is_utf8() {
+                !std::str::from_utf8(buffer).is_err_and(|error| error.error_len().is_none())
+            } else {
+                client_encoding
+                    .prefix_len(buffer, buffer.len())
+                    .map_err(ParamBuildError::Value)?
+                    == buffer.len()
+            };
+            if !complete {
+                return Err(ParamBuildError::IncompleteTvpDaeCharacter);
+            }
         }
         let value = match binding.c_type {
             SQL_C_CHAR => AppValue::NarrowText(std::mem::take(buffer)),
@@ -5270,7 +5278,20 @@ mod tests {
         let cp932 = ClientEncoding::for_code_page(932).unwrap();
         assert_eq!(
             buffered_dae_to_value(&column, &mut bytes.to_vec(), false, cp932),
-            Err(ParamBuildError::Value(ConvError::InvalidCharacterValue))
+            Err(ParamBuildError::IncompleteTvpDaeCharacter)
+        );
+        assert_eq!(
+            buffered_dae_to_value(
+                &column,
+                &mut b"{\"\xe2".to_vec(),
+                false,
+                ClientEncoding::UTF8
+            ),
+            Err(ParamBuildError::IncompleteTvpDaeCharacter)
+        );
+        assert_eq!(
+            ParamBuildError::IncompleteTvpDaeCharacter.diag(),
+            ERR_DAE_LENGTH_MISMATCH
         );
         column.c_type = SQL_C_BINARY;
         assert!(

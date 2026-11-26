@@ -97,8 +97,9 @@ Their descriptors retain that type; the TVP wire metadata and values use
 
 `SQL_C_CHAR` uses the connection's client encoding, `SQL_C_WCHAR` uses
 UTF-16LE, and `SQL_C_BINARY` uses UTF-8, not UTF-16LE or the client code page.
-`SQL_C_DEFAULT` resolves to `SQL_C_WCHAR`. Invalid UTF-8 and incomplete narrow
-DAE characters fail with `22018`; odd WCHAR byte lengths fail with `HY090`.
+`SQL_C_DEFAULT` resolves to `SQL_C_WCHAR`. Invalid UTF-8 fails with `22018`;
+incomplete `SQL_C_CHAR` DAE characters fail with `22026`. Odd WCHAR byte
+lengths fail with `HY090`.
 SQL Server validates JSON syntax.
 
 Column-wise and row-wise bindings share the existing TVP layout rules.

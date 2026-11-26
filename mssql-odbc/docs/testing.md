@@ -37,7 +37,11 @@ large values, invalid encoding, and statement reuse.
 
 Reference source: `sqlccmd.cpp`, `PutParamData`, maps a JSON TVP column to
 `SQL_WVARCHAR` with unlimited precision and converts binary input as UTF-8;
-`sqlcfunc.cpp` rejects odd JSON WCHAR byte lengths. These are source-level
+`sqlcfunc.cpp` rejects odd JSON WCHAR byte lengths. `ProcessDAEParam`
+(`sqlccmd.cpp:6070-6076`) rejects a terminal partial JSON input character:
+binary TVP input uses `IDS_22_005`, while character input uses `IDS_22_026`
+(`String data, length mismatch` in `dll/res/local.rc:92`).
+These are source-level
 contracts, not measured retail parity. Run both driver legs against a
 JSON-enabled server and a JSON-enabled native build, recording
 `SQL_DRIVER_VER`; compiled tests or capability skips do not establish parity.
