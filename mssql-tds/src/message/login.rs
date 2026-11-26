@@ -1983,6 +1983,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn json_feature_ack_is_processed_in_each_position() {
+        use FeatureExtension::{Json, SqlDnsCaching, UserAgent, Utf8Support};
+
+        for order in [
+            [Json, Utf8Support, SqlDnsCaching, UserAgent],
+            [Utf8Support, Json, SqlDnsCaching, UserAgent],
+            [Utf8Support, SqlDnsCaching, Json, UserAgent],
+            [Utf8Support, SqlDnsCaching, UserAgent, Json],
+            [UserAgent, Json, SqlDnsCaching, Utf8Support],
+            [UserAgent, Utf8Support, SqlDnsCaching, Json],
+        ] {
+            for payload in [&[1][..], &[2][..]] {
+                let mut request = FeaturesRequest::from((&ClientContext::default(), false));
+                for id in order {
+                    let data = match id {
+                        Json => payload,
+                        SqlDnsCaching => &[0],
+                        _ => &[1],
+                    };
+                    let result = request.set_acknowledged(id, data);
+                    if id == Json && payload == [2] {
+                        let error = result.unwrap_err();
+                        assert!(matches!(error, crate::error::Error::ProtocolError(_)));
+                        assert!(
+                            error
+                                .to_string()
+                                .contains("Unsupported JSON feature version")
+                        );
+                        break;
+                    }
+                    result.unwrap();
+                }
+                if payload == [1] {
+                    assert_eq!(
+                        request.is_acknowledged(Json).unwrap().negotiated_version(),
+                        1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_second_json_ack_is_not_hidden_by_a_valid_first_ack() {
+        let mut request = FeaturesRequest::from((&ClientContext::default(), false));
+        request
+            .set_acknowledged(FeatureExtension::Json, &[1])
+            .unwrap();
+        let error = request
+            .set_acknowledged(FeatureExtension::Json, &[2])
+            .unwrap_err();
+        assert!(matches!(error, crate::error::Error::ProtocolError(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("Unsupported JSON feature version")
+        );
+    }
+
     fn by_feature_id(blocks: Vec<(u8, Vec<u8>)>) -> BTreeMap<u8, Vec<u8>> {
         let count = blocks.len();
         let map: BTreeMap<_, _> = blocks.into_iter().collect();

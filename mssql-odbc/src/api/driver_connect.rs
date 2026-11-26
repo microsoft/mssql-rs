@@ -2319,7 +2319,7 @@ mod tests {
         });
         let h = TestHandles::with_env_dbc();
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        for payload in [vec![], vec![2], vec![255], vec![1, 0]] {
+        for payload in [vec![], vec![2], vec![0x80], vec![255], vec![1, 0]] {
             runtime.block_on(async { registry.lock().await.set_json_ack(Some(payload)) });
             assert_eq!(connect_to_json_mock(&h, addr), SQL_ERROR);
             {
@@ -2380,7 +2380,11 @@ mod tests {
             });
             let h = TestHandles::with_env_dbc();
             let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-            for (ack, expected) in [(Some(vec![1]), Some(1)), (None, None)] {
+            for (ack, expected) in [
+                (Some(vec![1]), Some(1)),
+                (None, None),
+                (Some(vec![0]), None),
+            ] {
                 runtime.block_on(async { registry.lock().await.set_json_ack(ack) });
                 let ret = connect_to_json_mock(&h, addr);
                 assert!(matches!(ret, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO), "{ret}");
@@ -2393,6 +2397,32 @@ mod tests {
                         .unwrap()
                         .negotiated_json_version(),
                     expected
+                );
+                assert_eq!(unsafe { sql_disconnect(h.dbc) }, SQL_SUCCESS);
+            }
+            for payload in [vec![], vec![2], vec![0x80], vec![1, 1]] {
+                runtime.block_on(async { registry.lock().await.set_json_ack(Some(payload)) });
+                assert_eq!(connect_to_json_mock(&h, addr), SQL_ERROR);
+                {
+                    let state = dbc.inner.lock().unwrap();
+                    assert_eq!(state.connection_state, ConnectionState::Disconnected);
+                    assert!(state.wire.client().is_none());
+                    let diag = state.diag_records.last().unwrap();
+                    assert_eq!(diag.sql_state, SQLSTATE_08001);
+                    assert!(diag.message.contains("JSON"), "{}", diag.message);
+                }
+                runtime.block_on(async { registry.lock().await.set_json_ack(Some(vec![1])) });
+                let ret = connect_to_json_mock(&h, addr);
+                assert!(matches!(ret, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO), "{ret}");
+                assert_eq!(
+                    dbc.inner
+                        .lock()
+                        .unwrap()
+                        .wire
+                        .client()
+                        .unwrap()
+                        .negotiated_json_version(),
+                    Some(1)
                 );
                 assert_eq!(unsafe { sql_disconnect(h.dbc) }, SQL_SUCCESS);
             }
