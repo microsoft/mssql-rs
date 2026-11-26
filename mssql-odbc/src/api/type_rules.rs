@@ -34,10 +34,10 @@ use crate::api::odbc_types::{
     SQL_C_TIMESTAMP, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP,
     SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT, SQL_C_UTINYINT, SQL_C_WCHAR, SQL_CHAR, SQL_DECIMAL,
     SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER, SQL_INTERVAL_MINUTE_TO_SECOND, SQL_INTERVAL_YEAR,
-    SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TABLE,
-    SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_UDT, SQL_SS_VARIANT, SQL_SS_VECTOR, SQL_SS_XML,
-    SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR,
-    SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlSmallInt,
+    SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_JSON,
+    SQL_SS_TABLE, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_UDT, SQL_SS_VARIANT, SQL_SS_VECTOR,
+    SQL_SS_XML, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY,
+    SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlSmallInt,
 };
 use crate::handles::OdbcVersion;
 
@@ -340,7 +340,7 @@ pub(crate) fn resolve_default_c_type(
         SQL_SS_TIMESTAMPOFFSET => SQL_C_BINARY,
         SQL_SS_VARIANT => SQL_C_CHAR,
         SQL_SS_UDT | SQL_SS_TABLE => SQL_C_BINARY,
-        SQL_SS_XML => SQL_C_WCHAR,
+        SQL_SS_XML | SQL_SS_JSON => SQL_C_WCHAR,
         SQL_SS_VECTOR => SQL_C_SS_VECTOR,
         _ => return None,
     })
@@ -350,6 +350,16 @@ pub(crate) fn resolve_default_c_type(
 mod tests {
     use super::*;
     use crate::api::odbc_types::SQL_C_TIME;
+
+    #[test]
+    fn json_default_is_wide_at_both_odbc_versions() {
+        for version in [OdbcVersion::Odbc3, OdbcVersion::Odbc3_80] {
+            assert_eq!(
+                resolve_default_c_type(SQL_SS_JSON, version),
+                Some(SQL_C_WCHAR)
+            );
+        }
+    }
 
     #[test]
     fn real_c_types_are_valid_even_when_unconvertible() {
