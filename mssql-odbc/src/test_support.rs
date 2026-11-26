@@ -223,6 +223,13 @@ impl TestHandles {
         Self::with_env_dbc_stmt_encoding(crate::conversion::client_encoding::ClientEncoding::UTF8)
     }
 
+    /// Allocate ENV + DBC + STMT with the DBC allocated under `version`.
+    pub(crate) fn with_env_dbc_stmt_version(version: u32) -> Self {
+        let mut h = Self::with_env_dbc_version(version);
+        h.stmt = h.alloc_stmt_under_dbc();
+        h
+    }
+
     pub(crate) fn with_env_dbc_stmt_encoding(
         encoding: crate::conversion::client_encoding::ClientEncoding,
     ) -> Self {
@@ -232,14 +239,18 @@ impl TestHandles {
             .lock()
             .unwrap()
             .client_encoding = encoding;
+        h.stmt = h.alloc_stmt_under_dbc();
+        h
+    }
+
+    fn alloc_stmt_under_dbc(&self) -> SqlHandle {
         let mut stmt: SqlHandle = SQL_NULL_HANDLE;
         assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, h.dbc, &mut stmt) },
+            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, self.dbc, &mut stmt) },
             SQL_SUCCESS
         );
         assert!(!stmt.is_null());
-        h.stmt = stmt;
-        h
+        stmt
     }
 
     /// Allocate an additional STMT under the same DBC. The returned handle is

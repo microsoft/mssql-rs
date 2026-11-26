@@ -1055,7 +1055,7 @@ pub(super) fn snapshot_bound_params(stmt: &StmtHandle) -> Result<BoundParamSet, 
         };
         state.long_as_max() == crate::api::odbc_types::SQL_XL_ON
     };
-    let odbc_version = stmt.parent_dbc().parent_env().odbc_version();
+    let odbc_version = stmt.parent_dbc().odbc_version();
 
     let (apd, ipd) = {
         let Ok(stmt_state) = stmt.inner.lock() else {

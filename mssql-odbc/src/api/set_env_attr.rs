@@ -96,7 +96,7 @@ fn sql_set_env_attr_safe(
                 .and_then(|v| OdbcVersion::try_from(v).ok());
             match version {
                 Some(v) => {
-                    env.set_odbc_version(v);
+                    state.odbc_version = v;
                     SQL_SUCCESS
                 }
                 None => {
@@ -148,7 +148,10 @@ mod tests {
         let ret = set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80);
         assert_eq!(ret, SQL_SUCCESS);
         let env_ref = unsafe { &*(env as *const EnvHandle) };
-        assert_eq!(env_ref.odbc_version(), OdbcVersion::Odbc3_80);
+        assert_eq!(
+            env_ref.inner.lock().unwrap().odbc_version,
+            OdbcVersion::Odbc3_80
+        );
         free_env(env);
     }
 
@@ -158,7 +161,10 @@ mod tests {
         let ret = set_attr(env, SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3);
         assert_eq!(ret, SQL_SUCCESS);
         let env_ref = unsafe { &*(env as *const EnvHandle) };
-        assert_eq!(env_ref.odbc_version(), OdbcVersion::Odbc3);
+        assert_eq!(
+            env_ref.inner.lock().unwrap().odbc_version,
+            OdbcVersion::Odbc3
+        );
         free_env(env);
     }
 
@@ -188,7 +194,7 @@ mod tests {
 
         let env_ref = unsafe { handle_from_raw::<EnvHandle>(h.env) };
         assert_eq!(
-            env_ref.odbc_version(),
+            env_ref.inner.lock().unwrap().odbc_version,
             OdbcVersion::Odbc3_80,
             "a rejected value must leave the prior version intact"
         );
@@ -211,8 +217,8 @@ mod tests {
         };
         assert_eq!(ret, SQL_ERROR);
         let env_ref = unsafe { handle_from_raw::<EnvHandle>(h.env) };
-        assert_eq!(env_ref.odbc_version(), OdbcVersion::Odbc3_80);
         let state = env_ref.inner.lock().unwrap();
+        assert_eq!(state.odbc_version, OdbcVersion::Odbc3_80);
         assert_eq!(state.diag_records.len(), 1);
         assert_eq!(&state.diag_records[0].sql_state, b"HY024");
     }
@@ -223,7 +229,10 @@ mod tests {
         let ret = set_attr(env, SQL_ATTR_ODBC_VERSION, 9999);
         assert_eq!(ret, SQL_ERROR);
         let env_ref = unsafe { &*(env as *const EnvHandle) };
-        assert_eq!(env_ref.odbc_version(), OdbcVersion::Unset);
+        assert_eq!(
+            env_ref.inner.lock().unwrap().odbc_version,
+            OdbcVersion::Unset
+        );
         free_env(env);
     }
 
@@ -262,7 +271,10 @@ mod tests {
             SQL_SUCCESS
         );
         let env_ref = unsafe { &*(env as *const EnvHandle) };
-        assert_eq!(env_ref.odbc_version(), OdbcVersion::Odbc3_80);
+        assert_eq!(
+            env_ref.inner.lock().unwrap().odbc_version,
+            OdbcVersion::Odbc3_80
+        );
         free_env(env);
     }
 
@@ -276,7 +288,10 @@ mod tests {
         );
         assert_eq!(set_attr(env, SQL_ATTR_ODBC_VERSION, 9999), SQL_ERROR);
         let env_ref = unsafe { &*(env as *const EnvHandle) };
-        assert_eq!(env_ref.odbc_version(), OdbcVersion::Odbc3_80);
+        assert_eq!(
+            env_ref.inner.lock().unwrap().odbc_version,
+            OdbcVersion::Odbc3_80
+        );
         free_env(env);
     }
 
@@ -295,7 +310,10 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS);
         let env_ref = unsafe { &*(env as *const EnvHandle) };
-        assert_eq!(env_ref.odbc_version(), OdbcVersion::Odbc3_80);
+        assert_eq!(
+            env_ref.inner.lock().unwrap().odbc_version,
+            OdbcVersion::Odbc3_80
+        );
         free_env(env);
     }
 

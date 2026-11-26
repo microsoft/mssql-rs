@@ -155,7 +155,7 @@ unsafe fn alloc_dbc_with_encoding(
     // divergence: msodbcsql serves such an application (`SQLAllocConnect`
     // asserts in debug builds only, `odbc/sqlcconn.cpp:527`), because it
     // accepts the 2.x declaration in the first place. Registry entry 14.
-    if env.odbc_version() == OdbcVersion::Unset {
+    if env_state.odbc_version == OdbcVersion::Unset {
         // Log the diagnostic's own text, not a paraphrase: on the Driver
         // Manager path the application never sees it (the DM substitutes
         // IM005), so tracing is the only place the reason survives.
@@ -178,6 +178,7 @@ unsafe fn alloc_dbc_with_encoding(
         input_handle,
         Arc::clone(&env.runtime),
         client_encoding,
+        env_state.odbc_version,
     ));
     let raw = handle_to_raw(dbc);
     env_state.connections.push(raw);
@@ -340,7 +341,7 @@ mod tests {
         let h = TestHandles::with_unset_env();
         let env = unsafe { handle_from_raw::<EnvHandle>(h.env) };
         assert_eq!(
-            env.odbc_version(),
+            env.inner.lock().unwrap().odbc_version,
             OdbcVersion::Unset,
             "precondition: no version recorded"
         );
@@ -509,8 +510,10 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
 
         let env = unsafe { &*(handle as *const EnvHandle) };
-        assert_eq!(env.odbc_version(), OdbcVersion::Unset);
-        assert!(env.inner.lock().unwrap().output_nts);
+        let state = env.inner.lock().unwrap();
+        assert_eq!(state.odbc_version, OdbcVersion::Unset);
+        assert!(state.output_nts);
+        drop(state);
 
         unsafe { free_handle::<EnvHandle>(handle) };
     }

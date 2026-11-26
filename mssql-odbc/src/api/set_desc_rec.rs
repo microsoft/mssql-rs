@@ -426,7 +426,7 @@ fn post_focused_tvp_record_diag(
 
 pub(super) fn current_odbc_version(desc: &DescHandle) -> OdbcVersion {
     let dbc = unsafe { handle_from_raw::<DbcHandle>(desc.parent_dbc) };
-    dbc.parent_env().odbc_version()
+    dbc.odbc_version()
 }
 
 pub(super) fn focused_tvp_initial_binding() -> crate::params::BoundParam {

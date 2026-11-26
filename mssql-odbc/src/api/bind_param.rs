@@ -145,7 +145,7 @@ fn sql_bind_parameter_safe(
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
     // The declared ODBC version selects the SQL_C_DEFAULT table.
-    let odbc_version = stmt.parent_dbc().parent_env().odbc_version();
+    let odbc_version = stmt.parent_dbc().odbc_version();
 
     let Ok(param_focus_guard) = stmt.param_focus_gate.lock() else {
         error!("SQLBindParameter: parameter-focus mutex poisoned");
@@ -1182,24 +1182,15 @@ mod tests {
         assert_eq!(bound.param.c_type, SQL_C_BINARY);
     }
 
-    /// The default C type follows the ENV's current version, declared here
-    /// after a 3.0 DBC exists, and is resolved without waiting on the ENV mutex.
+    /// The default C type follows the version the DBC was allocated under — a
+    /// later `SQLSetEnvAttr` does not reach it, as in msodbcsql — and is
+    /// resolved without waiting on the ENV mutex.
     #[test]
-    fn a_default_bind_reads_the_current_odbc_version_without_the_env_lock() {
-        use crate::api::odbc_types::{
-            SQL_C_SS_TIME2, SQL_HANDLE_STMT, SQL_OV_ODBC3, SQL_OV_ODBC3_80, SQL_SS_TIME2,
-        };
+    fn a_default_bind_uses_the_dbc_odbc_version_without_the_env_lock() {
+        use crate::api::odbc_types::{SQL_C_SS_TIME2, SQL_OV_ODBC3, SQL_OV_ODBC3_80, SQL_SS_TIME2};
 
-        let mut h = TestHandles::with_env_dbc_version(SQL_OV_ODBC3);
-        let mut stmt: SqlHandle = SQL_NULL_HANDLE;
-        assert_eq!(
-            unsafe {
-                crate::api::alloc_handle::sql_alloc_handle(SQL_HANDLE_STMT, h.dbc, &mut stmt)
-            },
-            SQL_SUCCESS
-        );
-        h.stmt = stmt;
-        h.declare_odbc_version(SQL_OV_ODBC3_80);
+        let h = TestHandles::with_env_dbc_stmt_version(SQL_OV_ODBC3_80);
+        h.declare_odbc_version(SQL_OV_ODBC3);
 
         let stmt = h.stmt as usize;
         let ret = h.run_while_env_locked(move || unsafe {
@@ -1225,7 +1216,7 @@ mod tests {
         let bound = binding[0].as_ref().expect("parameter 1 should be bound");
         assert_eq!(
             bound.param.c_type, SQL_C_SS_TIME2,
-            "3.8 resolves SQL_SS_TIME2 to SQL_C_SS_TIME2"
+            "the DBC keeps the 3.8 it was allocated under"
         );
     }
 

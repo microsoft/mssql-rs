@@ -11,7 +11,7 @@ use tracing::error;
 
 use super::env::SharedRuntime;
 use super::wire::{ConnectionWire, LeaseReturn, WireLease};
-use super::{EnvHandle, HandleType, HasObjectType};
+use super::{HandleType, HasObjectType, OdbcVersion};
 use crate::api::odbc_types::{
     DATACLASSIFICATION_VERSION_DEFAULT, DEFAULT_PACKET_SIZE, SQL_MODE_READ_WRITE,
     SQL_TXN_READ_COMMITTED,
@@ -57,6 +57,13 @@ pub(crate) struct DbcHandle {
     /// `SQL_CA_SS_DATA_CLASSIFICATION_VERSION` while holding only its DESC
     /// lock; taking `inner` there would invert DBC-before-DESC ordering.
     data_classification_version: AtomicU8,
+    /// `SQL_ATTR_ODBC_VERSION` copied from the ENV at allocation. It selects
+    /// the `SQL_C_DEFAULT` table on every fetch, execute and bind, so it lives
+    /// outside `inner` and is never written again: msodbcsql replicates the
+    /// version into `wStatus` at `SQLAllocConnect` (`sqlcconn.cpp:618`) and
+    /// `Sql2CDefault` reads only that copy (`sqlcprot.h:1823`), so a later
+    /// `SQLSetEnvAttr` does not reach an existing connection.
+    odbc_version: OdbcVersion,
     pub(crate) inner: Mutex<DbcState>,
 }
 
@@ -448,10 +455,15 @@ impl DbcHandle {
             .store(value, Ordering::Relaxed);
     }
 
+    pub(crate) fn odbc_version(&self) -> OdbcVersion {
+        self.odbc_version
+    }
+
     pub(crate) fn new(
         parent_env: *mut c_void,
         runtime: Arc<SharedRuntime>,
         client_encoding: ClientEncoding,
+        odbc_version: OdbcVersion,
     ) -> Self {
         Self {
             trace: Arc::default(),
@@ -460,6 +472,7 @@ impl DbcHandle {
             runtime,
             connection_timeout: AtomicU32::new(0),
             data_classification_version: AtomicU8::new(0),
+            odbc_version,
             inner: Mutex::new(DbcState {
                 diag_records: Default::default(),
                 client_encoding,
@@ -492,19 +505,6 @@ impl DbcHandle {
                 last_char_set: None,
             }),
         }
-    }
-
-    /// Returns a reference to the parent ENV handle.
-    ///
-    /// The returned reference is bound to `&self` so it cannot outlive this
-    /// connection, and the parent ENV is guaranteed alive for at least that
-    /// long because the DM frees all DBC handles before freeing their parent
-    /// ENV.
-    pub(crate) fn parent_env(&self) -> &EnvHandle {
-        // SAFETY: `parent_env` is set at construction to a live `EnvHandle`
-        // pointer (allocated by `handle_to_raw::<EnvHandle>`), is never mutated,
-        // and the ENV outlives this DBC per the DM contract.
-        unsafe { &*(self.parent_env as *const EnvHandle) }
     }
 
     /// Returns `false`, closing the lease's client, on a poisoned mutex or when

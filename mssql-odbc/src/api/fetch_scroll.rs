@@ -894,10 +894,10 @@ fn fetch_scroll_operation(
     stmt: &StmtHandle,
     fetch_orientation: SqlSmallInt,
 ) -> SqlReturn {
-    // The declared ODBC version selects the SQL_C_DEFAULT table. Read on every
-    // fetch rather than snapshotted on the DBC (see `EnvHandle::odbc_version`),
-    // and lock-free, so it costs nothing to take before validation.
-    let odbc_version = stmt.parent_dbc().parent_env().odbc_version();
+    // The declared ODBC version selects the SQL_C_DEFAULT table. It is fixed on
+    // the DBC at allocation (see `DbcHandle::odbc_version`), so the read takes
+    // no lock and costs nothing to do before validation.
+    let odbc_version = stmt.parent_dbc().odbc_version();
 
     // Under the STMT lock: validate, resolve the effective ARD and claim the
     // statement. The lock is released before any DESC lock (§7.1) and before
@@ -5417,22 +5417,20 @@ mod tests {
     /// the value alone -- so the resolved target is observed through *which*
     /// diagnostic comes back: `07006` for the typed 3.8 target that cannot take an
     /// int, `HYC00` for the binary 3.0 one. Hardcoding either version in
-    /// `fetch_scroll_safe` flips one of these and fails the test. The version
-    /// is declared through `SQLSetEnvAttr` after the DBC exists, so a value
-    /// snapshotted at DBC allocation (3.8) would fail the 3.0 case.
+    /// `fetch_scroll_safe` flips one of these and fails the test.
     fn fetch_time_column_row_state(version: OdbcVersion) -> (SqlReturn, [u8; 5]) {
         fetch_time_column_row_state_with(version, |h| unsafe {
             sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0)
         })
     }
 
+    /// Allocates the DBC under `version`, then fetches through `fetch`.
     fn fetch_time_column_row_state_with(
         version: OdbcVersion,
         fetch: impl FnOnce(&TestHandles) -> SqlReturn,
     ) -> (SqlReturn, [u8; 5]) {
-        let h = TestHandles::with_env_dbc_stmt();
+        let h = TestHandles::with_env_dbc_stmt_version(version as u32);
         h.mark_dbc_connected();
-        h.declare_odbc_version(version as u32);
 
         let mut metadata = int_columns(1);
         metadata[0].data_type = TdsDataType::TimeN;
@@ -5488,6 +5486,23 @@ mod tests {
             fetch_time_column_row_state(OdbcVersion::Odbc3),
             (SQL_ERROR, *b"HYC00"),
             "3.0 resolves SQL_SS_TIME2 to SQL_C_BINARY, which is not delivered yet"
+        );
+    }
+
+    /// msodbcsql copies the version onto the connection at `SQLAllocConnect`
+    /// (`sqlcconn.cpp:618`) and `Sql2CDefault` reads only that copy, so a
+    /// version declared after the DBC exists does not reach it. Only reachable
+    /// without a Driver Manager, which refuses the call with `HY010`.
+    #[test]
+    fn a_version_declared_after_dbc_allocation_does_not_reach_the_dbc() {
+        let state = fetch_time_column_row_state_with(OdbcVersion::Odbc3, |h| {
+            h.declare_odbc_version(OdbcVersion::Odbc3_80 as u32);
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) }
+        });
+        assert_eq!(
+            state,
+            (SQL_ERROR, *b"HYC00"),
+            "the DBC keeps the 3.0 it was allocated under"
         );
     }
 

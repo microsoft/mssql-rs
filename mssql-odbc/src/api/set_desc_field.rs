@@ -3109,7 +3109,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_default_c_type_uses_the_environment_odbc_version() {
+    fn focused_default_c_type_uses_the_declared_odbc_version() {
         for (odbc_version, expected_c_type) in [
             (
                 crate::handles::OdbcVersion::Odbc3,
@@ -3120,9 +3120,7 @@ mod tests {
                 crate::api::odbc_types::SQL_C_SS_TIME2,
             ),
         ] {
-            let h = TestHandles::with_env_dbc_stmt();
-            unsafe { handle_from_raw::<crate::handles::EnvHandle>(h.env) }
-                .set_odbc_version(odbc_version);
+            let h = TestHandles::with_env_dbc_stmt_version(odbc_version as u32);
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             {
                 let mut state = stmt.inner.lock().unwrap();
