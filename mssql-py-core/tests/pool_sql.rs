@@ -78,8 +78,9 @@ async fn acquire(
     spec: &ConnectSpec,
     isolation: Isolation,
 ) -> PoolLease {
-    manager
-        .acquire(
+    // Keep nested acquisition state off the test thread's stack.
+    Box::pin(
+        manager.acquire(
             PoolKey::new(vec![1].into_boxed_slice()).unwrap(),
             spec,
             &SqlConnectionFactory,
@@ -90,10 +91,11 @@ async fn acquire(
                 CancellationToken::new(),
             )
             .unwrap(),
-        )
-        .await
-        .unwrap()
-        .unwrap()
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap()
 }
 
 async fn scalar(client: &mut TdsClient, sql: &str) -> i32 {
@@ -110,8 +112,23 @@ async fn exec(client: &mut TdsClient, sql: &str) {
     client.close_query().await.unwrap();
 }
 
-#[tokio::test]
-async fn mock_recovery_keeps_the_lease_and_sends_the_application_batch_once() {
+#[test]
+fn mock_recovery_keeps_the_lease_and_sends_the_application_batch_once() {
+    std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(mock_recovery_on_small_stack())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn mock_recovery_on_small_stack() {
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     use mssql_mock_tds::{MockTdsServer, QueryResponse};
