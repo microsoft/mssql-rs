@@ -404,18 +404,18 @@ mod tests {
     fn connections_on_one_env_keep_their_own_odbc_version() {
         let h = TestHandles::with_env_dbc_version(SQL_OV_ODBC3);
         h.declare_odbc_version(SQL_OV_ODBC3_80);
-        let mut second: SqlHandle = ptr::null_mut();
+        let other = h.alloc_other_connection();
+
         assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_DBC, h.env, &mut second) },
-            SQL_SUCCESS
+            unsafe { handle_from_raw::<DbcHandle>(h.dbc) }.odbc_version(),
+            OdbcVersion::Odbc3,
+            "allocated under 3.0"
         );
-
-        let first_version = unsafe { handle_from_raw::<DbcHandle>(h.dbc) }.odbc_version();
-        let second_version = unsafe { handle_from_raw::<DbcHandle>(second) }.odbc_version();
-        unsafe { sql_free_handle(SQL_HANDLE_DBC, second) };
-
-        assert_eq!(first_version, OdbcVersion::Odbc3, "allocated under 3.0");
-        assert_eq!(second_version, OdbcVersion::Odbc3_80, "allocated under 3.8");
+        assert_eq!(
+            unsafe { handle_from_raw::<DbcHandle>(other.dbc) }.odbc_version(),
+            OdbcVersion::Odbc3_80,
+            "allocated under 3.8"
+        );
     }
 
     #[test]

@@ -301,9 +301,9 @@ impl TestHandles {
     }
 
     /// Allocates a second, independent connection under the same ENV, with
-    /// one explicit descriptor already allocated on it — for
-    /// cross-connection rejection tests. Both are freed by
-    /// [`OtherConnection`]'s own `Drop`, before this `TestHandles`'s ENV.
+    /// one explicit descriptor already allocated on it — for cross-connection
+    /// tests. Both are freed by [`OtherConnection`]'s own `Drop`, before this
+    /// `TestHandles`'s ENV.
     pub(crate) fn alloc_other_connection(&self) -> OtherConnection {
         let mut dbc: SqlHandle = SQL_NULL_HANDLE;
         assert_eq!(
@@ -392,7 +392,7 @@ impl Drop for TestHandles {
 /// cross-connection rejection tests. Frees the descriptor, then the DBC, on
 /// drop.
 pub(crate) struct OtherConnection {
-    dbc: SqlHandle,
+    pub(crate) dbc: SqlHandle,
     pub(crate) desc: SqlHandle,
 }
 
