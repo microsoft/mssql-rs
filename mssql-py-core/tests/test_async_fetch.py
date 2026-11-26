@@ -1328,6 +1328,85 @@ def test_materialization_cancellation_reports_recovery_outcome(
 
 
 @pytest.mark.integration
+def test_nextset_cancellation_settles_before_blocked_error_logging(client_context):
+    async def run():
+        conversion_entered = threading.Event()
+        release_conversion = threading.Event()
+        logging_entered = threading.Event()
+        release_logging = threading.Event()
+        logging_returned = threading.Event()
+        finder = BlockingDecimalFinder(conversion_entered, release_conversion)
+
+        class Logger(RecordingLogger):
+            def py_core_log(self, level, message, module_name, line):
+                super().py_core_log(level, message, module_name, line)
+                if (
+                    "PyAsyncCursor::nextset: failed" in message
+                    and "Result-set advance was cancelled" in message
+                ):
+                    logging_entered.set()
+                    release_logging.wait(15)
+                    logging_returned.set()
+
+        conn = await connect(client_context, Logger())
+        decimal_module = None
+        pending = settlement = None
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            await cursor.execute(
+                "SELECT 1; SELECT CAST(2 AS decimal(10, 2)); SELECT 99",
+                use_prepare=False,
+            )
+            assert await cursor.fetchall() == [(1,)]
+            # Start the executor before the finder can hold Python's import lock.
+            await asyncio.to_thread(lambda: None)
+            decimal_module = sys.modules.pop("decimal")
+            sys.meta_path.insert(0, finder)
+            pending = cursor.nextset()
+            assert await asyncio.to_thread(conversion_entered.wait, 2)
+
+            assert pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            assert await asyncio.to_thread(logging_entered.wait, 2)
+            settlement = asyncio.ensure_future(pending._cancel_and_settle())
+            await asyncio.wait_for(asyncio.shield(settlement), 2)
+
+            assert cursor.description is None
+            assert pending.cancelled()
+            assert not logging_returned.is_set()
+            assert not release_conversion.is_set()
+            probe = conn.cursor()
+            await probe.execute("SELECT 3, @@SPID", use_prepare=False)
+            assert await probe.fetchall() == [(3, session_id)]
+            assert not logging_returned.is_set()
+            await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), 2)
+
+            release_logging.set()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        finally:
+            release_logging.set()
+            release_conversion.set()
+            if finder in sys.meta_path:
+                sys.meta_path.remove(finder)
+            await asyncio.to_thread(__import__, "decimal")
+            if decimal_module is not None:
+                sys.modules["decimal"] = decimal_module
+            if pending is not None and not pending.done():
+                pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+            if settlement is not None and not settlement.done():
+                await asyncio.wait_for(asyncio.shield(settlement), 6)
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("method", ["execute", "executemany"])
 @pytest.mark.parametrize("use_prepare", [False, True], ids=["direct", "prepared"])
 def test_execute_cancellation_during_description_materialization_keeps_connection_reusable(

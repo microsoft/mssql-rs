@@ -1053,6 +1053,7 @@ pub(crate) fn nextset<'py>(
                         fetch_guard.fail(has_open_batch || connection_dead);
                         future_fetch_state.set(FetchStatus::NoResultSet);
                         future_description_state.replace(None);
+                        worker_control.complete_if_released();
                         None
                     }
                 };
@@ -1232,7 +1233,7 @@ mod tests {
         map_fetch_error, map_materialization_join_error, map_nextset_error, materialize_rows,
     };
     #[cfg(debug_assertions)]
-    use super::{arm_fetch_publication_pause, pause_fetch_publication_if_armed};
+    use super::{PublicationHook, arm_fetch_publication_pause, pause_fetch_publication_if_armed};
     use crate::async_fetch::BufferedResults;
     use crate::async_session::{
         AsyncConnectionState, ClaimError, ConnectionLifecycle, FetchCompletion,
@@ -1403,6 +1404,34 @@ mod tests {
         assert!(rows.is_empty());
         assert!(exhausted);
         assert!(!has_next);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn publication_hook_rejects_rearming_until_released() {
+        for publication_started in [false, true] {
+            let hook = PublicationHook::new();
+            let entered = hook.arm().unwrap();
+            let pause = hook.pause_if_armed();
+            tokio::pin!(pause);
+            if publication_started {
+                tokio::select! {
+                    () = &mut pause => panic!("Publication resumed before release"),
+                    result = entered => result.unwrap(),
+                }
+            }
+
+            let error = hook.arm().unwrap_err();
+            Python::attach(|py| {
+                assert!(error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+                assert!(error.to_string().contains("already armed"));
+            });
+
+            hook.release();
+            pause.await;
+            assert!(hook.arm().is_ok());
+            hook.release();
+        }
     }
 
     #[cfg(debug_assertions)]

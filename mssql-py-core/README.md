@@ -52,10 +52,21 @@ For SDK authors integrating the native runtime:
   protocol recovery. Shield that awaitable from caller cancellation before
   reusing the connection. Recovery is bounded to five seconds from the first
   cancellation; repeated waits do not restart that budget. Failed or timed-out
-  recovery leaves the connection broken. Cancelling the original
-  Python future alone still returns immediately while recovery runs in the
-  background. The hook adds per-operation lifetime bookkeeping, not per-row
-  copies, and does not change synchronous or connection/authentication APIs.
+  recovery leaves the connection broken. Worker interruption, delivery-task
+  join failures, and cancellation timeouts raise `OperationalError`.
+  Cancelling the original Python future alone still returns immediately while
+  recovery runs in the background. The hook adds per-operation lifetime
+  bookkeeping, not per-row copies, and does not change synchronous or
+  connection/authentication APIs.
+  Streaming `fetchone()` repeats this bookkeeping for each row. Relative to
+  the `pyo3-async-runtimes` delivery bridge, successful delivery adds one
+  blocking task/GIL acquisition to release backup Python references after
+  delivery. This preserves their lifetime through worker failure and recovery,
+  but cleanup can contend with subsequent fetches. `fetchmany()` and
+  `fetchall()` amortize the per-call cost. A
+  [fetch-loop benchmark](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/benchmarks/fetchone_delivery.py)
+  uses the existing test connection settings to measure warmed native
+  `fetchone()` and `fetchmany()` loops, excluding connection and execute time.
   Streaming fetches retain exclusive session ownership during Python row
   conversion while rows or later result sets remain. Cancellation can settle
   that batch without waiting for conversion. Fully exhausted batches release

@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::async_cursor::map_claim_error;
 use crate::async_description::DescriptionState;
-use crate::async_errors::map_tds_error;
+use crate::async_errors::{OperationalError, map_tds_error};
 use crate::async_fetch::{BufferedResults, FetchState, FetchStatus};
 use crate::async_handle::LogicalConnection;
 use crate::async_session::{AsyncConnectionState, FetchId, OperationId};
@@ -263,7 +263,7 @@ impl QueryControl {
                         operation = self.operation,
                         "Query cancellation acknowledgement timed out"
                     );
-                    return Err(PyRuntimeError::new_err(
+                    return Err(OperationalError::new_err(
                         "Query cancellation acknowledgement timed out; connection is broken",
                     ));
                 }
@@ -313,7 +313,7 @@ impl QueryControl {
                     "Query cancellation settlement timed out without owning the connection"
                 };
                 tracing::error!(operation = self.operation, retired, "{message}");
-                return Err(PyRuntimeError::new_err(message));
+                return Err(OperationalError::new_err(message));
             }
         }
         self.session.ensure_open().map_err(map_claim_error)
@@ -474,7 +474,7 @@ where
     let result = receiver.await;
     waiting.completed = true;
     result
-        .map_err(|error| PyRuntimeError::new_err(format!("Async query worker failed: {error}")))?
+        .map_err(|error| OperationalError::new_err(format!("Async query worker failed: {error}")))?
 }
 
 async fn schedule_delivery<T>(
@@ -515,7 +515,7 @@ where
         })
     })
     .await
-    .map_err(|error| PyRuntimeError::new_err(format!("Query result delivery failed: {error}")))?
+    .map_err(|error| OperationalError::new_err(format!("Query result delivery failed: {error}")))?
 }
 
 /// Registered workers retain recovery ownership until Python accepts their result.
@@ -598,9 +598,12 @@ where
 mod tests {
     use std::task::{Context, Poll, Waker};
 
+    use mssql_tds::connection::tds_client::ExecuteOptions;
+    use mssql_tds::test_client_support::{col_metadata_empty, tds_client_from_tokens};
     use tokio::sync::oneshot;
 
     use super::*;
+    use crate::async_errors::InterfaceError;
     use crate::async_session::{ClaimError, SessionOperationGuard};
 
     #[test]
@@ -668,6 +671,7 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("Event loop is closed"));
+        Python::attach(|py| assert!(error.is_instance_of::<PyRuntimeError>(py)));
         assert_eq!(session.ensure_open(), Err(ClaimError::Broken));
         assert!(session.must_discard());
     }
@@ -718,6 +722,7 @@ mod tests {
             .unwrap_err();
 
             assert!(error.to_string().contains("Result delivery failed"));
+            Python::attach(|py| assert!(error.is_instance_of::<PyRuntimeError>(py)));
             assert_eq!(session.is_broken(), phase == "unsettled", "{phase}");
             if phase != "unsettled" {
                 assert_eq!(session.validate_operation(current_id), Ok(()), "{phase}");
@@ -803,15 +808,100 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         tasks.abort_all();
         assert!(tasks.join_next().await.unwrap().unwrap_err().is_cancelled());
-        assert!(
-            waiting
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("worker failed")
-        );
+        let error = waiting.await.unwrap_err();
+        assert!(error.to_string().contains("worker failed"));
+        Python::attach(|py| assert!(error.is_instance_of::<OperationalError>(py)));
         assert!(control.is_settled());
         assert!(session.is_broken());
+    }
+
+    #[tokio::test]
+    async fn panicked_query_worker_returns_operational_error() {
+        let session = Arc::new(AsyncConnectionState::new());
+        let claim = session.claim_execute(1).unwrap();
+        let control = QueryControl::new(Arc::clone(&session), "execute");
+        control.register_execute(claim.operation_id);
+
+        let error = run_query_in_background::<_, ()>(
+            async { panic!("Controlled query worker panic") },
+            Arc::clone(&control),
+        )
+        .await
+        .unwrap_err();
+
+        Python::attach(|py| assert!(error.is_instance_of::<OperationalError>(py)));
+        assert!(error.to_string().contains("Async query worker failed"));
+        assert!(control.is_settled());
+        assert!(session.is_broken());
+    }
+
+    #[tokio::test]
+    async fn attention_acknowledgement_timeout_returns_operational_error() {
+        let mut client = tds_client_from_tokens(vec![col_metadata_empty()]);
+        client
+            .execute("SELECT 1".into(), ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert!(client.has_open_batch());
+        let session = Arc::new(AsyncConnectionState::new());
+        let claim = session.claim_execute(1).unwrap();
+        let control = QueryControl::new(Arc::clone(&session), "execute");
+        control.register_execute(claim.operation_id);
+        control.cancel();
+        let worker_control = Arc::clone(&control);
+
+        let error = run_query_in_background(
+            async move { worker_control.settle_open_batch(&mut client).await },
+            control,
+        )
+        .await
+        .unwrap_err();
+
+        Python::attach(|py| assert!(error.is_instance_of::<OperationalError>(py)));
+        assert!(
+            error
+                .to_string()
+                .contains("Query cancellation acknowledgement timed out")
+        );
+        assert_eq!(session.ensure_open(), Err(ClaimError::Broken));
+    }
+
+    #[tokio::test]
+    async fn result_delivery_task_panic_returns_operational_error() {
+        struct PanickingResult;
+
+        impl<'py> IntoPyObject<'py> for PanickingResult {
+            type Target = PyAny;
+            type Output = Bound<'py, PyAny>;
+            type Error = PyErr;
+
+            fn into_pyobject(self, _py: Python<'py>) -> Result<Self::Output, Self::Error> {
+                panic!("Controlled result conversion panic")
+            }
+        }
+
+        let control = QueryControl::new(Arc::new(AsyncConnectionState::new()), "execute");
+        let (event_loop, future, delivery, cleanup_loop) = Python::attach(|py| {
+            let event_loop = py
+                .import("asyncio")
+                .unwrap()
+                .call_method0("new_event_loop")
+                .unwrap();
+            let future = event_loop.call_method0("create_future").unwrap().unbind();
+            let cleanup_loop = event_loop.clone().unbind();
+            let delivery = Py::new(py, QueryDelivery { control }).unwrap();
+            (event_loop.unbind(), future, delivery, cleanup_loop)
+        });
+
+        let error = schedule_delivery(event_loop, future, delivery, Ok(PanickingResult))
+            .await
+            .unwrap_err();
+
+        Python::attach(|py| {
+            cleanup_loop.bind(py).call_method0("close").unwrap();
+            assert!(error.is_instance_of::<OperationalError>(py));
+        });
+        assert!(error.to_string().contains("Query result delivery failed"));
     }
 
     #[test]
@@ -866,6 +956,7 @@ mod tests {
             let error = control.wait_for_settlement().await.unwrap_err();
 
             assert!(error.to_string().contains("timed out"));
+            Python::attach(|py| assert!(error.is_instance_of::<OperationalError>(py)));
             assert!(!session.is_broken());
             assert!(!session.must_discard());
             assert_eq!(session.validate_operation(replacement_id), Ok(()));
@@ -901,6 +992,7 @@ mod tests {
         let error = control.wait_for_settlement().await.unwrap_err();
 
         assert!(error.to_string().contains("settlement timed out"));
+        Python::attach(|py| assert!(error.is_instance_of::<OperationalError>(py)));
         assert_eq!(started.elapsed(), SETTLEMENT_TIMEOUT);
         assert_eq!(session.ensure_open(), Err(ClaimError::Broken));
     }
@@ -923,7 +1015,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(control.wait_for_settlement().await.is_err());
+        let error = control.wait_for_settlement().await.unwrap_err();
+        Python::attach(|py| assert!(error.is_instance_of::<InterfaceError>(py)));
         assert_eq!(session.ensure_open(), Err(ClaimError::Broken));
     }
 }
