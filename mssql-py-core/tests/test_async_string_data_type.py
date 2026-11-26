@@ -829,20 +829,17 @@ def test_cancelled_execute_with_large_string_closes_safely(client_context, use_p
                                 with pytest.raises(asyncio.CancelledError):
                                     await pending
 
-                                for _ in range(100):
-                                    try:
-                                        await cursor.execute(
-                                            "SELECT N'after cancellation'", use_prepare=use_prepare
-                                        )
-                                    except mssql_py_core.InterfaceError as error:
-                                        if "busy" not in str(error).lower():
-                                            assert str(error) == "Connection is broken"
-                                            break
-                                        await asyncio.sleep(0.01)
-                                    else:
-                                        pytest.fail("Cancelled execute left the connection reusable")
-                                else:
-                                    pytest.fail("Cancelled execute left the connection permanently busy")
+                                await asyncio.wait_for(
+                                    asyncio.shield(pending._cancel_and_settle()), timeout=6
+                                )
+                                probe = conn.cursor()
+                                await probe.execute(
+                                    "SELECT N'after cancellation', @@SPID",
+                                    use_prepare=use_prepare,
+                                )
+                                assert await probe.fetchall() == [
+                                    ("after cancellation", session_id)
+                                ]
                                 assert not other.done()
                             finally:
                                 await control.execute(
@@ -1018,11 +1015,15 @@ def test_cancelled_large_string_insert_rolls_back_on_close(client_context, use_p
         async with owner:
             control = owner.cursor()
             table = f"##async_strings_{uuid.uuid4().hex}"
+            rollback_table = f"{table}_rollback"
             await control.execute(
                 f"CREATE TABLE {table} (id int PRIMARY KEY, value nvarchar(max))",
                 use_prepare=False,
             )
             try:
+                await control.execute(
+                    f"CREATE TABLE {rollback_table} (id int PRIMARY KEY)", use_prepare=False
+                )
                 await control.execute(
                     f"INSERT INTO {table} VALUES (0, N'baseline')", use_prepare=False
                 )
@@ -1033,6 +1034,16 @@ def test_cancelled_large_string_insert_rolls_back_on_close(client_context, use_p
                         cursor = writer.cursor()
                         await cursor.execute("SELECT @@SPID", use_prepare=False)
                         [(session_id,)] = await cursor.fetchall()
+                        # Keep prior uncommitted work outside the table locked by the controller.
+                        await cursor.execute(
+                            f"INSERT INTO {rollback_table} VALUES (1)",
+                            use_prepare=use_prepare,
+                        )
+                        await control.execute(
+                            f"SELECT id FROM {rollback_table} WITH (NOLOCK)",
+                            use_prepare=False,
+                        )
+                        assert await control.fetchall() == [(1,)]
                         await control.execute(
                             f"BEGIN TRANSACTION; SELECT id FROM {table} "
                             "WITH (TABLOCKX, HOLDLOCK)",
@@ -1049,6 +1060,9 @@ def test_cancelled_large_string_insert_rolls_back_on_close(client_context, use_p
                         assert pending.cancel()
                         with pytest.raises(asyncio.CancelledError):
                             await pending
+                        await asyncio.wait_for(
+                            asyncio.shield(pending._cancel_and_settle()), timeout=6
+                        )
                     finally:
                         if pending is not None and not pending.done():
                             pending.cancel()
@@ -1057,24 +1071,27 @@ def test_cancelled_large_string_insert_rolls_back_on_close(client_context, use_p
                         await control.execute(
                             "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION", use_prepare=False
                         )
-                    for _ in range(500):
-                        await control.execute(
-                            f"SELECT COUNT(*) FROM {table} WITH (NOLOCK) WHERE id = 1",
-                            use_prepare=False,
-                        )
-                        if await control.fetchall() == [(1,)]:
-                            break
-                        await asyncio.sleep(0.01)
-                    else:
-                        pytest.fail("Cancelled INSERT never executed server-side")
+                    await control.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE id = 1", use_prepare=False
+                    )
+                    assert await control.fetchall() == [(0,)]
+                    await control.execute(
+                        f"SELECT id FROM {rollback_table} WITH (NOLOCK)", use_prepare=False
+                    )
+                    assert await control.fetchall() == [(1,)]
                     await writer.close()
 
+                await control.execute(f"SELECT id FROM {rollback_table}", use_prepare=False)
+                assert await control.fetchall() == []
                 await control.execute(
                     f"SELECT id, value FROM {table} ORDER BY id", use_prepare=False
                 )
                 assert await control.fetchall() == [(0, "baseline")]
             finally:
-                await control.execute(f"DROP TABLE IF EXISTS {table}", use_prepare=False)
+                await control.execute(
+                    f"DROP TABLE IF EXISTS {table}; DROP TABLE IF EXISTS {rollback_table}",
+                    use_prepare=False,
+                )
 
     asyncio.run(run())
 
