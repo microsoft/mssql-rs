@@ -14,6 +14,13 @@ context. Increasing the scale pads with zeros. Precision is checked after
 rounding, so a carry that exceeds the destination precision still raises a
 conversion error.
 
+For `Decimal` and decimal-string inputs, source precision may exceed 38 if the
+rounded value fits the destination. For example,
+`123456789012345678901234567890123456.785` fits `DECIMAL(38,2)` after rounding to
+`123456789012345678901234567890123456.79`. This differs from `mssql-python`
+`execute()`, which rejects `Decimal` inputs with source precision above 38
+before server conversion.
+
 Python `float` inputs use binary floating-point formatting instead of this
 decimal rounding rule. Exact binary ties round to even: `2.5` becomes `2` at
 scale 0, and `0.125` becomes `0.12` at scale 2. Use `Decimal` or decimal strings
