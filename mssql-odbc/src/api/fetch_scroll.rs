@@ -3004,6 +3004,13 @@ unsafe fn deliver_bound(
     if binding.target_type == SQL_C_WCHAR {
         let utf16: Vec<u16> = text.encode_utf16().collect();
         unsafe { write_if_some(octet_length, (utf16.len() * 2) as SqlLen) };
+        let copied = utf16.len().min(buf_elements.saturating_sub(1));
+        let splits_json_pair = matches!(value, ColumnValues::Json(_))
+            && copied > 0
+            && utf16
+                .get(copied)
+                .is_some_and(|next| is_surrogate_pair(utf16[copied - 1], *next));
+        let buf_elements = buf_elements - usize::from(splits_json_pair);
         let truncated = unsafe { copy_with_nul(slot as *mut SqlWChar, buf_elements, &utf16) };
         if truncated || (slot.is_null() && !utf16.is_empty()) {
             return RowOutcome::Info(RowIssue::StringTruncated);

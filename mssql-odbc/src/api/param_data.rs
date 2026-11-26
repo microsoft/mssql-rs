@@ -1800,4 +1800,28 @@ mod tests {
         );
         assert!(!state.needs_data());
     }
+
+    #[test]
+    fn json_incomplete_character_at_param_data_aborts_and_clears_carry() {
+        use crate::api::odbc_types::SQL_SS_JSON;
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            let param = DaeParam::unbounded(0, std::ptr::null_mut(), None)
+                .with_binding_types(crate::api::odbc_types::SQL_C_WCHAR, SQL_SS_JSON);
+            let mut dae = DaeState::for_test(vec![param], Some(0));
+            dae.progress.put_data_called = true;
+            dae.progress.carry = vec![0x3d, 0xd8];
+            state.dae = Some(dae);
+        }
+        let mut token = std::ptr::null_mut();
+        assert_eq!(unsafe { sql_param_data(h.stmt, &mut token) }, SQL_ERROR);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_DAE_LENGTH_MISMATCH.state
+        );
+        assert!(!state.needs_data());
+    }
 }

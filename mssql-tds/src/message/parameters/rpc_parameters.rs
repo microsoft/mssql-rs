@@ -2255,6 +2255,19 @@ mod tests {
         assert_eq!(streamed_header_bytes(&param, false), expected);
     }
 
+    #[test]
+    fn serialize_data_at_exec_json_has_no_collation_or_schema() {
+        let param = RpcParameter::data_at_exec(
+            Some("@p".to_string()),
+            StatusFlags::BY_REF_VALUE,
+            StreamedSqlType::Json,
+        );
+        assert_eq!(
+            streamed_header_bytes(&param, false),
+            vec![2, 0x40, 0, 0x70, 0, 1, 0xf4]
+        );
+    }
+
     /// Every streamed type declares itself in the `sp_executesql` `@params`
     /// string under its own T-SQL name, so the server binds the same type it
     /// sees in TYPE_INFO.
@@ -2265,6 +2278,7 @@ mod tests {
             (StreamedSqlType::VarcharMax, "varchar(max)"),
             (StreamedSqlType::VarBinaryMax, "varbinary(max)"),
             (StreamedSqlType::Xml, "xml"),
+            (StreamedSqlType::Json, "json"),
             (
                 StreamedSqlType::Udt(UdtTypeName::new(
                     None,

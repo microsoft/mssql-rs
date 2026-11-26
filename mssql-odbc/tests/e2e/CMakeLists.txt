@@ -281,6 +281,7 @@ add_odbc_test(odbc_diagnostics_mutex_test tests/odbc_diagnostics_mutex_test.cpp)
 set_tests_properties(odbc_diagnostics_mutex_test PROPERTIES TIMEOUT 30)
 
 add_odbc_test(smoke_test         tests/smoke_test.cpp)
+add_odbc_test(json_parameter_test tests/json_parameter_test.cpp)
 add_odbc_test(alloc_env_test     tests/alloc_env_test.cpp)
 add_odbc_test(alloc_dbc_test     tests/alloc_dbc_test.cpp)
 add_odbc_test(alloc_stmt_test    tests/alloc_stmt_test.cpp)
