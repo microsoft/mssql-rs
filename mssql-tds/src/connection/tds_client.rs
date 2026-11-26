@@ -1602,6 +1602,12 @@ impl TdsClient {
         self.negotiated_settings.session_settings.json_version()
     }
 
+    /// VECTOR version enabled for the current physical session, or zero when
+    /// the server did not acknowledge it. Recovery replaces the negotiated value.
+    pub fn negotiated_vector_version(&self) -> u8 {
+        self.negotiated_settings.vector_version()
+    }
+
     /// Rows affected by the most recently executed statement.
     ///
     /// Returns the row count from the last DONE token that carried the

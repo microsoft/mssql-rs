@@ -166,6 +166,7 @@ pub(super) fn clear_session(dbc: &DbcHandle, state: &mut DbcState) {
     state.database_user_name = None;
     state.database_read_only = None;
     state.alias_types = None;
+    state.catalog_procedures = Default::default();
     state.last_collation_code_page = None;
     state.last_char_set = None;
     state.connection_state = ConnectionState::Disconnected;

@@ -60,7 +60,6 @@ use std::time::Instant;
 
 use tracing::{debug, error};
 
-use mssql_tds::connection::tds_client::ExecuteOptions;
 use mssql_tds::datatypes::sql_string::SqlString;
 use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::error::Error as TdsError;
@@ -615,30 +614,17 @@ fn run_catalog_operation(
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
-    let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
-        Ok(remaining) => remaining,
-        Err(()) => {
-            return fail_with_tds(
-                dbc,
-                stmt,
-                statement_handle,
-                client,
-                &query_timeout_expired_error(),
-            );
-        }
-    };
-
-    let (positional, named) = build_params(false);
     let pending = super::ird::clear_for_send(stmt, &client);
-    let mut exec_result = dbc.runtime.block_on(
-        client.execute_stored_procedure(
-            qualified_proc_name(catalog, proc),
-            Some(positional),
-            named,
-            ExecuteOptions::new()
-                .timeout_secs(query_timeout)
-                .cancel(&cancel_handle),
-        ),
+    let mut exec_result = super::catalog_procedure::execute(
+        dbc,
+        &mut client,
+        proc,
+        catalog.as_deref(),
+        || build_params(false),
+        |proc| qualified_proc_name(catalog, proc),
+        budget,
+        started,
+        &cancel_handle,
     );
 
     if retry_on_error && matches!(exec_result, Err(TdsError::SqlServerError { .. })) {
@@ -669,8 +655,8 @@ fn run_catalog_operation(
         // The gate above, by contrast, MATCHES msodbcsql: only a server error
         // retries, never a timeout or transport failure, mirroring its
         // `wStdErr != IDS_S1_T00_1` check (`sqlcdd.cpp:1883`).
-        let retry_timeout = match deduct_query_timeout(budget, started.elapsed()) {
-            Ok(remaining) => remaining,
+        match deduct_query_timeout(budget, started.elapsed()) {
+            Ok(_) => {}
             Err(()) => {
                 // The budget ran out before the fallback could run. Report the
                 // qualified attempt's own server error rather than `HYT00`:
@@ -679,21 +665,22 @@ fn run_catalog_operation(
                 // error is otherwise dropped here along with the info messages
                 // discarded above. (msodbcsql cannot reach this state, since
                 // its retry never re-checks the budget — see mssql-rs#547.)
-                let original = exec_result.expect_err("matches! above proved this is an Err");
-                error!(%original, "{name}: query timeout expired before the unqualified retry");
-                return fail_with_tds(dbc, stmt, statement_handle, client, &original);
+                if let Err(original) = exec_result {
+                    error!(%original, "{name}: query timeout expired before the unqualified retry");
+                    return fail_with_tds(dbc, stmt, statement_handle, client, &original);
+                }
             }
-        };
-        let (retry_positional, retry_named) = build_params(true);
-        exec_result = dbc.runtime.block_on(
-            client.execute_stored_procedure(
-                qualified_proc_name(&None, proc),
-                Some(retry_positional),
-                retry_named,
-                ExecuteOptions::new()
-                    .timeout_secs(retry_timeout)
-                    .cancel(&cancel_handle),
-            ),
+        }
+        exec_result = super::catalog_procedure::execute(
+            dbc,
+            &mut client,
+            proc,
+            None,
+            || build_params(true),
+            |proc| qualified_proc_name(&None, proc),
+            budget,
+            started,
+            &cancel_handle,
         );
     }
 

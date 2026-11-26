@@ -15,7 +15,6 @@ use std::time::Instant;
 
 use tracing::{debug, error};
 
-use mssql_tds::connection::tds_client::ExecuteOptions;
 use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
 
@@ -30,8 +29,8 @@ use crate::api::odbc_types::{
     SQL_ALL_TYPES, SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_CHAR, SQL_DATETIME, SQL_DECIMAL,
     SQL_DOUBLE, SQL_ERROR, SQL_FLOAT, SQL_GUID, SQL_INTEGER, SQL_INTERVAL_MINUTE_TO_SECOND,
     SQL_INTERVAL_YEAR, SQL_INVALID_HANDLE, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NUMERIC,
-    SQL_REAL, SQL_SMALLINT, SQL_SS_TABLE, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT,
-    SQL_SS_VECTOR, SQL_SS_XML, SQL_TIME, SQL_TIMESTAMP, SQL_TINYINT, SQL_TYPE_DATE,
+    SQL_REAL, SQL_SMALLINT, SQL_SS_JSON, SQL_SS_TABLE, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET,
+    SQL_SS_VARIANT, SQL_SS_VECTOR, SQL_SS_XML, SQL_TIME, SQL_TIMESTAMP, SQL_TINYINT, SQL_TYPE_DATE,
     SQL_TYPE_DRIVER_START, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR,
     SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlHandle, SqlReturn, SqlSmallInt,
 };
@@ -41,11 +40,7 @@ use crate::handles::stmt::{
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
-/// Catalog procedure returning the ODBC `SQLGetTypeInfo` result set. This
-/// driver targets SQL Server 2016+, so the Katmai (`_100`) form is always
-/// available; selecting `_90`/`_170` by negotiated server version and vector
-/// support is deferred until that version is surfaced to the ODBC layer.
-const DATATYPE_INFO_PROC: &str = "[sys].sp_datatype_info_100";
+const DATATYPE_INFO_PROC: &str = "sp_datatype_info_100";
 
 /// `@ODBCVer` value sent for ODBC 3.x applications against a Katmai+ server.
 // Classic SQLGetTypeInfoW sends this pseudo-version 4 on Yukon-or-newer servers
@@ -176,9 +171,6 @@ fn sql_get_type_info_w_operation(
         (stmt_state.query_timeout, cancel_handle)
     };
 
-    // `@data_type` is positional and uses the ODBC 3.x identifier unchanged.
-    let (positional, named) = type_info_rpc_params(data_type);
-
     let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLGetTypeInfoW") {
         Ok(client) => client,
         Err(rc) => return rc,
@@ -225,29 +217,17 @@ fn sql_get_type_info_w_operation(
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
-    let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
-        Ok(remaining) => remaining,
-        Err(()) => {
-            return fail_with_tds(
-                dbc,
-                stmt,
-                statement_handle,
-                client,
-                &query_timeout_expired_error(),
-            );
-        }
-    };
-
     let pending = super::ird::clear_for_send(stmt, &client);
-    let exec_result = dbc.runtime.block_on(
-        client.execute_stored_procedure(
-            DATATYPE_INFO_PROC.to_string(),
-            Some(positional),
-            named,
-            ExecuteOptions::new()
-                .timeout_secs(query_timeout)
-                .cancel(&cancel_handle),
-        ),
+    let exec_result = super::catalog_procedure::execute(
+        dbc,
+        &mut client,
+        DATATYPE_INFO_PROC,
+        None,
+        || type_info_rpc_params(data_type),
+        |proc| format!("[sys].{proc}"),
+        budget,
+        started,
+        &cancel_handle,
     );
     if let Err(e) = exec_result {
         error!(%e, "SQLGetTypeInfoW: execution failed");
@@ -318,8 +298,6 @@ enum TypeClass {
 ///    discards a HYC00 from it, so the interval types reach the RPC and come
 ///    back as an empty result set rather than an error.
 ///
-/// `SQL_SS_VECTOR` is the one id that deliberately does not follow msodbcsql
-/// yet; see its arm below.
 fn classify_sql_type(data_type: SqlSmallInt) -> TypeClass {
     match data_type {
         SQL_ALL_TYPES
@@ -352,7 +330,9 @@ fn classify_sql_type(data_type: SqlSmallInt) -> TypeClass {
         | SQL_SS_TIME2
         | SQL_SS_TIMESTAMPOFFSET
         | SQL_SS_VARIANT
-        | SQL_SS_XML => TypeClass::Valid,
+        | SQL_SS_XML
+        | SQL_SS_JSON
+        | SQL_SS_VECTOR => TypeClass::Valid,
         // Step 3: `IsValidSqlType` calls these HYC00, which `SQLGetTypeInfoW`
         // then discards, so the caller gets an empty result set.
         SQL_INTERVAL_YEAR..=SQL_INTERVAL_MINUTE_TO_SECOND => TypeClass::Valid,
@@ -363,18 +343,6 @@ fn classify_sql_type(data_type: SqlSmallInt) -> TypeClass {
         // (13-19) and the `SQL_NATIVE_*` ids are -21/-22, so all of them reach
         // the final `Invalid` arm and get HY004 without special-casing.
         SQL_SS_TABLE => TypeClass::Invalid,
-        // Deliberately not msodbcsql's answer. msodbcsql accepts this id, but
-        // only because it also switches the catalog proc: `sp_datatype_info_170`
-        // when the connection negotiated vector support, `sp_datatype_info_100`
-        // otherwise (`sqlcdd.cpp:1931`, selected at lines 2049-2056). This
-        // driver always calls `_100`, which has no vector row, so accepting the
-        // id would report success while telling the application the type does
-        // not exist. HYC00 says "not implemented", which is true until the
-        // negotiated vector capability is surfaced from `mssql-tds` to this
-        // layer and `_170` can be selected; accept it in the arm above at that
-        // point. Tracked by AB#48326 (P9g: Vector parameter binding and the
-        // SQL_SS_VECTOR client struct).
-        SQL_SS_VECTOR => TypeClass::NotAnOdbcType,
         // Step 2: unlike the SS types above, `SQL_SS_UDT` has no internal
         // "MAPPED" form, so it — and every other unmapped id in the driver
         // range — falls through to the HYC00 bound.
@@ -715,16 +683,11 @@ mod tests {
         }
     }
 
-    /// The deliberate exception: msodbcsql accepts `SQL_SS_VECTOR`, but only
-    /// together with the `sp_datatype_info_170` selection this driver does not
-    /// have yet. Flip this to `Valid` when that lands.
     #[test]
-    fn vector_is_deferred_until_the_170_catalog_proc_is_selectable() {
-        assert!(matches!(
-            classify_sql_type(SQL_SS_VECTOR),
-            TypeClass::NotAnOdbcType
-        ));
-        assert_eq!(DATATYPE_INFO_PROC, "[sys].sp_datatype_info_100");
+    fn native_types_are_valid_catalog_filters_even_when_legacy_catalogs_omit_them() {
+        for data_type in [SQL_SS_JSON, SQL_SS_VECTOR] {
+            assert!(matches!(classify_sql_type(data_type), TypeClass::Valid));
+        }
     }
 
     /// `SQLGetTypeInfo` sends the Yukon pseudo-version, not the 3 the catalog
