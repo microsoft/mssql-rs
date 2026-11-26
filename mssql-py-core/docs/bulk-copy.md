@@ -4,6 +4,16 @@ Conversion notes for SDK authors using the
 [`mssql_py_core` extension](../README.md). For the Python database API, use
 [`mssql-python`](https://github.com/microsoft/mssql-python).
 
+## Decimal scale
+
+Bulk copy rounds Python `Decimal`, decimal strings, and Arrow `decimal128`
+values to the destination `DECIMAL`/`NUMERIC` scale, with ties rounded away
+from zero (`123.455` becomes `123.46`; `-123.455` becomes `-123.46` at scale 2).
+Conversion uses exact decimal arithmetic, independent of Python's decimal
+context. Increasing the scale pads with zeros. Precision is checked after
+rounding, so a carry that exceeds the destination precision still raises a
+conversion error. NULL handling and batch transaction behavior are unchanged.
+
 ## Datetime strings
 
 Bulk copy parses ISO datetime strings targeting `DATETIME2` and `DATETIMEOFFSET`

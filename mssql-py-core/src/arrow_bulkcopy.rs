@@ -501,7 +501,7 @@ impl ColumnPlan {
                 // then re-scale to the destination column's precision/scale (so
                 // decimal128(10,2) -> DECIMAL(10,4) stores 123.4500, not 1.2345).
                 let s = decimal128_to_string(raw, scale);
-                let parts = DecimalParts::from_string(&s, dest.precision, dest.scale)?;
+                let parts = DecimalParts::from_string_rounded(&s, dest.precision, dest.scale)?;
                 Ok(match dest.sql_type {
                     SqlDbType::Numeric => ColumnValues::Numeric(parts),
                     _ => ColumnValues::Decimal(parts),
@@ -1474,6 +1474,32 @@ mod tests {
         match plan.extract_value(arr.as_ref(), 0, &dest).unwrap() {
             ColumnValues::Numeric(d) => assert_eq!(d.to_string(), "123.45"),
             other => panic!("expected Numeric, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decimal128_rounds_to_dest_scale_and_checks_carry() {
+        for sql_type in [SqlDbType::Decimal, SqlDbType::Numeric] {
+            let mut dest = meta("amt", sql_type, true);
+            dest.precision = 5;
+            dest.scale = 2;
+            let arr: ArrayRef = Arc::new(
+                Decimal128Array::from(vec![Some(123455), Some(-123455), Some(999995)])
+                    .with_precision_and_scale(6, 3)
+                    .unwrap(),
+            );
+            let plan = one_col_plan(DataType::Decimal128(6, 3), &dest);
+            for (row, expected) in [(0, "123.46"), (1, "-123.46")] {
+                let value = plan.extract_value(arr.as_ref(), row, &dest).unwrap();
+                let parts = match value {
+                    ColumnValues::Decimal(parts) if sql_type == SqlDbType::Decimal => parts,
+                    ColumnValues::Numeric(parts) if sql_type == SqlDbType::Numeric => parts,
+                    other => panic!("unexpected decimal value: {other:?}"),
+                };
+                assert_eq!(parts.to_string(), expected);
+            }
+            let error = plan.extract_value(arr.as_ref(), 2, &dest).unwrap_err();
+            assert!(error.to_string().contains("exceeds target precision"));
         }
     }
 

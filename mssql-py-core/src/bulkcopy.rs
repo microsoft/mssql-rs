@@ -500,7 +500,7 @@ impl PythonRowAdapter {
                 Ok(Some(result))
             }
 
-            // Decimal → Decimal/Numeric: Validate precision/scale
+            // Decimal → Decimal/Numeric: Round to destination scale
             (SourcePythonType::Decimal, SqlDbType::Decimal | SqlDbType::Numeric) => {
                 let result = Self::coerce_decimal_to_decimal(py_obj, target_meta)?;
                 Ok(Some(result))
@@ -846,7 +846,7 @@ impl PythonRowAdapter {
             .map_err(|e| Error::UsageError(format!("Failed to extract string: {}", e)))?;
 
         let decimal_parts =
-            DecimalParts::from_string(&s, target_meta.precision, target_meta.scale)?;
+            DecimalParts::from_string_rounded(&s, target_meta.precision, target_meta.scale)?;
 
         if target_meta.sql_type == SqlDbType::Numeric {
             Ok(ColumnValues::Numeric(decimal_parts))
@@ -894,7 +894,7 @@ impl PythonRowAdapter {
     }
 
     /// Coerce a Python Decimal to a SQL Server DECIMAL/NUMERIC type.
-    /// Validates that the Python Decimal's precision and scale match the target.
+    /// Rounds to the target scale, then validates precision.
     fn coerce_decimal_to_decimal(
         py_obj: &Bound<'_, PyAny>,
         target_meta: &BulkCopyColumnMetadata,
@@ -904,7 +904,7 @@ impl PythonRowAdapter {
             && let Ok(s) = decimal_str.extract::<String>()
         {
             let decimal_parts =
-                DecimalParts::from_string(&s, target_meta.precision, target_meta.scale)?;
+                DecimalParts::from_string_rounded(&s, target_meta.precision, target_meta.scale)?;
 
             if target_meta.sql_type == SqlDbType::Numeric {
                 return Ok(ColumnValues::Numeric(decimal_parts));

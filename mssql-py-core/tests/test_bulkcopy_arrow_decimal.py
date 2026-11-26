@@ -173,6 +173,34 @@ def test_cursor_bulkcopy_arrow_decimal_null_to_non_nullable_column(client_contex
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("sql_type", ["DECIMAL", "NUMERIC"])
+def test_cursor_bulkcopy_arrow_decimal_rounds_to_destination(client_context, sql_type):
+    """Arrow scale reduction follows the same tie rule as Python Decimal rows."""
+    conn = mssql_py_core.PyCoreConnection(client_context)
+    cursor = conn.cursor()
+    table_name = "#BulkCopyArrowDecimalRounding"
+    try:
+        cursor.execute(f"CREATE TABLE {table_name} (amt {sql_type}(5,2))")
+        source = pa.table(
+            {"amt": pa.array(
+                [Decimal("123.455"), Decimal("-123.455"), Decimal("123.454"), None],
+                type=pa.decimal128(6, 3),
+            )}
+        )
+        result = cursor.bulkcopy_arrow(
+            table_name, source, batch_size=2, use_internal_transaction=True
+        )
+        assert result["rows_copied"] == 4
+        assert result["batch_count"] == 2
+        cursor.execute(f"SELECT amt FROM {table_name} ORDER BY amt")
+        assert [row[0] for row in cursor.fetchall()] == [
+            None, Decimal("-123.46"), Decimal("123.45"), Decimal("123.46")
+        ]
+    finally:
+        conn.close()
+
+
+@pytest.mark.integration
 def test_cursor_bulkcopy_arrow_decimal_mismatched_scale(client_context):
     """Arrow decimal scale != destination scale re-scales to the column's scale.
 
