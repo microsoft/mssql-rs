@@ -85,6 +85,29 @@ Selected reference scenarios are ported from msodbcsql `feature/JsonFeature`
 at `88c4dd572852d225448b61173fe56fd59ab22e4c`; they have not yet been measured
 against a JSON-enabled native driver and SQL Server. No retail parity is claimed.
 
+Negotiated native JSON support and JSON TVP transport are distinct: TVP
+columns always use the text representation described below.
+
+## JSON table-valued parameter columns
+
+Bind JSON columns as `SQL_SS_JSON` while the TVP is the parameter focus.
+Their descriptors retain that type; the TVP wire metadata and values use
+`nvarchar(max)`, including NULLs, regardless of JSON negotiation,
+`ColumnSize`, or `LongAsMax`.
+
+`SQL_C_CHAR` uses the connection's client encoding, `SQL_C_WCHAR` uses
+UTF-16LE, and `SQL_C_BINARY` uses UTF-8, not UTF-16LE or the client code page.
+`SQL_C_DEFAULT` resolves to `SQL_C_WCHAR`. Invalid UTF-8 fails with `22018`;
+incomplete `SQL_C_CHAR` DAE characters fail with `22026`. Odd WCHAR byte
+lengths fail with `HY090`.
+SQL Server validates JSON syntax.
+
+Column-wise and row-wise bindings share the existing TVP layout rules.
+DAE cells remain buffered until the complete table is ready; conversion
+validates the completed character sequence, allowing characters split across
+`SQLPutData` calls. Wide DAE input transfers its existing UTF-16LE allocation
+to the table value without an intermediate UTF-8 representation.
+
 ## Connection-operation timeouts
 
 `SQL_ATTR_CONNECTION_TIMEOUT` bounds connection-scoped network requests,

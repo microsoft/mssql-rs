@@ -1506,8 +1506,13 @@ mod tests {
         let state = stmt.inner.lock().unwrap();
         let column = state.tvp_column_bindings[&1][0].unwrap();
         assert_eq!(column.parameter_value_ptr, replacement_ptr);
-        let value =
-            unsafe { crate::conversion::param_convert::bound_tvp_cell_to_value(&column) }.unwrap();
+        let value = unsafe {
+            crate::conversion::param_convert::bound_tvp_cell_to_value(
+                &column,
+                crate::conversion::client_encoding::ClientEncoding::UTF8,
+            )
+        }
+        .unwrap();
         assert_eq!(
             value,
             mssql_tds::datatypes::sqltypes::SqlType::Int(Some(99))
@@ -1549,9 +1554,13 @@ mod tests {
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             let column = stmt.inner.lock().unwrap().tvp_column_bindings[&1][0].unwrap();
             assert_eq!((column.app_precision, column.app_scale), (38, 0));
-            let result =
-                unsafe { crate::conversion::param_convert::bound_tvp_cell_to_value(&column) }
-                    .unwrap();
+            let result = unsafe {
+                crate::conversion::param_convert::bound_tvp_cell_to_value(
+                    &column,
+                    crate::conversion::client_encoding::ClientEncoding::UTF8,
+                )
+            }
+            .unwrap();
             let SqlType::Decimal(Some(parts)) = result else {
                 panic!("expected decimal cell");
             };
@@ -1643,9 +1652,13 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let column = stmt.inner.lock().unwrap().tvp_column_bindings[&1][0].unwrap();
         assert_eq!((column.app_precision, column.app_scale), (10, 2));
-        let SqlType::Decimal(Some(parts)) =
-            unsafe { crate::conversion::param_convert::bound_tvp_cell_to_value(&column) }.unwrap()
-        else {
+        let SqlType::Decimal(Some(parts)) = unsafe {
+            crate::conversion::param_convert::bound_tvp_cell_to_value(
+                &column,
+                crate::conversion::client_encoding::ClientEncoding::UTF8,
+            )
+        }
+        .unwrap() else {
             panic!("expected decimal cell");
         };
         assert_eq!(parts.magnitude(), 123);

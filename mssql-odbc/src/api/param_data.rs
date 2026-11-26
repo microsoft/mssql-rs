@@ -153,13 +153,14 @@ fn collect_bound_tvp_cells(
             return Ok(());
         }
         // Bound cell buffers remain application-owned throughout Need Data.
-        let value = unsafe { bound_tvp_cell_to_value(&param.binding) }.map_err(|error| {
-            row_error(ParamBuildError::TvpCellConversion {
-                row: row_index,
-                column: column_index,
-                diagnostic: error.diag(),
-            })
-        })?;
+        let value = unsafe { bound_tvp_cell_to_value(&param.binding, param.client_encoding) }
+            .map_err(|error| {
+                row_error(ParamBuildError::TvpCellConversion {
+                    row: row_index,
+                    column: column_index,
+                    diagnostic: error.diag(),
+                })
+            })?;
         dae.tvp_cells.push(BufferedTvpCell {
             tvp_index,
             row_index,

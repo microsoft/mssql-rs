@@ -1342,7 +1342,7 @@ pub(super) unsafe fn build_named_params_for_row(
                     })?
             };
             if parent_dae || fixed_dae_rows.is_some() {
-                let staged = build_tvp_dae_params(
+                let mut staged = build_tvp_dae_params(
                     i,
                     &tvp_binding,
                     snapshot.udt_names.clone(),
@@ -1356,6 +1356,9 @@ pub(super) unsafe fn build_named_params_for_row(
                     parameter: i + 1,
                     source,
                 })?;
+                for param in &mut staged {
+                    param.client_encoding = snapshot.client_encoding;
+                }
                 dae_params.extend(staged);
                 if let Some(count) = fixed_dae_rows {
                     tvp_row_counts.insert(i, count);
@@ -1382,6 +1385,7 @@ pub(super) unsafe fn build_named_params_for_row(
                         0,
                         column_offset,
                         layout.bind_type,
+                        snapshot.client_encoding,
                     )
                 }
                 .map_err(|source| ParamRowBuildError::Conversion {
@@ -1822,6 +1826,7 @@ pub(super) fn rebuild_deferred_params(
             tvp_index,
             row_count,
             tvp_cells,
+            dae.client_encoding,
         ) {
             Ok(param) => *slot = param.with_odbc_ordinal(parameter_ordinal),
             Err(error) => {
@@ -4389,6 +4394,176 @@ mod tests {
             }
             other => panic!("expected NULL table rows, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn json_tvp_exported_rowwise_binding_preserves_metadata_and_client_encoding() {
+        use crate::api::exports::{SQLBindParameter, SQLGetDescFieldW, SQLSetStmtAttrW};
+        use crate::api::odbc_types::{
+            SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_PARAMSET_SIZE, SQL_C_BINARY, SQL_C_SLONG,
+            SQL_DESC_CONCISE_TYPE, SQL_NULL_DATA, SQL_SOPT_SS_PARAM_FOCUS, SQL_SS_JSON,
+            SQL_SS_TABLE, SQL_SUCCESS, SqlPointer, SqlSmallInt,
+        };
+        use crate::conversion::client_encoding::ClientEncoding;
+        use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
+        use mssql_tds::datatypes::sqltypes::SqlType;
+
+        #[repr(C)]
+        struct Row {
+            text: [u8; 16],
+            text_length: SqlLen,
+            number: i32,
+            number_length: SqlLen,
+        }
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let encoding = ClientEncoding::for_code_page(1252).unwrap();
+        stmt.parent_dbc().inner.lock().unwrap().client_encoding = encoding;
+        let mut rows = [
+            Row {
+                text: [0; 16],
+                text_length: 9,
+                number: 11,
+                number_length: 0,
+            },
+            Row {
+                text: [0; 16],
+                text_length: SQL_NULL_DATA,
+                number: 22,
+                number_length: 0,
+            },
+        ];
+        rows[0].text[..9].copy_from_slice(b"{\"k\":\"\xe9\"}");
+        let mut count = 2;
+        let mut type_name: Vec<u16> = "JsonRows".encode_utf16().collect();
+        assert_eq!(
+            unsafe {
+                SQLBindParameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_BINARY,
+                    SQL_SS_TABLE,
+                    2,
+                    0,
+                    type_name.as_mut_ptr().cast(),
+                    SqlLen::try_from(type_name.len() * 2).unwrap(),
+                    &mut count,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { SQLSetStmtAttrW(h.stmt, SQL_SOPT_SS_PARAM_FOCUS, 1usize as SqlPointer, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                SQLSetStmtAttrW(
+                    h.stmt,
+                    SQL_ATTR_PARAM_BIND_TYPE,
+                    size_of::<Row>() as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { SQLSetStmtAttrW(h.stmt, SQL_ATTR_PARAMSET_SIZE, 2usize as SqlPointer, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                SQLBindParameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_CHAR,
+                    SQL_SS_JSON,
+                    1,
+                    0,
+                    rows[0].text.as_mut_ptr().cast(),
+                    16,
+                    &raw mut rows[0].text_length,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                SQLBindParameter(
+                    h.stmt,
+                    2,
+                    SQL_PARAM_INPUT,
+                    SQL_C_SLONG,
+                    SQL_INTEGER,
+                    10,
+                    0,
+                    (&raw mut rows[0].number).cast(),
+                    4,
+                    &raw mut rows[0].number_length,
+                )
+            },
+            SQL_SUCCESS
+        );
+        let mut concise_type = 0;
+        assert_eq!(
+            unsafe {
+                SQLGetDescFieldW(
+                    h.ipd(),
+                    1,
+                    SqlSmallInt::try_from(SQL_DESC_CONCISE_TYPE).unwrap(),
+                    (&raw mut concise_type).cast(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(concise_type, SQL_SS_JSON);
+        assert_eq!(
+            unsafe { SQLSetStmtAttrW(h.stmt, SQL_SOPT_SS_PARAM_FOCUS, std::ptr::null_mut(), 0) },
+            SQL_SUCCESS
+        );
+
+        let snapshot = snapshot_bound_params(stmt).unwrap();
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params = snapshot.params;
+        let built = unsafe { build_named_params(&mut state, 1, 0, "test") }.unwrap();
+        match mssql_tds::test_client_support::rpc_parameter_value(&built.params[0]).unwrap() {
+            SqlType::Table(_, Some(table)) => assert_eq!(
+                table.rows,
+                vec![
+                    vec![
+                        SqlType::NVarcharMax(Some(SqlString::new(
+                            "{\"k\":\"\u{e9}\"}"
+                                .encode_utf16()
+                                .flat_map(u16::to_le_bytes)
+                                .collect(),
+                            EncodingType::Utf16,
+                        ))),
+                        SqlType::Int(Some(11))
+                    ],
+                    vec![SqlType::NVarcharMax(None), SqlType::Int(Some(22))],
+                ]
+            ),
+            other => panic!("expected JSON table rows, got {other:?}"),
+        }
+        unsafe { (&raw mut rows[0].text_length).write_unaligned(SQL_DATA_AT_EXEC) };
+        let deferred = unsafe { build_named_params(&mut state, 1, 0, "test") }.unwrap();
+        assert_eq!(deferred.dae_params.len(), 4);
+        assert!(
+            deferred
+                .dae_params
+                .iter()
+                .all(|param| param.client_encoding == encoding)
+        );
+        assert!(
+            deferred
+                .dae_params
+                .iter()
+                .any(|param| param.binding.sql_type == SQL_SS_JSON)
+        );
     }
 
     #[test]

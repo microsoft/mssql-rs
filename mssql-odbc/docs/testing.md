@@ -15,6 +15,40 @@ stack budget, run:
 cargo nextest run --release --frozen -p mssqlodbc --lib -E 'test(exec_direct_on_small_stack)'
 ```
 
+## JSON TVP acceptance
+
+Run the JSON/TVP Rust regressions with:
+
+```powershell
+cargo nextest run -p mssqlodbc --frozen --lib -E 'test(tvp) | test(json)'
+```
+
+The production RPC serializer tests compare JSON TVP metadata, UTF-16LE
+values, NULLs, and buffered DAE against `nvarchar(max)` bytes. They include
+client-code-page input and multi-packet values.
+
+The C++ `json_tvp_test` target adapts JSON TVP cases from
+`SqlClientDrivers/msodbcsql`, branch `feature/JsonFeature`, revision
+`88c4dd572852d225448b61173fe56fd59ab22e4c`:
+`json_tvp_edge_test.cpp` and `json_outputparam_test.cpp` under
+`/testsrc/ntdbms/sqlncli/ODBC/gtests/tests/`. It uses SQL Server's
+`CAST(text AS json)` as the value oracle and covers bindings, DAE, metadata,
+large values, invalid encoding, and statement reuse.
+
+Reference source: `sqlccmd.cpp`, `PutParamData`, maps a JSON TVP column to
+`SQL_WVARCHAR` with unlimited precision and converts binary input as UTF-8;
+`sqlcfunc.cpp` rejects odd JSON WCHAR byte lengths. `ProcessDAEParam`
+(`sqlccmd.cpp:6070-6076`) rejects a terminal partial JSON input character:
+binary TVP input uses `IDS_22_005`, while character input uses `IDS_22_026`
+(`String data, length mismatch` in `dll/res/local.rc:92`).
+These are source-level
+contracts, not measured retail parity. Run both driver legs against a
+JSON-enabled server and a JSON-enabled native build, recording
+`SQL_DRIVER_VER`; compiled tests or capability skips do not establish parity.
+The native defaulted-column case requires the generic TVP
+`SQL_CA_SS_COLUMN_HAS_DEFAULT_VALUE` descriptor field, which is outside this
+JSON slice and is not covered here.
+
 ## Buffer safety with Miri
 
 The `miri-odbc` nextest profile selects the opt-in `memory_safety` unit-test
