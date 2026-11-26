@@ -12,7 +12,12 @@ from zero (`123.455` becomes `123.46`; `-123.455` becomes `-123.46` at scale 2).
 Conversion uses exact decimal arithmetic, independent of Python's decimal
 context. Increasing the scale pads with zeros. Precision is checked after
 rounding, so a carry that exceeds the destination precision still raises a
-conversion error. NULL handling and batch transaction behavior are unchanged.
+conversion error.
+
+Python `float` inputs use binary floating-point formatting instead of this
+decimal rounding rule. Exact binary ties round to even: `2.5` becomes `2` at
+scale 0, and `0.125` becomes `0.12` at scale 2. Use `Decimal` or decimal strings
+when decimal half-away-from-zero rounding is required.
 
 ## Datetime strings
 

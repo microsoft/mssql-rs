@@ -792,7 +792,7 @@ fn narrow_int(v: i64, dest: &BulkCopyColumnMetadata) -> TdsResult<ColumnValues> 
 }
 
 /// Format a `decimal128` raw value at the given scale as a decimal string for
-/// [`DecimalParts::from_string`].
+/// [`DecimalParts::from_string_rounded`].
 fn decimal128_to_string(raw: i128, scale: u8) -> String {
     if scale == 0 {
         return raw.to_string();
