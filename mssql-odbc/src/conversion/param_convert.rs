@@ -393,6 +393,9 @@ unsafe fn bound_param_to_value_encoded(
     let value = match (app_value, family) {
         // Binary native JSON is opaque UTF-8 wire data; SQL Server validates it.
         (AppValue::Binary(bytes), SqlFamily::Json) => SqlType::Json(Some(SqlJson::new(bytes))),
+        (AppValue::NarrowText(bytes), SqlFamily::Json) if encoding.is_utf8() => {
+            SqlType::Json(Some(SqlJson::new(bytes)))
+        }
         (text @ (AppValue::NarrowText(_) | AppValue::WideText(_)), SqlFamily::Json) => {
             let text = json_input_text(text, encoding, false)?;
             SqlType::Json(Some(SqlJson::new(text.bytes)))
@@ -1048,7 +1051,6 @@ pub(crate) struct DaeTranscode {
     source: DaeSource,
     target: DaeTarget,
     validate_passthrough: bool,
-    json: bool,
 }
 
 impl DaeTranscode {
@@ -1058,6 +1060,7 @@ impl DaeTranscode {
     pub(crate) fn new(c_type: SqlSmallInt, sql_type: SqlSmallInt, collation: SqlCollation) -> Self {
         let source = match c_type {
             SQL_C_WCHAR => DaeSource::Utf16,
+            SQL_C_CHAR if sql_type == SQL_SS_JSON => DaeSource::Raw,
             SQL_C_CHAR => DaeSource::Utf8,
             _ => DaeSource::Raw,
         };
@@ -1071,7 +1074,6 @@ impl DaeTranscode {
             source,
             target,
             validate_passthrough: false,
-            json: sql_type == SQL_SS_JSON,
         }
     }
 
@@ -1110,24 +1112,6 @@ impl DaeTranscode {
         let split = buf.len() - self.incomplete_tail(&buf);
         carry.extend_from_slice(&buf[split..]);
         self.encode(&self.decode(&buf[..split]))
-    }
-
-    pub(crate) fn try_push(
-        &self,
-        carry: &mut Vec<u8>,
-        chunk: &[u8],
-    ) -> Result<DaeChunk, ParamBuildError> {
-        if self.json && self.source == DaeSource::Utf8 {
-            let mut bytes = std::mem::take(carry);
-            bytes.extend_from_slice(chunk);
-            let split = bytes.len() - incomplete_utf8_tail(&bytes);
-            std::str::from_utf8(&bytes[..split])
-                .map_err(|_| ParamBuildError::Value(ConvError::InvalidCharacterValue))?;
-            carry.extend_from_slice(&bytes[split..]);
-            bytes.truncate(split);
-            return Ok(DaeChunk::exact(bytes));
-        }
-        Ok(self.push(carry, chunk))
     }
 
     /// Converts what a value ended part-way through. The bytes cannot be
@@ -4431,7 +4415,7 @@ mod tests {
     }
 
     #[test]
-    fn json_input_uses_client_code_page_and_rejects_partial_character_input() {
+    fn json_input_uses_client_code_page_and_preserves_utf8_client_bytes() {
         let cp1252 = ClientEncoding::for_code_page(1252).unwrap();
         let mut bytes = b"{\"v\":\"\xe9\"}".to_vec();
         let mut length = SqlLen::try_from(bytes.len()).unwrap();
@@ -4448,8 +4432,8 @@ mod tests {
         binding.parameter_value_ptr = bytes.as_mut_ptr().cast();
         unsafe { binding.strlen_or_ind_ptr.write_unaligned(1) };
         assert_eq!(
-            unsafe { bound_param_to_value(&binding) }.unwrap_err(),
-            ParamBuildError::Value(ConvError::InvalidCharacterValue)
+            unsafe { bound_param_to_value(&binding) }.unwrap().0,
+            SqlType::Json(Some(SqlJson::new(vec![0xc3])))
         );
         binding.c_type = SQL_C_WCHAR;
         assert_eq!(
@@ -4480,25 +4464,27 @@ mod tests {
             for split in 0..=bytes.len() {
                 let transcoder = DaeTranscode::new(c_type, SQL_SS_JSON, SqlCollation::default());
                 let mut carry = Vec::new();
-                let mut wire = transcoder
-                    .try_push(&mut carry, &bytes[..split])
-                    .unwrap()
-                    .bytes;
-                wire.extend(
-                    transcoder
-                        .try_push(&mut carry, &bytes[split..])
-                        .unwrap()
-                        .bytes,
-                );
+                let mut wire = transcoder.push(&mut carry, &bytes[..split]).bytes;
+                wire.extend(transcoder.push(&mut carry, &bytes[split..]).bytes);
                 assert!(carry.is_empty(), "split {split}");
                 assert_eq!(wire, text.as_bytes());
             }
         }
         let transcoder = DaeTranscode::new(SQL_C_CHAR, SQL_SS_JSON, SqlCollation::default());
-        assert_eq!(
-            transcoder.try_push(&mut Vec::new(), &[0xff]).err(),
-            Some(ParamBuildError::Value(ConvError::InvalidCharacterValue))
-        );
+        for bytes in [
+            &[0xff][..],
+            &[0xc0, 0xaf],
+            &[0xed, 0xa0, 0xbd, 0xed, 0xb8, 0x80],
+            &[0xf0, 0x9f],
+        ] {
+            for split in 0..=bytes.len() {
+                let mut carry = Vec::new();
+                let mut wire = transcoder.push(&mut carry, &bytes[..split]).bytes;
+                wire.extend(transcoder.push(&mut carry, &bytes[split..]).bytes);
+                assert_eq!(wire, bytes);
+                assert!(carry.is_empty());
+            }
+        }
     }
 
     /// `sql_variant` wraps the inner declaration rather than declaring itself,
