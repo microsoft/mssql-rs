@@ -261,11 +261,19 @@ fn sql_param_data_operation(
         if !dae.progress.put_data_called {
             Some(ERR_FUNCTION_SEQUENCE)
         } else if !dae.progress.is_null {
-            match dae.current_param().and_then(|param| param.expected_len) {
-                Some(expected) if expected != dae.progress.bytes_sent => {
-                    Some(ERR_DAE_LENGTH_MISMATCH)
+            if dae
+                .current_param()
+                .is_some_and(|param| param.binding.sql_type == crate::api::odbc_types::SQL_SS_JSON)
+                && !dae.progress.carry.is_empty()
+            {
+                Some(ERR_DAE_LENGTH_MISMATCH)
+            } else {
+                match dae.current_param().and_then(|param| param.expected_len) {
+                    Some(expected) if expected != dae.progress.bytes_sent => {
+                        Some(ERR_DAE_LENGTH_MISMATCH)
+                    }
+                    _ => None,
                 }
-                _ => None,
             }
         } else {
             None

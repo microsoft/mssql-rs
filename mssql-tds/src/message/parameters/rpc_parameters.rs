@@ -127,6 +127,8 @@ pub enum StreamedSqlType {
     /// XML data. Chunks must contain UTF-16LE bytes; the streaming client adds
     /// a BOM when absent and preserves exactly one when present.
     Xml,
+    /// Native JSON data. Chunks contain UTF-8 bytes without a BOM.
+    Json,
     /// CLR user-defined type data. Chunks are the opaque CLR-serialized payload.
     Udt(UdtTypeName),
 }
@@ -143,6 +145,7 @@ impl StreamedSqlType {
             Self::VarcharMax => SqlType::VarcharMax(None),
             Self::VarBinaryMax => SqlType::VarBinaryMax(None),
             Self::Xml => SqlType::Xml(None),
+            Self::Json => SqlType::Json(None),
             Self::Udt(type_name) => SqlType::Udt(type_name.clone(), None),
         }
     }

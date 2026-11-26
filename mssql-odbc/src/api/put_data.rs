@@ -541,7 +541,13 @@ unsafe fn sql_put_data_operation(
             let measured = match dae.current_param().and_then(|param| param.transcode) {
                 Some(transcode) => {
                     let mut carry = std::mem::take(&mut dae.progress.carry);
-                    let output = transcode.push(&mut carry, chunk);
+                    let output = match transcode.try_push(&mut carry, chunk) {
+                        Ok(output) => output,
+                        Err(error) => {
+                            drop(stmt_state);
+                            return abort_dae_with_diag(dbc, stmt, statement_handle, error.diag());
+                        }
+                    };
                     dae.progress.carry = carry;
                     output.bytes
                 }
@@ -689,7 +695,13 @@ unsafe fn sql_put_data_operation(
                 Some(dae) => {
                     let mut carry = std::mem::take(&mut dae.progress.carry);
                     carry_restore = Some(carry.clone());
-                    let out = transcode.push(&mut carry, &fitted);
+                    let out = match transcode.try_push(&mut carry, &fitted) {
+                        Ok(output) => output,
+                        Err(error) => {
+                            drop(stmt_state);
+                            return abort_dae_with_diag(dbc, stmt, statement_handle, error.diag());
+                        }
+                    };
                     dae.progress.carry = carry;
                     chunk_had_loss = out.had_loss;
                     Cow::Owned(out.bytes)
