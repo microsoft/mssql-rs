@@ -8,6 +8,7 @@ mod bind_col;
 mod bind_param;
 mod cancel;
 mod catalog;
+pub(crate) mod catalog_procedure;
 mod close_cursor;
 mod col_attribute;
 mod connect;

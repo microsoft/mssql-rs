@@ -62,6 +62,34 @@ JSON-specific parameter bindings are separate from result support. Native
 parity testing requires a JSON-enabled msodbcsql build and a JSON-capable server;
 the installed retail ODBC18 driver is not a substitute for that build.
 
+### Catalog discovery
+
+`SQLColumns` and `SQLGetTypeInfo` select `sp_columns_170` and
+`sp_datatype_info_170` only when the current session negotiated VECTOR support.
+JSON acknowledgement alone does not select these procedures. Otherwise they
+use the existing `_100` procedures. The ODBC connection currently inherits the
+TDS client's VECTOR request; this does not add a `VectorTypeSupport` keyword.
+
+A missing modern procedure (server error 2812) retries its `_100` counterpart.
+The negative cache is independent for columns and type information, keyed by
+the exact effective database name and physical session. Switching databases
+selects that database's entry; reconnect and recovery discard old-session
+entries. Permission errors, transport failures, timeouts, and empty results
+are not cached as missing procedures. Internal retries share the query timeout
+budget.
+
+Catalog rows are returned unchanged: an older procedure may omit native JSON
+even on a JSON-capable connection. `SQLGetTypeInfo(SQL_SS_JSON)` is a valid
+filter, including when the server returns no rows. Table-type and linked-server
+catalog dispatch remain outside the implemented catalog surface.
+
+This follows the procedure selection and 2812 fallback in msodbcsql's
+`sqlcdd.cpp` (`DoDD`, `SQLGetTypeInfoW`, `CatalogProcedureIsMissing`) on
+`feature/JsonFeature`, read at commit
+`bcc837d6dfed6a190e6d4d7042d701e033e2440e`. Source evidence is not a measured
+retail-driver parity claim. Native JSON comparison requires a JSON-enabled
+reference build; retail Driver 18 is not a substitute.
+
 ## Connection-operation timeouts
 
 `SQL_ATTR_CONNECTION_TIMEOUT` bounds connection-scoped network requests,

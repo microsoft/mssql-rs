@@ -253,6 +253,7 @@ pub(crate) struct DbcState {
     /// finishing lookup overwrite the new client with the old one and attach the
     /// old session's answer to it.
     pub(crate) session_generation: u64,
+    pub(crate) catalog_procedures: crate::api::catalog_procedure::CatalogProcedureCache,
     /// `SQL_USER_NAME`: the database principal `USER_NAME()` reported, keyed to
     /// the session state it was read in — see [`CachedDatabaseUserName`].
     /// Populated lazily on the first `SQLGetInfo(SQL_USER_NAME)` rather than at
@@ -485,6 +486,7 @@ impl DbcHandle {
                 stmt_query_timeout: 0,
                 identity: ConnectionIdentity::default(),
                 session_generation: 0,
+                catalog_procedures: Default::default(),
                 database_user_name: None,
                 database_read_only: None,
                 alias_types: None,
