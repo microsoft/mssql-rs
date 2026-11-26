@@ -266,12 +266,10 @@ impl PoolLease {
         };
         let settled = match &result {
             Ok(_) => true,
-            Err(PoolError::Execute(error)) => !matches!(
+            // Other errors can leave an unread response before a batch is marked open.
+            Err(PoolError::Execute(error)) => matches!(
                 error.as_ref(),
-                mssql_tds::error::Error::OperationCancelledError(_)
-                    | mssql_tds::error::Error::TokenAcquisitionCancelled
-                    | mssql_tds::error::Error::TimeoutError(_)
-                    | mssql_tds::error::Error::ConnectionClosed(_)
+                mssql_tds::error::Error::SqlServerError { .. }
             ),
             _ => false,
         };

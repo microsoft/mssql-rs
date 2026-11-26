@@ -346,6 +346,88 @@ async fn connection_closed_discards_even_without_a_cached_dead_flag() {
 }
 
 #[tokio::test]
+async fn unclassified_failure_before_first_result_discards_unread_client() {
+    use mssql_tds::error::Error;
+
+    for error in [
+        Error::ProtocolError("unexpected response before first result".into()),
+        Error::UnimplementedFeature {
+            feature: "unsupported response environment change".into(),
+            context: "before first result".into(),
+        },
+        Error::UsageError("unexpected response token before first result".into()),
+    ] {
+        let expected = std::mem::discriminant(&error);
+        let manager = manager(1);
+        let reads = Arc::new(Semaphore::new(2));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let client = tds_client_from_tokens_gated(
+            vec![col_metadata_empty(), done_no_more()],
+            reads.clone(),
+            dropped.clone(),
+        );
+        let mut first = lease(&manager, client).await;
+        let result = first
+            .run(None, &CancellationToken::new(), |client, _| {
+                Box::pin(async move {
+                    assert!(!client.is_connection_dead());
+                    assert!(!client.has_open_batch());
+                    Err::<(), _>(error)
+                })
+            })
+            .await;
+        assert!(matches!(result, Err(PoolError::Execute(error))
+            if std::mem::discriminant(error.as_ref()) == expected));
+        assert!(first.discard);
+        assert!(first.client_mut().is_connection_dead());
+        assert_eq!(reads.available_permits(), 2);
+        first.release().await.unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(reads.available_permits(), 2);
+        let mut slot = manager
+            .reserve(key(), control(CancellationToken::new()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(slot.take_value().is_none());
+    }
+}
+
+#[tokio::test]
+async fn synchronized_sql_error_before_first_result_keeps_client_reusable() {
+    let manager = manager(1);
+    let reads = Arc::new(Semaphore::new(2));
+    let client = tds_client_from_tokens_gated(
+        vec![sql_error(50003, 16, "statement failed"), done_no_more()],
+        reads.clone(),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let mut first = lease(&manager, client).await;
+    let result = first
+        .run(None, &CancellationToken::new(), |client, options| {
+            Box::pin(async move {
+                client
+                    .execute("RAISERROR ('statement failed', 16, 1)".into(), options)
+                    .await
+            })
+        })
+        .await;
+    assert!(matches!(result, Err(PoolError::Execute(error))
+        if matches!(error.as_ref(), mssql_tds::error::Error::SqlServerError { .. })));
+    assert_eq!(reads.available_permits(), 0);
+    assert!(!first.discard);
+    assert!(!first.client_mut().has_open_batch());
+    assert!(!first.client_mut().is_connection_dead());
+    first.release().await.unwrap();
+    let mut slot = manager
+        .reserve(key(), control(CancellationToken::new()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(slot.take_value().is_some());
+}
+
+#[tokio::test]
 async fn command_budget_longer_than_login_timeout_allows_slow_recovery() {
     use mssql_mock_tds::{MockTdsServer, QueryResponse};
     use mssql_tds::connection::client_context::{EntraIdTokenFactory, TdsAuthenticationMethod};

@@ -847,7 +847,12 @@ SPID may change; invalidate session-bound prepared handles and caches.
 Recovery retains the same exclusive lease and capacity slot. Abort the old local transport before
 opening its replacement. The lease supplies TDS options with the remaining command budget,
 rounded up to whole seconds while retaining the original absolute outer timer. A
-`ConnectionClosed` result forces discard even if the cached dead flag is not set.
+failed operation is reusable only for a SQL-server error whose TDS response is synchronized
+or remains explicitly open for return-time draining, and only while the client stays live.
+Other execution errors force discard even if the cached dead flag and open-batch marker
+are clear: these flags do not prove that the initial response was consumed. This conservative
+private-pool policy also discards non-server preflight errors rather than adding public TDS
+synchronization state or guessing from error text. Direct TDS execution and recovery are unchanged.
 One operation deadline covers recovery and execution; absent a command
 timeout, recovery still has a finite connection-timeout budget. Cancellation stops retry/auth
 work. Interrupted or failed recovery makes the logical connection unusable and forces discard.
