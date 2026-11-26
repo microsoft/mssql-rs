@@ -892,6 +892,7 @@ pub(crate) struct DaeParam {
     /// declared and converted from `ParameterType` when it closes.
     pub(crate) binding: BoundParam,
     pub(crate) long_as_max: bool,
+    pub(crate) client_encoding: crate::conversion::client_encoding::ClientEncoding,
     /// The binding's UDT identity, owned here because the descriptor snapshot
     /// it came from does not outlive the execute that parks this sequence.
     pub(crate) udt_names: Option<Arc<UdtNames>>,
@@ -932,6 +933,7 @@ impl DaeParam {
             length_limit,
             binding,
             long_as_max,
+            client_encoding: crate::conversion::client_encoding::ClientEncoding::UTF8,
             udt_names,
             transcode: None,
             tvp_cell_binding: None,

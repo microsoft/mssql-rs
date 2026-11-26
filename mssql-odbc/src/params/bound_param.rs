@@ -78,6 +78,7 @@ pub(crate) struct BoundParam {
 #[derive(Debug, Clone)]
 pub(crate) struct ParamSnapshot {
     pub(crate) param: BoundParam,
+    pub(crate) client_encoding: crate::conversion::client_encoding::ClientEncoding,
     /// Effective connection policy captured once for this execution.
     pub(crate) long_as_max: bool,
     /// `None` for every parameter that is not a `SQL_SS_UDT`.
@@ -88,6 +89,7 @@ impl From<BoundParam> for ParamSnapshot {
     fn from(param: BoundParam) -> Self {
         Self {
             param,
+            client_encoding: crate::conversion::client_encoding::ClientEncoding::UTF8,
             long_as_max: false,
             udt_names: None,
         }
@@ -324,6 +326,7 @@ impl BoundParam {
                 let param = Self::from_records(apd_record, ipd_record, odbc_version)?;
                 Some(ParamSnapshot {
                     param,
+                    client_encoding: crate::conversion::client_encoding::ClientEncoding::UTF8,
                     long_as_max,
                     // Filtered to match the doc on the field, and for the same
                     // reason `parameter_definition` filters: `classify_field`

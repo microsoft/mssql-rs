@@ -22,9 +22,9 @@ use crate::api::odbc_types::{
     SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID, SQL_C_NUMERIC, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
     SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP, SQL_C_WCHAR, SQL_CHAR, SQL_DECIMAL,
     SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NUMERIC,
-    SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_UDT, SQL_SS_VARIANT,
-    SQL_SS_XML, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY,
-    SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlSmallInt,
+    SQL_REAL, SQL_SMALLINT, SQL_SS_JSON, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_UDT,
+    SQL_SS_VARIANT, SQL_SS_XML, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP,
+    SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlSmallInt,
 };
 use crate::api::type_rules::is_integer_c_type;
 
@@ -56,7 +56,7 @@ const TEMPORAL_SQL_TARGETS: &[SqlSmallInt] = &[
 
 /// `xml` takes a character payload but declares its own wire type, so it is
 /// listed apart from `CHARACTER_SQL_TARGETS`.
-const CHARACTER_PAYLOAD_SQL_TARGETS: &[SqlSmallInt] = &[SQL_SS_XML];
+const CHARACTER_PAYLOAD_SQL_TARGETS: &[SqlSmallInt] = &[SQL_SS_XML, SQL_SS_JSON];
 
 /// A CLR UDT takes its payload untouched from a `SQL_C_BINARY` buffer, and its
 /// identity from the IPD's `SQL_CA_SS_UDT_*` fields.
@@ -106,7 +106,11 @@ pub(crate) fn is_supported_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt
             CHARACTER_PAYLOAD_SQL_TARGETS,
             &[SQL_SS_VARIANT],
         ],
-        SQL_C_BINARY => &[BINARY_SQL_TARGETS, &[SQL_SS_VARIANT], UDT_SQL_TARGETS],
+        SQL_C_BINARY => &[
+            BINARY_SQL_TARGETS,
+            &[SQL_SS_VARIANT, SQL_SS_JSON],
+            UDT_SQL_TARGETS,
+        ],
         SQL_C_BIT => &[&[SQL_BIT]],
         SQL_C_FLOAT | SQL_C_DOUBLE => &[&[SQL_REAL, SQL_FLOAT, SQL_DOUBLE]],
         SQL_C_GUID => &[&[SQL_GUID]],

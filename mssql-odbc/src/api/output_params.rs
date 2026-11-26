@@ -654,4 +654,79 @@ mod tests {
             RowOutcome::Info(crate::api::fetch_scroll::RowIssue::StringTruncated)
         );
     }
+
+    #[test]
+    fn json_outputs_use_current_bindings_and_deliver_once_with_lengths() {
+        use crate::api::odbc_types::{SQL_C_BINARY, SQL_C_DEFAULT, SQL_C_WCHAR, SQL_SS_JSON};
+        use mssql_tds::datatypes::sql_json::SqlJson;
+
+        let text = "[\"\u{e9}\u{1f600}\"]";
+        for c_type in [SQL_C_CHAR, SQL_C_BINARY, SQL_C_WCHAR, SQL_C_DEFAULT] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut buffer = [0xcc; 64];
+            let mut indicator = -99;
+            bind(
+                &h,
+                output_param(
+                    c_type,
+                    SQL_SS_JSON,
+                    buffer.as_mut_ptr().cast(),
+                    64,
+                    &mut indicator,
+                ),
+            );
+            {
+                let mut state = stmt.inner.lock().unwrap();
+                state.batch_exhausted = true;
+                state.pending_output_params = Some((
+                    vec![returned(
+                        "@P1",
+                        0,
+                        ColumnValues::Json(SqlJson::new(text.as_bytes().to_vec())),
+                    )],
+                    None,
+                ));
+            }
+            assert_eq!(buffer[0], 0xcc);
+            assert_eq!(indicator, -99);
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+            let expected: Vec<u8> = if matches!(c_type, SQL_C_WCHAR | SQL_C_DEFAULT) {
+                text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+            } else {
+                text.as_bytes().to_vec()
+            };
+            assert_eq!(
+                indicator,
+                crate::api::odbc_types::SqlLen::try_from(expected.len()).unwrap()
+            );
+            assert_eq!(&buffer[..expected.len()], &expected);
+            buffer.fill(0xab);
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+            assert_eq!(buffer, [0xab; 64]);
+        }
+    }
+
+    #[test]
+    fn json_output_truncation_keeps_surrogate_pairs_and_reports_full_length() {
+        use crate::api::odbc_types::{SQL_C_WCHAR, SQL_SS_JSON};
+        use mssql_tds::datatypes::sql_json::SqlJson;
+
+        let mut buffer = [0xcc; 8];
+        let mut indicator = -99;
+        let binding = output_param(
+            SQL_C_WCHAR,
+            SQL_SS_JSON,
+            buffer.as_mut_ptr().cast(),
+            8,
+            &mut indicator,
+        );
+        let value = ColumnValues::Json(SqlJson::new("[\"\u{1f600}\"]".as_bytes().to_vec()));
+        assert_eq!(
+            unsafe { write_value(&binding, &value, TextOutput::UTF8) },
+            RowOutcome::Info(crate::api::fetch_scroll::RowIssue::StringTruncated)
+        );
+        assert_eq!(&buffer[..6], &[b'[', 0, b'"', 0, 0, 0]);
+        assert_eq!(indicator, 12);
+    }
 }

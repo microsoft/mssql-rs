@@ -25,6 +25,7 @@ use mssql_tds::datatypes::column_values::{
     SqlDate, SqlDateTime2, SqlDateTimeOffset, SqlTime, SqlXml,
 };
 use mssql_tds::datatypes::decoder::DecimalParts;
+use mssql_tds::datatypes::sql_json::SqlJson;
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString, encode_narrow};
 use mssql_tds::datatypes::sql_tvp::{TvpColumnDef, TvpTableData, TvpTypeName};
 use mssql_tds::datatypes::sql_udt::UdtTypeName;
@@ -40,8 +41,8 @@ use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_BINARY, SQL_C_CHAR, SQL_C_NUMERIC, SQL_C_WCHAR,
     SQL_CHAR, SQL_DATA_AT_EXEC, SQL_DECIMAL, SQL_DEFAULT_PARAM, SQL_DOUBLE, SQL_FLOAT, SQL_GUID,
     SQL_INTEGER, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NULL_DATA,
-    SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_UDT,
-    SQL_SS_VARIANT, SQL_SS_VECTOR, SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT,
+    SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_JSON, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET,
+    SQL_SS_UDT, SQL_SS_VARIANT, SQL_SS_VECTOR, SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT,
     SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR,
     SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlGuid, SqlLen, SqlNumericStruct, SqlSmallInt,
     SqlSsVectorLayout, SqlULen,
@@ -60,6 +61,7 @@ use crate::api::type_rules::{
     SQL_PREC_BIGCHARBINARY, SQL_PREC_NCHAR, SQL_PREC_NTEXT, SQL_PREC_NUMERIC, SQL_PREC_TEXTIMAGE,
     SQL_PREC_UDT, SQL_PREC_UNLIMITED, is_wide_character_sql_type,
 };
+use crate::conversion::client_encoding::ClientEncoding;
 use crate::conversion::datetime::{
     DateTimeParts, MAX_DAYS_SINCE_0001, TICKS_PER_DAY, civil_from_days_since_0001,
     days_since_0001_from_civil, is_valid_timezone_offset, parse_datetime_literal,
@@ -245,14 +247,27 @@ pub(crate) unsafe fn tvp_cell_data_at_exec_indicator(param: &BoundParam) -> Opti
 /// # Safety
 /// See [`bound_param_to_value_with_outcome`].
 #[inline]
+#[cfg(any(test, fuzzing))]
 pub(crate) unsafe fn bound_param_to_rpc(
     name: impl Into<Option<String>>,
     param: &BoundParam,
     udt_names: Option<&UdtNames>,
     long_as_max: bool,
 ) -> Result<(RpcParameter, ConvOk), ParamBuildError> {
+    unsafe { bound_param_to_rpc_encoded(name, param, udt_names, long_as_max, ClientEncoding::UTF8) }
+}
+
+/// # Safety
+/// Same buffer contract as [`bound_param_to_rpc`].
+pub(crate) unsafe fn bound_param_to_rpc_encoded(
+    name: impl Into<Option<String>>,
+    param: &BoundParam,
+    udt_names: Option<&UdtNames>,
+    long_as_max: bool,
+    encoding: ClientEncoding,
+) -> Result<(RpcParameter, ConvOk), ParamBuildError> {
     let ((value, type_metadata), outcome) =
-        unsafe { bound_param_to_value_with_outcome(param, udt_names) }?;
+        unsafe { bound_param_to_value_encoded(param, udt_names, encoding) }?;
     // BY_REF_VALUE is what makes the server send a RETURNVALUE token back for
     // this parameter; without it an OUTPUT binding would be sent as a plain
     // input and silently produce nothing.
@@ -330,6 +345,16 @@ unsafe fn bound_param_to_value_with_outcome(
     param: &BoundParam,
     udt_names: Option<&UdtNames>,
 ) -> Result<(TypedValue, ConvOk), ParamBuildError> {
+    unsafe { bound_param_to_value_encoded(param, udt_names, ClientEncoding::UTF8) }
+}
+
+/// # Safety
+/// Same application-buffer contract as [`bound_param_to_value_with_outcome`].
+unsafe fn bound_param_to_value_encoded(
+    param: &BoundParam,
+    udt_names: Option<&UdtNames>,
+    encoding: ClientEncoding,
+) -> Result<(TypedValue, ConvOk), ParamBuildError> {
     if is_output_only(param.input_output_type) {
         return typed_null(
             param.sql_type,
@@ -354,11 +379,27 @@ unsafe fn bound_param_to_value_with_outcome(
         Indicator::Length(len) => len,
     };
 
+    if param.sql_type == SQL_SS_JSON
+        && param.c_type == SQL_C_WCHAR
+        && len_spec >= 0
+        && len_spec % 2 != 0
+    {
+        return Err(ParamBuildError::InvalidBufferLength);
+    }
     let app_value = unsafe { read_param_value(param, len_spec) }?;
     let family =
         sql_family(param.sql_type).ok_or(ParamBuildError::UnsupportedSqlType(param.sql_type))?;
 
     let value = match (app_value, family) {
+        // Binary native JSON is opaque UTF-8 wire data; SQL Server validates it.
+        (AppValue::Binary(bytes), SqlFamily::Json) => SqlType::Json(Some(SqlJson::new(bytes))),
+        (AppValue::NarrowText(bytes), SqlFamily::Json) if encoding.is_utf8() => {
+            SqlType::Json(Some(SqlJson::new(bytes)))
+        }
+        (text @ (AppValue::NarrowText(_) | AppValue::WideText(_)), SqlFamily::Json) => {
+            let text = json_input_text(text, encoding, false)?;
+            SqlType::Json(Some(SqlJson::new(text.bytes)))
+        }
         (AppValue::Integer(v), SqlFamily::Integer) => convert_integer_sql(param.sql_type, v)?,
         (AppValue::NarrowText(bytes), SqlFamily::Character) => {
             convert_character_sql(param.sql_type, param.column_size, AppText::Utf8(bytes))?
@@ -794,6 +835,7 @@ pub(crate) fn dae_length_limit(
 ///
 /// LONG values keep the MAX/PLP framing they would have streamed with, as
 /// msodbcsql's `PutParamData` does; LongAsMax selects only their declaration.
+#[cfg(test)]
 pub(crate) fn buffered_dae_to_rpc(
     name: String,
     binding: &BoundParam,
@@ -802,13 +844,35 @@ pub(crate) fn buffered_dae_to_rpc(
     is_null: bool,
     long_as_max: bool,
 ) -> Result<(RpcParameter, ConvOk), ParamBuildError> {
+    buffered_dae_to_rpc_encoded(
+        name,
+        binding,
+        udt_names,
+        buffer,
+        is_null,
+        long_as_max,
+        ClientEncoding::UTF8,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn buffered_dae_to_rpc_encoded(
+    name: String,
+    binding: &BoundParam,
+    udt_names: Option<&UdtNames>,
+    buffer: &[u8],
+    is_null: bool,
+    long_as_max: bool,
+    encoding: ClientEncoding,
+) -> Result<(RpcParameter, ConvOk), ParamBuildError> {
     let mut indicator: SqlLen = if is_null {
         SQL_NULL_DATA
     } else {
         SqlLen::try_from(buffer.len()).map_err(|_| ParamBuildError::StringTruncation)?
     };
     let synthetic = buffered_dae_binding(binding, buffer, &mut indicator);
-    let (parameter, outcome) = unsafe { bound_param_to_rpc(name, &synthetic, udt_names, true) }?;
+    let (parameter, outcome) =
+        unsafe { bound_param_to_rpc_encoded(name, &synthetic, udt_names, true, encoding) }?;
     let declaration = match binding.sql_type {
         SQL_LONGVARCHAR | SQL_WLONGVARCHAR | SQL_LONGVARBINARY => {
             dae_streamed_declaration(binding.sql_type, binding.column_size, long_as_max)?
@@ -915,6 +979,9 @@ pub(crate) fn dae_plan(
         SQL_SS_XML if is_supported_conversion(c_type, sql_type) => {
             DaePlan::Stream(StreamedSqlType::Xml)
         }
+        SQL_SS_JSON if is_supported_conversion(c_type, sql_type) => {
+            DaePlan::Stream(StreamedSqlType::Json)
+        }
         SQL_SS_UDT if is_supported_conversion(c_type, sql_type) => {
             DaePlan::Stream(StreamedSqlType::Udt(udt_type_name(udt_names)?))
         }
@@ -943,7 +1010,7 @@ pub(crate) fn dae_streamed_declaration(
         SQL_LONGVARCHAR => (!long_as_max).then_some(SqlType::Text(None)),
         SQL_WLONGVARCHAR => (!long_as_max).then_some(SqlType::NText(None)),
         SQL_LONGVARBINARY => (!long_as_max).then_some(SqlType::Image(None)),
-        SQL_SS_XML | SQL_SS_UDT => None,
+        SQL_SS_XML | SQL_SS_JSON | SQL_SS_UDT => None,
         other => return Err(ParamBuildError::UnsupportedSqlType(other)),
     })
 }
@@ -993,6 +1060,7 @@ impl DaeTranscode {
     pub(crate) fn new(c_type: SqlSmallInt, sql_type: SqlSmallInt, collation: SqlCollation) -> Self {
         let source = match c_type {
             SQL_C_WCHAR => DaeSource::Utf16,
+            SQL_C_CHAR if sql_type == SQL_SS_JSON => DaeSource::Raw,
             SQL_C_CHAR => DaeSource::Utf8,
             _ => DaeSource::Raw,
         };
@@ -1038,6 +1106,7 @@ impl DaeTranscode {
         if self.is_passthrough() && !self.validate_passthrough {
             return DaeChunk::exact(chunk.to_vec());
         }
+
         let mut buf = std::mem::take(carry);
         buf.extend_from_slice(chunk);
         let split = buf.len() - self.incomplete_tail(&buf);
@@ -1185,6 +1254,7 @@ enum SqlFamily {
     /// `xml` takes the same UTF-16 payload as the wide character types but
     /// declares its own wire type, so it cannot ride the character converter.
     Xml,
+    Json,
     /// `sql_variant` wraps whatever the application supplied; the declaration is
     /// the inner type's, not a `sql_variant` of its own.
     Variant,
@@ -1212,10 +1282,55 @@ fn sql_family(sql_type: SqlSmallInt) -> Option<SqlFamily> {
         | SQL_SS_TIME2
         | SQL_SS_TIMESTAMPOFFSET => Some(SqlFamily::DateTime),
         SQL_SS_XML => Some(SqlFamily::Xml),
+        SQL_SS_JSON => Some(SqlFamily::Json),
         SQL_SS_VARIANT => Some(SqlFamily::Variant),
         SQL_SS_UDT => Some(SqlFamily::Udt),
         _ => None,
     }
+}
+
+/// Shared native/TVP JSON text conversion. Syntax validation belongs to SQL Server.
+pub(crate) fn json_input_text(
+    value: AppValue,
+    encoding: ClientEncoding,
+    wide: bool,
+) -> Result<SqlString, ParamBuildError> {
+    let text = match value {
+        AppValue::WideText(bytes) => {
+            if !bytes.len().is_multiple_of(2) {
+                return Err(ParamBuildError::InvalidBufferLength);
+            }
+            if wide {
+                return Ok(SqlString::new(bytes, EncodingType::Utf16));
+            }
+            decode_utf16le(&bytes)
+        }
+        AppValue::NarrowText(bytes) => {
+            let text = encoding.decode(&bytes).map_err(ParamBuildError::Value)?;
+            if !wide && encoding.is_utf8() {
+                return Ok(SqlString::new(bytes, EncodingType::Utf8));
+            }
+            text.into_owned()
+        }
+        AppValue::Binary(bytes) => {
+            let text = ClientEncoding::UTF8
+                .decode(&bytes)
+                .map_err(ParamBuildError::Value)?;
+            if !wide {
+                return Ok(SqlString::new(bytes, EncodingType::Utf8));
+            }
+            text.into_owned()
+        }
+        _ => return Err(ParamBuildError::ConversionNotImplemented),
+    };
+    Ok(if wide {
+        SqlString::new(
+            text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+            EncodingType::Utf16,
+        )
+    } else {
+        SqlString::new(text.into_bytes(), EncodingType::Utf8)
+    })
 }
 
 /// Application text in the encoding its C type dictates.
@@ -2088,6 +2203,7 @@ fn typed_null(
             return Ok((SqlType::DateTimeOffset(None), Some(metadata)));
         }
         SQL_SS_XML => SqlType::Xml(None),
+        SQL_SS_JSON => SqlType::Json(None),
         // A NULL `sql_variant` carries no payload, so the inner type only has to
         // be a legal one - it never reaches the wire.
         SQL_SS_VARIANT => SqlType::Variant(Box::new(SqlType::Varchar(None, 1))),
@@ -4248,6 +4364,126 @@ mod tests {
         match value {
             SqlType::Xml(Some(x)) => assert_eq!(x.as_string(), "<a/>"),
             other => panic!("expected Xml(Some), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_input_preserves_utf8_and_ignores_column_size() {
+        let expected = "{\"v\":\"\u{e9}\u{1f600}\",\"nul\":\"\\u0000\"}";
+        for (c_type, mut bytes) in [
+            (SQL_C_CHAR, expected.as_bytes().to_vec()),
+            (SQL_C_BINARY, expected.as_bytes().to_vec()),
+            (
+                SQL_C_WCHAR,
+                expected.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+            ),
+        ] {
+            let mut length = SqlLen::try_from(bytes.len()).unwrap();
+            let mut binding = param(c_type, bytes.as_mut_ptr().cast(), &mut length);
+            binding.sql_type = SQL_SS_JSON;
+            binding.column_size = 1;
+            assert_eq!(
+                unsafe { bound_param_to_value(&binding) }.unwrap().0,
+                SqlType::Json(Some(SqlJson::new(expected.as_bytes().to_vec())))
+            );
+            let (rpc, _) =
+                unsafe { bound_param_to_rpc(Some("@P1".into()), &binding, None, false) }.unwrap();
+            assert_eq!(
+                mssql_tds::test_client_support::rpc_parameter_declaration(&rpc).unwrap(),
+                "json"
+            );
+        }
+    }
+
+    #[test]
+    fn json_null_and_output_only_never_read_value_buffers() {
+        for c_type in [SQL_C_CHAR, SQL_C_WCHAR, SQL_C_BINARY] {
+            let mut indicator = SQL_NULL_DATA;
+            let mut binding = param(c_type, std::ptr::null_mut(), &mut indicator);
+            binding.sql_type = SQL_SS_JSON;
+            assert_eq!(
+                unsafe { bound_param_to_value(&binding) }.unwrap().0,
+                SqlType::Json(None)
+            );
+            binding.input_output_type = crate::api::odbc_types::SQL_PARAM_OUTPUT;
+            unsafe { binding.strlen_or_ind_ptr.write_unaligned(123) };
+            assert_eq!(
+                unsafe { bound_param_to_value(&binding) }.unwrap().0,
+                SqlType::Json(None)
+            );
+        }
+    }
+
+    #[test]
+    fn json_input_uses_client_code_page_and_preserves_utf8_client_bytes() {
+        let cp1252 = ClientEncoding::for_code_page(1252).unwrap();
+        let mut bytes = b"{\"v\":\"\xe9\"}".to_vec();
+        let mut length = SqlLen::try_from(bytes.len()).unwrap();
+        let mut binding = param(SQL_C_CHAR, bytes.as_mut_ptr().cast(), &mut length);
+        binding.sql_type = SQL_SS_JSON;
+        assert_eq!(
+            unsafe { bound_param_to_value_encoded(&binding, None, cp1252) }
+                .unwrap()
+                .0
+                .0,
+            SqlType::Json(Some(SqlJson::new("{\"v\":\"\u{e9}\"}".as_bytes().to_vec())))
+        );
+        bytes = vec![0xc3];
+        binding.parameter_value_ptr = bytes.as_mut_ptr().cast();
+        unsafe { binding.strlen_or_ind_ptr.write_unaligned(1) };
+        assert_eq!(
+            unsafe { bound_param_to_value(&binding) }.unwrap().0,
+            SqlType::Json(Some(SqlJson::new(vec![0xc3])))
+        );
+        binding.c_type = SQL_C_WCHAR;
+        assert_eq!(
+            unsafe { bound_param_to_value(&binding) }.unwrap_err(),
+            ParamBuildError::InvalidBufferLength
+        );
+        binding.c_type = SQL_C_BINARY;
+        assert_eq!(
+            unsafe { bound_param_to_value(&binding) }.unwrap().0,
+            SqlType::Json(Some(SqlJson::new(vec![0xc3])))
+        );
+    }
+
+    #[test]
+    fn json_dae_reassembles_every_utf8_and_utf16_split() {
+        let text = "[\"\u{e9}\u{1f600}\"]";
+        for (c_type, bytes) in [
+            (SQL_C_CHAR, text.as_bytes().to_vec()),
+            (
+                SQL_C_WCHAR,
+                text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+            ),
+        ] {
+            assert_eq!(
+                dae_plan(c_type, SQL_SS_JSON, None).unwrap(),
+                DaePlan::Stream(StreamedSqlType::Json)
+            );
+            for split in 0..=bytes.len() {
+                let transcoder = DaeTranscode::new(c_type, SQL_SS_JSON, SqlCollation::default());
+                let mut carry = Vec::new();
+                let mut wire = transcoder.push(&mut carry, &bytes[..split]).bytes;
+                wire.extend(transcoder.push(&mut carry, &bytes[split..]).bytes);
+                assert!(carry.is_empty(), "split {split}");
+                assert_eq!(wire, text.as_bytes());
+            }
+        }
+        let transcoder = DaeTranscode::new(SQL_C_CHAR, SQL_SS_JSON, SqlCollation::default());
+        for bytes in [
+            &[0xff][..],
+            &[0xc0, 0xaf],
+            &[0xed, 0xa0, 0xbd, 0xed, 0xb8, 0x80],
+            &[0xf0, 0x9f],
+        ] {
+            for split in 0..=bytes.len() {
+                let mut carry = Vec::new();
+                let mut wire = transcoder.push(&mut carry, &bytes[..split]).bytes;
+                wire.extend(transcoder.push(&mut carry, &bytes[split..]).bytes);
+                assert_eq!(wire, bytes);
+                assert!(carry.is_empty());
+            }
         }
     }
 

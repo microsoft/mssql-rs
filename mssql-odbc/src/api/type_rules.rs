@@ -287,6 +287,7 @@ pub(crate) fn classify_parameter_sql_type(sql_type: SqlSmallInt) -> SqlTypeSuppo
         | SQL_SS_VARIANT
         | SQL_SS_UDT
         | SQL_SS_XML
+        | crate::api::odbc_types::SQL_SS_JSON
         | SQL_SS_TABLE
         | SQL_SS_VECTOR => SqlTypeSupport::Supported,
         // SQL Server has no interval type, so no conversion could ever succeed.

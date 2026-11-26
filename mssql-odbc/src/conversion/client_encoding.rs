@@ -324,8 +324,8 @@ impl ClientEncoding {
         Ok(text.len())
     }
 
-    /// Bound-column truncation only. Resumable SQLGetData byte offsets need not
-    /// fall on character boundaries and must not use this operation.
+    /// Encoded-character boundary checks and bound-column truncation.
+    /// Resumable SQLGetData byte offsets need not fall on character boundaries.
     pub(crate) fn prefix_len(self, bytes: &[u8], capacity: usize) -> Result<usize, ConvError> {
         let capacity = capacity.min(bytes.len());
         if self.is_utf8() {

@@ -58,9 +58,32 @@ delivery, including PLP chunking and NULL indicators; other C targets report
 `07006` without consuming the row or value. A native JSON result without a
 current-session JSON acknowledgement is a protocol error.
 
-JSON-specific parameter bindings are separate from result support. Native
-parity testing requires a JSON-enabled msodbcsql build and a JSON-capable server;
-the installed retail ODBC18 driver is not a substitute for that build.
+Native scalar parameters accept `SQL_SS_JSON` (`-157`) with `SQL_C_CHAR`,
+`SQL_C_WCHAR`, or `SQL_C_BINARY`; `SQL_C_DEFAULT` resolves to `SQL_C_WCHAR`.
+Input, bound output, input/output, and typed NULLs use the native TDS JSON type.
+`ColumnSize` does not narrow a JSON declaration. SQL Server validates JSON
+syntax; the driver does not parse JSON documents.
+
+Character inputs use the connection's client encoding for `SQL_C_CHAR` and
+UTF-16LE for `SQL_C_WCHAR`, then transmit UTF-8. UTF-8 client `SQL_C_CHAR`
+and native `SQL_C_BINARY` inputs preserve opaque bytes, leaving malformed
+UTF-8 to SQL Server. Output lengths count bytes in the selected C encoding;
+outputs become available after all procedure results have been consumed.
+
+JSON input data-at-execution supports `SQLParamData`/`SQLPutData`, including
+UTF-8 and UTF-16 characters split across chunks. An unfinished UTF-16 character
+at parameter close returns `22026` and abandons the sequence. Non-UTF-8
+`SQL_C_CHAR` JSON is buffered until complete because the client code-page
+decoder is not incremental; a partial terminal code-page character also returns
+`22026` before decoding. Other streamable JSON inputs retain chunked delivery.
+
+`SQL_PARAM_OUTPUT_STREAM` and `SQL_PARAM_INPUT_OUTPUT_STREAM` remain unsupported
+(`HYC00`). Materialized truncated outputs report the complete converted length;
+native unknown-length PLP output's `SQL_NO_TOTAL` behavior is not yet preserved.
+These are implementation gaps for tasks 50720/50721, not deliberate deviations.
+Selected reference scenarios are ported from msodbcsql `feature/JsonFeature`
+at `88c4dd572852d225448b61173fe56fd59ab22e4c`; they have not yet been measured
+against a JSON-enabled native driver and SQL Server. No retail parity is claimed.
 
 ## Connection-operation timeouts
 

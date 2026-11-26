@@ -30,8 +30,7 @@ use crate::api::odbc_types::{
 use crate::api::type_rules::parameter_column_size_is_valid;
 use crate::conversion::error::ConvOk;
 use crate::conversion::param_convert::{
-    DaePlan, DaeTranscode, ParamBuildError, bound_param_to_rpc, buffered_dae_to_rpc,
-    dae_length_limit, dae_plan, dae_streamed_declaration,
+    DaePlan, DaeTranscode, ParamBuildError, dae_length_limit, dae_plan, dae_streamed_declaration,
 };
 use crate::error::{HasDiagnostics, post_sql_error};
 use crate::handles::dbc::{ConnectionState, DbcState};
@@ -1048,12 +1047,15 @@ pub(super) fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
 /// a zero-marker statement execute successfully despite the internal
 /// failure, and reported a misleading `07002` for one with markers.
 pub(super) fn snapshot_bound_params(stmt: &StmtHandle) -> Result<BoundParamSet, SqlReturn> {
-    let long_as_max = {
+    let (long_as_max, client_encoding) = {
         let Ok(state) = stmt.parent_dbc().inner.lock() else {
             error!("snapshotting parameters: dbc mutex poisoned");
             return Err(SQL_ERROR);
         };
-        state.long_as_max() == crate::api::odbc_types::SQL_XL_ON
+        (
+            state.long_as_max() == crate::api::odbc_types::SQL_XL_ON,
+            state.client_encoding,
+        )
     };
     // Read before the STMT lock below, matching bind_param.rs's own
     // parent-before-child lock ordering for the same lookup.
@@ -1092,7 +1094,15 @@ pub(super) fn snapshot_bound_params(stmt: &StmtHandle) -> Result<BoundParamSet, 
             &ipd_state,
             odbc_version,
             long_as_max,
-        ),
+        )
+        .into_iter()
+        .map(|snapshot| {
+            snapshot.map(|mut snapshot| {
+                snapshot.client_encoding = client_encoding;
+                snapshot
+            })
+        })
+        .collect(),
         header: ParamArrayHeader::from_headers(&apd_state.header, &ipd_state.header),
     })
 }
@@ -1394,12 +1404,20 @@ pub(super) unsafe fn build_named_params_for_row(
             unsafe { crate::conversion::param_convert::data_at_exec_indicator(&bound_param) };
 
         if let Some(indicator) = dae_indicator {
-            let plan = dae_plan(bound_param.c_type, bound_param.sql_type, udt_names).map_err(
+            let mut plan = dae_plan(bound_param.c_type, bound_param.sql_type, udt_names).map_err(
                 |source| ParamRowBuildError::Conversion {
                     parameter: i + 1,
                     source,
                 },
             )?;
+            // The platform client codec has no incremental decoder. Keep non-UTF8
+            // JSON character data until its complete value can be decoded.
+            if bound_param.sql_type == crate::api::odbc_types::SQL_SS_JSON
+                && bound_param.c_type == crate::api::odbc_types::SQL_C_CHAR
+                && !snapshot.client_encoding.is_utf8()
+            {
+                plan = DaePlan::Buffer;
+            }
             let length_limit = dae_length_limit(
                 bound_param.c_type,
                 bound_param.sql_type,
@@ -1468,7 +1486,7 @@ pub(super) unsafe fn build_named_params_for_row(
                 }
             };
             params.push(rpc);
-            dae_params.push(DaeParam::new(
+            let mut dae_param = DaeParam::new(
                 i,
                 dae_expected_length(indicator),
                 buffered,
@@ -1476,7 +1494,9 @@ pub(super) unsafe fn build_named_params_for_row(
                 bound_param,
                 snapshot.udt_names.clone(),
                 snapshot.long_as_max,
-            ));
+            );
+            dae_param.client_encoding = snapshot.client_encoding;
+            dae_params.push(dae_param);
         } else {
             if bound_param.sql_type == SQL_SS_XML
                 && !parameter_column_size_is_valid(bound_param.sql_type, bound_param.column_size)
@@ -1487,12 +1507,19 @@ pub(super) unsafe fn build_named_params_for_row(
                 });
             }
             unsafe { crate::conversion::param_convert::stamp_numeric_apd(&bound_param) };
-            let (param, outcome) =
-                unsafe { bound_param_to_rpc(name, &bound_param, udt_names, snapshot.long_as_max) }
-                    .map_err(|source| ParamRowBuildError::Conversion {
-                        parameter: i + 1,
-                        source,
-                    })?;
+            let (param, outcome) = unsafe {
+                crate::conversion::param_convert::bound_param_to_rpc_encoded(
+                    name,
+                    &bound_param,
+                    udt_names,
+                    snapshot.long_as_max,
+                    snapshot.client_encoding,
+                )
+            }
+            .map_err(|source| ParamRowBuildError::Conversion {
+                parameter: i + 1,
+                source,
+            })?;
             if outcome == ConvOk::Truncated && dae_params.is_empty() {
                 fractional_truncated = true;
             }
@@ -1711,13 +1738,14 @@ pub(super) fn rebuild_deferred_params(
             return Err(SQL_ERROR);
         };
         let name = parameter_name(*index);
-        match buffered_dae_to_rpc(
+        match crate::conversion::param_convert::buffered_dae_to_rpc_encoded(
             name,
             &dae.binding,
             dae.udt_names.as_deref(),
             bytes,
             *is_null,
             dae.long_as_max,
+            dae.client_encoding,
         ) {
             Ok((param, outcome)) => {
                 *slot = param;

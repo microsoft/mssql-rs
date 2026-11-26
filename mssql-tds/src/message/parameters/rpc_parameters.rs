@@ -127,6 +127,8 @@ pub enum StreamedSqlType {
     /// XML data. Chunks must contain UTF-16LE bytes; the streaming client adds
     /// a BOM when absent and preserves exactly one when present.
     Xml,
+    /// Native JSON data. Chunks contain UTF-8 bytes without a BOM.
+    Json,
     /// CLR user-defined type data. Chunks are the opaque CLR-serialized payload.
     Udt(UdtTypeName),
 }
@@ -143,6 +145,7 @@ impl StreamedSqlType {
             Self::VarcharMax => SqlType::VarcharMax(None),
             Self::VarBinaryMax => SqlType::VarBinaryMax(None),
             Self::Xml => SqlType::Xml(None),
+            Self::Json => SqlType::Json(None),
             Self::Udt(type_name) => SqlType::Udt(type_name.clone(), None),
         }
     }
@@ -2252,6 +2255,19 @@ mod tests {
         assert_eq!(streamed_header_bytes(&param, false), expected);
     }
 
+    #[test]
+    fn serialize_data_at_exec_json_has_no_collation_or_schema() {
+        let param = RpcParameter::data_at_exec(
+            Some("@p".to_string()),
+            StatusFlags::BY_REF_VALUE,
+            StreamedSqlType::Json,
+        );
+        assert_eq!(
+            streamed_header_bytes(&param, false),
+            vec![2, 0x40, 0, 0x70, 0, 1, 0xf4]
+        );
+    }
+
     /// Every streamed type declares itself in the `sp_executesql` `@params`
     /// string under its own T-SQL name, so the server binds the same type it
     /// sees in TYPE_INFO.
@@ -2262,6 +2278,7 @@ mod tests {
             (StreamedSqlType::VarcharMax, "varchar(max)"),
             (StreamedSqlType::VarBinaryMax, "varbinary(max)"),
             (StreamedSqlType::Xml, "xml"),
+            (StreamedSqlType::Json, "json"),
             (
                 StreamedSqlType::Udt(UdtTypeName::new(
                     None,
