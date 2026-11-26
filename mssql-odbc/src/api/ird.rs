@@ -244,6 +244,119 @@ mod tests {
         assert!(ird_records(&h).is_empty());
     }
 
+    #[test]
+    fn json_metadata_agrees_across_column_and_descriptor_entrypoints() {
+        use crate::api::exports::{SQLColAttributeW, SQLDescribeColW, SQLGetDescFieldW};
+        use crate::api::odbc_types::*;
+        use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
+        use mssql_tds::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut metadata = int_columns(1);
+        metadata[0].data_type = TdsDataType::Json;
+        metadata[0].type_info = TypeInfo::partial_len(TdsDataType::Json, 0, None).unwrap();
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_EXEC_CONTEXT);
+            state.column_metadata = metadata.clone();
+        }
+        populate_ird(stmt, &metadata, None).unwrap();
+        let (mut ty, mut size, mut scale) = (0, 99, -1);
+        assert_eq!(
+            unsafe {
+                SQLDescribeColW(
+                    h.stmt,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut ty,
+                    &mut size,
+                    &mut scale,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!((ty, size, scale), (SQL_SS_JSON, 0, 0));
+        for (field, expected) in [
+            (SQL_DESC_TYPE, SqlLen::from(SQL_SS_JSON)),
+            (SQL_DESC_CONCISE_TYPE, SqlLen::from(SQL_SS_JSON)),
+            (SQL_DESC_LENGTH, 0),
+            (SQL_DESC_OCTET_LENGTH, 0),
+            (SQL_DESC_DISPLAY_SIZE, 0),
+            (SQL_DESC_PRECISION, 0),
+            (SQL_DESC_SCALE, 0),
+            (SQL_DESC_SEARCHABLE, 0),
+        ] {
+            let mut actual = -99;
+            assert_eq!(
+                unsafe {
+                    SQLColAttributeW(
+                        h.stmt,
+                        1,
+                        field,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        &mut actual,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(actual, expected, "field {field}");
+        }
+        for (field, expected) in [
+            (SQL_DESC_CONCISE_TYPE, SQL_SS_JSON),
+            (SQL_DESC_TYPE, SQL_SS_JSON),
+            (SQL_DESC_SEARCHABLE, 0),
+        ] {
+            let mut actual: SqlSmallInt = -99;
+            assert_eq!(
+                unsafe {
+                    SQLGetDescFieldW(
+                        h.ird(),
+                        1,
+                        SqlSmallInt::try_from(field).unwrap(),
+                        (&raw mut actual).cast(),
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(actual, expected);
+        }
+        for (field, expected) in [
+            (SQL_DESC_TYPE_NAME, "json"),
+            (SQL_DESC_LITERAL_PREFIX, "'"),
+            (SQL_DESC_LITERAL_SUFFIX, "'"),
+        ] {
+            let mut text = [0u16; 16];
+            let mut len = 0;
+            assert_eq!(
+                unsafe {
+                    SQLGetDescFieldW(
+                        h.ird(),
+                        1,
+                        SqlSmallInt::try_from(field).unwrap(),
+                        text.as_mut_ptr().cast(),
+                        32,
+                        &mut len,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                String::from_utf16(&text[..usize::try_from(len).unwrap() / 2]).unwrap(),
+                expected
+            );
+        }
+        populate_ird(stmt, &int_columns(1), None).unwrap();
+        assert_eq!(ird_records(&h)[0].concise_type, SQL_INTEGER);
+    }
+
     /// Panics while holding the IRD lock, leaving the mutex poisoned.
     fn poison_ird(ird: SqlHandle) {
         let handle = unsafe { handle_from_raw::<DescHandle>(ird) };

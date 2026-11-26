@@ -806,8 +806,8 @@ impl RowWriter for BoundRowWriter<'_> {
 ///
 /// `SQL_SS_XML` is deliberately not in that list: msodbcsql maps it to
 /// `SQL_C_WCHAR` too, so there is no deviation to record, and it is unreachable
-/// here anyway because [`odbc_sql_type`] reports xml and json columns as
-/// `SQL_WLONGVARCHAR`.
+/// here for XML because [`odbc_sql_type`] reports it as `SQL_WLONGVARCHAR`.
+/// Native JSON also resolves to `SQL_C_WCHAR`, matching both native tables.
 ///
 /// A column whose SQL type has no default is left at `SQL_C_DEFAULT`, which
 /// [`deliver_bound`] reports as an unsupported target for any row carrying a
@@ -1114,6 +1114,16 @@ fn fill_rowset(
             mark_no_rows(row_status_ptr, 0, row_array_size);
             debug!("SQLFetchScroll: SQL_ATTR_MAX_ROWS reached; returning SQL_NO_DATA");
             return SQL_NO_DATA;
+        }
+        if bindings.iter().any(|binding| {
+            !matches!(binding.target_type, SQL_C_CHAR | SQL_C_WCHAR | SQL_C_BINARY)
+                && stmt_state
+                    .column_metadata
+                    .get(usize::from(binding.column_number).saturating_sub(1))
+                    .is_some_and(|meta| meta.data_type == TdsDataType::Json)
+        }) {
+            post_diag(&mut stmt_state, ERR_RESTRICTED_DATA_TYPE);
+            return SQL_ERROR;
         }
         row_budget(
             stmt_state.max_rows,

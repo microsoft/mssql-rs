@@ -532,6 +532,25 @@ pub(crate) fn connect_mock_server_with_trailing_info(
     response: mssql_mock_tds::QueryResponse,
     trailing_info: Vec<mssql_mock_tds::InfoMessage>,
 ) -> MockServer {
+    connect_mock_server_configured(dbc, query, response, trailing_info, None)
+}
+
+pub(crate) fn connect_mock_server_with_json_ack(
+    dbc: &crate::handles::dbc::DbcHandle,
+    query: &str,
+    response: mssql_mock_tds::QueryResponse,
+    json_ack: Option<Vec<u8>>,
+) -> MockServer {
+    connect_mock_server_configured(dbc, query, response, Vec::new(), json_ack)
+}
+
+fn connect_mock_server_configured(
+    dbc: &crate::handles::dbc::DbcHandle,
+    query: &str,
+    response: mssql_mock_tds::QueryResponse,
+    trailing_info: Vec<mssql_mock_tds::InfoMessage>,
+    json_ack: Option<Vec<u8>>,
+) -> MockServer {
     use crate::handles::dbc::ConnectionState;
     use mssql_mock_tds::MockTdsServer;
     use mssql_tds::connection::client_context::ClientContext;
@@ -549,6 +568,7 @@ pub(crate) fn connect_mock_server_with_trailing_info(
             let addr = server.local_addr();
             let registry = server.query_registry();
             let connections = server.connection_store();
+            registry.lock().await.set_json_ack(json_ack);
             registry
                 .lock()
                 .await

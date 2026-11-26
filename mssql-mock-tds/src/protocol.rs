@@ -1117,6 +1117,8 @@ fn append_result_set(
             result.put_slice(&col.collation);
         } else if col.data_type == crate::query_response::SqlDataType::VarBinaryMax {
             result.put_u16_le(PLP_TYPE_LENGTH_MARKER);
+        } else if col.data_type == crate::query_response::SqlDataType::Json {
+            // Native JSON TYPE_INFO consists solely of the type token.
         } else {
             result.put_u8(col.data_type.max_length());
         }

@@ -9,10 +9,11 @@ use tracing::{debug, error};
 use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_CHAR, SQL_DECIMAL, SQL_DOUBLE, SQL_ERROR, SQL_GUID,
     SQL_INTEGER, SQL_INVALID_HANDLE, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NO_NULLS,
-    SQL_NULLABLE, SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET,
-    SQL_SS_UDT, SQL_SS_VARIANT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TINYINT, SQL_TYPE_DATE,
-    SQL_TYPE_TIMESTAMP, SQL_UNKNOWN_TYPE, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR,
-    SQL_WVARCHAR, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_NULLABLE, SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_JSON, SQL_SS_TIME2,
+    SQL_SS_TIMESTAMPOFFSET, SQL_SS_UDT, SQL_SS_VARIANT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
+    SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIMESTAMP, SQL_UNKNOWN_TYPE, SQL_VARBINARY, SQL_VARCHAR,
+    SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt,
+    SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_DESCRIPTOR_INDEX, ERR_NOT_CURSOR_SPECIFICATION,
@@ -242,7 +243,8 @@ pub(crate) fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -
         TdsDataType::VarBinary | TdsDataType::BigVarBinary => SQL_VARBINARY,
         TdsDataType::Image => SQL_LONGVARBINARY,
         TdsDataType::Guid => SQL_GUID,
-        TdsDataType::Xml | TdsDataType::Json => SQL_WLONGVARCHAR,
+        TdsDataType::Xml => SQL_WLONGVARCHAR,
+        TdsDataType::Json => SQL_SS_JSON,
         // mssql-python keys its sql_variant handling off this exact type, so
         // reporting the column as character data hides the variant entirely.
         TdsDataType::SsVariant => SQL_SS_VARIANT,

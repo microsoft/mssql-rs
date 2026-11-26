@@ -21,13 +21,14 @@ use crate::api::odbc_types::{
     SQL_DATETIME, SQL_DECIMAL, SQL_DESC_AUTO_UNIQUE_VALUE, SQL_DESC_BASE_COLUMN_NAME,
     SQL_DESC_CASE_SENSITIVE, SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT,
     SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_DISPLAY_SIZE, SQL_DESC_FIXED_PREC_SCALE,
-    SQL_DESC_LABEL, SQL_DESC_LENGTH, SQL_DESC_LOCAL_TYPE_NAME, SQL_DESC_NAME, SQL_DESC_NULLABLE,
-    SQL_DESC_NUM_PREC_RADIX, SQL_DESC_OCTET_LENGTH, SQL_DESC_PRECISION, SQL_DESC_SCALE,
-    SQL_DESC_SEARCHABLE, SQL_DESC_TYPE, SQL_DESC_TYPE_NAME, SQL_DESC_UNNAMED, SQL_DESC_UNSIGNED,
-    SQL_DESC_UPDATABLE, SQL_DOUBLE, SQL_ERROR, SQL_FLOAT, SQL_INTEGER, SQL_INVALID_HANDLE,
-    SQL_NAMED, SQL_NO_NULLS, SQL_NULLABLE, SQL_NUMERIC, SQL_PRED_BASIC, SQL_PRED_CHAR,
-    SQL_PRED_NONE, SQL_PRED_SEARCHABLE, SQL_REAL, SQL_SMALLINT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
-    SQL_UNNAMED, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_DESC_LABEL, SQL_DESC_LENGTH, SQL_DESC_LITERAL_PREFIX, SQL_DESC_LITERAL_SUFFIX,
+    SQL_DESC_LOCAL_TYPE_NAME, SQL_DESC_NAME, SQL_DESC_NULLABLE, SQL_DESC_NUM_PREC_RADIX,
+    SQL_DESC_OCTET_LENGTH, SQL_DESC_PRECISION, SQL_DESC_SCALE, SQL_DESC_SEARCHABLE, SQL_DESC_TYPE,
+    SQL_DESC_TYPE_NAME, SQL_DESC_UNNAMED, SQL_DESC_UNSIGNED, SQL_DESC_UPDATABLE, SQL_DOUBLE,
+    SQL_ERROR, SQL_FLOAT, SQL_INTEGER, SQL_INVALID_HANDLE, SQL_NAMED, SQL_NO_NULLS, SQL_NULLABLE,
+    SQL_NUMERIC, SQL_PRED_BASIC, SQL_PRED_CHAR, SQL_PRED_NONE, SQL_PRED_SEARCHABLE, SQL_REAL,
+    SQL_SMALLINT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_UNNAMED, SqlHandle, SqlLen, SqlPointer,
+    SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_DESCRIPTOR_FIELD, ERR_INVALID_DESCRIPTOR_INDEX,
@@ -121,7 +122,7 @@ unsafe fn sql_col_attribute_w_impl(
 }
 
 /// Which output parameter a field identifier writes to.
-enum Attr {
+pub(super) enum Attr {
     Numeric(SqlLen),
     Text(String),
 }
@@ -281,6 +282,11 @@ fn column_attribute(
     field_identifier: SqlUSmallInt,
     alias_type_name: Option<&str>,
 ) -> Option<Attr> {
+    if meta.data_type == TdsDataType::Json
+        && let Some(attr) = json_attribute(field_identifier)
+    {
+        return Some(attr);
+    }
     let attr = match field_identifier {
         SQL_DESC_CONCISE_TYPE => Attr::Numeric(SqlLen::from(concise_type(meta))),
         SQL_DESC_TYPE => Attr::Numeric(SqlLen::from(verbose_type(meta))),
@@ -353,6 +359,16 @@ fn column_attribute(
         _ => return None,
     };
     Some(attr)
+}
+
+pub(super) fn json_attribute(field: SqlUSmallInt) -> Option<Attr> {
+    Some(match field {
+        SQL_DESC_TYPE_NAME | SQL_DESC_LOCAL_TYPE_NAME => Attr::Text("json".to_string()),
+        SQL_DESC_LITERAL_PREFIX | SQL_DESC_LITERAL_SUFFIX => Attr::Text("'".to_string()),
+        SQL_DESC_SEARCHABLE => Attr::Numeric(SQL_PRED_NONE),
+        SQL_DESC_CASE_SENSITIVE | SQL_DESC_DISPLAY_SIZE => Attr::Numeric(0),
+        _ => return None,
+    })
 }
 
 /// True for the types SQL Server reports as `datetime`/`smalldatetime`/
@@ -562,9 +578,11 @@ fn searchable(meta: &ColumnMetadata) -> SqlLen {
         // The legacy LOB text types accept `LIKE` but not comparison.
         TdsDataType::Text | TdsDataType::NText => SQL_PRED_CHAR,
         // Not usable in a `WHERE` clause without a conversion or a method call.
-        TdsDataType::Image | TdsDataType::Xml | TdsDataType::Udt | TdsDataType::Vector => {
-            SQL_PRED_NONE
-        }
+        TdsDataType::Image
+        | TdsDataType::Xml
+        | TdsDataType::Json
+        | TdsDataType::Udt
+        | TdsDataType::Vector => SQL_PRED_NONE,
         // Character and calendar types take every predicate including `LIKE`.
         TdsDataType::Char
         | TdsDataType::BigChar

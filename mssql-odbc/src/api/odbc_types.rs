@@ -690,6 +690,9 @@ pub const SQL_SS_UDT: SqlSmallInt = -151;
 pub const SQL_SS_XML: SqlSmallInt = -152;
 pub const SQL_SS_TABLE: SqlSmallInt = -153;
 pub const SQL_SS_VECTOR: SqlSmallInt = -156;
+pub const SQL_SS_JSON: SqlSmallInt = -157;
+pub const SQL_DESC_LITERAL_PREFIX: SqlUSmallInt = 27;
+pub const SQL_DESC_LITERAL_SUFFIX: SqlUSmallInt = 28;
 
 /// Start of the driver-specific SQL type id range (`odbc/sqlsrv.h`). It is -80,
 /// not -150: the SS ids above sit well below it, so msodbcsql maps the ones it
