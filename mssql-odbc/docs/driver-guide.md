@@ -74,7 +74,8 @@ JSON input data-at-execution supports `SQLParamData`/`SQLPutData`, including
 UTF-8 and UTF-16 characters split across chunks. An unfinished UTF-16 character
 at parameter close returns `22026` and abandons the sequence. Non-UTF-8
 `SQL_C_CHAR` JSON is buffered until complete because the client code-page
-decoder is not incremental; other streamable JSON inputs retain chunked delivery.
+decoder is not incremental; a partial terminal code-page character also returns
+`22026` before decoding. Other streamable JSON inputs retain chunked delivery.
 
 `SQL_PARAM_OUTPUT_STREAM` and `SQL_PARAM_INPUT_OUTPUT_STREAM` remain unsupported
 (`HYC00`). Materialized truncated outputs report the complete converted length;

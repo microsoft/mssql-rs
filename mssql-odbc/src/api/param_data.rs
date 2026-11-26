@@ -39,6 +39,8 @@ use super::util::write_if_some;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NEED_DATA, SqlHandle, SqlPointer, SqlReturn,
 };
+use crate::conversion::error::ConvError;
+use crate::conversion::param_convert::ParamBuildError;
 use crate::error::free_errors;
 use crate::handles::stmt::{DaeTarget, STMT_STATE_EXEC_STARTED};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
@@ -261,6 +263,26 @@ fn sql_param_data_operation(
         if !dae.progress.put_data_called {
             Some(ERR_FUNCTION_SEQUENCE)
         } else if !dae.progress.is_null {
+            let encoded_tail_error = dae
+                .current_param()
+                .filter(|param| {
+                    param.binding.sql_type == crate::api::odbc_types::SQL_SS_JSON
+                        && param.binding.c_type == crate::api::odbc_types::SQL_C_CHAR
+                        && !param.client_encoding.is_utf8()
+                        && param.is_buffered()
+                })
+                .and_then(|param| {
+                    match param
+                        .client_encoding
+                        .prefix_len(&dae.progress.buffer, dae.progress.buffer.len())
+                    {
+                        Ok(length) if length == dae.progress.buffer.len() => None,
+                        Ok(_) | Err(ConvError::InvalidCharacterValue) => {
+                            Some(ERR_DAE_LENGTH_MISMATCH)
+                        }
+                        Err(error) => Some(ParamBuildError::Value(error).diag()),
+                    }
+                });
             if dae
                 .current_param()
                 .is_some_and(|param| param.binding.sql_type == crate::api::odbc_types::SQL_SS_JSON)
@@ -268,12 +290,14 @@ fn sql_param_data_operation(
             {
                 Some(ERR_DAE_LENGTH_MISMATCH)
             } else {
-                match dae.current_param().and_then(|param| param.expected_len) {
-                    Some(expected) if expected != dae.progress.bytes_sent => {
-                        Some(ERR_DAE_LENGTH_MISMATCH)
+                encoded_tail_error.or_else(|| {
+                    match dae.current_param().and_then(|param| param.expected_len) {
+                        Some(expected) if expected != dae.progress.bytes_sent => {
+                            Some(ERR_DAE_LENGTH_MISMATCH)
+                        }
+                        _ => None,
                     }
-                    _ => None,
-                }
+                })
             }
         } else {
             None
@@ -1815,6 +1839,37 @@ mod tests {
             dae.progress.carry = vec![0x3d, 0xd8];
             state.dae = Some(dae);
         }
+        let mut token = std::ptr::null_mut();
+        assert_eq!(unsafe { sql_param_data(h.stmt, &mut token) }, SQL_ERROR);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_DAE_LENGTH_MISMATCH.state
+        );
+        assert!(!state.needs_data());
+    }
+
+    #[test]
+    fn json_buffered_cp932_partial_character_is_rejected_before_substitution() {
+        use crate::api::odbc_types::{SQL_SS_JSON, SQL_SUCCESS};
+        use crate::api::put_data::sql_put_data;
+        use crate::conversion::client_encoding::ClientEncoding;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            let mut param = DaeParam::unbounded(0, std::ptr::null_mut(), None)
+                .with_binding_types(SQL_C_CHAR, SQL_SS_JSON);
+            param.client_encoding = ClientEncoding::for_code_page(932).unwrap();
+            param.set_buffered(true);
+            state.dae = Some(DaeState::for_test(vec![param], Some(0)));
+        }
+        let mut bytes = [b'[', b'"', 0x82];
+        assert_eq!(
+            unsafe { sql_put_data(h.stmt, bytes.as_mut_ptr().cast(), 3) },
+            SQL_SUCCESS
+        );
         let mut token = std::ptr::null_mut();
         assert_eq!(unsafe { sql_param_data(h.stmt, &mut token) }, SQL_ERROR);
         let state = stmt.inner.lock().unwrap();
