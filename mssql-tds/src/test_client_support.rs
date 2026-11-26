@@ -129,6 +129,37 @@ pub fn serialized_value_wire_bytes(
 /// path it was written to avoid.
 pub const CAPTURE_PACKET_SIZE: u32 = 4096;
 
+/// Captures a complete positional RPC parameter, including TVP metadata and
+/// rows, through the production serializer with packet headers removed.
+pub fn serialized_rpc_parameter_wire_bytes(
+    parameter: &crate::message::parameters::rpc_parameters::RpcParameter,
+    collation: &crate::token::tokens::SqlCollation,
+) -> TdsResult<Vec<u8>> {
+    use crate::datatypes::encoder::GenericEncoder;
+    use crate::io::packet_writer::{PacketWriter, TdsPacketWriter};
+    use crate::message::messages::PacketType;
+
+    let mut sink = CapturingWriter {
+        size: CAPTURE_PACKET_SIZE,
+        sent: Vec::new(),
+    };
+    {
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut sink, None, None);
+        futures::executor::block_on(parameter.serialize(
+            &mut writer,
+            collation,
+            true,
+            &GenericEncoder::new(),
+        ))?;
+        futures::executor::block_on(writer.finalize())?;
+    }
+    let mut out = Vec::new();
+    for packet in sink.sent {
+        out.extend_from_slice(&packet[PacketWriter::PACKET_HEADER_SIZE..]);
+    }
+    Ok(out)
+}
+
 /// A [`NetworkWriter`] that keeps whatever is sent to it.
 ///
 /// Deliberately not a discard sink: `PacketWriter` flushes completed packets

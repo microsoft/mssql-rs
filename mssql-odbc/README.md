@@ -98,7 +98,9 @@ covers connection defaults, timeouts, parameter streaming, descriptors, data
 classification, character encoding, migration notes, and tracing. Its
 [JSON section](https://github.com/microsoft/mssql-rs/blob/main/mssql-odbc/docs/driver-guide.md#json-feature-negotiation)
 covers native result types, session negotiation, scalar parameters, encodings,
-input streaming, and remaining output-streaming gaps. See the
+input streaming, and remaining output-streaming gaps. The
+[TVP column guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-odbc/docs/driver-guide.md#json-table-valued-parameter-columns)
+documents native JSON bindings, input encodings, and buffered DAE. See the
 [parity registry](https://github.com/microsoft/mssql-rs/blob/main/mssql-odbc/docs/parity-deviations.md)
 for deliberate differences from Microsoft ODBC Driver for SQL Server.
 

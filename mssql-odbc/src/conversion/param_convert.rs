@@ -888,9 +888,31 @@ pub(crate) fn buffered_dae_to_rpc_encoded(
 
 pub(crate) fn buffered_dae_to_value(
     binding: &BoundParam,
-    buffer: &[u8],
+    buffer: &mut Vec<u8>,
     is_null: bool,
+    client_encoding: ClientEncoding,
 ) -> Result<(SqlType, ConvOk), ParamBuildError> {
+    if binding.sql_type == SQL_SS_JSON {
+        if is_null {
+            return Ok((SqlType::NVarcharMax(None), ConvOk::Exact));
+        }
+        if binding.c_type == SQL_C_CHAR
+            && client_encoding
+                .prefix_len(buffer, buffer.len())
+                .map_err(ParamBuildError::Value)?
+                != buffer.len()
+        {
+            return Err(ParamBuildError::Value(ConvError::InvalidCharacterValue));
+        }
+        let value = match binding.c_type {
+            SQL_C_CHAR => AppValue::NarrowText(std::mem::take(buffer)),
+            SQL_C_WCHAR => AppValue::WideText(std::mem::take(buffer)),
+            SQL_C_BINARY => AppValue::Binary(std::mem::take(buffer)),
+            other => return Err(ParamBuildError::UnsupportedCType(other)),
+        };
+        return json_input_text(value, client_encoding, true)
+            .map(|text| (SqlType::NVarcharMax(Some(text)), ConvOk::Exact));
+    }
     if !is_null
         && crate::conversion::parameter_value_stride(binding.c_type, 0)
             .is_some_and(|width| buffer.len() < width)
@@ -2337,14 +2359,15 @@ fn udt_type_name(names: Option<&UdtNames>) -> Result<UdtTypeName, ParamBuildErro
 /// (its octet-length slot: a non-negative count, or `SQL_DEFAULT_PARAM`/absent for an
 /// empty table). Each constituent column — captured while the TVP was the
 /// parameter focus — supplies one `SqlType` per row through the same scalar
-/// conversion a top-level parameter uses, so a TVP cell behaves exactly like
-/// the equivalent scalar.
+/// conversion a top-level parameter uses. JSON is the exception: its descriptor
+/// remains native JSON while its TVP metadata and cells use `nvarchar(max)`.
 ///
 /// # Safety
 /// `tvp` and every column in `columns` must satisfy the `SQLBindParameter`
 /// contract for the duration of this call; their value and indicator buffers
 /// are read here. `bind_offset` positions the top-level table binding;
 /// `column_bind_offset` and `column_bind_type` describe its independent child layout.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn build_tvp_param(
     name: Option<String>,
     tvp: &BoundParam,
@@ -2353,6 +2376,7 @@ pub(crate) unsafe fn build_tvp_param(
     bind_offset: isize,
     column_bind_offset: isize,
     column_bind_type: SqlULen,
+    client_encoding: ClientEncoding,
 ) -> Result<RpcParameter, ParamBuildError> {
     let type_name = tvp_type_name(udt_names)?;
 
@@ -2406,13 +2430,13 @@ pub(crate) unsafe fn build_tvp_param(
             if unsafe { tvp_cell_data_at_exec_indicator(&positioned) }.is_some() {
                 return Err(ParamBuildError::TvpColumnDataAtExec(index));
             }
-            let value = unsafe { bound_tvp_cell_to_value(&positioned) }.map_err(|error| {
-                ParamBuildError::TvpCellConversion {
+            let value = unsafe { bound_tvp_cell_to_value(&positioned, client_encoding) }.map_err(
+                |error| ParamBuildError::TvpCellConversion {
                     row,
                     column: index,
                     diagnostic: error.diag(),
-                }
-            })?;
+                },
+            )?;
             cells.push(value);
         }
         rows.push(cells);
@@ -2432,6 +2456,7 @@ pub(crate) fn build_tvp_param_from_dae(
     tvp_index: usize,
     row_count: usize,
     buffered_cells: &mut [crate::handles::stmt::BufferedTvpCell],
+    client_encoding: ClientEncoding,
 ) -> Result<RpcParameter, ParamBuildError> {
     let type_name = tvp_type_name(udt_names)?;
     if row_count == 0 {
@@ -2489,7 +2514,15 @@ pub(crate) fn build_tvp_param_from_dae(
             let value = (|| {
                 let value = match cell.value.take() {
                     Some(value) => value,
-                    None => buffered_dae_to_value(column, &cell.bytes, cell.is_null)?.0,
+                    None => {
+                        buffered_dae_to_value(
+                            column,
+                            &mut cell.bytes,
+                            cell.is_null,
+                            client_encoding,
+                        )?
+                        .0
+                    }
                 };
                 normalize_tvp_cell(column, value)
             })()
@@ -2516,7 +2549,20 @@ pub(crate) fn build_tvp_param_from_dae(
 /// The binding's buffers must remain valid through this row's collection.
 pub(crate) unsafe fn bound_tvp_cell_to_value(
     column: &BoundParam,
+    client_encoding: ClientEncoding,
 ) -> Result<SqlType, ParamBuildError> {
+    if column.sql_type == SQL_SS_JSON {
+        let length = match unsafe { read_indicator(column) }? {
+            Indicator::Null => return Ok(SqlType::NVarcharMax(None)),
+            Indicator::Length(length) => length,
+        };
+        if column.c_type == SQL_C_WCHAR && length >= 0 && length % 2 != 0 {
+            return Err(ParamBuildError::InvalidBufferLength);
+        }
+        let value = unsafe { read_param_value(column, length) }?;
+        return json_input_text(value, client_encoding, true)
+            .map(|text| SqlType::NVarcharMax(Some(text)));
+    }
     unsafe { stamp_numeric_apd(column) };
     if column.c_type == SQL_C_NUMERIC
         && matches!(sql_family(column.sql_type), Some(SqlFamily::Decimal))
@@ -2636,6 +2682,10 @@ fn tvp_type_name(names: Option<&UdtNames>) -> Result<TvpTypeName, ParamBuildErro
 /// `None`-valued template (`Decimal`/`Numeric`/`Time`/`DateTime2`/
 /// `DateTimeOffset`).
 fn tvp_column_def(column: &BoundParam) -> Result<TvpColumnDef, ParamBuildError> {
+    // JSON TVP columns always use text transport, even after JSON negotiation.
+    if column.sql_type == SQL_SS_JSON {
+        return Ok(TvpColumnDef::new(SqlType::NVarcharMax(None)));
+    }
     let (template, metadata) = typed_null(
         column.sql_type,
         column.column_size,
@@ -4847,6 +4897,7 @@ mod tests {
                     0,
                     0,
                     SQL_BIND_BY_COLUMN,
+                    ClientEncoding::UTF8,
                 )
             },
             Err(ParamBuildError::TvpColumnUnbound(0))
@@ -4868,18 +4919,31 @@ mod tests {
             let width = crate::conversion::parameter_value_stride(c_type, 0).unwrap();
             for length in [0, width - 1] {
                 assert!(matches!(
-                    buffered_dae_to_value(&binding, &vec![0; length], false),
+                    buffered_dae_to_value(
+                        &binding,
+                        &mut vec![0; length],
+                        false,
+                        ClientEncoding::UTF8
+                    ),
                     Err(ParamBuildError::InvalidBufferLength)
                 ));
             }
-            assert!(buffered_dae_to_value(&binding, &[], true).is_ok());
+            assert!(
+                buffered_dae_to_value(&binding, &mut Vec::new(), true, ClientEncoding::UTF8)
+                    .is_ok()
+            );
         }
         let mut binding = param(SQL_C_SLONG, std::ptr::null_mut(), std::ptr::null_mut());
         binding.sql_type = SQL_INTEGER;
         assert_eq!(
-            buffered_dae_to_value(&binding, &42i32.to_ne_bytes(), false)
-                .unwrap()
-                .0,
+            buffered_dae_to_value(
+                &binding,
+                &mut 42i32.to_ne_bytes().to_vec(),
+                false,
+                ClientEncoding::UTF8
+            )
+            .unwrap()
+            .0,
             SqlType::Int(Some(42))
         );
     }
@@ -4894,12 +4958,34 @@ mod tests {
         let mut default: SqlLen = SQL_DEFAULT_PARAM;
         let tvp = param(SQL_C_BINARY, std::ptr::null_mut(), &mut default);
         assert!(
-            unsafe { build_tvp_param(None, &tvp, Some(&names), &[], 0, 0, SQL_BIND_BY_COLUMN) }
-                .is_ok()
+            unsafe {
+                build_tvp_param(
+                    None,
+                    &tvp,
+                    Some(&names),
+                    &[],
+                    0,
+                    0,
+                    SQL_BIND_BY_COLUMN,
+                    ClientEncoding::UTF8,
+                )
+            }
+            .is_ok()
         );
 
-        let err = unsafe { build_tvp_param(None, &tvp, None, &[], 0, 0, SQL_BIND_BY_COLUMN) }
-            .unwrap_err();
+        let err = unsafe {
+            build_tvp_param(
+                None,
+                &tvp,
+                None,
+                &[],
+                0,
+                0,
+                SQL_BIND_BY_COLUMN,
+                ClientEncoding::UTF8,
+            )
+        }
+        .unwrap_err();
         assert!(matches!(err, ParamBuildError::MissingTableTypeName));
     }
 
@@ -4928,14 +5014,32 @@ mod tests {
         tvp.column_size = 2;
         assert!(
             unsafe {
-                build_tvp_param(None, &tvp, Some(&names), &columns, 0, 0, SQL_BIND_BY_COLUMN)
+                build_tvp_param(
+                    None,
+                    &tvp,
+                    Some(&names),
+                    &columns,
+                    0,
+                    0,
+                    SQL_BIND_BY_COLUMN,
+                    ClientEncoding::UTF8,
+                )
             }
             .is_ok()
         );
 
         let unbound = vec![None];
         let err = unsafe {
-            build_tvp_param(None, &tvp, Some(&names), &unbound, 0, 0, SQL_BIND_BY_COLUMN)
+            build_tvp_param(
+                None,
+                &tvp,
+                Some(&names),
+                &unbound,
+                0,
+                0,
+                SQL_BIND_BY_COLUMN,
+                ClientEncoding::UTF8,
+            )
         }
         .unwrap_err();
         assert!(matches!(err, ParamBuildError::TvpColumnUnbound(0)));
@@ -4963,6 +5067,221 @@ mod tests {
                 TvpColumnDef::new(expected)
             );
         }
+    }
+
+    #[test]
+    fn json_tvp_bound_and_buffered_rows_have_nvarchar_max_wire_bytes() {
+        use crate::handles::stmt::BufferedTvpCell;
+        use mssql_tds::test_client_support::serialized_rpc_parameter_wire_bytes;
+
+        let text = "{\"k\":\"\u{e9}\u{20ac}\"}";
+        let wide: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let cp1252 = ClientEncoding::for_code_page(1252).unwrap();
+        let names = UdtNames {
+            tvp_type_name: "JsonRows".into(),
+            ..Default::default()
+        };
+        for (c_type, encoding, bytes) in [
+            (SQL_C_CHAR, ClientEncoding::UTF8, text.as_bytes()),
+            (SQL_C_CHAR, cp1252, &b"{\"k\":\"\xe9\x80\"}"[..]),
+            (SQL_C_BINARY, cp1252, text.as_bytes()),
+            (SQL_C_WCHAR, cp1252, wide.as_slice()),
+        ] {
+            for column_size in [0, 4, SQL_PREC_UNLIMITED] {
+                let mut values = bytes.repeat(2);
+                let mut lengths = [SqlLen::try_from(bytes.len()).unwrap(), SQL_NULL_DATA];
+                let mut column = param(c_type, values.as_mut_ptr().cast(), lengths.as_mut_ptr());
+                column.sql_type = SQL_SS_JSON;
+                column.column_size = column_size;
+                column.buffer_length = SqlLen::try_from(bytes.len()).unwrap();
+                let mut count = 2;
+                let mut parent = param(SQL_C_BINARY, std::ptr::null_mut(), &mut count);
+                parent.column_size = 2;
+                let bound = unsafe {
+                    build_tvp_param(
+                        None,
+                        &parent,
+                        Some(&names),
+                        &[Some(column)],
+                        0,
+                        0,
+                        SQL_BIND_BY_COLUMN,
+                        encoding,
+                    )
+                }
+                .unwrap();
+                let expected = RpcParameter::new(
+                    None,
+                    StatusFlags::NONE,
+                    SqlType::Table(
+                        tvp_type_name(Some(&names)).unwrap(),
+                        Some(TvpTableData::new(
+                            vec![TvpColumnDef::new(SqlType::NVarcharMax(None))],
+                            vec![
+                                vec![SqlType::NVarcharMax(Some(SqlString::new(
+                                    wide.clone(),
+                                    EncodingType::Utf16,
+                                )))],
+                                vec![SqlType::NVarcharMax(None)],
+                            ],
+                        )),
+                    ),
+                );
+                let collation = SqlCollation::default();
+                let expected_bytes =
+                    serialized_rpc_parameter_wire_bytes(&expected, &collation).unwrap();
+                assert_eq!(
+                    serialized_rpc_parameter_wire_bytes(&bound, &collation).unwrap(),
+                    expected_bytes
+                );
+
+                let mut cells = [
+                    BufferedTvpCell {
+                        tvp_index: 0,
+                        row_index: 0,
+                        column_index: 0,
+                        bytes: bytes.to_vec(),
+                        is_null: false,
+                        value: None,
+                    },
+                    BufferedTvpCell {
+                        tvp_index: 0,
+                        row_index: 1,
+                        column_index: 0,
+                        bytes: Vec::new(),
+                        is_null: true,
+                        value: None,
+                    },
+                ];
+                let buffered = build_tvp_param_from_dae(
+                    None,
+                    Some(&names),
+                    &[Some(column)],
+                    0,
+                    2,
+                    &mut cells,
+                    encoding,
+                )
+                .unwrap();
+                assert_eq!(
+                    serialized_rpc_parameter_wire_bytes(&buffered, &collation).unwrap(),
+                    expected_bytes
+                );
+                assert_eq!(column.sql_type, SQL_SS_JSON);
+            }
+        }
+    }
+
+    #[test]
+    fn json_tvp_large_utf16_value_keeps_its_buffer_and_text_wire_format() {
+        use mssql_tds::test_client_support::serialized_rpc_parameter_wire_bytes;
+
+        let text = format!(
+            "{{\"k\":\"{}\"}}",
+            "\u{e9}\u{20ac}\u{1f600}".repeat(200_000)
+        );
+        let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let pointer = bytes.as_ptr();
+        let string =
+            json_input_text(AppValue::WideText(bytes), ClientEncoding::UTF8, true).unwrap();
+        assert_eq!(string.bytes.as_ptr(), pointer);
+        let mut length = SqlLen::try_from(string.bytes.len()).unwrap();
+        assert!(length > 1024 * 1024);
+        let mut column = param(
+            SQL_C_WCHAR,
+            string.bytes.as_ptr().cast_mut().cast(),
+            &mut length,
+        );
+        column.sql_type = SQL_SS_JSON;
+        column.column_size = 1;
+        column.buffer_length = length;
+        let json = unsafe { bound_tvp_cell_to_value(&column, ClientEncoding::UTF8) }.unwrap();
+        let mut buffered = string.bytes.clone();
+        let buffered_pointer = buffered.as_ptr();
+        let (buffered_value, _) =
+            buffered_dae_to_value(&column, &mut buffered, false, ClientEncoding::UTF8).unwrap();
+        let SqlType::NVarcharMax(Some(buffered_text)) = &buffered_value else {
+            panic!("expected a wide DAE table cell");
+        };
+        assert_eq!(buffered_text.bytes.as_ptr(), buffered_pointer);
+        assert!(buffered.is_empty());
+        let expected =
+            RpcParameter::new(None, StatusFlags::NONE, SqlType::NVarcharMax(Some(string)));
+        let actual = RpcParameter::new(None, StatusFlags::NONE, json);
+        let buffered = RpcParameter::new(None, StatusFlags::NONE, buffered_value);
+        let collation = SqlCollation::default();
+        let expected_bytes = serialized_rpc_parameter_wire_bytes(&expected, &collation).unwrap();
+        assert!(expected_bytes.len() > usize::try_from(length).unwrap());
+        assert_eq!(
+            serialized_rpc_parameter_wire_bytes(&actual, &collation).unwrap(),
+            expected_bytes
+        );
+        assert_eq!(
+            serialized_rpc_parameter_wire_bytes(&buffered, &collation).unwrap(),
+            expected_bytes
+        );
+    }
+
+    #[test]
+    fn json_tvp_rejects_invalid_encoding_but_leaves_json_syntax_to_server() {
+        for bytes in [
+            &b"\xff"[..],
+            &b"\xe2"[..],
+            &b"\xed\xa0\x80"[..],
+            &b"\xf4\x90\x80\x80"[..],
+        ] {
+            let mut column = param(
+                SQL_C_BINARY,
+                bytes.as_ptr().cast_mut().cast(),
+                std::ptr::null_mut(),
+            );
+            column.sql_type = SQL_SS_JSON;
+            let mut length = SqlLen::try_from(bytes.len()).unwrap();
+            column.strlen_or_ind_ptr = &raw mut length;
+            column.octet_length_ptr = &raw mut length;
+            assert_eq!(
+                unsafe { bound_tvp_cell_to_value(&column, ClientEncoding::UTF8) },
+                Err(ParamBuildError::Value(ConvError::InvalidCharacterValue))
+            );
+            assert_eq!(
+                buffered_dae_to_value(&column, &mut bytes.to_vec(), false, ClientEncoding::UTF8),
+                Err(ParamBuildError::Value(ConvError::InvalidCharacterValue))
+            );
+        }
+        let mut odd_length = 1;
+        let bytes = [b'{', 0];
+        let mut column = param(
+            SQL_C_WCHAR,
+            bytes.as_ptr().cast_mut().cast(),
+            &mut odd_length,
+        );
+        column.sql_type = SQL_SS_JSON;
+        assert_eq!(
+            unsafe { bound_tvp_cell_to_value(&column, ClientEncoding::UTF8) },
+            Err(ParamBuildError::InvalidBufferLength)
+        );
+        assert_eq!(
+            buffered_dae_to_value(&column, &mut vec![b'{'], false, ClientEncoding::UTF8),
+            Err(ParamBuildError::InvalidBufferLength)
+        );
+        let bytes = [0x82];
+        column.c_type = SQL_C_CHAR;
+        column.parameter_value_ptr = bytes.as_ptr().cast_mut().cast();
+        let cp932 = ClientEncoding::for_code_page(932).unwrap();
+        assert_eq!(
+            buffered_dae_to_value(&column, &mut bytes.to_vec(), false, cp932),
+            Err(ParamBuildError::Value(ConvError::InvalidCharacterValue))
+        );
+        column.c_type = SQL_C_BINARY;
+        assert!(
+            buffered_dae_to_value(
+                &column,
+                &mut b"{\"k\":".to_vec(),
+                false,
+                ClientEncoding::UTF8
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -5028,6 +5347,7 @@ mod tests {
                 0,
                 0,
                 SQL_BIND_BY_COLUMN,
+                ClientEncoding::UTF8,
             )
         }
         .unwrap();
@@ -5076,8 +5396,16 @@ mod tests {
             ..Default::default()
         };
 
-        let rpc = build_tvp_param_from_dae(None, Some(&names), &[Some(column)], 0, 1, &mut cells)
-            .unwrap();
+        let rpc = build_tvp_param_from_dae(
+            None,
+            Some(&names),
+            &[Some(column)],
+            0,
+            1,
+            &mut cells,
+            ClientEncoding::UTF8,
+        )
+        .unwrap();
         let SqlType::Table(_, Some(data)) = rpc_parameter_value(&rpc).unwrap() else {
             panic!("expected a materialized TVP");
         };
@@ -5103,7 +5431,7 @@ mod tests {
         column.app_scale = 3;
 
         assert!(matches!(
-            unsafe { bound_tvp_cell_to_value(&column) },
+            unsafe { bound_tvp_cell_to_value(&column, ClientEncoding::UTF8) },
             Err(ParamBuildError::Value(ConvError::OutOfRange))
         ));
 
@@ -5123,6 +5451,7 @@ mod tests {
                 0,
                 0,
                 SQL_BIND_BY_COLUMN,
+                ClientEncoding::UTF8,
             )
         };
         assert!(matches!(
@@ -5167,8 +5496,15 @@ mod tests {
             ..Default::default()
         };
 
-        let result =
-            build_tvp_param_from_dae(None, Some(&names), &[Some(column)], 0, 1, &mut cells);
+        let result = build_tvp_param_from_dae(
+            None,
+            Some(&names),
+            &[Some(column)],
+            0,
+            1,
+            &mut cells,
+            ClientEncoding::UTF8,
+        );
         assert!(matches!(
             result,
             Err(ParamBuildError::TvpCellConversion {
@@ -5187,10 +5523,22 @@ mod tests {
         };
         let mut count: SqlLen = 0;
         let tvp = param(SQL_C_BINARY, std::ptr::null_mut(), &mut count);
-        let bound =
-            unsafe { build_tvp_param(None, &tvp, Some(&names), &[], 0, 0, SQL_BIND_BY_COLUMN) }
+        let bound = unsafe {
+            build_tvp_param(
+                None,
+                &tvp,
+                Some(&names),
+                &[],
+                0,
+                0,
+                SQL_BIND_BY_COLUMN,
+                ClientEncoding::UTF8,
+            )
+        }
+        .unwrap();
+        let dae =
+            build_tvp_param_from_dae(None, Some(&names), &[], 0, 0, &mut [], ClientEncoding::UTF8)
                 .unwrap();
-        let dae = build_tvp_param_from_dae(None, Some(&names), &[], 0, 0, &mut []).unwrap();
         use mssql_tds::test_client_support::{rpc_parameter_status, rpc_parameter_value};
         assert_eq!(
             rpc_parameter_status(&dae).bits(),
@@ -5229,8 +5577,16 @@ mod tests {
             value: None,
         }];
 
-        let rpc = build_tvp_param_from_dae(None, Some(&names), &[Some(column)], 0, 1, &mut cells)
-            .unwrap();
+        let rpc = build_tvp_param_from_dae(
+            None,
+            Some(&names),
+            &[Some(column)],
+            0,
+            1,
+            &mut cells,
+            ClientEncoding::UTF8,
+        )
+        .unwrap();
         match mssql_tds::test_client_support::rpc_parameter_value(&rpc).unwrap() {
             SqlType::Table(_, Some(data)) => {
                 assert_eq!(data.rows, vec![vec![SqlType::Int(Some(42))]]);
@@ -5250,7 +5606,18 @@ mod tests {
         let mut tvp = param(SQL_C_BINARY, std::ptr::null_mut(), &mut count);
         tvp.column_size = 1;
         assert!(matches!(
-            unsafe { build_tvp_param(None, &tvp, Some(&names), &[], 0, 0, SQL_BIND_BY_COLUMN) },
+            unsafe {
+                build_tvp_param(
+                    None,
+                    &tvp,
+                    Some(&names),
+                    &[],
+                    0,
+                    0,
+                    SQL_BIND_BY_COLUMN,
+                    ClientEncoding::UTF8,
+                )
+            },
             Err(ParamBuildError::InvalidTvpRowCount)
         ));
     }
@@ -5284,6 +5651,7 @@ mod tests {
                     0,
                     0,
                     SQL_BIND_BY_COLUMN,
+                    ClientEncoding::UTF8,
                 )
             },
             Err(ParamBuildError::TvpColumnDataAtExec(0))
@@ -5301,7 +5669,18 @@ mod tests {
         let mut tvp = param(SQL_C_BINARY, std::ptr::null_mut(), &mut count);
         tvp.column_size = SqlULen::MAX;
         assert!(matches!(
-            unsafe { build_tvp_param(None, &tvp, Some(&names), &[], 0, 0, SQL_BIND_BY_COLUMN) },
+            unsafe {
+                build_tvp_param(
+                    None,
+                    &tvp,
+                    Some(&names),
+                    &[],
+                    0,
+                    0,
+                    SQL_BIND_BY_COLUMN,
+                    ClientEncoding::UTF8,
+                )
+            },
             Err(ParamBuildError::MemoryAllocation)
         ));
     }
@@ -5355,6 +5734,7 @@ mod tests {
                 4,
                 4,
                 SQL_BIND_BY_COLUMN,
+                ClientEncoding::UTF8,
             )
         }
         .unwrap();
