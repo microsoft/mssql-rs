@@ -36,6 +36,11 @@ macro_rules! session_from {
 /// the native callback executes only this query.
 pub const DRIVER_QUERY: &str = concat!(session_columns!(), session_from!());
 
+/// The SQLSTATE of ODBC Driver 18's failure to authenticate a user with
+/// Microsoft Entra ID (`IDS_FA_AUTH_FAILED`): it could not get a token for the
+/// login.
+pub(crate) const ENTRA_TOKEN_FAILED: &str = "FA004";
+
 /// [`DRIVER_QUERY`] with `extra` columns, written as `a, b`, after its own. The
 /// query is the same text with the columns inserted before its `FROM`, so there
 /// is one definition of it.

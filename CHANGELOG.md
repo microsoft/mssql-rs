@@ -12,6 +12,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   `ClientContext::security_context_provider` to replace the built-in
   SSPI/GSSAPI context for integrated auth, e.g. NTLM on Linux/macOS (#707).
 
+- `mssql-tds`: `ClientContext::entra_integrated_sspi_fallback`, off by
+  default: an `ActiveDirectoryIntegrated` login then uses SSPI (Kerberos off
+  Windows) unless the server's pre-login answer requires Microsoft Entra on an
+  encrypted connection, as the ODBC driver decides. The connect stages record
+  the server's answer (`fed_auth_required`) and the choice (`authentication`)
+  (AB#49431).
+
 - Shared MultiSubnetFailover (MSF) startup configuration: explicit connection
   setting > application default > `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT`
   (`true`/`false`) > built-in on. Rust, native Python, and Node.js expose

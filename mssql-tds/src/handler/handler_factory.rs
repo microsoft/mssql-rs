@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 use crate::connection::blocking::off_runtime_thread;
-use crate::connection::client_context::{ClientContext, TransportContext};
+use crate::connection::client_context::{ClientContext, TdsAuthenticationMethod, TransportContext};
 use crate::connection::connect_stage;
 use crate::connection::dns_cache::Resolution;
 use crate::connection::session_recovery::SessionRecoveryData;
@@ -47,11 +47,13 @@ impl HandlerFactory {
         &'a self,
         prelogin_fedauth_supported: bool,
         login_stage: &'a tracing::Span,
+        sspi_context: Option<Box<ClientContext>>,
     ) -> LoginHandler<'a> {
         LoginHandler {
             factory: self,
             prelogin_fedauth_supported,
             login_stage,
+            sspi_context,
         }
     }
 
@@ -323,6 +325,7 @@ impl<'a, 'b> SessionHandler<'a, 'b> {
             target: connect_stage::TARGET,
             connect_stage::PRELOGIN,
             encryption = tracing::field::Empty,
+            fed_auth_required = tracing::field::Empty,
             os_error = tracing::field::Empty,
             io_kind = tracing::field::Empty,
             error = tracing::field::Empty,
@@ -337,6 +340,10 @@ impl<'a, 'b> SessionHandler<'a, 'b> {
             connect_stage::ENCRYPTION,
             tracing::field::debug(pre_login_result.encryption_setting),
         );
+        prelogin_stage.record(
+            connect_stage::FED_AUTH_REQUIRED,
+            pre_login_result.is_fed_auth_supported,
+        );
         prelogin_stage.record(connect_stage::OK, true);
         drop(prelogin_stage);
 
@@ -349,15 +356,21 @@ impl<'a, 'b> SessionHandler<'a, 'b> {
             target: connect_stage::TARGET,
             connect_stage::LOGIN,
             spn = tracing::field::Empty,
+            authentication = tracing::field::Empty,
             os_error = tracing::field::Empty,
             io_kind = tracing::field::Empty,
             error = tracing::field::Empty,
             ok = tracing::field::Empty,
             redirected = tracing::field::Empty
         );
+        let sspi_context = self.integrated_choice(&pre_login_result, &login_stage);
         let mut login_result = self
             .factory
-            .login_handler(pre_login_result.is_fed_auth_supported, &login_stage)
+            .login_handler(
+                pre_login_result.is_fed_auth_supported,
+                &login_stage,
+                sspi_context,
+            )
             .execute(reader_writer, self.transport_context)
             .await
             .inspect_err(|error| {
@@ -394,6 +407,44 @@ impl<'a, 'b> SessionHandler<'a, 'b> {
             .execute(reader_writer)
             .await?;
         Ok(result)
+    }
+
+    /// With [`ClientContext::entra_integrated_sspi_fallback`], how an
+    /// `ActiveDirectoryIntegrated` login authenticates, as the ODBC driver
+    /// decides it (`TdsSend.cpp`, `prelogin.cpp`): with Microsoft Entra only
+    /// when the server's pre-login answer requires it and the connection is
+    /// encrypted, otherwise with SSPI. Records the choice on `login_stage`;
+    /// for SSPI, the context to log in with instead.
+    fn integrated_choice(
+        &self,
+        prelogin: &PreloginResult,
+        login_stage: &tracing::Span,
+    ) -> Option<Box<ClientContext>> {
+        let context = &self.factory.context;
+        if !context.entra_integrated_sspi_fallback
+            || context.tds_authentication_method
+                != TdsAuthenticationMethod::ActiveDirectoryIntegrated
+        {
+            return None;
+        }
+        let encrypted = matches!(
+            prelogin.encryption_setting,
+            NegotiatedEncryptionSetting::Strict | NegotiatedEncryptionSetting::Mandatory
+        );
+        if prelogin.is_fed_auth_supported && encrypted {
+            login_stage.record(
+                connect_stage::AUTHENTICATION,
+                connect_stage::AUTHENTICATION_ENTRA,
+            );
+            return None;
+        }
+        login_stage.record(
+            connect_stage::AUTHENTICATION,
+            connect_stage::AUTHENTICATION_SSPI,
+        );
+        let mut sspi = Box::new(context.clone());
+        sspi.tds_authentication_method = TdsAuthenticationMethod::SSPI;
+        Some(sspi)
     }
 
     fn validate_prelogin_result(&self, _result: &PreloginResult) -> TdsResult<()> {
@@ -600,9 +651,20 @@ pub struct LoginHandler<'a> {
     prelogin_fedauth_supported: bool,
     /// The login's connect stage, which records the SPN requested.
     login_stage: &'a tracing::Span,
+    /// The factory's context switched to SSPI, when an
+    /// `ActiveDirectoryIntegrated` login falls back to it. Boxed: the handler
+    /// lives in the connection's future.
+    sspi_context: Option<Box<ClientContext>>,
 }
 
 impl LoginHandler<'_> {
+    /// The context the login is made with.
+    fn context(&self) -> &ClientContext {
+        self.sspi_context
+            .as_deref()
+            .unwrap_or(&self.factory.context)
+    }
+
     async fn execute<T: TdsTokenStreamReader + NetworkReaderWriter>(
         &self,
         reader_writer: &mut T,
@@ -711,7 +773,7 @@ impl LoginHandler<'_> {
                     ));
                 }
             };
-            let context = &self.factory.context;
+            let context = self.context();
             let entra_id_token_factory = context.entra_id_token_factory()?;
 
             let token = entra_id_token_factory
@@ -773,7 +835,7 @@ impl LoginHandler<'_> {
     where
         'b: 'a,
     {
-        let context = &self.factory.context;
+        let context = self.context();
         let is_integrated_security = context.integrated_security();
 
         // If using integrated security, create SSPI handler and get initial token
@@ -924,6 +986,67 @@ mod tests {
         assert_eq!(
             server_name_from_login_messages(&messages).as_deref(),
             Some("SQLPROD01")
+        );
+    }
+
+    /// With the fallback, an `ActiveDirectoryIntegrated` login uses Microsoft
+    /// Entra only when the server requires it on an encrypted connection, as
+    /// the ODBC driver does, and SSPI otherwise. Without the fallback, and for
+    /// other methods, the login is left as it is.
+    #[test]
+    fn active_directory_integrated_uses_entra_only_when_required_and_encrypted() {
+        use super::{HandlerFactory, PreloginResult};
+        use crate::connection::client_context::{
+            ClientContext, TdsAuthenticationMethod, TransportContext,
+        };
+        use crate::core::NegotiatedEncryptionSetting::{
+            self, LoginOnly, Mandatory, NoEncryption, Strict,
+        };
+
+        let choice = |method: &TdsAuthenticationMethod,
+                      fallback: bool,
+                      required: bool,
+                      encryption: NegotiatedEncryptionSetting| {
+            let factory = HandlerFactory {
+                context: ClientContext {
+                    tds_authentication_method: method.clone(),
+                    entra_integrated_sspi_fallback: fallback,
+                    ..Default::default()
+                },
+                recovery_data: None,
+                dns_resolution: None,
+            };
+            let transport = TransportContext::Tcp {
+                host: "localhost".to_string(),
+                port: 1433,
+                instance_name: None,
+            };
+            let prelogin = PreloginResult {
+                client_connection_id: uuid::Uuid::nil(),
+                encryption_setting: encryption,
+                is_fed_auth_supported: required,
+            };
+            factory
+                .session_handler(&transport)
+                .integrated_choice(&prelogin, &tracing::Span::none())
+                .map(|context| context.tds_authentication_method)
+        };
+        let integrated = TdsAuthenticationMethod::ActiveDirectoryIntegrated;
+        let sspi = Some(TdsAuthenticationMethod::SSPI);
+        assert_eq!(choice(&integrated, true, true, Mandatory), None);
+        assert_eq!(choice(&integrated, true, true, Strict), None);
+        assert_eq!(choice(&integrated, true, true, LoginOnly), sspi);
+        assert_eq!(choice(&integrated, true, true, NoEncryption), sspi);
+        assert_eq!(choice(&integrated, true, false, Mandatory), sspi);
+        assert_eq!(choice(&integrated, false, false, NoEncryption), None);
+        assert_eq!(
+            choice(
+                &TdsAuthenticationMethod::ActiveDirectoryPassword,
+                true,
+                false,
+                NoEncryption
+            ),
+            None
         );
     }
 

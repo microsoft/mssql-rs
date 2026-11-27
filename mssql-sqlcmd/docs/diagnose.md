@@ -1,6 +1,6 @@
 # sqlcmd diagnose
 
-`sqlcmd diagnose [-S <server> | -D -S <dsn>] [-U <login> -P <password> | -E | -G {-U <login> -P <password> | -P <token-file>}] [-d <database>] [-N[s|m|o]] [-C] [-F <certificate-name>] [-l <seconds>] [-K ReadOnly] [-M] [-a <packet-size>] [-A] [-H <workstation>] [--depth <depth>] [--local-detail] [--format json]`
+`sqlcmd diagnose [-S <server> | -D -S <dsn>] [-U <login> -P <password> | -E | -G [-U <login> -P <password> | -P <token-file> | -E]] [-d <database>] [-N[s|m|o]] [-C] [-F <certificate-name>] [-l <seconds>] [-K ReadOnly] [-M] [-a <packet-size>] [-A] [-H <workstation>] [--depth <depth>] [--local-detail] [--format json]`
 checks, from the bottom up, that a connection can be made, and when it cannot,
 where and why. It follows the diagnostic depths of the sqlcmd specification;
 each includes the ones before it, and the deepest is the default:
@@ -24,13 +24,25 @@ what it needs; it keeps the phases it went through, and the run is
 
 With `-G` (Microsoft Entra authentication), diagnose takes the method sqlcmd
 selects, and names it as sqlcmd's `--format json` does: `-G` with `-U` is
-`ActiveDirectoryPassword`, and `-G -P <file>` without `-U`
-`ActiveDirectoryAccessToken`, with the authentication's source `-G`. `-G`
-without `-U` or `-P` (`ActiveDirectoryIntegrated`) is not supported yet: the
-driver sqlcmd uses then logs in with Microsoft Entra, or with Windows
-authentication (Kerberos elsewhere) when the server's pre-login answer does
-not require Microsoft Entra or only the login is encrypted, and diagnose does
-not model that choice. Connection input reads the access token file as sqlcmd
+`ActiveDirectoryPassword`, `-G -P <file>` without `-U`
+`ActiveDirectoryAccessToken`, and `-G` without `-U` or `-P`, or `-G -E`,
+`ActiveDirectoryIntegrated`, with the authentication's source `-G`. With
+`ActiveDirectoryIntegrated`, the driver sqlcmd uses logs in with Microsoft
+Entra when the server's pre-login answer requires it on an encrypted
+connection, and otherwise with Windows authentication (Kerberos elsewhere).
+The report keeps the selected method apart from how the login authenticated:
+the connection attempt's `authenticationUsed` (`entra`, or `windows` or
+`kerberos`). sqlcmd's driver shows it only by its own error getting a
+Microsoft Entra token (`FA004`): ODBC Driver 18 does not report how such a
+login authenticated, so a login it made says so in a limitation. When the
+driver's attempt fails without showing it, the diagnostic client's attempt,
+which chooses the same way, gives the server's answer (`fedAuthRequired`)
+and an informational finding names the choice; it is made after a refused
+login too, as it sends no password. Without sqlcmd's driver, the client
+makes that choice itself: with Windows authentication it logs in as for
+`-E`, with the same Kerberos evidence, and with Microsoft Entra it goes as
+far as the server's request for a token, as for `ActiveDirectoryPassword`.
+Connection input reads the access token file as sqlcmd
 does, its bytes as they are (up to sqlcmd's 1 MiB), and the client sends them
 as the token: a file that is missing (`accessTokenFileNotFound`), cannot be
 read (`accessTokenFileUnreadable`), is too large (`accessTokenFileTooLarge`)
@@ -45,7 +57,12 @@ such as a pipe no one writes to or a share that does not answer, is
 `inconclusive` (`accessTokenFileTimedOut`), and a cancel is seen during the
 read. The
 server's rejection of an Entra login is `diagnosed` with
-`security.authentication.entra` and `"entraStage": "serverRejection"`.
+`security.authentication.entra` and `"entraStage": "serverRejection"`. When
+sqlcmd's driver cannot get the token (its error `FA004`), the connection
+attempt is `diagnosed` with `security.authentication.entra` and
+`"entraStage": "tokenAcquisition"`; the driver's error does not tell
+acquiring the credential (a password, the Windows sign-in or a Kerberos
+ticket) apart from requesting the token, which a limitation says.
 When sqlcmd's own driver makes the connection attempt (`driver_connect`), it
 logs in with Microsoft Entra as a normal run does, and the diagnostic client's
 login after a driver failure is evidence only: with `ActiveDirectoryAccessToken`
@@ -65,8 +82,9 @@ The caller must supply those resolved settings; the library does not read
 `odbc.ini` itself. **Native sqlcmd rejects
 `diagnose -D` on Linux and macOS**; native DSN resolution is separate work.
 DSN connections outside `diagnose` are unaffected. On Windows, native
-sqlcmd treats `-D` as obsolete. Native diagnosis also refuses `-J`,
-and `-G` without `-U` or `-P`. Command-line `-K` and `-M` are supported through the request fields
+sqlcmd treats `-D` as obsolete. Native diagnosis also refuses `-J`, and,
+until it passes `MSSQL_SQLCMD_AUTH_ENTRA_INTEGRATED`, `-G` without `-U` or
+`-P`. Command-line `-K` and `-M` are supported through the request fields
 below.
 
 Native diagnosis rejects password-change switches `-z` and `-Z` before

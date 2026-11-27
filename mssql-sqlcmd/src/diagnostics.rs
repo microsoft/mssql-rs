@@ -86,6 +86,12 @@ pub enum Authentication {
     /// A Microsoft Entra access token that sqlcmd reads from `file`, the `-P`
     /// value (`-G -P` without `-U`).
     EntraAccessToken { file: String },
+    /// Microsoft Entra integrated authentication (`-G` without `-U` or `-P`,
+    /// `ActiveDirectoryIntegrated`): Microsoft Entra when the server's
+    /// pre-login answer requires it on an encrypted connection, Windows
+    /// authentication (Kerberos off Windows) otherwise, as the ODBC driver
+    /// decides.
+    EntraIntegrated,
 }
 
 fn own_connection_succeeded_skip() -> Skip {
@@ -112,6 +118,7 @@ impl std::fmt::Debug for Authentication {
             Authentication::EntraAccessToken { .. } => {
                 f.debug_struct("EntraAccessToken").finish_non_exhaustive()
             }
+            Authentication::EntraIntegrated => f.write_str("EntraIntegrated"),
         }
     }
 }
@@ -123,6 +130,7 @@ impl Authentication {
             Authentication::Integrated => "Integrated",
             Authentication::EntraPassword { .. } => "ActiveDirectoryPassword",
             Authentication::EntraAccessToken { .. } => "ActiveDirectoryAccessToken",
+            Authentication::EntraIntegrated => "ActiveDirectoryIntegrated",
         }
     }
 
@@ -139,7 +147,9 @@ impl Authentication {
     pub fn is_entra(&self) -> bool {
         matches!(
             self,
-            Authentication::EntraPassword { .. } | Authentication::EntraAccessToken { .. }
+            Authentication::EntraPassword { .. }
+                | Authentication::EntraAccessToken { .. }
+                | Authentication::EntraIntegrated
         )
     }
 
@@ -150,6 +160,69 @@ impl Authentication {
         {
             *password = String::new();
         }
+    }
+}
+
+/// How an `ActiveDirectoryIntegrated` login authenticated, as the ODBC driver
+/// decides it from the server's pre-login answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IntegratedChoice {
+    /// Microsoft Entra: the server required it on an encrypted connection.
+    Entra,
+    /// Windows authentication (SSPI), Kerberos off Windows.
+    Sspi,
+}
+
+impl IntegratedChoice {
+    /// As the report's `authenticationUsed` names it.
+    fn name(self) -> &'static str {
+        match self {
+            IntegratedChoice::Entra => "entra",
+            IntegratedChoice::Sspi if cfg!(windows) => "windows",
+            IntegratedChoice::Sspi => "kerberos",
+        }
+    }
+
+    /// The choice a login stage of the diagnostic client recorded, when it
+    /// made one.
+    fn recorded(step: &Step) -> Option<Self> {
+        match step.detail(connect_stage::AUTHENTICATION)? {
+            connect_stage::AUTHENTICATION_ENTRA => Some(IntegratedChoice::Entra),
+            connect_stage::AUTHENTICATION_SSPI => Some(IntegratedChoice::Sspi),
+            _ => None,
+        }
+    }
+}
+
+const ENTRA_DOMAIN: &str = "security.authentication.entra";
+const INTEGRATED_DOMAIN: &str = if cfg!(windows) {
+    "security.authentication.windows"
+} else {
+    "security.authentication.kerberos"
+};
+
+/// The areas a login failure of `authentication` can be in: one, unless an
+/// `ActiveDirectoryIntegrated` login's `choice` between Microsoft Entra and
+/// SSPI is not known.
+fn authentication_domains(
+    authentication: &Authentication,
+    choice: Option<IntegratedChoice>,
+) -> &'static [&'static str] {
+    match (authentication, choice) {
+        (Authentication::SqlPassword { .. }, _) => &["security.authentication.sql"],
+        (Authentication::Integrated, _)
+        | (Authentication::EntraIntegrated, Some(IntegratedChoice::Sspi)) => &[INTEGRATED_DOMAIN],
+        (Authentication::EntraPassword { .. } | Authentication::EntraAccessToken { .. }, _)
+        | (Authentication::EntraIntegrated, Some(IntegratedChoice::Entra)) => &[ENTRA_DOMAIN],
+        (Authentication::EntraIntegrated, None) => &[ENTRA_DOMAIN, INTEGRATED_DOMAIN],
+    }
+}
+
+/// The area `domains` name: the one, or undetermined between them.
+fn domain_of(domains: &[&'static str]) -> Domain {
+    match *domains {
+        [one] => Domain::specific(one),
+        _ => Domain::undetermined(domains),
     }
 }
 
@@ -455,7 +528,7 @@ impl Request {
 /// The version of the diagnostic coverage matrix this implementation follows
 /// (`docs/diagnose-coverage.md`): which phases are checked, with which signals,
 /// and which coverage states each can report.
-pub const COVERAGE_MATRIX_VERSION: &str = "1.5";
+pub const COVERAGE_MATRIX_VERSION: &str = "1.6";
 
 /// The link to driver-tracing guidance for `sqlcmd diagnose`, given when the
 /// client's own evidence cannot explain a failure. It is a Microsoft FWLink so
@@ -1570,13 +1643,22 @@ fn run_until(request: Request, canceled: &dyn Fn() -> bool) -> Report {
 /// [`run_until`], parsing the server as the client does on Windows
 /// (`windows`) or elsewhere, so tests check either platform's.
 fn run_until_on(request: Request, canceled: &dyn Fn() -> bool, windows: bool) -> Report {
+    run_prepared(request, canceled, |diagnosis| diagnosis.windows = windows)
+}
+
+/// [`run_until`], with the diagnosis `prepare`d first.
+fn run_prepared(
+    request: Request,
+    canceled: &dyn Fn() -> bool,
+    prepare: impl FnOnce(&mut Diagnosis),
+) -> Report {
     let start_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0);
     let start = Instant::now();
     let mut diagnosis = Diagnosis::new(request);
-    diagnosis.windows = windows;
+    prepare(&mut diagnosis);
 
     if let Some(reason) = diagnosis.request.invalid.clone() {
         diagnosis.finding(
@@ -1655,6 +1737,10 @@ struct Diagnosis {
     /// How the client's Kerberos ticket cache is looked for: None on
     /// Windows, which keeps tickets in the logon session; tests set either.
     ticket_cache: Option<fn() -> (&'static str, String)>,
+    /// The SSPI/GSSAPI context the diagnostic client logs in with: None for
+    /// the platform's; tests set their own.
+    security_context_provider:
+        Option<std::sync::Arc<dyn mssql_tds::security::SecurityContextProvider>>,
     recorder: StageRecorder,
     target: Option<Target>,
     checks: Vec<Check>,
@@ -1679,6 +1765,9 @@ struct Diagnosis {
     /// Whether the server asked for a Microsoft Entra token that a credential
     /// provider would acquire, which diagnose does not.
     token_request: entra::TokenRequest,
+    /// How an `ActiveDirectoryIntegrated` login authenticated
+    /// ([`Authentication::EntraIntegrated`]), once the evidence shows it.
+    integrated_choice: Option<IntegratedChoice>,
     limitations: Vec<LocalizedText>,
     status: ExecutionStatus,
     /// The server the diagnostic client connects to: as sqlcmd gives it to
@@ -1836,6 +1925,7 @@ impl Diagnosis {
             request,
             windows: cfg!(windows),
             ticket_cache: (!cfg!(windows)).then_some(kerberos_ticket_cache as fn() -> _),
+            security_context_provider: None,
             recorder: StageRecorder::new(),
             target: None,
             checks: Vec::new(),
@@ -1848,6 +1938,7 @@ impl Diagnosis {
             own_failure: None,
             access_token: None,
             token_request: entra::TokenRequest::default(),
+            integrated_choice: None,
             limitations: Vec::new(),
             status: ExecutionStatus::Completed,
             client_server: String::new(),
@@ -2444,8 +2535,13 @@ impl Diagnosis {
             });
         }
         let text = self.failure_text(error);
-        let classified =
-            classify_connection_error(error, &text, None, &self.request.authentication);
+        let classified = classify_connection_error(
+            error,
+            &text,
+            None,
+            &self.request.authentication,
+            self.integrated_choice,
+        );
         let mut check = Check::new(carrier, classified.coverage);
         check.duration_ms = Some(attempt_ms);
         check.deadline_ms = Some(self.request.timeout_ms());
@@ -3366,8 +3462,13 @@ impl Diagnosis {
         } else {
             (error, self.failure_text(error))
         };
-        let classified =
-            classify_connection_error(error, &text, None, &self.request.authentication);
+        let classified = classify_connection_error(
+            error,
+            &text,
+            None,
+            &self.request.authentication,
+            self.integrated_choice,
+        );
         let mut check = Check::new(id, Coverage::Inconclusive);
         check.deadline_ms = Some(self.request.timeout_ms());
         let finding = match unreached {
@@ -3787,7 +3888,10 @@ impl Diagnosis {
     /// missing driver) and that transport opened, `mssql-tds` logs in too, for
     /// evidence only: phase timings, the TLS failure, Kerberos; or, when it
     /// connects where the driver could not, that the problem is in sqlcmd's
-    /// own connection.
+    /// own connection. An `ActiveDirectoryIntegrated` login whose choice
+    /// between Microsoft Entra and SSPI the driver did not show is tried after
+    /// a refused login too: it sends no password, and the attempt shows the
+    /// choice.
     async fn driver_attempt(
         &mut self,
         driver: driver::DriverHook,
@@ -3824,6 +3928,14 @@ impl Diagnosis {
                 .filter(|transport| *transport != "other");
             if let Some(transport) = transport {
                 check.fields.push(Field::plain("transport", transport));
+            }
+            if self.request.authentication == Authentication::EntraIntegrated {
+                self.limitation_text(LocalizedText::new(
+                    "diagnose.limitation.integrated_choice_not_reported",
+                    "sqlcmd's driver does not report whether the ActiveDirectoryIntegrated login \
+                     used Microsoft Entra or Windows authentication (Kerberos off Windows).",
+                    vec![],
+                ));
             }
 
             let driver_check = self.checks.len();
@@ -3895,10 +4007,24 @@ impl Diagnosis {
         });
         let refused_login = any_error(&LOGIN_ERRORS);
         let refused_database = any_error(&DATABASE_ERRORS);
+        // The driver could not get a Microsoft Entra token for the login.
+        let token_failed = self.request.authentication.is_entra()
+            && outcome
+                .records
+                .iter()
+                .any(|r| r.sql_state == driver::ENTRA_TOKEN_FAILED);
+        if token_failed && self.request.authentication == Authentication::EntraIntegrated {
+            self.integrated_choice = Some(IntegratedChoice::Entra);
+        }
+        let choice_open = self.request.authentication == Authentication::EntraIntegrated
+            && self.integrated_choice.is_none();
         let (coverage, domain, auth) = if refused_login {
             (
                 Coverage::Diagnosed,
-                Domain::specific(authentication_domain(&self.request.authentication)),
+                domain_of(authentication_domains(
+                    &self.request.authentication,
+                    self.integrated_choice,
+                )),
                 AuthOutcome::Failed,
             )
         } else if refused_database {
@@ -3906,6 +4032,12 @@ impl Diagnosis {
                 Coverage::Diagnosed,
                 Domain::specific("target.sqlServer"),
                 AuthOutcome::Succeeded,
+            )
+        } else if token_failed {
+            (
+                Coverage::Diagnosed,
+                Domain::specific(ENTRA_DOMAIN),
+                AuthOutcome::Failed,
             )
         } else if missing_driver {
             (
@@ -3929,12 +4061,14 @@ impl Diagnosis {
         check.coverage = coverage;
         check.domain = Some(domain);
         self.authentication = Some(auth);
-        // SQL Server ending a Microsoft Entra login is its rejection, as the
-        // diagnostic client reports it when it makes the attempt.
-        if refused_login && server_refused && self.request.authentication.is_entra() {
-            check
-                .fields
-                .push(Field::plain("entraStage", "serverRejection"));
+        if token_failed {
+            self.limitation_text(LocalizedText::new(
+                "diagnose.limitation.entra_token_failure_stage",
+                "sqlcmd's driver reports that it could not get a Microsoft Entra token (FA004); \
+                 its error does not tell acquiring the credential (a password, the Windows \
+                 sign-in or a Kerberos ticket) apart from requesting the token.",
+                vec![],
+            ));
         }
         // The driver's own words, as they are: the finding quoting them is
         // flagged for review.
@@ -3958,6 +4092,28 @@ impl Diagnosis {
             &first,
         );
         self.errors.extend(records);
+        // What the driver's own error shows goes on the check before the
+        // diagnostic client's attempt, which a cancel can cut short: the stage
+        // of a Microsoft Entra login (SQL Server ending it, or the driver not
+        // getting its token), and how an ActiveDirectoryIntegrated login
+        // authenticated.
+        if refused_login && server_refused && self.logs_in_with_entra() {
+            check
+                .fields
+                .push(Field::plain("entraStage", "serverRejection"));
+        } else if token_failed {
+            check
+                .fields
+                .push(Field::plain("entraStage", "tokenAcquisition"));
+        }
+        if !choice_open
+            && self.request.authentication == Authentication::EntraIntegrated
+            && let Some(choice) = self.integrated_choice
+        {
+            check
+                .fields
+                .push(Field::plain("authenticationUsed", choice.name()));
+        }
         let driver_check = self.checks.len();
         self.checks.push(check.clone());
         let skip = if cancel_requested() {
@@ -3970,7 +4126,13 @@ impl Diagnosis {
             .await;
         check = self.checks[driver_check].clone();
 
-        let evidence = transport_opened && !(refused_login || refused_database || missing_driver);
+        // A refused login or database is not repeated, unless an
+        // ActiveDirectoryIntegrated login's choice between Microsoft Entra and
+        // SSPI is open: it sends no password, and the diagnostic client's
+        // attempt shows the choice.
+        let evidence = transport_opened
+            && !missing_driver
+            && (choice_open || !(refused_login || refused_database));
         if evidence && !cancel_requested() {
             let (checks, errors) = (self.checks.len(), self.errors.len());
             // The driver's check keeps its own transport. Its SPN is the one
@@ -4002,7 +4164,7 @@ impl Diagnosis {
             self.server = None;
             if let Some(tds) = tds {
                 check.subphases = tds.subphases;
-                for key in ["failedPhase", "tlsFailure"] {
+                for key in ["failedPhase", "tlsFailure", "fedAuthRequired"] {
                     if let Some(field) = tds.fields.iter().find(|f| f.key == key) {
                         check.fields.push(field.clone());
                     }
@@ -4069,17 +4231,91 @@ impl Diagnosis {
                 }
             }
         }
+        // The choice the diagnostic client made for an ActiveDirectoryIntegrated
+        // login, from the server's pre-login answer: sqlcmd's driver decides
+        // the same way.
+        if choice_open && let Some(choice) = self.integrated_choice {
+            let undecided = domain_of(authentication_domains(&self.request.authentication, None));
+            if check.domain.as_ref() == Some(&undecided) {
+                check.domain = Some(domain_of(authentication_domains(
+                    &self.request.authentication,
+                    Some(choice),
+                )));
+            }
+            self.finding(
+                Certainty::Informational,
+                CheckId::ConnectionAttempt,
+                match choice {
+                    IntegratedChoice::Entra => LocalizedText::new(
+                        "diagnose.finding.integrated_choice_entra",
+                        "The diagnostic client (mssql-tds) found that the server requires \
+                         Microsoft Entra on this encrypted connection; sqlcmd's driver, which \
+                         decides the same way, logs in with Microsoft Entra.",
+                        vec![],
+                    ),
+                    IntegratedChoice::Sspi => LocalizedText::new(
+                        "diagnose.finding.integrated_choice_sspi",
+                        "The diagnostic client (mssql-tds) found that the server does not \
+                         require Microsoft Entra on this connection, or the connection is not \
+                         encrypted; sqlcmd's driver, which decides the same way, logs in with \
+                         Windows authentication (Kerberos off Windows).",
+                        vec![],
+                    ),
+                },
+            );
+        }
+        // SQL Server ending an ActiveDirectoryIntegrated login the diagnostic
+        // client found to use Microsoft Entra.
+        if choice_open && refused_login && server_refused && self.logs_in_with_entra() {
+            check
+                .fields
+                .push(Field::plain("entraStage", "serverRejection"));
+        }
         self.checks[driver_check] = check;
+        // The Kerberos evidence of a login found to use SSPI only now.
+        if choice_open && self.logs_in_with_sspi() {
+            self.enrich_driver_check(driver_check, endpoint.as_ref())
+                .await;
+        }
+    }
+
+    /// Whether the login authenticates with SSPI (Kerberos off Windows): `-E`,
+    /// or an `ActiveDirectoryIntegrated` login that chose it.
+    fn logs_in_with_sspi(&self) -> bool {
+        match self.request.authentication {
+            Authentication::Integrated => true,
+            Authentication::EntraIntegrated => {
+                self.integrated_choice == Some(IntegratedChoice::Sspi)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the login authenticates with Microsoft Entra: `-G` with a login
+    /// or an access token, or an `ActiveDirectoryIntegrated` login that chose
+    /// it.
+    fn logs_in_with_entra(&self) -> bool {
+        match self.request.authentication {
+            Authentication::EntraPassword { .. } | Authentication::EntraAccessToken { .. } => true,
+            Authentication::EntraIntegrated => {
+                self.integrated_choice == Some(IntegratedChoice::Entra)
+            }
+            _ => false,
+        }
     }
 
     async fn enrich_driver_check(&mut self, index: usize, endpoint: Option<&(String, u16)>) {
-        if self.request.authentication != Authentication::Integrated {
+        if !self.logs_in_with_sspi() {
             return;
         }
         // The callback's result is already stored if optional evidence is canceled.
         let mut check = self.checks[index].clone();
         let budget = self.request.timeout();
-        if let Some((host, port)) = endpoint {
+        // The SPN the diagnostic client recorded requesting, when it logged in,
+        // or the one made for the endpoint.
+        if self.spn.is_none()
+            && let Some((host, port)) = endpoint
+        {
             let spn = self.requested_spn(host, *port, budget).await;
             self.spn = Some(platform_spn(&spn));
         }
@@ -4790,10 +5026,24 @@ impl Diagnosis {
                     .insert(method.clone(), Box::new(self.token_request.clone()));
                 context.tds_authentication_method = method;
             }
+            // The client chooses as the ODBC driver does, from the server's
+            // pre-login answer: SSPI, or Microsoft Entra as far as the
+            // server's request for a token.
+            Authentication::EntraIntegrated => {
+                let method = TdsAuthenticationMethod::ActiveDirectoryIntegrated;
+                context
+                    .auth_method_map
+                    .insert(method.clone(), Box::new(self.token_request.clone()));
+                context.tds_authentication_method = method;
+                context.entra_integrated_sspi_fallback = true;
+            }
         }
         if let Some(database) = &request.database {
             context.database = database.clone();
         }
+        context
+            .security_context_provider
+            .clone_from(&self.security_context_provider);
         context.encryption_options = EncryptionOptions {
             mode: match request.encrypt {
                 Encrypt::Optional => EncryptionSetting::PreferOff,
@@ -4919,6 +5169,24 @@ impl Diagnosis {
             .filter(|s| s.stage == Stage::Login)
             .find_map(|s| s.detail(connect_stage::SPN))
             .map(str::to_string);
+        // An ActiveDirectoryIntegrated login: the server's pre-login answer
+        // the client chose from, as the ODBC driver does, and the choice.
+        if self.request.authentication == Authentication::EntraIntegrated {
+            let latest = |stage| all.iter().rev().filter(move |s| s.stage == stage);
+            if let Some(required) =
+                latest(Stage::Prelogin).find_map(|s| s.detail(connect_stage::FED_AUTH_REQUIRED))
+            {
+                check
+                    .fields
+                    .push(Field::plain("fedAuthRequired", required.to_string()));
+            }
+            if let Some(choice) = latest(Stage::Login).find_map(|s| IntegratedChoice::recorded(s)) {
+                check
+                    .fields
+                    .push(Field::plain("authenticationUsed", choice.name()));
+                self.integrated_choice.get_or_insert(choice);
+            }
+        }
         // When sqlcmd's own driver made the attempt, mssql-tds logged in only
         // for evidence.
         if self.request.driver.is_none() {
@@ -4932,7 +5200,7 @@ impl Diagnosis {
         }
         // The ticket cache is looked for within what is left of the attempt's
         // time limit, not a fresh one, and the time it takes is the check's.
-        let cache_location = if self.request.authentication == Authentication::Integrated {
+        let cache_location = if self.logs_in_with_sspi() {
             let budget = self
                 .request
                 .timeout()
@@ -4959,6 +5227,7 @@ impl Diagnosis {
                     &text,
                     failed_phase,
                     &self.request.authentication,
+                    self.integrated_choice,
                 );
                 check.coverage = classified.coverage;
                 check.domain = Some(classified.domain);
@@ -4970,7 +5239,7 @@ impl Diagnosis {
                 }
                 // The server ended a Microsoft Entra login: the stage the
                 // client can see is the server's rejection.
-                if self.request.authentication.is_entra()
+                if self.logs_in_with_entra()
                     && classified.auth == AuthOutcome::Failed
                     && matches!(error, Error::SqlServerError { .. })
                 {
@@ -5102,7 +5371,9 @@ impl Diagnosis {
     /// `budget`, what is left of the attempt's time limit. Where it looked
     /// (`KRB5CCNAME`, `default`, or the cache type), when it did.
     async fn kerberos_evidence(&mut self, check: &mut Check, budget: Duration) -> Option<String> {
-        if let Some(spn) = self.spn.clone() {
+        if let Some(spn) = self.spn.clone()
+            && check.field("spn").is_none()
+        {
             check
                 .fields
                 .push(Field::identifier("spn", spn, Category::Spn));
@@ -5924,25 +6195,15 @@ struct Classified {
     errors: Vec<ErrorRecord>,
 }
 
-fn authentication_domain(authentication: &Authentication) -> &'static str {
-    match authentication {
-        Authentication::SqlPassword { .. } => "security.authentication.sql",
-        Authentication::Integrated if cfg!(windows) => "security.authentication.windows",
-        Authentication::Integrated => "security.authentication.kerberos",
-        Authentication::EntraPassword { .. } | Authentication::EntraAccessToken { .. } => {
-            "security.authentication.entra"
-        }
-    }
-}
-
 fn classify_connection_error(
     error: &Error,
     text: &LocalizedText,
     phase: Option<Stage>,
     authentication: &Authentication,
+    choice: Option<IntegratedChoice>,
 ) -> Classified {
     let errors = error_records(error, text, CheckId::ConnectionAttempt);
-    let auth_domain = authentication_domain(authentication);
+    let auth_domains = authentication_domains(authentication, choice);
     let reached_login = phase == Some(Stage::Login);
 
     if let Error::SqlServerError { diagnostics } = error {
@@ -5950,12 +6211,12 @@ fn classify_connection_error(
         let number = first.map_or(0, |e| e.number);
         let text = first.map_or_else(|| error.to_string(), |e| e.message.clone());
         let (domain, auth) = if LOGIN_ERRORS.contains(&number) {
-            (Domain::specific(auth_domain), AuthOutcome::Failed)
+            (domain_of(auth_domains), AuthOutcome::Failed)
         } else if DATABASE_ERRORS.contains(&number) {
             (Domain::specific("target.sqlServer"), AuthOutcome::Succeeded)
         } else {
             (
-                Domain::undetermined(&[auth_domain, "target.sqlServer"]),
+                Domain::undetermined(&[auth_domains, &["target.sqlServer"]].concat()),
                 if reached_login {
                     AuthOutcome::Failed
                 } else {
@@ -6003,7 +6264,7 @@ fn classify_connection_error(
     if let Error::Security(security) = error {
         return Classified {
             coverage: Coverage::Diagnosed,
-            domain: Domain::specific(auth_domain),
+            domain: domain_of(auth_domains),
             auth: AuthOutcome::Failed,
             tls_category: None,
             from_message_text: false,
@@ -6443,6 +6704,7 @@ pub(crate) mod tests {
             &LocalizedText::literal(error.to_string()),
             phase,
             authentication,
+            None,
         )
     }
 
@@ -15036,6 +15298,11 @@ pub(crate) mod tests {
                 "ActiveDirectoryAccessToken",
                 None,
             ),
+            (
+                Authentication::EntraIntegrated,
+                "ActiveDirectoryIntegrated",
+                None,
+            ),
         ];
         for (authentication, name, user) in cases {
             assert!(authentication.is_entra());
@@ -15317,6 +15584,344 @@ pub(crate) mod tests {
         let report = run(sql);
         let attempt = checked(&report, CheckId::ConnectionAttempt);
         assert_eq!(attempt.field("entraStage"), None);
+    }
+
+    /// [`run`], with the diagnosis `prepare`d first.
+    fn run_with(request: Request, prepare: impl FnOnce(&mut Diagnosis)) -> Report {
+        let _only = RUNNING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct InProgress;
+        impl Drop for InProgress {
+            fn drop(&mut self) {
+                end_run();
+            }
+        }
+        begin_run();
+        let _in_progress = InProgress;
+        run_prepared(request, &cancel_requested, prepare)
+    }
+
+    /// An SSPI/GSSAPI context that cannot be made: the client's integrated
+    /// login fails at once, whatever this computer's own credentials.
+    struct NoCredentials;
+
+    impl mssql_tds::security::SecurityContextProvider for NoCredentials {
+        fn create_context(
+            &self,
+            _config: &mssql_tds::security::IntegratedAuthConfig,
+            _server: &str,
+            _port: u16,
+        ) -> Result<Box<dyn mssql_tds::security::SecurityContext>, mssql_tds::security::SecurityError>
+        {
+            Err(
+                mssql_tds::security::SecurityError::AcquireCredentialsFailed {
+                    code: 0x8009_030E,
+                    message: "No credentials are available in the security package".to_string(),
+                },
+            )
+        }
+    }
+
+    /// With sqlcmd's own driver connection, an ActiveDirectoryIntegrated login
+    /// that succeeds passes. ODBC Driver 18 does not show whether it used
+    /// Microsoft Entra or Windows authentication (Kerberos elsewhere): the
+    /// report says so, and claims neither.
+    #[test]
+    fn with_sqlcmds_driver_an_integrated_entra_login_passes_without_showing_its_choice() {
+        let (hook, _) = fake_driver(driver::DriverOutcome {
+            connected: true,
+            ..driver::DriverOutcome::default()
+        });
+        let mut request = request("tcp:nosuchhost.invalid,1433", Depth::ConnectionAttempt);
+        request.authentication = Authentication::EntraIntegrated;
+        request.driver = Some(hook);
+        let report = run(request);
+        assert_eq!(report.outcome, DiagnosticOutcome::Passed, "{report:#?}");
+        assert_eq!(report.authentication, Some(AuthOutcome::Succeeded));
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.field("authenticationUsed"), None, "{attempt:#?}");
+        assert!(
+            report.limitations.iter().any(|l| l
+                .render("en-US")
+                .starts_with("sqlcmd's driver does not report whether")),
+            "{:#?}",
+            report.limitations
+        );
+        let json = report::json(&report, "v").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["authentication"],
+            serde_json::json!({ "method": "ActiveDirectoryIntegrated", "outcome": "succeeded" })
+        );
+    }
+
+    /// sqlcmd's driver failing to get a Microsoft Entra token (FA004) is a
+    /// failed token acquisition: the login is Microsoft Entra, and the
+    /// driver's error does not tell its credential and token requests apart.
+    #[test]
+    fn a_driver_that_gets_no_entra_token_failed_to_acquire_it() {
+        for (authentication, used) in [
+            (Authentication::EntraIntegrated, Some("entra")),
+            (entra_password(), None),
+        ] {
+            let (hook, _) = fake_driver(driver_failure(
+                "FA004",
+                0,
+                "Failed to authenticate the user '' in Entra ID (Authentication option is \
+                 'ActiveDirectoryIntegrated'). Error code 0xCAA2000C; state 10",
+            ));
+            let mut request = request("tcp:nosuchhost.invalid,1433", Depth::ConnectionAttempt);
+            request.authentication = authentication;
+            request.driver = Some(hook);
+            let report = run(request);
+            let attempt = checked(&report, CheckId::ConnectionAttempt);
+            assert_eq!(attempt.coverage, Coverage::Diagnosed, "{report:#?}");
+            assert_eq!(attempt.domain, Some(Domain::specific(ENTRA_DOMAIN)));
+            assert_eq!(attempt.field("entraStage"), Some("tokenAcquisition"));
+            assert_eq!(attempt.field("authenticationUsed"), used);
+            assert_eq!(report.authentication, Some(AuthOutcome::Failed));
+            assert_eq!(report.exit_code(), 1);
+            assert!(
+                report
+                    .limitations
+                    .iter()
+                    .any(|l| l.render("en-US").contains("(FA004)")),
+                "{:#?}",
+                report.limitations
+            );
+        }
+    }
+
+    /// A cancel during the diagnostic client's attempt keeps what the driver's
+    /// own error showed: that it could not get a Microsoft Entra token (FA004),
+    /// and so that the ActiveDirectoryIntegrated login used Microsoft Entra.
+    #[test]
+    fn a_cancel_during_evidence_keeps_what_the_drivers_error_showed() {
+        let (_listener, server) = silent_listener();
+        let canceled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = canceled.clone();
+        let mut request = request(&server, Depth::ConnectionAttempt);
+        request.authentication = Authentication::EntraIntegrated;
+        request.driver = Some(driver::DriverHook::new(move |_, _| {
+            seen.store(true, Ordering::SeqCst);
+            driver_failure(
+                "FA004",
+                0,
+                "Failed to authenticate the user '' in Entra ID (Authentication option is \
+                 'ActiveDirectoryIntegrated'). Error code 0xCAA2000C; state 10",
+            )
+        }));
+        let report = run_until(request, &|| canceled.load(Ordering::SeqCst));
+        assert_eq!(report.execution_status, ExecutionStatus::Canceled);
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(
+            attempt.domain,
+            Some(Domain::specific(ENTRA_DOMAIN)),
+            "{report:#?}"
+        );
+        assert_eq!(attempt.field("entraStage"), Some("tokenAcquisition"));
+        assert_eq!(attempt.field("authenticationUsed"), Some("entra"));
+    }
+
+    /// With sqlcmd's own driver connection, a refused ActiveDirectoryIntegrated
+    /// login whose choice between Microsoft Entra and Windows authentication
+    /// nothing showed is in either area, and no Microsoft Entra stage is
+    /// claimed.
+    #[test]
+    fn a_refused_integrated_entra_login_whose_choice_is_unknown_is_in_either_area() {
+        let (hook, _) = fake_driver(driver_failure(
+            "28000",
+            18456,
+            "Login failed for user 'CONTOSO\\alice'.",
+        ));
+        let mut request = request("tcp:nosuchhost.invalid,1433", Depth::ConnectionAttempt);
+        request.authentication = Authentication::EntraIntegrated;
+        request.driver = Some(hook);
+        let report = run(request);
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.coverage, Coverage::Diagnosed, "{report:#?}");
+        assert_eq!(
+            attempt.domain,
+            Some(Domain::undetermined(&[ENTRA_DOMAIN, INTEGRATED_DOMAIN]))
+        );
+        assert_eq!(attempt.field("entraStage"), None);
+        assert_eq!(attempt.field("authenticationUsed"), None);
+        assert_eq!(report.authentication, Some(AuthOutcome::Failed));
+    }
+
+    /// With sqlcmd's own driver connection, a refused ActiveDirectoryIntegrated
+    /// login is tried by the diagnostic client too: it sends no password, and
+    /// the server's pre-login answer shows the driver's choice. Over a
+    /// connection that is not encrypted that is Windows authentication
+    /// (Kerberos elsewhere), whatever the answer, and the login's Kerberos
+    /// evidence follows.
+    #[test]
+    fn the_diagnostic_client_shows_how_sqlcmds_driver_chose() {
+        let server = EntraServer::start();
+        let (hook, _) = fake_driver(driver_failure(
+            "28000",
+            18456,
+            "Login failed for user 'CONTOSO\\alice'.",
+        ));
+        let mut request = server.request(Depth::ConnectionAttempt, Authentication::EntraIntegrated);
+        request.driver = Some(hook);
+        let report = run_with(request, |diagnosis| {
+            diagnosis.security_context_provider = Some(std::sync::Arc::new(NoCredentials));
+        });
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(
+            attempt.domain,
+            Some(Domain::specific(INTEGRATED_DOMAIN)),
+            "{report:#?}"
+        );
+        assert_eq!(attempt.field("fedAuthRequired"), Some("true"));
+        assert_eq!(attempt.field("entraStage"), None);
+        assert_eq!(attempt.field("authenticationUsed"), None);
+        assert!(attempt.field("spn").is_some(), "{attempt:#?}");
+        let findings: Vec<String> = report
+            .findings
+            .iter()
+            .map(|f| f.text.render("en-US"))
+            .collect();
+        assert!(
+            findings.iter().any(|f| f.starts_with(
+                "The diagnostic client (mssql-tds) found that the server does not require \
+                 Microsoft Entra"
+            )),
+            "{findings:#?}"
+        );
+        assert_eq!(report.authentication, Some(AuthOutcome::Failed));
+    }
+
+    /// An SSPI/GSSAPI context the client's integrated login completes with:
+    /// mssql-tds records the SPN it requested.
+    struct MockCredentials;
+
+    impl mssql_tds::security::SecurityContextProvider for MockCredentials {
+        fn create_context(
+            &self,
+            _config: &mssql_tds::security::IntegratedAuthConfig,
+            _server: &str,
+            _port: u16,
+        ) -> Result<Box<dyn mssql_tds::security::SecurityContext>, mssql_tds::security::SecurityError>
+        {
+            Ok(Box::new(
+                mssql_tds::security::mock::MockSecurityContext::single_round(b"t".to_vec()),
+            ))
+        }
+    }
+
+    /// When the diagnostic client logs a refused ActiveDirectoryIntegrated
+    /// login in with Windows authentication (Kerberos elsewhere), the driver's
+    /// check shows the SPN the client requested and the login's Kerberos
+    /// evidence, each once.
+    #[test]
+    fn the_driver_check_shows_the_spn_the_diagnostic_client_requested_once() {
+        let server = EntraServer::start();
+        let (hook, _) = fake_driver(driver_failure(
+            "28000",
+            18456,
+            "Login failed for user 'CONTOSO\\alice'.",
+        ));
+        let mut request = server.request(Depth::ConnectionAttempt, Authentication::EntraIntegrated);
+        request.driver = Some(hook);
+        let report = run_with(request, |diagnosis| {
+            diagnosis.security_context_provider = Some(std::sync::Arc::new(MockCredentials));
+        });
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(
+            attempt.field("diagnosticClient"),
+            Some("connected"),
+            "{report:#?}"
+        );
+        let count = |key: &str| attempt.fields.iter().filter(|f| f.key == key).count();
+        assert_eq!(count("spn"), 1, "{attempt:#?}");
+        assert!(
+            attempt
+                .field("spn")
+                .is_some_and(|spn| spn.starts_with("MSSQLSvc/")),
+            "{attempt:#?}"
+        );
+        assert_eq!(count("kerberosTicketCache"), 1, "{attempt:#?}");
+        assert_eq!(attempt.field("authenticationUsed"), None);
+    }
+
+    /// The diagnostic client logs an ActiveDirectoryIntegrated login in as the
+    /// ODBC driver does: with Windows authentication (Kerberos elsewhere) when
+    /// the server does not require Microsoft Entra, its failure then in that
+    /// area; otherwise with Microsoft Entra, up to the server's request for a
+    /// token. It reports the server's answer and its choice.
+    #[test]
+    fn the_diagnostic_client_chooses_as_the_odbc_driver_does() {
+        let stages = |required: &'static str, chose: &'static str| {
+            Stages::new()
+                .add(
+                    Stage::Dns,
+                    Some(true),
+                    0,
+                    1,
+                    &[(cs::HOST, "db01.contoso.com"), (cs::ADDRESSES, "10.0.0.1")],
+                )
+                .add(
+                    Stage::Tcp,
+                    Some(true),
+                    1,
+                    2,
+                    &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1433")],
+                )
+                .add(
+                    Stage::Prelogin,
+                    Some(true),
+                    2,
+                    3,
+                    &[(cs::FED_AUTH_REQUIRED, required)],
+                )
+                .add(
+                    Stage::Login,
+                    Some(false),
+                    3,
+                    4,
+                    &[(cs::AUTHENTICATION, chose)],
+                )
+        };
+        let mut integrated = request("tcp:db01.contoso.com,1433", Depth::ConnectionAttempt);
+        integrated.authentication = Authentication::EntraIntegrated;
+
+        let report = observed(
+            integrated.clone(),
+            stages("false", cs::AUTHENTICATION_SSPI),
+            Ended::Failed(server_error(
+                18456,
+                "Login failed for user 'CONTOSO\\alice'.",
+            )),
+        );
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(
+            attempt.domain,
+            Some(Domain::specific(INTEGRATED_DOMAIN)),
+            "{attempt:#?}"
+        );
+        assert_eq!(attempt.field("fedAuthRequired"), Some("false"));
+        assert_eq!(
+            attempt.field("authenticationUsed"),
+            Some(IntegratedChoice::Sspi.name())
+        );
+        assert_eq!(attempt.field("entraStage"), None);
+        assert_eq!(report.authentication, Some(AuthOutcome::Failed));
+
+        let report = observed_with(
+            integrated,
+            stages("true", cs::AUTHENTICATION_ENTRA),
+            Ended::Failed(Error::UsageError("no token".to_string())),
+            |diagnosis| diagnosis.token_request = entra::TokenRequest::already_made(),
+        );
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.coverage, Coverage::Skipped, "{attempt:#?}");
+        assert_eq!(attempt.field("fedAuthRequired"), Some("true"));
+        assert_eq!(attempt.field("authenticationUsed"), Some("entra"));
+        assert_eq!(report.authentication, Some(AuthOutcome::NotEvaluated));
+        assert_eq!(report.execution_status, ExecutionStatus::Partial);
     }
 
     /// When the server asked for a token diagnose does not acquire, the

@@ -66,8 +66,10 @@ pub const INSTANCE_LOOKUP: &str = "instance_lookup";
 /// failure [`OS_ERROR`] and [`ERROR`].
 pub const PIPE: &str = "pipe";
 
-/// The PRELOGIN exchange. Fields: [`ENCRYPTION`], what was negotiated; on
-/// failure [`OS_ERROR`] and [`ERROR`].
+/// The PRELOGIN exchange. Fields: [`ENCRYPTION`], what was negotiated;
+/// [`FED_AUTH_REQUIRED`], the server's answer to whether federated
+/// authentication (Microsoft Entra) is required; on failure [`OS_ERROR`] and
+/// [`ERROR`].
 pub const PRELOGIN: &str = "prelogin";
 
 /// The TLS handshake. On failure: [`OS_ERROR`] and [`ERROR`]. On macOS, a
@@ -77,7 +79,9 @@ pub const TLS: &str = "tls";
 
 /// LOGIN7 and the server's response, up to a successful login. Fields:
 /// [`REDIRECTED`] when the server routed the login elsewhere; [`SPN`] with
-/// integrated authentication; on failure [`OS_ERROR`] and [`ERROR`].
+/// integrated authentication; [`AUTHENTICATION`] when the client chose how an
+/// `ActiveDirectoryIntegrated` login authenticates; on failure [`OS_ERROR`]
+/// and [`ERROR`].
 pub const LOGIN: &str = "login";
 
 /// The field the login stage records, as `true`, when the server ended the
@@ -111,6 +115,17 @@ pub const PIPE_PATH: &str = "pipe";
 pub const KIND: &str = "kind";
 /// The negotiated encryption.
 pub const ENCRYPTION: &str = "encryption";
+/// `true` when the server's pre-login answer requires federated
+/// authentication (Microsoft Entra).
+pub const FED_AUTH_REQUIRED: &str = "fed_auth_required";
+/// How an `ActiveDirectoryIntegrated` login authenticated when the client
+/// chose, as the ODBC driver does: [`AUTHENTICATION_SSPI`] or
+/// [`AUTHENTICATION_ENTRA`].
+pub const AUTHENTICATION: &str = "authentication";
+/// [`AUTHENTICATION`] of a login made with SSPI (Kerberos off Windows).
+pub const AUTHENTICATION_SSPI: &str = "sspi";
+/// [`AUTHENTICATION`] of a login made with Microsoft Entra.
+pub const AUTHENTICATION_ENTRA: &str = "entra";
 /// The SPN integrated authentication requested, in the form the platform
 /// takes (SSPI's `service/host:port`, GSSAPI's `service@host`).
 pub const SPN: &str = "spn";

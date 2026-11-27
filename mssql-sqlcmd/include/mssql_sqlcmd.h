@@ -248,12 +248,19 @@ void MSSQL_SQLCMD_CALL mssql_sqlcmd_free_text(const uint16_t* text, size_t len);
 /* Microsoft Entra (-G). With driver_connect, sqlcmd's own driver logs in with
    it. Without it, diagnose does not acquire tokens: with a method that needs
    one it goes as far as the server's request for a token, and the login is not
-   evaluated. -G without -U or -P (integrated) has no value yet: the driver
-   uses it or Windows authentication, depending on the server. */
+   evaluated. */
 #define MSSQL_SQLCMD_AUTH_ENTRA_PASSWORD 2     /* -G -U: user and password */
 #define MSSQL_SQLCMD_AUTH_ENTRA_ACCESS_TOKEN 3 /* -G -P without -U: password is
                                                   the -P value, the file sqlcmd
                                                   reads the access token from */
+#define MSSQL_SQLCMD_AUTH_ENTRA_INTEGRATED 4   /* -G without -U or -P
+                                                  (ActiveDirectoryIntegrated):
+                                                  Microsoft Entra when the
+                                                  server's pre-login answer
+                                                  requires it on an encrypted
+                                                  connection, Windows
+                                                  authentication (Kerberos
+                                                  elsewhere) otherwise */
 
 #define MSSQL_SQLCMD_ENCRYPT_OPTIONAL 0  /* -No */
 #define MSSQL_SQLCMD_ENCRYPT_MANDATORY 1 /* -N, -Nm (sqlcmd's default) */
