@@ -202,22 +202,21 @@ pub(super) fn drive_streaming(
                     "no data-at-execution token is left for the open request",
                 );
             }
-            Stop::NeedData | Stop::OpenCell | Stop::FlushRun | Stop::CloseTable => {}
-        }
-
-        if !run.is_empty() {
-            if let Err(rc) = write_on_open_rpc(dbc, stmt, statement_handle, |client| {
-                dbc.runtime.block_on(client.write_streamed_tvp_cells(&run))
-            }) {
-                return rc;
+            Stop::FlushRun => {
+                if let Err(rc) = flush_run(dbc, stmt, statement_handle, &mut run) {
+                    return rc;
+                }
             }
-            run.clear();
-        }
-
-        match stop {
-            Stop::FlushRun => {}
-            Stop::NeedData => return need_data(stmt, value_ptr_ptr),
+            Stop::NeedData => {
+                if let Err(rc) = flush_run(dbc, stmt, statement_handle, &mut run) {
+                    return rc;
+                }
+                return need_data(stmt, value_ptr_ptr);
+            }
             Stop::OpenCell => {
+                if let Err(rc) = flush_run(dbc, stmt, statement_handle, &mut run) {
+                    return rc;
+                }
                 if let Err(rc) = write_on_open_rpc(dbc, stmt, statement_handle, |client| {
                     dbc.runtime.block_on(client.begin_streamed_tvp_cell())
                 }) {
@@ -226,6 +225,9 @@ pub(super) fn drive_streaming(
                 return need_data(stmt, value_ptr_ptr);
             }
             Stop::CloseTable => {
+                if let Err(rc) = flush_run(dbc, stmt, statement_handle, &mut run) {
+                    return rc;
+                }
                 let client = match checkout(stmt, |dae| dae.open_tvp = None) {
                     Ok(client) => client,
                     Err(rc) => return rc,
@@ -235,9 +237,25 @@ pub(super) fn drive_streaming(
                     CloseOutcome::Finished(rc) => return rc,
                 }
             }
-            Stop::Failed(_) | Stop::Exhausted => unreachable!("handled above"),
         }
     }
+}
+
+/// Writes the converted cells in `run`, if any, and empties it.
+fn flush_run(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    run: &mut Vec<SqlType>,
+) -> Result<(), SqlReturn> {
+    if run.is_empty() {
+        return Ok(());
+    }
+    write_on_open_rpc(dbc, stmt, statement_handle, |client| {
+        dbc.runtime.block_on(client.write_streamed_tvp_cells(run))
+    })?;
+    run.clear();
+    Ok(())
 }
 
 /// Closes a TVP row-control token while the RPC is open. A positive count
