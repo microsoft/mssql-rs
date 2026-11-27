@@ -256,9 +256,11 @@ other statements see the connection as busy.
 
 Write failures end the streamed request. A failure while closing a parameter
 retracts an incomplete message where possible; an unrecoverable write or
-response failure closes the transport. Usage errors leave the stream available
-for correction or cancellation. For errors propagated to the application, the
-ODBC layer:
+response failure closes the transport. A server error answering the completed
+request, such as a TVP that does not match its table type, is read like any
+response and keeps the session, as it does for a materialized execute. Usage
+errors leave the stream available for correction or cancellation. For errors
+propagated to the application, the ODBC layer:
 
 1. Clears all DAE state (`take_dae`).
 2. Restores the prepared plan and any unconsumed orphan so `SQLExecute` can be

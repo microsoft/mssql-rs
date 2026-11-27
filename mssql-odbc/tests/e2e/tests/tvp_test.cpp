@@ -1569,6 +1569,78 @@ TEST_F(TvpTest, DaeStreamsChunkedMaxCellsAcrossOneRowBatches) {
     EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
 }
 
+// The mssql-python schema-mismatch shape: a DAE table that binds fewer columns
+// than its server type. The server rejects it, and the session must survive.
+TEST_F(TvpTest, DaeTableWithTooFewColumnsFailsAndKeepsTheSession) {
+    const std::string proc = "count_" + suffix_;
+    cleanup_sql_ = {"DROP PROCEDURE IF EXISTS dbo.[" + proc + "]"};
+    ASSERT_SQL_OK(DirectRc("CREATE PROCEDURE dbo.[" + proc + "] @t dbo.[" + type_name_ +
+                           "] READONLY AS SELECT COUNT(*) FROM @t"),
+                  SQL_HANDLE_STMT, stmt_);
+    for (bool prepared : {false, true}) {
+        SCOPED_TRACE(prepared ? "prepared" : "direct");
+        // A temp table pins the session: connection recovery cannot rebuild
+        // it, so a dropped connection cannot hide behind a reconnect.
+        Direct("DROP TABLE IF EXISTS #session_marker");
+        Direct("CREATE TABLE #session_marker (x int)");
+        auto session_alive = [&] {
+            SQLINTEGER present = 0;
+            SQLLEN indicator = 0;
+            if (!SQL_SUCCEEDED(DirectRc("SELECT CASE WHEN OBJECT_ID('tempdb..#session_marker') "
+                                        "IS NULL THEN 0 ELSE 1 END")) ||
+                !SQL_SUCCEEDED(SQLFetch(stmt_)) ||
+                !SQL_SUCCEEDED(SQLGetData(stmt_, 1, SQL_C_SLONG, &present, 0, &indicator))) {
+                ADD_FAILURE() << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+            }
+            return present == 1;
+        };
+        ASSERT_TRUE(session_alive());
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+        const std::string sql = "EXEC dbo.[" + proc + "] ?";
+        if (prepared) ASSERT_SQL_OK(Prepare(sql), SQL_HANDLE_STMT, stmt_);
+        BindTvp(1, type_name_, 4);
+        row_counts_.back() = SQL_DATA_AT_EXEC;
+        Focus(1);
+        SQLINTEGER id_token = 0;
+        SQLLEN id_length = SQL_DATA_AT_EXEC;
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                       0, 0, &id_token, 0, &id_length),
+                      SQL_HANDLE_STMT, stmt_);
+        RestoreFocus();
+
+        SQLRETURN rc;
+        if (prepared) {
+            rc = SQLExecute(stmt_);
+        } else {
+            auto text = ODBCTestUtils::ToSqlTStr(sql);
+            rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(text.c_str()), SQL_NTS);
+        }
+        ASSERT_EQ(rc, SQL_NEED_DATA) << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        bool row_sent = false;
+        SQLPOINTER token = nullptr;
+        int calls = 0;
+        while ((rc = SQLParamData(stmt_, &token)) == SQL_NEED_DATA) {
+            ASSERT_LT(++calls, 10);
+            if (token == type_bufs_.back().data()) {
+                ASSERT_SQL_OK(SQLPutData(stmt_, row_sent ? nullptr : reinterpret_cast<SQLPOINTER>(1),
+                                         row_sent ? 0 : 1),
+                              SQL_HANDLE_STMT, stmt_);
+                row_sent = true;
+            } else {
+                ASSERT_EQ(token, &id_token);
+                SQLINTEGER one = 1;
+                ASSERT_SQL_OK(SQLPutData(stmt_, &one, sizeof(one)), SQL_HANDLE_STMT, stmt_);
+            }
+        }
+        EXPECT_EQ(rc, SQL_ERROR);
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+        EXPECT_TRUE(session_alive()) << "the failed execute must not cost the session";
+        Direct("DROP TABLE IF EXISTS #session_marker");
+    }
+}
+
 // Two TVPs with a scalar parameter between them bind and execute together; each
 // TVP's columns are captured under its own focus.
 // Benefits-from-mock-tds: Assert distinct TVP payloads after lazy token-list extension.

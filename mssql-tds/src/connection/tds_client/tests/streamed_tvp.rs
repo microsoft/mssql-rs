@@ -419,6 +419,31 @@ async fn a_float16_cell_needs_vector_version_two() {
     }
 }
 
+/// A server error answering the finished request is an ordinary statement
+/// failure: its tokens were read in full, so the session stays usable, as it
+/// does when the same table is sent materialized.
+#[tokio::test]
+async fn a_server_error_after_the_table_keeps_the_connection() {
+    let (mut client, _sent) = create_capturing_client(vec![
+        Tokens::Error(error_token_with_severity(16)),
+        done_no_more(),
+        done_no_more(),
+    ]);
+    begin_table(&mut client).await;
+    client.write_streamed_tvp_cells(&rows()[0]).await.unwrap();
+
+    let error = client.end_streamed_param().await.unwrap_err();
+
+    assert!(matches!(error, Error::SqlServerError { .. }), "{error:?}");
+    assert!(!client.transport.connection_known_dead());
+    assert!(!client.has_open_batch());
+    client
+        .execute("SELECT 43".to_string(), ())
+        .await
+        .expect("the next statement runs on the same session");
+    assert_eq!(client.connection_recovery_count(), 0);
+}
+
 /// A cell rejected while it is being written may already have earlier rows
 /// on the wire, so the request is withdrawn rather than resumed.
 #[tokio::test]

@@ -3638,6 +3638,13 @@ impl TdsClient {
                 drop(message);
                 match self.position_on_first_result().await {
                     Ok(result) => Ok(StreamedParamStatus::Complete(result)),
+                    // The server's error tokens were read like any response,
+                    // so the stream is in sync and the session survives, as
+                    // it does for a materialized execute.
+                    Err(e @ crate::error::Error::SqlServerError { .. }) => {
+                        self.abort_pending_prepare_capture();
+                        Err(e)
+                    }
                     Err(e) => {
                         if !self.take_settled_drain_interruption(&e) {
                             self.abort_streamed_write().await;
