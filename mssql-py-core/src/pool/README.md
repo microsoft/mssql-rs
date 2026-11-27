@@ -136,6 +136,9 @@ semantics are covered. Version 1.17.0 rejected these spellings and is not the
 contract targeted by this latest-consumer test. Validate against an installed
 release wheel: a source checkout can contain unreleased changes, and a package
 mirror can lag behind the public release.
+`VectorTypeSupport`, added to the consumer allowlist in 1.19.0, is explicitly
+rejected by this private pool preparation contract rather than ignored or
+treated as key-equivalent. Vector negotiation is not enabled by this slice.
 
 The PR pipeline has dedicated Windows/Linux/macOS key-contract legs. Their
 configuration is not proof of passing results. Existing live-SQL regression jobs

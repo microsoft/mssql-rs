@@ -342,6 +342,8 @@ fn unsupported_authentication_and_attributes_fail_closed() {
             ("language", "secret-value"),
             ("mars_enabled", "secret-value"),
             ("workstation_id", "secret-value"),
+            ("vector_type_support", "Yes"),
+            ("vector_type_support", "No"),
             ("unknown-secret-value", "secret-value"),
             ("encryption", "true"),
             ("trust_server_certificate", "true"),

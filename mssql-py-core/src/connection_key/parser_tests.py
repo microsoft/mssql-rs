@@ -60,7 +60,7 @@ def verify_pool_keys(same_key):
     ]
     check.assertEqual(
         {keyword.lower() for keyword, *_ in cases},
-        set(_ALLOWED_CONNECTION_STRING_PARAMS) - {"driver"},
+        set(_ALLOWED_CONNECTION_STRING_PARAMS) - {"driver", "vectortypesupport"},
         "Every accepted keyword spelling needs an explicit key-contract case",
     )
     for keyword, value, field, partitions in cases:
@@ -84,6 +84,10 @@ def verify_pool_keys(same_key):
         check.assertTrue(same_key(actual, _context(keyword.upper(), value, field)), keyword)
     check.assertEqual(_context("KeepAlive", "31")["keep_alive"], 31000)
     check.assertEqual(_context("KeepAliveInterval", "2")["keep_alive_interval"], 2000)
+    for keyword in ("VectorTypeSupport", "VECTORTYPESUPPORT"):
+        for value in ("Yes", "No"):
+            with check.assertRaises((ConnectionStringParseError, ValueError)):
+                same_key(baseline, _context(keyword, value))
 
     entries = [(key, value) for key, value, _ in _BASE]
     reversed_context = build_async_connection_context(
