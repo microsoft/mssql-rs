@@ -183,22 +183,9 @@ fn sql_get_data_operation(
     );
 
     // The declared ODBC version selects the SQL_C_DEFAULT table, so it is only
-    // read for a defaulted retrieval — and before the STMT lock, to preserve
-    // parent-before-child lock ordering (the same order as `bind_param.rs`,
-    // `catalog.rs`, and `fetch_scroll.rs`). Gating costs nothing here, unlike
-    // on the fetch path: the placeholder arrives as a scalar argument rather
-    // than having to be read out of the bindings first, so there is no
-    // lock-order inversion to avoid.
-    let default_odbc_version = if target_type == SQL_C_DEFAULT {
-        let env = stmt.parent_dbc().parent_env();
-        let Ok(env_state) = env.inner.lock() else {
-            error!("SQLGetData: env mutex poisoned");
-            return SQL_ERROR;
-        };
-        Some(env_state.odbc_version)
-    } else {
-        None
-    };
+    // needed for a defaulted retrieval.
+    let default_odbc_version =
+        (target_type == SQL_C_DEFAULT).then(|| stmt.parent_dbc().odbc_version());
 
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLGetData: stmt mutex poisoned");
@@ -4293,8 +4280,8 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_C_SLONG, SQL_C_TYPE_TIMESTAMP, SqlSsTime2Struct};
     use crate::api::odbc_types::{SQL_NO_DATA, SQL_NTS, SQL_NULL_HANDLE};
+    use crate::handles::DbcHandle;
     use crate::handles::stmt::BufferedGetDataRow;
-    use crate::handles::{DbcHandle, EnvHandle};
     use crate::test_support::TestHandles;
     use crate::test_support::assert_last_diag;
     use mssql_tds::datatypes::sql_string::SqlString;
@@ -8430,11 +8417,7 @@ mod tests {
     fn get_data_time_column_as_default(version: OdbcVersion) -> (SqlReturn, SqlSsTime2Struct) {
         use mssql_tds::datatypes::column_values::SqlTime;
 
-        let h = TestHandles::with_env_dbc_stmt();
-        {
-            let env = unsafe { handle_from_raw::<EnvHandle>(h.env) };
-            env.inner.lock().unwrap().odbc_version = version;
-        }
+        let h = TestHandles::with_env_dbc_stmt_version(version as u32);
         // 13:45:30.1234567 in 100 ns ticks since midnight.
         let ticks = (13 * 3600 + 45 * 60 + 30) * 10_000_000 + 1_234_567;
         stmt_with_captured_column(
