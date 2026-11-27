@@ -51,6 +51,19 @@ type ConnectionParts = (
     Vec<SessionStateToken>,
 );
 
+async fn finish_failed_login(
+    transport: &mut network_transport::NetworkTransport,
+    recovery: bool,
+    error: Error,
+) -> Error {
+    if recovery {
+        transport.abort_transport();
+    } else if let Err(close_error) = transport.close_transport().await {
+        debug!(error = %close_error, "Transport shutdown after failed login failed");
+    }
+    error
+}
+
 /// Factory for establishing TDS connections and producing [`TdsClient`] instances.
 pub struct TdsConnectionProvider;
 
@@ -843,6 +856,7 @@ impl TdsConnectionProvider {
             return Err(Diagnosis::stop_error());
         }
 
+        let recovering = recovery_data.is_some();
         let factory = HandlerFactory {
             context: context.clone(),
             recovery_data,
@@ -867,10 +881,7 @@ impl TdsConnectionProvider {
                     session_state_tokens,
                 ))
             }
-            Err(err) => {
-                let _ = transport.close_transport().await;
-                Err(err)
-            }
+            Err(err) => Err(finish_failed_login(&mut transport, recovering, err).await),
         }
     }
 
@@ -933,6 +944,106 @@ impl TdsConnectionProvider {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    struct StalledShutdown {
+        shutdown: std::sync::Arc<AtomicBool>,
+        dropped: std::sync::Arc<AtomicBool>,
+    }
+
+    impl tokio::io::AsyncRead for StalledShutdown {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncWrite for StalledShutdown {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.shutdown.store(true, Ordering::SeqCst);
+            std::task::Poll::Pending
+        }
+    }
+
+    impl network_transport::Stream for StalledShutdown {
+        fn tls_handshake_starting(&mut self) {}
+        fn tls_handshake_completed(&mut self) {}
+    }
+
+    impl Drop for StalledShutdown {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_login_errors_survive_stalled_shutdown() {
+        for recovery in [false, true] {
+            for error in [
+                Error::TokenAcquisitionCancelled,
+                Error::OperationCancelledError("credential cancelled".into()),
+                Error::ImplementationError("invalid login configuration".into()),
+                Error::Security(crate::security::SecurityError::AuthenticationDenied(
+                    "test credential rejected".into(),
+                )),
+            ] {
+                let expected_kind = std::mem::discriminant(&error);
+                let expected_text = error.to_string();
+                let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+                let dropped = std::sync::Arc::new(AtomicBool::new(false));
+                let context = ClientContext::default();
+                let mut transport = network_transport::NetworkTransport::new(
+                    Box::new(StalledShutdown {
+                        shutdown: shutdown.clone(),
+                        dropped: dropped.clone(),
+                    }),
+                    crate::connection::transport::ssl_handler::SslHandler {
+                        server_host_name: context.transport_context.get_server_name().clone(),
+                        encryption_options: context.encryption_options.clone(),
+                    },
+                    context.packet_size as u32,
+                    context.encryption_options.mode,
+                    false,
+                );
+                let result = timeout(
+                    Duration::from_secs(1),
+                    finish_failed_login(&mut transport, recovery, error),
+                )
+                .await;
+                assert_eq!(shutdown.load(Ordering::SeqCst), !recovery);
+                if recovery {
+                    let error = result.expect("cleanup replaced the original login error");
+                    assert_eq!(std::mem::discriminant(&error), expected_kind);
+                    assert_eq!(error.to_string(), expected_text);
+                    assert!(dropped.load(Ordering::SeqCst));
+                } else {
+                    assert!(result.is_err());
+                    transport.abort_transport();
+                    assert!(dropped.load(Ordering::SeqCst));
+                }
+            }
+        }
+    }
 
     #[test]
     fn connection_future_stays_small() {

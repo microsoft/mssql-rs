@@ -12,6 +12,7 @@ use mssql_tds::connection::{
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::CancelHandle;
 
+use super::auth::RecoveryAuth;
 use super::error::{OpenError, PoolError, PoolResult};
 
 /// Accepts the key adapter's fingerprint, never a connection string or token.
@@ -112,12 +113,6 @@ impl ConnectSpec {
 
     pub(super) fn validate_pool(&self) -> PoolResult<()> {
         let context = self.context();
-        if context.connect_retry_count != 0 {
-            return Err(PoolError::InvalidRequest {
-                field: "connect_retry_count",
-                reason: "pooled sessions require zero",
-            });
-        }
         if context.tds_authentication_method != TdsAuthenticationMethod::Password
             || context.access_token.is_some()
             || !context.auth_method_map.is_empty()
@@ -144,11 +139,32 @@ impl ConnectSpec {
 pub(crate) struct OpenedConnection {
     client: TdsClient,
     auth: AuthMetadata,
+    recovery: Option<RecoveryAuth>,
 }
 
 impl OpenedConnection {
     pub(crate) fn new(client: TdsClient, auth: AuthMetadata) -> Self {
-        Self { client, auth }
+        Self {
+            client,
+            auth,
+            recovery: None,
+        }
+    }
+
+    pub(super) fn with_recovery(
+        client: TdsClient,
+        auth: AuthMetadata,
+        recovery: RecoveryAuth,
+    ) -> Self {
+        Self {
+            client,
+            auth,
+            recovery: Some(recovery),
+        }
+    }
+
+    pub(super) fn recovery_auth(&self) -> Option<&RecoveryAuth> {
+        self.recovery.as_ref()
     }
 
     /// Transfers the client and authentication metadata to their next owner.
@@ -158,6 +174,12 @@ impl OpenedConnection {
 
     pub(crate) fn client_mut(&mut self) -> &mut TdsClient {
         &mut self.client
+    }
+
+    pub(super) fn record_auth(&mut self, auth: AuthMetadata) -> PoolResult<()> {
+        auth.verify_binding(&self.auth.binding)?;
+        self.auth = auth;
+        Ok(())
     }
 
     pub(super) fn verify_auth(&self, spec: &ConnectSpec) -> PoolResult<()> {
