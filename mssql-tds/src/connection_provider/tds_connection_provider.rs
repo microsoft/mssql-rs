@@ -12,7 +12,7 @@ use tracing::{debug, info};
 use crate::connection::client_context::{ClientContext, TransportContext};
 use crate::connection::connect_stage;
 use crate::connection::connection_actions::{
-    ActionOutcome, ConnectionAction, ConnectionActionChain, ExecutionContext,
+    ActionOutcome, ConnectionAction, ConnectionActionChain, ExecutionContext, SsrpRequest,
 };
 use crate::connection::instance_cache::InstanceCache;
 use crate::connection::session_recovery::SessionRecoveryData;
@@ -50,6 +50,20 @@ type ConnectionParts = (
     Vec<SqlInfoMessage>,
     Vec<SessionStateToken>,
 );
+
+/// An opened transport, with the name resolution it connected from.
+type OpenedTransport = (
+    network_transport::NetworkTransport,
+    Option<crate::connection::dns_cache::Resolution>,
+);
+
+/// The port a default instance's dedicated administrator connection
+/// listens on, unless SQL Server took another (SNI open.cpp).
+const DEFAULT_DAC_PORT: u16 = 1434;
+
+/// The name SNI asks SQL Server Browser's DAC request for a default
+/// instance's dedicated administrator connection port with (open.cpp).
+const DEFAULT_INSTANCE_NAME: &str = "MSSQLServer";
 
 /// Factory for establishing TDS connections and producing [`TdsClient`] instances.
 pub struct TdsConnectionProvider;
@@ -230,6 +244,9 @@ impl TdsConnectionProvider {
     /// memory first (Windows) and asks SQL Server Browser only if that does
     /// not connect; a [`DiagnosticStop::Resolution`] stop on that path
     /// happens before shared memory is opened, without a Browser lookup.
+    /// A named instance's dedicated administrator connection asks SQL Server
+    /// Browser's DAC request for its port, and a default instance's asks it
+    /// only when port 1434 does not open, as the client does.
     /// Over TCP without MultiSubnetFailover, once an
     /// address accepts the connection, it also connects to the addresses
     /// after it (at most 64, as MultiSubnetFailover tries), at the same time
@@ -495,6 +512,7 @@ impl TdsConnectionProvider {
 
             let connect_retry_count = context.connect_retry_count;
             let connect_retry_interval = Duration::from_secs(context.connect_retry_interval.into());
+            let default_instance_dac = action_chain.default_instance_dac_host().is_some();
 
             let cancellation_token = cancel_handle.map(|handle| handle.cancel_token.child_token());
 
@@ -532,6 +550,10 @@ impl TdsConnectionProvider {
 
                 // Try each transport context in order
                 for (transport_ctx, _action_timeout_ms) in &transport_contexts {
+                    #[cfg(windows)]
+                    if attempt == 0 && Self::tried_before_the_browser(&action_chain, transport_ctx) {
+                        continue;
+                    }
                     debug!("Attempt {}: connecting with {:?}", attempt, transport_ctx);
 
                     // Check for cancellation
@@ -544,33 +566,15 @@ impl TdsConnectionProvider {
                         ));
                     }
 
-                    let connect_future = Self::connect_with_transport_context(&context, transport_ctx, None, diagnosis);
-
-                    // Recompute remaining time budget before each timeout call
-                    let remaining = deadline.map(|dl| dl.saturating_duration_since(Instant::now()));
-                    let connection_result = match remaining {
-                        Some(remaining) => {
-                            match timeout(remaining, connect_future).await {
-                                Ok(result) => result,
-                                Err(_) => Err(TimeoutError(TimeoutErrorType::String(
-                                    "Timeout while connecting".to_string(),
-                                ))),
-                            }
-                        }
-                        None => connect_future.await,
+                    let attempted = if default_instance_dac {
+                        Self::connect_default_instance_dac(&context, transport_ctx, ssrp::SSRP_PORT, deadline, &mut redirect_count, diagnosis).await?
+                    } else {
+                        Self::connect_and_login(&context, transport_ctx, deadline, &mut redirect_count, diagnosis).await
                     };
 
-                    match Self::follow_redirects(&context, connection_result, deadline, &mut redirect_count, diagnosis).await {
-                        Ok((transport, negotiated_settings, execution_context, info_messages, session_state_tokens)) => {
+                    match attempted {
+                        Ok(client) => {
                             debug!("Connection successful via action chain");
-                            let mut client = TdsClient::new(
-                                transport,
-                                negotiated_settings,
-                                execution_context,
-                                context.clone(),
-                                session_state_tokens,
-                            );
-                            client.extend_info_messages(info_messages);
                             return Ok(client);
                         }
                         Err(err) => {
@@ -608,13 +612,16 @@ impl TdsConnectionProvider {
         ssrp_timeout_ms: u64,
         bound_resolution: bool,
     ) -> TdsResult<()> {
-        let (server, instance) = action_chain
+        let (server, instance, request) = action_chain
             .actions()
             .iter()
             .find_map(|a| match a {
                 ConnectionAction::QuerySsrp {
-                    server, instance, ..
-                } => Some((server.clone(), instance.clone())),
+                    server,
+                    instance,
+                    request,
+                    ..
+                } => Some((server.clone(), instance.clone(), *request)),
                 _ => None,
             })
             .ok_or_else(|| {
@@ -623,11 +630,19 @@ impl TdsConnectionProvider {
                 )
             })?;
 
-        let timeout_ms = if ssrp_timeout_ms == 0 {
-            ssrp::DEFAULT_SSRP_TIMEOUT_MS
-        } else {
-            ssrp_timeout_ms
-        };
+        let timeout_ms = Self::ssrp_timeout(ssrp_timeout_ms);
+        if request == SsrpRequest::DacPort {
+            let port = Self::look_up_dac_port(
+                &server,
+                &instance,
+                ssrp::SSRP_PORT,
+                timeout_ms,
+                bound_resolution,
+            )
+            .await?;
+            exec_context.store_outcome(ActionOutcome::SsrpResolvedDac { port });
+            return Ok(());
+        }
         debug!(server = %server, instance = %instance, timeout_ms, "Executing SSRP query");
 
         let stage = tracing::info_span!(
@@ -741,6 +756,234 @@ impl TdsConnectionProvider {
         Ok(())
     }
 
+    /// SQL Server Browser's time limit: `ssrp_timeout_ms`, or the default.
+    fn ssrp_timeout(ssrp_timeout_ms: u64) -> u64 {
+        if ssrp_timeout_ms == 0 {
+            ssrp::DEFAULT_SSRP_TIMEOUT_MS
+        } else {
+            ssrp_timeout_ms
+        }
+    }
+
+    /// Whether `transport` is shared memory the client tried before it asked
+    /// SQL Server Browser: the first pass over the transports the Browser's
+    /// answer gave does not try it again, as SNI tries each transport once
+    /// (open.cpp); a retry tries it again.
+    #[cfg(windows)]
+    fn tried_before_the_browser(
+        chain: &ConnectionActionChain,
+        transport: &TransportContext,
+    ) -> bool {
+        matches!(transport, TransportContext::SharedMemory { .. })
+            && chain.requires_ssrp()
+            && chain.first_shared_memory_transport().is_some()
+    }
+
+    /// Asks SQL Server Browser on `server` (at UDP `ssrp_port`) for the
+    /// dedicated administrator connection port of `instance` (SNI's
+    /// `SSRP::GetAdminPort`) within `timeout_ms`, recorded as an instance
+    /// lookup stage with [`connect_stage::REQUEST_DAC`]. Never the
+    /// instance's own port.
+    async fn look_up_dac_port(
+        server: &str,
+        instance: &str,
+        ssrp_port: u16,
+        timeout_ms: u64,
+        bound_resolution: bool,
+    ) -> TdsResult<u16> {
+        debug!(server = %server, instance = %instance, timeout_ms, "Asking SQL Server Browser for the DAC port");
+        let stage = tracing::info_span!(
+            target: connect_stage::TARGET,
+            connect_stage::INSTANCE_LOOKUP,
+            server = %server,
+            instance = %instance,
+            request = connect_stage::REQUEST_DAC,
+            addresses = tracing::field::Empty,
+            port = tracing::field::Empty,
+            result = tracing::field::Empty,
+            os_error = tracing::field::Empty,
+            error = tracing::field::Empty,
+            ok = tracing::field::Empty
+        );
+        let port = ssrp::query_dac_port(
+            server,
+            instance,
+            ssrp_port,
+            timeout_ms,
+            bound_resolution,
+            |addresses| {
+                if !stage.is_disabled() {
+                    stage.record(
+                        connect_stage::ADDRESSES,
+                        connect_stage::address_list(addresses),
+                    );
+                }
+            },
+        )
+        .await
+        .map_err(|lookup| {
+            if !stage.is_disabled() {
+                stage.record(connect_stage::RESULT, lookup.code());
+                if let Some(code) = lookup.os_error() {
+                    stage.record(connect_stage::OS_ERROR, code);
+                }
+                if let Some(detail) = lookup.detail() {
+                    stage.record(connect_stage::ERROR, detail);
+                }
+                stage.record(connect_stage::OK, false);
+            }
+            Error::ConnectionError(format!(
+                "An error occurred while obtaining the dedicated administrator connection (DAC) \
+                 port of [{}\\{}]. Make sure that SQL Server Browser is running, or check the \
+                 error log for the port number. ({})",
+                server,
+                instance,
+                Error::from(lookup)
+            ))
+        })?;
+        debug!(port, "SSRP resolved the DAC port");
+        stage.record(connect_stage::PORT, port);
+        stage.record(connect_stage::OK, true);
+        Ok(port)
+    }
+
+    /// A default instance's dedicated administrator connection over
+    /// `default` (TCP port 1434), as SNI makes it (open.cpp): when that port
+    /// does not open, it asks SQL Server Browser's DAC request (at UDP
+    /// `ssrp_port`) for the port and connects there instead. The outer error
+    /// ends the connection attempt: the Browser gave no port, or gave 1434
+    /// again. The inner result is the login's, as for any transport.
+    async fn connect_default_instance_dac(
+        context: &ClientContext,
+        default: &TransportContext,
+        ssrp_port: u16,
+        deadline: Option<Instant>,
+        redirect_count: &mut u32,
+        diagnosis: Option<&Diagnosis>,
+    ) -> TdsResult<TdsResult<TdsClient>> {
+        let TransportContext::Tcp { host, .. } = default else {
+            return Ok(Self::connect_and_login(
+                context,
+                default,
+                deadline,
+                redirect_count,
+                diagnosis,
+            )
+            .await);
+        };
+        let not_opened =
+            match Self::before(deadline, Self::open_transport(context, default, diagnosis)).await {
+                Ok(opened) => {
+                    let login = Self::before(
+                        deadline,
+                        Self::start_session(context, default, opened, None, diagnosis),
+                    )
+                    .await;
+                    return Ok(Self::logged_in(
+                        context,
+                        login,
+                        deadline,
+                        redirect_count,
+                        diagnosis,
+                    )
+                    .await);
+                }
+                Err(error) if error.is_transient_connect_error() => error,
+                Err(error) => return Ok(Err(error)),
+            };
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(Err(not_opened));
+        }
+        debug!(host = %host, error = %not_opened, "DAC port 1434 did not open; asking SQL Server Browser");
+        let port = Self::look_up_dac_port(
+            host,
+            DEFAULT_INSTANCE_NAME,
+            ssrp_port,
+            Self::ssrp_timeout(context.ssrp_timeout_ms),
+            diagnosis.is_some(),
+        )
+        .await?;
+        let port = Self::default_instance_dac_port(port, &not_opened)?;
+        let given = TransportContext::Tcp {
+            host: host.clone(),
+            port,
+            instance_name: None,
+        };
+        Ok(Self::connect_and_login(context, &given, deadline, redirect_count, diagnosis).await)
+    }
+
+    /// The `given` port SQL Server Browser gave for a default instance's
+    /// dedicated administrator connection once port 1434 did not open
+    /// (`not_opened`, how it failed): 1434 again is SNI's error 42.
+    fn default_instance_dac_port(given: u16, not_opened: &Error) -> TdsResult<u16> {
+        if given == DEFAULT_DAC_PORT {
+            return Err(Error::ConnectionError(format!(
+                "Could not establish dedicated administrator connection (DAC) on default port. \
+                 Make sure that DAC is enabled. ({not_opened})"
+            )));
+        }
+        Ok(given)
+    }
+
+    /// Connects over `transport_ctx` and logs in, following routing
+    /// redirects, within what is left before `deadline`.
+    async fn connect_and_login(
+        context: &ClientContext,
+        transport_ctx: &TransportContext,
+        deadline: Option<Instant>,
+        redirect_count: &mut u32,
+        diagnosis: Option<&Diagnosis>,
+    ) -> TdsResult<TdsClient> {
+        let login = Self::before(
+            deadline,
+            Self::connect_with_transport_context(context, transport_ctx, None, diagnosis),
+        )
+        .await;
+        Self::logged_in(context, login, deadline, redirect_count, diagnosis).await
+    }
+
+    /// The client of a `login`, once its routing redirects are followed.
+    async fn logged_in(
+        context: &ClientContext,
+        login: TdsResult<ConnectionParts>,
+        deadline: Option<Instant>,
+        redirect_count: &mut u32,
+        diagnosis: Option<&Diagnosis>,
+    ) -> TdsResult<TdsClient> {
+        let (
+            transport,
+            negotiated_settings,
+            execution_context,
+            info_messages,
+            session_state_tokens,
+        ) = Self::follow_redirects(context, login, deadline, redirect_count, diagnosis).await?;
+        let mut client = TdsClient::new(
+            transport,
+            negotiated_settings,
+            execution_context,
+            context.clone(),
+            session_state_tokens,
+        );
+        client.extend_info_messages(info_messages);
+        Ok(client)
+    }
+
+    /// `work`, or the connect timeout once `deadline` passes first.
+    async fn before<T>(
+        deadline: Option<Instant>,
+        work: impl Future<Output = TdsResult<T>>,
+    ) -> TdsResult<T> {
+        // Recompute remaining time budget before each timeout call
+        match deadline.map(|deadline| deadline.saturating_duration_since(Instant::now())) {
+            Some(remaining) => timeout(remaining, work).await.unwrap_or_else(|_| {
+                Err(TimeoutError(TimeoutErrorType::String(
+                    "Timeout while connecting".to_string(),
+                )))
+            }),
+            None => work.await,
+        }
+    }
+
     /// Follows routing ENVCHANGEs until a login completes or fails for another
     /// reason. The shared-memory shortcut and the transport loop both hand
     /// their login here, so a route is honored whichever transport carried it
@@ -811,13 +1054,24 @@ impl TdsConnectionProvider {
         recovery_data: Option<Box<SessionRecoveryData>>,
         diagnosis: Option<&Diagnosis>,
     ) -> TdsResult<ConnectionParts> {
+        let opened = Self::open_transport(context, transport_context, diagnosis).await?;
+        Self::start_session(context, transport_context, opened, recovery_data, diagnosis).await
+    }
+
+    /// Opens the transport `transport_context` names: resolving and
+    /// connecting, with TLS where the transport begins with it (TDS 8.0).
+    async fn open_transport(
+        context: &ClientContext,
+        transport_context: &TransportContext,
+        diagnosis: Option<&Diagnosis>,
+    ) -> TdsResult<OpenedTransport> {
         if let Some(trace) = &context.connection_trace {
             trace.begin_transport_attempt();
         }
         // Create network transport directly
         // Convert connect_timeout from seconds to milliseconds
         let connect_timeout_ms = (context.connect_timeout as u64) * 1000;
-        let (mut transport, dns_resolution) = network_transport::create_transport(
+        network_transport::create_transport(
             context.ipaddress_preference,
             context.tds_version(),
             transport_context,
@@ -835,8 +1089,19 @@ impl TdsConnectionProvider {
             connect_timeout_ms,
             diagnosis,
         )
-        .await?;
+        .await
+    }
 
+    /// Runs the session handler over the `opened` transport, up to a
+    /// completed login; a diagnostic attempt that stops after the transport
+    /// stops here first.
+    async fn start_session(
+        context: &ClientContext,
+        transport_context: &TransportContext,
+        (mut transport, dns_resolution): OpenedTransport,
+        recovery_data: Option<Box<SessionRecoveryData>>,
+        diagnosis: Option<&Diagnosis>,
+    ) -> TdsResult<ConnectionParts> {
         if diagnosis.is_some_and(|diagnosis| diagnosis.stops_at(DiagnosticStop::Transport)) {
             // Dropping the transport closes it at once; nothing was sent on it.
             drop(transport);
@@ -1605,6 +1870,158 @@ mod tests {
             );
         }
 
+        /// A named instance's dedicated administrator connection asks SQL
+        /// Server Browser for its DAC port alone, recorded as such, and
+        /// connects to nothing when the Browser gives none: never the
+        /// instance's own port, nor a guessed one.
+        #[test]
+        fn a_named_instance_dac_asks_the_browser_for_its_dac_port_alone() {
+            let instance = "NoSuchDiagnoseInstance";
+            let (result, log) = diagnose(&format!("admin:127.0.0.1\\{instance}"), None);
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("the lookup cannot succeed: {:#?}", log.stages()),
+            };
+            let lookup = log.named(stage::INSTANCE_LOOKUP);
+            assert_eq!(lookup.len(), 1, "{:#?}", log.stages());
+            assert_eq!(lookup[0].field(stage::REQUEST), Some(stage::REQUEST_DAC));
+            assert_eq!(lookup[0].field(stage::SERVER), Some("127.0.0.1"));
+            assert_eq!(lookup[0].field(stage::INSTANCE), Some(instance));
+            assert_eq!(lookup[0].field(stage::OK), Some("false"));
+            assert!(lookup[0].field(stage::RESULT).is_some(), "{lookup:#?}");
+            assert!(log.named(stage::TCP).is_empty(), "{:#?}", log.stages());
+            assert!(
+                error.to_string().contains(&format!(
+                    "An error occurred while obtaining the dedicated administrator connection \
+                     (DAC) port of [127.0.0.1\\{instance}]."
+                )),
+                "{error}"
+            );
+        }
+
+        /// A default instance's dedicated administrator connection to
+        /// 127.0.0.1 whose port 1434 is `port`, SQL Server Browser asked at
+        /// UDP `ssrp_port`: the outer error ends the attempt, the inner
+        /// result is the login's.
+        fn default_instance_dac(port: u16, ssrp_port: u16) -> (TdsResult<TdsResult<()>>, StageLog) {
+            observe(|| async move {
+                let mut context = context();
+                let chain =
+                    TdsConnectionProvider::action_chain(&mut context, "admin:127.0.0.1").unwrap();
+                assert_eq!(chain.default_instance_dac_host(), Some("127.0.0.1"));
+                let default = TransportContext::Tcp {
+                    host: "127.0.0.1".to_string(),
+                    port,
+                    instance_name: None,
+                };
+                let mut redirects = 0;
+                TdsConnectionProvider::connect_default_instance_dac(
+                    &context,
+                    &default,
+                    ssrp_port,
+                    Some(Instant::now() + Duration::from_secs(5)),
+                    &mut redirects,
+                    None,
+                )
+                .await
+                .map(|login| login.map(drop))
+            })
+        }
+
+        /// A default instance's dedicated administrator connection whose
+        /// port does not open asks SQL Server Browser for its DAC port, as
+        /// SNI does; with no Browser to answer, that ends the attempt.
+        #[test]
+        fn a_default_instance_dac_that_does_not_open_asks_the_browser() {
+            let (listener, port) = closing_listener();
+            drop(listener);
+            // A Browser that never answers, not one this computer may run.
+            let browser = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let ssrp_port = browser.local_addr().unwrap().port();
+            let (result, log) = default_instance_dac(port, ssrp_port);
+            drop(browser);
+            let error = result.expect_err("no port to connect to ends the attempt");
+            let tcp = log.named(stage::TCP);
+            assert_eq!(tcp.len(), 1, "{:#?}", log.stages());
+            assert_eq!(tcp[0].field(stage::OK), Some("false"));
+            let lookup = log.named(stage::INSTANCE_LOOKUP);
+            assert_eq!(lookup.len(), 1, "{:#?}", log.stages());
+            assert_eq!(lookup[0].field(stage::REQUEST), Some(stage::REQUEST_DAC));
+            assert_eq!(
+                lookup[0].field(stage::INSTANCE),
+                Some(DEFAULT_INSTANCE_NAME)
+            );
+            assert!(
+                error.to_string().contains(
+                    "port of [127.0.0.1\\MSSQLServer]. Make sure that SQL Server Browser"
+                ),
+                "{error}"
+            );
+        }
+
+        /// A default instance's dedicated administrator connection whose
+        /// port does not open connects to the port SQL Server Browser gives
+        /// for it, as SNI does.
+        #[test]
+        fn a_default_instance_dac_connects_where_the_browser_says() {
+            let (listener, port) = closing_listener();
+            drop(listener);
+            // The DAC: it takes the connection and closes it.
+            let dac = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let dac_port = dac.local_addr().unwrap().port();
+            std::thread::spawn(move || drop(dac.accept()));
+            let browser = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let ssrp_port = browser.local_addr().unwrap().port();
+            browser
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let answered = std::thread::spawn(move || {
+                let mut request = [0u8; 512];
+                let (_, client) = browser.recv_from(&mut request).unwrap();
+                browser
+                    .send_to(&ssrp::dac_answer(dac_port), client)
+                    .unwrap();
+            });
+            let (result, log) = default_instance_dac(port, ssrp_port);
+            answered.join().expect("SQL Server Browser is asked");
+            let login = result.expect("the port the Browser gives is connected to");
+            assert!(login.is_err(), "the DAC closed the connection");
+            let dac_port = dac_port.to_string();
+            let lookup = log.named(stage::INSTANCE_LOOKUP);
+            assert_eq!(lookup.len(), 1, "{:#?}", log.stages());
+            assert_eq!(lookup[0].field(stage::PORT), Some(dac_port.as_str()));
+            assert_eq!(lookup[0].field(stage::OK), Some("true"));
+            let tcp = log.named(stage::TCP);
+            assert_eq!(tcp.len(), 2, "{:#?}", log.stages());
+            assert_eq!(tcp[0].field(stage::OK), Some("false"));
+            assert_eq!(tcp[1].field(stage::PORT), Some(dac_port.as_str()));
+            assert_eq!(tcp[1].field(stage::OK), Some("true"), "{tcp:#?}");
+        }
+
+        /// SQL Server Browser giving port 1434 again for a default
+        /// instance's dedicated administrator connection is SNI's error 42,
+        /// with how 1434 failed.
+        #[test]
+        fn a_default_instance_dac_port_of_1434_again_is_refused() {
+            let refused = Error::ConnectionError("connection refused".to_string());
+            assert_eq!(
+                TdsConnectionProvider::default_instance_dac_port(53110, &refused).unwrap(),
+                53110
+            );
+            let error =
+                TdsConnectionProvider::default_instance_dac_port(DEFAULT_DAC_PORT, &refused)
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                error.contains(
+                    "Could not establish dedicated administrator connection (DAC) on default \
+                     port. Make sure that DAC is enabled."
+                ),
+                "{error}"
+            );
+            assert!(error.contains("connection refused"), "{error}");
+        }
+
         /// A local named instance without a protocol prefix is tried over
         /// shared memory first, as the client does: a resolution stop comes
         /// before shared memory is opened and asks no Browser, and SQL Server
@@ -1643,6 +2060,45 @@ mod tests {
                     Some("NoSuchDiagnoseInstance")
                 );
             }
+        }
+
+        /// Shared memory, tried before SQL Server Browser was asked for a
+        /// local named instance without a prefix, is not tried again once the
+        /// Browser answered: the first pass goes on to the endpoints it gave.
+        #[cfg(windows)]
+        #[test]
+        fn shared_memory_tried_before_the_browser_is_not_tried_again() {
+            let mut context = context();
+            let chain =
+                TdsConnectionProvider::action_chain(&mut context, r".\NoSuchDiagnoseInstance")
+                    .unwrap();
+            let mut answered = ExecutionContext::new();
+            answered.store_outcome(ActionOutcome::SsrpResolved { port: 50001 });
+            let first_pass: Vec<TransportContext> = chain
+                .resolve_transport_contexts_with_context(&answered)
+                .into_iter()
+                .map(|(transport, _)| transport)
+                .filter(|t| !TdsConnectionProvider::tried_before_the_browser(&chain, t))
+                .collect();
+            assert!(
+                matches!(
+                    first_pass.as_slice(),
+                    [TransportContext::Tcp { port: 50001, .. }]
+                ),
+                "{first_pass:?}"
+            );
+
+            // `lpc:` asks no Browser: its shared memory is the transport.
+            let chain = TdsConnectionProvider::action_chain(&mut context, "lpc:.").unwrap();
+            let transports =
+                chain.resolve_transport_contexts_with_context(&ExecutionContext::new());
+            assert!(
+                transports
+                    .iter()
+                    .any(|(t, _)| matches!(t, TransportContext::SharedMemory { .. })
+                        && !TdsConnectionProvider::tried_before_the_browser(&chain, t)),
+                "{transports:?}"
+            );
         }
 
         /// A pipe stops before it is opened, and records how its opening

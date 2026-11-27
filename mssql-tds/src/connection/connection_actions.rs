@@ -28,6 +28,8 @@ pub enum ConnectionAction {
         instance: String,
         /// Where to store the result (for next action)
         result_slot: ResultSlot,
+        /// What SQL Server Browser is asked for
+        request: SsrpRequest,
     },
 
     /// Update connection cache with resolved information
@@ -67,7 +69,7 @@ pub enum ConnectionAction {
         timeout_ms: u64,
     },
 
-    /// Attempt Dedicated Admin Connection (DAC)
+    /// Attempt Dedicated Admin Connection (DAC) to a default instance
     ConnectDac { host: String, timeout_ms: u64 },
 
     /// Resolve LocalDB instance to Named Pipe path (Windows only)
@@ -101,10 +103,21 @@ impl ConnectionAction {
                 format!("Check connection cache for '{}'", cache_key)
             }
             ConnectionAction::QuerySsrp {
-                server, instance, ..
-            } => {
-                format!("Query SQL Browser for '{}\\{}'", server, instance)
-            }
+                server,
+                instance,
+                request,
+                ..
+            } => match request {
+                SsrpRequest::Instance => {
+                    format!("Query SQL Browser for '{}\\{}'", server, instance)
+                }
+                SsrpRequest::DacPort => {
+                    format!(
+                        "Query SQL Browser for the DAC port of '{}\\{}'",
+                        server, instance
+                    )
+                }
+            },
             ConnectionAction::UpdateCache { cache_key, port } => {
                 format!("Update cache '{}' with port {}", cache_key, port)
             }
@@ -154,11 +167,24 @@ impl ConnectionAction {
     }
 }
 
+/// What a SQL Server Browser query asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SsrpRequest {
+    /// The instance's endpoints: its TCP port and pipe (CLNT_UCAST_INST).
+    Instance,
+    /// The TCP port of the instance's dedicated administrator connection
+    /// (CLNT_UCAST_DAC), never the instance's own port.
+    DacPort,
+}
+
 /// Slot for storing intermediate results between actions
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResultSlot {
     /// Port resolved from SSRP
     ResolvedPort,
+    /// Dedicated administrator connection port resolved from SSRP's DAC
+    /// request
+    ResolvedDacPort,
     /// Pipe path resolved from LocalDB
     ResolvedPipePath,
     /// Full connection info from cache
@@ -189,6 +215,8 @@ pub enum ActionOutcome {
     CacheMiss,
     /// SSRP resolved port
     SsrpResolved { port: u16 },
+    /// SSRP's DAC request resolved the dedicated administrator connection's port
+    SsrpResolvedDac { port: u16 },
     /// SSRP resolved named pipe path (when TCP is not available)
     SsrpResolvedPipe { pipe_path: String },
     /// LocalDB resolved to pipe path
@@ -221,6 +249,9 @@ impl ExecutionContext {
             ActionOutcome::SsrpResolved { .. } => {
                 self.slots.insert(ResultSlot::ResolvedPort, outcome);
             }
+            ActionOutcome::SsrpResolvedDac { .. } => {
+                self.slots.insert(ResultSlot::ResolvedDacPort, outcome);
+            }
             ActionOutcome::SsrpResolvedPipe { .. } => {
                 self.slots.insert(ResultSlot::ResolvedPipePath, outcome);
             }
@@ -252,7 +283,9 @@ impl ExecutionContext {
     /// Get port from a slot (if available)
     pub fn get_port(&self, slot: ResultSlot) -> Option<u16> {
         match self.get_outcome(slot)? {
-            ActionOutcome::SsrpResolved { port } => Some(*port),
+            ActionOutcome::SsrpResolved { port } | ActionOutcome::SsrpResolvedDac { port } => {
+                Some(*port)
+            }
             ActionOutcome::CacheHit { port, .. } => *port,
             _ => None,
         }
@@ -462,6 +495,16 @@ impl ConnectionActionChain {
             .iter()
             .any(|a| matches!(a, ConnectionAction::CheckCache { .. }))
     }
+
+    /// The host of a default instance's dedicated administrator connection,
+    /// when the chain makes one: SNI asks SQL Server Browser for its port
+    /// when port 1434 does not connect (open.cpp).
+    pub fn default_instance_dac_host(&self) -> Option<&str> {
+        self.actions.iter().find_map(|a| match a {
+            ConnectionAction::ConnectDac { host, .. } => Some(host.as_str()),
+            _ => None,
+        })
+    }
 }
 
 impl fmt::Display for ConnectionActionChain {
@@ -527,11 +570,12 @@ impl ConnectionAction {
                 })
             }
             ConnectionAction::ConnectDac { host, .. } => {
-                // DAC uses TCP on port 1434 (SQL Browser port) by default
-                // The actual DAC port is typically instance_port + 1 or a specific admin port
+                // A default instance's DAC listens on TCP 1434 (SNI
+                // open.cpp); a named instance's port comes from SQL Server
+                // Browser's DAC request (`QuerySsrp` with `DacPort`).
                 Some(TransportContext::Tcp {
                     host: host.clone(),
-                    port: 1434, // DAC default port
+                    port: 1434,
                     instance_name: None,
                 })
             }
@@ -577,6 +621,19 @@ impl ConnectionActionChainBuilder {
             server: server.to_string(),
             instance: instance.to_string(),
             result_slot: ResultSlot::ResolvedPort,
+            request: SsrpRequest::Instance,
+        });
+        self
+    }
+
+    /// Add an SSRP query for a named instance's dedicated administrator
+    /// connection port
+    pub fn add_dac_port_query(&mut self, server: &str, instance: &str) -> &mut Self {
+        self.actions.push(ConnectionAction::QuerySsrp {
+            server: server.to_string(),
+            instance: instance.to_string(),
+            result_slot: ResultSlot::ResolvedDacPort,
+            request: SsrpRequest::DacPort,
         });
         self
     }
@@ -762,6 +819,10 @@ pub trait ConnectionExecutor {
     /// Query SQL Server Browser (SSRP) to resolve instance details
     async fn query_ssrp(&self, server: &str, instance: &str) -> TdsResult<SsrpResponse>;
 
+    /// Query SQL Server Browser for a named instance's dedicated
+    /// administrator connection port
+    async fn query_dac_port(&self, server: &str, instance: &str) -> TdsResult<u16>;
+
     /// Update connection cache with resolved information
     async fn update_cache(&mut self, key: &str, info: CachedConnectionInfo) -> TdsResult<()>;
 
@@ -806,7 +867,8 @@ pub trait ConnectionExecutor {
             ConnectionAction::QuerySsrp {
                 server,
                 instance,
-                result_slot: _,
+                request: SsrpRequest::Instance,
+                ..
             } => match self.query_ssrp(server, instance).await {
                 Ok(response) => {
                     let outcome = ActionOutcome::SsrpResolved {
@@ -816,6 +878,23 @@ pub trait ConnectionExecutor {
                     Ok(ActionResult::Success(outcome))
                 }
                 Err(e) => Ok(ActionResult::Continue(format!("SSRP query failed: {}", e))),
+            },
+
+            ConnectionAction::QuerySsrp {
+                server,
+                instance,
+                request: SsrpRequest::DacPort,
+                ..
+            } => match self.query_dac_port(server, instance).await {
+                Ok(port) => {
+                    let outcome = ActionOutcome::SsrpResolvedDac { port };
+                    context.store_outcome(outcome.clone());
+                    Ok(ActionResult::Success(outcome))
+                }
+                Err(e) => Ok(ActionResult::Continue(format!(
+                    "SSRP DAC port query failed: {}",
+                    e
+                ))),
             },
 
             ConnectionAction::UpdateCache { cache_key, port } => {
@@ -1030,6 +1109,19 @@ mod tests {
         assert_eq!(ctx.get_port(ResultSlot::CachedConnectionInfo), Some(1433));
     }
 
+    /// The port SQL Server Browser's DAC request gives is the DAC's alone:
+    /// it never stands for the instance's own port, nor that for it.
+    #[test]
+    fn a_dac_port_is_kept_apart_from_the_instance_port() {
+        let mut ctx = ExecutionContext::new();
+        ctx.store_outcome(ActionOutcome::SsrpResolvedDac { port: 53110 });
+        assert_eq!(ctx.get_port(ResultSlot::ResolvedDacPort), Some(53110));
+        assert_eq!(ctx.get_port(ResultSlot::ResolvedPort), None);
+        ctx.store_outcome(ActionOutcome::SsrpResolved { port: 54321 });
+        assert_eq!(ctx.get_port(ResultSlot::ResolvedDacPort), Some(53110));
+        assert_eq!(ctx.get_port(ResultSlot::ResolvedPort), Some(54321));
+    }
+
     #[test]
     fn test_action_chain_builder() {
         let metadata = ConnectionMetadata {
@@ -1080,6 +1172,7 @@ mod tests {
             server: "myserver".to_string(),
             instance: "SQLEXPRESS".to_string(),
             result_slot: ResultSlot::ResolvedPort,
+            request: SsrpRequest::Instance,
         };
         assert_eq!(
             action.describe(),
@@ -1219,6 +1312,7 @@ mod tests {
             server: "s".to_string(),
             instance: "i".to_string(),
             result_slot: ResultSlot::ResolvedPort,
+            request: SsrpRequest::Instance,
         };
         assert!(ssrp.describe().contains("SQL Browser"));
 
@@ -1389,6 +1483,7 @@ mod tests {
                 server: "s".to_string(),
                 instance: "i".to_string(),
                 result_slot: ResultSlot::ResolvedPort,
+                request: SsrpRequest::Instance,
             },
             ConnectionAction::UpdateCache {
                 cache_key: "k".to_string(),

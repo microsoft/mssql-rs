@@ -1760,12 +1760,6 @@
       ]
     },
     {
-      "id": "diagnose.limitation.admin_named_instance_dac_unsupported",
-      "message": "The dedicated administrator connection to a named instance gets its port from SQL Server Browser's DAC request, which the diagnostic client does not make. Its endpoint evidence is unavailable; sqlcmd's own driver, when supplied, still checks the connection.",
-      "translation": "The dedicated administrator connection to a named instance gets its port from SQL Server Browser's DAC request, which the diagnostic client does not make. Its endpoint evidence is unavailable; sqlcmd's own driver, when supplied, still checks the connection.",
-      "placeholders": []
-    },
-    {
       "id": "diagnose.limitation.async_runtime",
       "message": "The diagnosis could not start its async runtime: {error}.",
       "translation": "The diagnosis could not start its async runtime: {error}.",
@@ -3528,6 +3522,146 @@
           "expr": "seconds"
         }
       ]
+    },
+    {
+      "id": "diagnose.detail.dac_port",
+      "message": "{server}: DAC port {port}",
+      "translation": "{server}: DAC port {port}",
+      "placeholders": [
+        {
+          "id": "server",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "server"
+        },
+        {
+          "id": "port",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "port"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.no_dac_port",
+      "message": "{server}: no DAC port",
+      "translation": "{server}: no DAC port",
+      "placeholders": [
+        {
+          "id": "server",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "server"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.error.not_connected",
+      "message": "it did not connect",
+      "translation": "it did not connect",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.browser_no_dac_port",
+      "message": "SQL Server Browser on {host} gave no dedicated administrator connection (DAC) port for instance {instance}: {problem}.",
+      "translation": "SQL Server Browser on {host} gave no dedicated administrator connection (DAC) port for instance {instance}: {problem}.",
+      "placeholders": [
+        {
+          "id": "host",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "host"
+        },
+        {
+          "id": "instance",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "instance"
+        },
+        {
+          "id": "problem",
+          "string": "%[3]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 3,
+          "expr": "problem"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.browser_no_default_dac_port",
+      "message": "Port 1434 did not connect, and SQL Server Browser on {host} gave no other dedicated administrator connection (DAC) port for the default instance: {problem}.",
+      "translation": "Port 1434 did not connect, and SQL Server Browser on {host} gave no other dedicated administrator connection (DAC) port for the default instance: {problem}.",
+      "placeholders": [
+        {
+          "id": "host",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "host"
+        },
+        {
+          "id": "problem",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "problem"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.dac_default_port_not_connected",
+      "message": "Port 1434, a default instance's dedicated administrator connection (DAC) port, did not connect ({reason}); as the client does, sqlcmd then asked SQL Server Browser for the DAC port, checked below.",
+      "translation": "Port 1434, a default instance's dedicated administrator connection (DAC) port, did not connect ({reason}); as the client does, sqlcmd then asked SQL Server Browser for the DAC port, checked below.",
+      "placeholders": [
+        {
+          "id": "reason",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "reason"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.dac_port_1434_again",
+      "message": "Port 1434 did not connect, and SQL Server Browser on {host} gave 1434 as the default instance's dedicated administrator connection (DAC) port: as the client does, sqlcmd does not try it again.",
+      "translation": "Port 1434 did not connect, and SQL Server Browser on {host} gave 1434 as the default instance's dedicated administrator connection (DAC) port: as the client does, sqlcmd does not try it again.",
+      "placeholders": [
+        {
+          "id": "host",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "host"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.dac_remote_admin_connections",
+      "message": "Unless its 'remote admin connections' option is on, SQL Server accepts a dedicated administrator connection (DAC) only from its own computer, on the loopback address.",
+      "translation": "Unless its 'remote admin connections' option is on, SQL Server accepts a dedicated administrator connection (DAC) only from its own computer, on the loopback address.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.error.ssrp_resolve_timed_out",
+      "message": "the server name did not resolve in the time limit",
+      "translation": "the server name did not resolve in the time limit",
+      "placeholders": []
     }
   ]
 }

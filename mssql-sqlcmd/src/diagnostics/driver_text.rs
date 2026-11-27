@@ -21,16 +21,39 @@
 //! own prefix around them (`Sqlcmd: Error: ...`) follows the report's locale.
 
 use super::target::Protocol;
-use super::{Check, CheckId, Encrypt, ErrorRecord, LocalizedText, Skip};
+use super::{BROWSER_REQUEST, Check, CheckId, DAC_PORT, Encrypt, ErrorRecord, LocalizedText, Skip};
 
 /// The client that made the connection attempt, as sqlcmd's error lines name it.
 pub const CLIENT: &str = "mssql-tds";
 
 /// SNI error 26, with the fixed status SNI shows when its SQL Server Browser
-/// lookup fails: no port in the answer, or a host name that does not resolve
-/// (the resolver's own code is not shown; checked live with ODBC Driver 17).
+/// lookup fails: no answer, an answer it cannot parse, or a host name that
+/// does not resolve (the resolver's own code is not shown; checked live with
+/// ODBC Drivers 17 and 18).
 const ERROR_LOCATING_SERVER: &str =
     "SQL Server Network Interfaces: Error Locating Server/Instance Specified [xFFFFFFFF]. ";
+/// SNI error 28, when SQL Server Browser answered but listed none of the
+/// protocols the client may use: no TCP port for `tcp:`, or no usable
+/// endpoint at all (checked live with ODBC Driver 18).
+const PROTOCOL_NOT_SUPPORTED: &str =
+    "SQL Server Network Interfaces: Server doesn't support requested protocol [xFFFFFFFF]. ";
+/// SNI error 43, for a dedicated administrator connection whose SQL Server
+/// Browser DAC lookup fails: no answer, an answer that is not a DAC port, or
+/// a host name that does not resolve (checked live with ODBC Driver 18).
+const DAC_PORT_NOT_OBTAINED: &str = "SQL Server Network Interfaces: An error occurred while \
+     obtaining the dedicated administrator connection (DAC) port. Make sure that SQL Browser is \
+     running, or check the error log for the port number [xFFFFFFFF]. ";
+
+/// SNI error 42, for a default instance's dedicated administrator connection
+/// when port 1434 did not connect and SQL Server Browser gave 1434 again:
+/// with the Windows code of how port 1434 failed (checked live with ODBC
+/// Driver 18).
+fn dac_default_port_failed(code: i32) -> LocalizedText {
+    driver(format!(
+        "SQL Server Network Interfaces: Could not establish dedicated administrator connection \
+         (DAC) on default port. Make sure that DAC is enabled [{code}]. "
+    ))
+}
 /// The driver's HYT00 and 08001 summaries.
 const LOGIN_TIMEOUT_EXPIRED: &str = "Login timeout expired";
 const CLIENT_UNABLE: &str = "Client unable to establish connection";
@@ -157,6 +180,17 @@ fn apply_with(
     let attempt_opened = checks
         .iter()
         .any(|c| c.id == CheckId::ConnectionAttempt && c.field("failedPhase").is_some());
+    // A default instance's dedicated administrator connection: port 1434 did
+    // not connect (its connects failed, or its name did not resolve) and SQL
+    // Server Browser gave 1434 again, so SNI reports port 1434's failure, with
+    // its code, as its error 42.
+    let dac_port_unchanged = protocol == Some(Protocol::Admin)
+        && checks.iter().any(|c| {
+            c.id == CheckId::InstanceResolution
+                && c.field(BROWSER_REQUEST).is_some()
+                && c.field("instance").is_none()
+                && c.field("port").and_then(|p| p.parse::<u16>().ok()) == Some(DAC_PORT)
+        });
     for record in errors.iter_mut() {
         // sqlcmd's own driver records are already its words.
         if record.source == "driver" {
@@ -165,6 +199,10 @@ fn apply_with(
         // A transport the client moved past is not in a normal run's errors.
         record.text = if record.superseded {
             None
+        } else if dac_port_unchanged && record.check == CheckId::TcpConnect {
+            tcp_code(record, windows).map(dac_default_port_failed)
+        } else if dac_port_unchanged && record.check == CheckId::NameResolution {
+            dns_code(record, windows).map(dac_default_port_failed)
         } else {
             let opening = match record.check {
                 CheckId::TcpConnect => true,
@@ -242,9 +280,17 @@ fn text(
     windows: bool,
 ) -> Option<LocalizedText> {
     let tcp = |code: i32| driver(format!("TCP Provider: {}", system_text(code, windows)));
+    let admin = protocol == Some(Protocol::Admin);
     match (record.source, record.check) {
         ("sqlServer", _) => Some(record.message.clone()),
+        ("sqlBrowser", _) if admin => Some(driver(DAC_PORT_NOT_OBTAINED)),
+        ("sqlBrowser", _) if record.code.as_deref() == Some("noTcpPort") => {
+            Some(driver(PROTOCOL_NOT_SUPPORTED))
+        }
         ("sqlBrowser", _) => Some(driver(ERROR_LOCATING_SERVER)),
+        ("os", CheckId::NameResolution) if name_in_lookup && admin => {
+            Some(driver(DAC_PORT_NOT_OBTAINED))
+        }
         ("os", CheckId::NameResolution) if name_in_lookup => Some(driver(ERROR_LOCATING_SERVER)),
         ("os", CheckId::NameResolution) => dns_code(record, windows).map(tcp),
         ("os", CheckId::TcpConnect) if protocol.is_none_or(Protocol::uses_tcp) => {
@@ -968,6 +1014,169 @@ mod tests {
             "Named Pipes Provider: Could not open a connection to SQL Server [2]. "
         );
         assert_eq!(pipe.len(), 2);
+    }
+
+    /// SQL Server Browser answered without the protocol the client may use
+    /// (`tcp:` to an instance whose TCP is disabled, say): SNI's error 28,
+    /// not the error 26 of a lookup that failed.
+    #[test]
+    fn a_browser_answer_without_the_protocol_is_sni_error_28() {
+        let mut no_port = record("sqlBrowser", CheckId::InstanceResolution, "no endpoint");
+        no_port.code = Some("noTcpPort".to_string());
+        let mut errors = vec![no_port];
+        let checks = [failed(CheckId::InstanceResolution)];
+        apply_for(
+            &mut errors,
+            &checks,
+            Some(Protocol::Tcp),
+            r"tcp:db01\SQLEXPRESS",
+            true,
+        );
+        assert_eq!(
+            texts(&errors)[0],
+            "SQL Server Network Interfaces: Server doesn't support requested protocol \
+             [xFFFFFFFF]. "
+        );
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[1].code.as_deref(), Some("networkRelatedError"));
+    }
+
+    /// A dedicated administrator connection's SQL Server Browser failures are
+    /// SNI's error 43, whether the Browser did not answer or the name did not
+    /// resolve inside the lookup.
+    #[test]
+    fn a_dac_lookup_that_fails_is_sni_error_43() {
+        const NOT_OBTAINED: &str = "SQL Server Network Interfaces: An error occurred while \
+             obtaining the dedicated administrator connection (DAC) port. Make sure that SQL \
+             Browser is running, or check the error log for the port number [xFFFFFFFF]. ";
+        let mut no_answer = record("sqlBrowser", CheckId::InstanceResolution, "no answer");
+        no_answer.code = Some("noAnswer".to_string());
+        let mut errors = vec![no_answer];
+        let checks = [failed(CheckId::InstanceResolution)];
+        apply_for(
+            &mut errors,
+            &checks,
+            Some(Protocol::Admin),
+            r"admin:db01\SQL1",
+            true,
+        );
+        assert_eq!(texts(&errors)[0], NOT_OBTAINED);
+        assert_eq!(errors[1].code.as_deref(), Some("loginTimeoutExpired"));
+        assert_eq!(errors[2].code.as_deref(), Some("networkRelatedError"));
+
+        let mut errors = vec![os(
+            CheckId::NameResolution,
+            "notFound",
+            Some(11001),
+            "No such host is known.",
+        )];
+        let checks = [
+            failed(CheckId::NameResolution),
+            Check::skipped(
+                CheckId::InstanceResolution,
+                Skip::BlockedBy(CheckId::NameResolution),
+            ),
+        ];
+        apply_for(
+            &mut errors,
+            &checks,
+            Some(Protocol::Admin),
+            r"admin:db01\SQL1",
+            false,
+        );
+        assert_eq!(texts(&errors)[0], NOT_OBTAINED);
+    }
+
+    /// A default instance's dedicated administrator connection whose port
+    /// 1434 did not connect, and for which SQL Server Browser gave 1434
+    /// again: SNI's error 42, with how port 1434 failed, on every platform.
+    /// A named instance's DAC port is a TCP connect like any other.
+    #[test]
+    fn a_default_dac_port_given_again_is_sni_error_42() {
+        let lookup = |instance: Option<&str>| {
+            let mut check = Check::new(CheckId::InstanceResolution, Coverage::Passed);
+            check.fields.push(Field::plain("host", "db01"));
+            if let Some(instance) = instance {
+                check.fields.push(Field::plain("instance", instance));
+            }
+            check.fields.push(Field::plain(BROWSER_REQUEST, "dac"));
+            check.fields.push(Field::plain("port", "1434"));
+            check
+        };
+        for (code, os_error, expected, windows) in [
+            ("refused", 10061, "10061", true),
+            ("refused", 111, "10061", false),
+            ("timedOut", 10060, "258", true),
+        ] {
+            let mut errors = vec![os(CheckId::TcpConnect, code, Some(os_error), "failed")];
+            let checks = [lookup(None), failed(CheckId::TcpConnect)];
+            apply_for(
+                &mut errors,
+                &checks,
+                Some(Protocol::Admin),
+                "admin:db01",
+                windows,
+            );
+            assert_eq!(
+                texts(&errors)[0],
+                format!(
+                    "SQL Server Network Interfaces: Could not establish dedicated administrator \
+                     connection (DAC) on default port. Make sure that DAC is enabled \
+                     [{expected}]. "
+                ),
+                "{code} {windows}"
+            );
+            assert_eq!(
+                errors.last().and_then(|e| e.code.as_deref()),
+                Some("networkRelatedError")
+            );
+            assert_eq!(
+                errors
+                    .iter()
+                    .any(|e| e.code.as_deref() == Some("loginTimeoutExpired")),
+                code == "timedOut"
+            );
+        }
+
+        // Port 1434's name did not resolve: error 42 gives the resolver's
+        // code, on every platform.
+        for (os_error, windows) in [(11001, true), (-2, false)] {
+            let mut errors = vec![os(
+                CheckId::NameResolution,
+                "notFound",
+                Some(os_error),
+                "not known",
+            )];
+            let checks = [lookup(None), failed(CheckId::NameResolution)];
+            apply_for(
+                &mut errors,
+                &checks,
+                Some(Protocol::Admin),
+                "admin:db01",
+                windows,
+            );
+            assert_eq!(
+                texts(&errors)[0],
+                "SQL Server Network Interfaces: Could not establish dedicated administrator \
+                 connection (DAC) on default port. Make sure that DAC is enabled [11001]. ",
+                "{windows}"
+            );
+            assert_eq!(
+                errors.last().and_then(|e| e.code.as_deref()),
+                Some("networkRelatedError")
+            );
+        }
+
+        let mut errors = vec![os(CheckId::TcpConnect, "refused", Some(10061), "refused")];
+        let checks = [lookup(Some("SQL1")), failed(CheckId::TcpConnect)];
+        apply_for(
+            &mut errors,
+            &checks,
+            Some(Protocol::Admin),
+            r"admin:db01\SQL1",
+            false,
+        );
+        assert_eq!(texts(&errors)[0], "TCP Provider: Error code 0x274D");
     }
 
     /// Shared memory opens a pipe, and SNI words its failure as the shared

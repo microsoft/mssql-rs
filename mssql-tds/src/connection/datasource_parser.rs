@@ -690,6 +690,8 @@ impl ParsedDataSource {
     /// - `server\instance` (no protocol) → SSRP is required
     /// - `lpc:server\instance` → SSRP is NOT required (Shared Memory opens the
     ///   instance's endpoint by name)
+    /// - `admin:server\instance` → SSRP's DAC request is required, for the
+    ///   instance's dedicated administrator connection port
     pub fn needs_ssrp(&self) -> bool {
         // SSRP is needed if:
         // 1. Instance name is specified, AND
@@ -769,6 +771,15 @@ impl ParsedDataSource {
 
         // Step 3: Handle SSRP query if needed
         if self.needs_ssrp() {
+            // A named instance's dedicated administrator connection: its port
+            // comes from SQL Server Browser's DAC request alone, never the
+            // instance's own port (SNI open.cpp, SSRP::GetAdminPort).
+            if self.protocol_name == "admin" {
+                builder.add_dac_port_query(&self.server_name, &self.instance_name);
+                builder.add_connect_tcp_from_slot(&self.server_name, ResultSlot::ResolvedDacPort);
+                return builder.build();
+            }
+
             // For local connections with no protocol prefix, try Shared Memory
             // before SSRP. SM doesn't need instance resolution — it uses the
             // instance name directly. If SM succeeds the executor skips SSRP.
@@ -811,8 +822,8 @@ impl ParsedDataSource {
                     }
                 }
                 _ => {
-                    // Other protocols (admin) don't use SSRP this way; lpc
-                    // never reaches here (see needs_ssrp)
+                    // No other protocol gets here: admin asks above, and
+                    // lpc needs no SSRP (see needs_ssrp)
                     builder.add_connect_tcp_from_slot(&self.server_name, ResultSlot::ResolvedPort);
                 }
             }
@@ -1734,25 +1745,41 @@ mod tests {
         );
     }
 
+    /// A named instance's dedicated administrator connection asks SQL Server
+    /// Browser for its DAC port and connects to that port alone: never the
+    /// instance's own port, and never through the instance cache.
     #[test]
-    fn ssrp_wildcard_protocol_arm() {
-        // Exercises the `_ =>` match arm in the SSRP protocol section of
-        // to_connection_actions. The "admin" protocol with a named instance
-        // (no port) requires SSRP and falls through to the wildcard arm.
+    fn an_admin_named_instance_connects_to_the_dac_port_alone() {
         let parsed = ParsedDataSource::parse("admin:myserver\\INST", false).unwrap();
         assert!(parsed.needs_ssrp());
+        assert!(!parsed.can_use_cache);
 
         let chain = parsed.to_connection_actions(15000);
-        use crate::connection::connection_actions::ConnectionAction;
-
+        use crate::connection::connection_actions::{ConnectionAction, SsrpRequest};
         assert!(chain.requires_ssrp());
-        let has_tcp_from_slot = chain
-            .actions()
-            .iter()
-            .any(|a| matches!(a, ConnectionAction::ConnectTcpFromSlot { .. }));
-        assert!(
-            has_tcp_from_slot,
-            "Wildcard SSRP arm should add ConnectTcpFromSlot"
+        assert!(!chain.uses_cache());
+        assert_eq!(chain.default_instance_dac_host(), None);
+        assert_eq!(
+            chain.actions(),
+            [
+                ConnectionAction::QuerySsrp {
+                    server: "myserver".to_string(),
+                    instance: "INST".to_string(),
+                    result_slot: ResultSlot::ResolvedDacPort,
+                    request: SsrpRequest::DacPort,
+                },
+                ConnectionAction::ConnectTcpFromSlot {
+                    host: "myserver".to_string(),
+                    port_slot: ResultSlot::ResolvedDacPort,
+                    timeout_ms: 15000,
+                },
+            ]
         );
+
+        // A default instance's DAC starts on port 1434.
+        let parsed = ParsedDataSource::parse("admin:myserver", false).unwrap();
+        let chain = parsed.to_connection_actions(15000);
+        assert!(!chain.requires_ssrp());
+        assert_eq!(chain.default_instance_dac_host(), Some("myserver"));
     }
 }
