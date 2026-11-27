@@ -1324,16 +1324,7 @@ pub(super) unsafe fn build_named_params_for_row(
                     })?
             };
             if parent_dae || fixed_dae_rows.is_some() {
-                let status = if crate::conversion::param_convert::is_output_direction(
-                    tvp_binding.input_output_type,
-                ) {
-                    StatusFlags::BY_REF_VALUE
-                } else {
-                    StatusFlags::NONE
-                };
-                let streamed = crate::conversion::param_convert::streamed_tvp_param(
-                    name.clone(),
-                    status,
+                let streamed = crate::conversion::param_convert::streamed_tvp_definition(
                     snapshot.udt_names.as_deref(),
                     columns,
                 );
@@ -1356,11 +1347,21 @@ pub(super) unsafe fn build_named_params_for_row(
                 if let Some(count) = fixed_dae_rows {
                     tvp_row_counts.insert(i, count);
                 }
+                let status = if crate::conversion::param_convert::is_output_direction(
+                    tvp_binding.input_output_type,
+                ) {
+                    StatusFlags::BY_REF_VALUE
+                } else {
+                    StatusFlags::NONE
+                };
                 // A collected table keeps a placeholder until
                 // `rebuild_deferred_params` materializes it.
-                let param = streamed.unwrap_or_else(|| {
-                    RpcParameter::data_at_exec(name, status, StreamedSqlType::VarBinaryMax)
-                });
+                let param = match streamed {
+                    Some((type_name, definitions)) => {
+                        RpcParameter::data_at_exec_table(name, status, type_name, definitions)
+                    }
+                    None => RpcParameter::data_at_exec(name, status, StreamedSqlType::VarBinaryMax),
+                };
                 params.push(param.with_odbc_ordinal(ordinal));
             } else {
                 let rpc = unsafe {

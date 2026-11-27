@@ -295,14 +295,9 @@ pub(super) fn close_collected_cell(
                     column_index,
                 },
                 binding,
-            )) = dae.current_param().map(|param| {
-                (
-                    param.target,
-                    param
-                        .tvp_cell_binding
-                        .map_or(param.binding, |layout| layout.binding),
-                )
-            })
+            )) = dae
+                .current_param()
+                .map(|param| (param.target, param.binding))
             else {
                 drop(stmt_state);
                 return abort_internal(

@@ -172,9 +172,9 @@ enum RpcValue {
 
 /// The type and column metadata of a table-valued parameter streamed by row.
 #[derive(Debug, Clone)]
-pub(crate) struct StreamedTable {
-    pub(crate) type_name: TvpTypeName,
-    pub(crate) columns: Vec<TvpColumnDef>,
+struct StreamedTable {
+    type_name: TvpTypeName,
+    columns: Vec<TvpColumnDef>,
 }
 
 impl StreamedTable {
@@ -184,13 +184,13 @@ impl StreamedTable {
     }
 
     /// Writes everything that precedes the first row: the table type, its
-    /// column metadata, and the end of the (empty) optional metadata.
+    /// column metadata, and the end of the (empty) optional metadata. Callers
+    /// validate first, before any part of the request is written.
     async fn write_header(
         &self,
         packet_writer: &mut PacketWriter<'_>,
         db_collation: &SqlCollation,
     ) -> TdsResult<()> {
-        self.validate()?;
         packet_writer
             .write_byte_async(TdsDataType::SqlTable as u8)
             .await?;
@@ -500,12 +500,18 @@ impl RpcParameter {
         )
     }
 
-    /// Column metadata of a streamed table-valued parameter.
-    pub(crate) fn into_streamed_table_columns(self) -> Option<Vec<TvpColumnDef>> {
-        match self.value {
-            RpcValue::StreamedTable(table) => Some(table.columns),
-            _ => None,
-        }
+    /// Column metadata and diagnostic identity of a streamed table-valued
+    /// parameter, or `None` for any other parameter.
+    pub(crate) fn into_streamed_table(self) -> Option<(Vec<TvpColumnDef>, TvpParameterRef)> {
+        let ordinal = self.odbc_ordinal();
+        let RpcValue::StreamedTable(table) = self.value else {
+            return None;
+        };
+        // Streamed parameters are validated as named before they open.
+        let parameter = ordinal
+            .map(TvpParameterRef::OdbcOrdinal)
+            .unwrap_or_else(|| TvpParameterRef::Name(self.name.unwrap_or_default()));
+        Some((table.columns, parameter))
     }
 
     pub(crate) fn ensure_vector_version_supported(&self, version: u8) -> TdsResult<()> {

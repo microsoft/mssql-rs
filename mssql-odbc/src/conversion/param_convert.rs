@@ -2403,18 +2403,17 @@ pub(crate) fn buffered_tvp_cell_to_value(
     normalize_tvp_cell(column, buffered_dae_to_value(column, bytes, is_null)?.0)
 }
 
-/// The streamed form of a data-at-execution TVP: its header goes out when
-/// the RPC opens and its rows follow as the application supplies them.
+/// The type name and column definitions a data-at-execution TVP streams with:
+/// its header goes out when the RPC opens and its rows follow as the
+/// application supplies them.
 ///
 /// `None` when the type name or a column's metadata cannot be resolved up
-/// front. Such a table is collected instead, so the problem is reported where
-/// it always was rather than earlier on a new path.
-pub(crate) fn streamed_tvp_param(
-    name: Option<String>,
-    status: StatusFlags,
+/// front. Such a table is collected instead, and the problem is reported when
+/// it is materialized.
+pub(crate) fn streamed_tvp_definition(
     udt_names: Option<&UdtNames>,
     columns: &[Option<BoundParam>],
-) -> Option<RpcParameter> {
+) -> Option<(TvpTypeName, Vec<TvpColumnDef>)> {
     let type_name = tvp_type_name(udt_names).ok()?;
     if columns.is_empty() {
         return None;
@@ -2424,12 +2423,7 @@ pub(crate) fn streamed_tvp_param(
     for column in columns {
         definitions.push(tvp_column_def(column.as_ref()?).ok()?);
     }
-    Some(RpcParameter::data_at_exec_table(
-        name,
-        status,
-        type_name,
-        definitions,
-    ))
+    Some((type_name, definitions))
 }
 
 /// Whether a TVP cell supplied at execution can go to the wire chunk by chunk.

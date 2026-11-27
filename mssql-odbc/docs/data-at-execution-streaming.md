@@ -219,11 +219,9 @@ receives `SQLPutData` chunks through `write_streamed_chunk`, and closes with
 `end_streamed_tvp_cell`; other DAE cells are collected and converted at close,
 like the materialized table. A zero row-control count, or the cursor leaving a
 fixed-row table, closes it with `end_streamed_param`. Tokens behind the cursor
-are discarded as each refilled batch begins.
-
-The table streams only once every earlier parameter is on the wire. When a later
-buffered scalar holds the request back, the table's tokens are collected and
-`rebuild_deferred_params` materializes it, exactly as before streaming.
+are discarded as each refilled batch begins. A table that must wait for a later
+buffered parameter is collected and materialized by `rebuild_deferred_params`
+instead (see [Driver Guide](driver-guide.md)).
 
 ### Parameter Order
 

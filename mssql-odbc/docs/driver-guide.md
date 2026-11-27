@@ -80,9 +80,9 @@ than the table size. An error after rows have been sent withdraws the request;
 SQL Server never executes a partial table.
 
 The ordering rule above applies to tables too: a TVP before a buffered scalar
-DAE parameter is collected whole and sent with the deferred execute. A TVP
-whose type name or column metadata cannot be resolved at execute time is also
-collected, so its diagnostic is reported as before.
+DAE parameter is collected whole and sent with the deferred execute. So is a TVP
+whose type name or column metadata cannot be resolved at execute time; its
+diagnostic is reported when the table is materialized.
 
 See [Data-at-Execution Streaming](data-at-execution-streaming.md) for the call
 sequence, examples, and supported conversions.

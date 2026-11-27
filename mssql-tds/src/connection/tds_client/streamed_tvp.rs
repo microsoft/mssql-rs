@@ -40,10 +40,7 @@ impl StreamedTableCursor {
     /// The cursor for a parameter whose header was just written, or `None`
     /// when it is not a streamed table.
     pub(super) fn open(param: RpcParameter) -> Option<Box<Self>> {
-        let parameter = param.tvp_parameter_ref(TvpParameterRef::Name(
-            param.name.clone().unwrap_or_else(|| "unnamed".to_string()),
-        ));
-        let columns = param.into_streamed_table_columns()?;
+        let (columns, parameter) = param.into_streamed_table()?;
         Some(Box::new(Self {
             columns: columns.into_boxed_slice(),
             parameter,
