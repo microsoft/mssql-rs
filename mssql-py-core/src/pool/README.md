@@ -133,6 +133,11 @@ semantics are covered. Version 1.17.0 rejected these spellings and is not the
 contract targeted by this latest-consumer test. Validate against an installed
 release wheel: a source checkout can contain unreleased changes, and a package
 mirror can lag behind the public release.
+Version 1.19.0 accepts `VectorTypeSupport` in the connection-string parser but
+rejects it during strict async adaptation. The contract covers that exact
+rejection, including keyword casing, without adding native vector support.
+This case applies only when the consumer recognizes the keyword, preserving
+compatibility with 1.18.0 and the completeness check for future keywords.
 
 The PR pipeline has dedicated Windows/Linux/macOS key-contract legs. Their
 configuration is not proof of passing results. Existing live-SQL regression jobs
