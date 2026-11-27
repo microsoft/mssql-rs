@@ -63,7 +63,7 @@ use crate::connection::bulk_copy_state::{ATTENTION_TIMEOUT_SECONDS, BulkCopyTime
 use crate::connection::metadata_retriever::{FmtOnlyMetadataRetriever, MetadataRetriever};
 use crate::connection::tds_client::TdsClient;
 use crate::core::TdsResult;
-use crate::datatypes::bulk_copy_metadata::{BulkCopyColumnMetadata, SqlDbType};
+use crate::datatypes::bulk_copy_metadata::{BulkCopyColumnMetadata, SqlDbType, VectorBulkInput};
 use crate::error::Error;
 use crate::error::SqlInfoMessage;
 use crate::error::bulk_copy_errors::{
@@ -72,6 +72,7 @@ use crate::error::bulk_copy_errors::{
 use crate::message::transaction_management::TransactionIsolationLevel;
 use crate::sql_identifier::parse_bulk_copy_target_identifier;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// Options for configuring bulk copy operations.
@@ -359,11 +360,16 @@ pub struct BulkCopy<'a> {
     /// Cached destination table metadata (retrieved from server)
     destination_metadata: Option<Vec<BulkCopyColumnMetadata>>,
 
+    /// Original metadata of vector columns whose bulk input was redeclared, by column index
+    vector_destination_metadata: HashMap<usize, BulkCopyColumnMetadata>,
     /// Metadata retriever strategy
     metadata_retriever: Box<dyn MetadataRetriever + 'a>,
 
     /// Timeout state for tracking operation timeout and attention handling
     timeout_state: Option<BulkCopyTimeoutState>,
+
+    /// Whether `start_timeout` started `timeout_state` for the next write
+    timeout_started: bool,
 }
 
 impl<'a> BulkCopy<'a> {
@@ -387,8 +393,10 @@ impl<'a> BulkCopy<'a> {
             column_mappings: Vec::new(),
             progress_callback: None,
             destination_metadata: None,
+            vector_destination_metadata: HashMap::new(),
             metadata_retriever: Box::new(FmtOnlyMetadataRetriever::new()),
             timeout_state: None,
+            timeout_started: false,
         }
     }
 
@@ -422,8 +430,10 @@ impl<'a> BulkCopy<'a> {
             column_mappings: Vec::new(),
             progress_callback: None,
             destination_metadata: None,
+            vector_destination_metadata: HashMap::new(),
             metadata_retriever: retriever,
             timeout_state: None,
+            timeout_started: false,
         }
     }
 
@@ -780,6 +790,51 @@ impl<'a> BulkCopy<'a> {
         self.resolve_column_mappings(&destination_metadata)
     }
 
+    /// Declare how a destination vector column's values are transmitted.
+    ///
+    /// By default a vector column is sent with the destination's base type. Call
+    /// this after [`Self::retrieve_destination_metadata`] and before writing rows
+    /// to send native vectors of another base type or UTF-8 JSON text instead;
+    /// SQL Server converts them to the destination column, matching
+    /// Microsoft.Data.SqlClient. Every value written to the column must then use
+    /// the declared representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if metadata has not been retrieved, the column does not
+    /// exist, or it is not an unencrypted vector column.
+    pub fn set_vector_bulk_input(
+        &mut self,
+        destination_column: &str,
+        input: VectorBulkInput,
+    ) -> TdsResult<()> {
+        let metadata = self.destination_metadata.as_mut().ok_or_else(|| {
+            Error::UsageError(
+                "Retrieve destination metadata before declaring vector bulk input".to_string(),
+            )
+        })?;
+        let index = metadata
+            .iter()
+            .position(|column| column.column_name == destination_column)
+            .ok_or_else(|| {
+                Error::UsageError(format!(
+                    "Destination column '{destination_column}' does not exist"
+                ))
+            })?;
+        // Derive every declaration from the destination column, so a later
+        // declaration still sees its vector type after a JSON declaration.
+        let original = self
+            .vector_destination_metadata
+            .get(&index)
+            .unwrap_or(&metadata[index])
+            .clone();
+        metadata[index] = original.with_vector_bulk_input(input)?;
+        self.vector_destination_metadata
+            .entry(index)
+            .or_insert(original);
+        Ok(())
+    }
+
     /// Set a progress callback to receive notifications during the operation.
     ///
     /// The callback is invoked every `notification_interval` rows (if set).
@@ -941,9 +996,11 @@ impl<'a> BulkCopy<'a> {
         // on a reused client and report it as this one's (AB#47598).
         self.client.set_code_page_conversion_loss(false);
 
-        // Initialize timeout state for this operation
-        // A timeout of 0 means infinite (no timeout)
-        self.timeout_state = Some(BulkCopyTimeoutState::from_seconds(self.options.timeout_sec));
+        // Initialize timeout state for this operation, unless `start_timeout`
+        // already started it. A timeout of 0 means infinite (no timeout).
+        if !std::mem::take(&mut self.timeout_started) {
+            self.timeout_state = Some(BulkCopyTimeoutState::from_seconds(self.options.timeout_sec));
+        }
 
         // ═══════════════════════════════════════════════════════════════════════
         // VALIDATION: Check for conflicting transaction states
@@ -1297,6 +1354,35 @@ impl<'a> BulkCopy<'a> {
             .as_ref()
             .and_then(|state| state.remaining_ms())
     }
+
+    /// Start the operation timeout now rather than when writing begins.
+    ///
+    /// Call this before reading source rows ahead of
+    /// [`Self::write_to_server_zerocopy`] (for example to inspect values), so
+    /// the time spent producing them counts toward the timeout. The next write
+    /// keeps this deadline instead of starting a new one.
+    pub fn start_timeout(&mut self) {
+        self.timeout_state = Some(BulkCopyTimeoutState::from_seconds(self.options.timeout_sec));
+        self.timeout_started = true;
+    }
+
+    /// Return a bulk copy timeout error if the configured timeout has expired.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BulkCopyError::Timeout`] once the deadline has passed.
+    pub fn check_timeout(&self) -> TdsResult<()> {
+        if self.is_timed_out() {
+            return Err(Error::BulkCopyError(BulkCopyError::Timeout(
+                BulkCopyTimeoutError::new(
+                    0,
+                    self.options.timeout_sec,
+                    Some("Bulk copy operation timed out".to_string()),
+                ),
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Zero-copy bulk copy trait for direct serialization to TDS packets.
@@ -1487,6 +1573,36 @@ mod tests {
         assert_conversion_loss_survives_internal_transaction_error(false).await;
     }
 
+    #[tokio::test]
+    async fn started_timeout_is_checked_and_kept_by_the_next_write() {
+        let mut client = crate::test_client_support::tds_client_from_tokens(Vec::new());
+        let mut bulk_copy =
+            BulkCopy::with_retriever(&mut client, "dbo.t", Box::new(UnreachableMetadataRetriever))
+                .timeout(Duration::from_secs(1));
+        bulk_copy.destination_metadata = Some(Vec::new());
+        bulk_copy.check_timeout().unwrap();
+
+        bulk_copy.start_timeout();
+        bulk_copy.check_timeout().unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(matches!(
+            bulk_copy.check_timeout(),
+            Err(Error::BulkCopyError(BulkCopyError::Timeout(_)))
+        ));
+
+        // The write keeps the deadline started before it, then later writes start fresh.
+        bulk_copy
+            .write_to_server_zerocopy(Vec::<LossyTextRow>::new())
+            .await
+            .unwrap();
+        assert!(bulk_copy.is_timed_out());
+        bulk_copy
+            .write_to_server_zerocopy(Vec::<LossyTextRow>::new())
+            .await
+            .unwrap();
+        assert!(!bulk_copy.is_timed_out());
+    }
+
     struct UnreachableMetadataRetriever;
 
     #[async_trait::async_trait]
@@ -1515,6 +1631,64 @@ mod tests {
             Err(Error::UsageError(message))
                 if message == "Too many identifier parts: 4 (maximum is 3)"
         ));
+    }
+
+    #[tokio::test]
+    async fn set_vector_bulk_input_rewrites_cached_destination_metadata() {
+        use crate::datatypes::bulk_copy_metadata::TypeLength;
+        use crate::datatypes::sqldatatypes::{VECTOR_HEADER_SIZE, VectorBaseType};
+
+        let mut client = crate::test_client_support::tds_client_from_tokens(Vec::new());
+        let mut bulk_copy = BulkCopy::with_retriever(
+            &mut client,
+            "dbo.vectors",
+            Box::new(UnreachableMetadataRetriever),
+        );
+        let native = VectorBulkInput::Native(VectorBaseType::Float32);
+        assert!(bulk_copy.set_vector_bulk_input("v", native).is_err());
+
+        let length = (VECTOR_HEADER_SIZE + 3 * 2) as i32;
+        bulk_copy.destination_metadata = Some(vec![
+            BulkCopyColumnMetadata::new("id", SqlDbType::Int, 0x26)
+                .with_length(4, TypeLength::Fixed(4)),
+            BulkCopyColumnMetadata::new("v", SqlDbType::Vector, 0xF5)
+                .with_length(length, TypeLength::Variable(length))
+                .with_scale(VectorBaseType::Float16 as u8),
+        ]);
+        assert!(bulk_copy.set_vector_bulk_input("missing", native).is_err());
+        assert!(bulk_copy.set_vector_bulk_input("id", native).is_err());
+
+        bulk_copy.set_vector_bulk_input("v", native).unwrap();
+        let metadata = bulk_copy.retrieve_destination_metadata().await.unwrap();
+        assert_eq!(metadata[1].get_sql_type_definition().unwrap(), "vector(3)");
+        assert_eq!(metadata[0].sql_type, SqlDbType::Int);
+
+        bulk_copy
+            .set_vector_bulk_input("v", VectorBulkInput::Utf8Json)
+            .unwrap();
+        let metadata = bulk_copy.retrieve_destination_metadata().await.unwrap();
+        assert_eq!(
+            metadata[1].get_sql_type_definition().unwrap(),
+            "varchar(max)"
+        );
+
+        // Later declarations derive from the destination vector column, not the JSON one.
+        bulk_copy
+            .set_vector_bulk_input("v", VectorBulkInput::Utf8Json)
+            .unwrap();
+        let metadata = bulk_copy.retrieve_destination_metadata().await.unwrap();
+        assert_eq!(metadata[1].sql_type, SqlDbType::VarChar);
+        bulk_copy
+            .set_vector_bulk_input("v", VectorBulkInput::Native(VectorBaseType::Float16))
+            .unwrap();
+        let metadata = bulk_copy.retrieve_destination_metadata().await.unwrap();
+        assert_eq!(metadata[1].sql_type, SqlDbType::Vector);
+        assert_eq!(metadata[1].scale, VectorBaseType::Float16 as u8);
+        assert_eq!(metadata[1].length, length);
+        bulk_copy.set_vector_bulk_input("v", native).unwrap();
+        let metadata = bulk_copy.retrieve_destination_metadata().await.unwrap();
+        assert_eq!(metadata[1].scale, VectorBaseType::Float32 as u8);
+        assert_eq!(metadata[1].length, (VECTOR_HEADER_SIZE + 3 * 4) as i32);
     }
 
     #[test]

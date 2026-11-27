@@ -2,9 +2,10 @@
 // Licensed under the MIT License.
 
 use mssql_tds::connection::bulk_copy::{
-    BulkCopy, ColumnMapping as TdsColumnMapping, ColumnMappingSource,
+    BulkCopy, BulkLoadRow, ColumnMapping as TdsColumnMapping, ColumnMappingSource,
 };
 use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet, StatementResult, TdsClient};
+use mssql_tds::datatypes::bulk_copy_metadata::{SqlDbType, VectorBulkInput};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::decoder::DECIMAL_STR_LEN;
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
@@ -16,13 +17,19 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
-use crate::arrow_bulkcopy::{ArrowBatchRowAdapter, ColumnPlan, build_column_plans};
-use crate::bulkcopy::PythonRowAdapter;
+use crate::arrow_bulkcopy::{
+    ArrowBatchRowAdapter, ColumnPlan, ColumnPlanKind, build_column_plans,
+    validate_batch_vector_metadata,
+};
+use crate::bulkcopy::{PythonBulkRow, PythonRowAdapter, vector_bulk_input_for};
 use crate::python_logger_adapter::scoped_tracing_bridge;
 use crate::utils::convert_tds_error;
 use arrow::array::{RecordBatch, StructArray};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
+
+/// Rows scanned for a vector column's first non-NULL value when choosing its bulk input type.
+const VECTOR_BULK_INPUT_LOOKAHEAD_ROWS: usize = 1000;
 
 /// Python Cursor class for Core TDS backend
 #[pyclass]
@@ -454,36 +461,114 @@ impl PyCoreCursor {
             let resolved_mappings_arc = Arc::new(resolved_mappings);
 
             // Create true streaming iterator from Python data source
-            // Chain first row (if exists) back with remaining rows for zero-copy streaming
+            // Chain buffered look-ahead rows back with remaining rows for zero-copy streaming
             info!("bulkcopy: Creating streaming PythonRowAdapter iterator");
-            let metadata_arc = Arc::new(destination_metadata);
+            // Declare each vector column's incoming representation from its first non-NULL
+            // value, as Microsoft.Data.SqlClient does for untyped sources; SQL Server converts
+            // it to the destination column. Rows are streamed, so look ahead a bounded number
+            // of rows and replay them; all-NULL prefixes keep the destination representation.
+            let mut incoming_metadata = destination_metadata;
+            let mut first_row = first_row_result;
+            // Look-ahead rows are converted as soon as they are inspected, before the iterator
+            // advances, so a source that reuses mutable objects cannot rewrite buffered rows.
+            let mut buffered_rows: Vec<PyResult<PythonBulkRow>> = Vec::new();
+            let mut metadata_snapshot = Arc::new(incoming_metadata.clone());
+            let mut snapshot_stale = false;
+            let mut pending: Vec<usize> = resolved_mappings_arc
+                .iter()
+                .enumerate()
+                .filter(|(_, mapping)| {
+                    let destination = &incoming_metadata[mapping.destination_index];
+                    destination.sql_type == SqlDbType::Vector && !destination.is_encrypted
+                })
+                .map(|(index, _)| index)
+                .collect();
+            if !pending.is_empty() {
+                // Rows read ahead count toward the bulk copy timeout, which the write keeps.
+                bulk_copy.start_timeout();
+            }
+            while !pending.is_empty() && buffered_rows.len() < VECTOR_BULK_INPUT_LOOKAHEAD_ROWS {
+                let Some(row) = first_row.take().or_else(|| py_iter.next()) else {
+                    break;
+                };
+                bulk_copy.check_timeout().map_err(convert_tds_error)?;
+                // An iterator error ends the look-ahead; replay preserves existing handling.
+                let row = match row {
+                    Ok(row) => row,
+                    Err(e) => {
+                        buffered_rows.push(Err(e));
+                        break;
+                    }
+                };
+                if let Ok(tuple) = row.cast::<PyTuple>() {
+                    let mut still_pending = Vec::with_capacity(pending.len());
+                    for mapping_index in pending {
+                        let mapping = &resolved_mappings_arc[mapping_index];
+                        let Ok(sample) = tuple.get_item(mapping.source_index) else {
+                            continue;
+                        };
+                        if sample.is_none() {
+                            still_pending.push(mapping_index);
+                            continue;
+                        }
+                        let destination = &incoming_metadata[mapping.destination_index];
+                        let Some(input) = vector_bulk_input_for(&sample, destination)
+                            .map_err(convert_tds_error)?
+                        else {
+                            continue;
+                        };
+                        let incoming = destination
+                            .with_vector_bulk_input(input)
+                            .map_err(convert_tds_error)?;
+                        bulk_copy
+                            .set_vector_bulk_input(&incoming.column_name, input)
+                            .map_err(convert_tds_error)?;
+                        incoming_metadata[mapping.destination_index] = incoming;
+                        snapshot_stale = true;
+                    }
+                    pending = still_pending;
+                }
+                // Columns still pending are NULL in this row, so its conversion does not
+                // depend on representations chosen for later rows.
+                if snapshot_stale {
+                    metadata_snapshot = Arc::new(incoming_metadata.clone());
+                    snapshot_stale = false;
+                }
+                let adapter = PythonRowAdapter::with_metadata(
+                    row.clone().unbind(),
+                    Arc::clone(&metadata_snapshot),
+                    Some(Arc::clone(&resolved_mappings_arc)),
+                    first_row_col_count,
+                );
+                buffered_rows.push(Ok(PythonBulkRow::converted(&adapter, data_source.py())));
+            }
+            let metadata_arc = Arc::new(incoming_metadata);
 
-            // Build iterator: first row (if exists) + remaining rows from Python iterator
-            let all_rows_iter = first_row_result
+            // Build iterator: converted look-ahead rows + remaining rows from Python iterator
+            let live_rows = first_row
                 .into_iter()
                 .chain(py_iter)
-                .map(|result| match result {
-                    Ok(bound) => Ok(bound.unbind()),
-                    Err(e) => Err(e),
-                })
-                .filter_map(|result: PyResult<Py<PyAny>>| match result {
-                    Ok(tuple) => Some(tuple),
+                .map(|result| result.map(|bound| bound.unbind()))
+                .map(move |result| {
+                    result.map(|row| {
+                        PythonBulkRow::Live(PythonRowAdapter::with_metadata(
+                            row,
+                            Arc::clone(&metadata_arc),
+                            Some(Arc::clone(&resolved_mappings_arc)),
+                            first_row_col_count,
+                        ))
+                    })
+                });
+            let row_adapters = buffered_rows.into_iter().chain(live_rows).filter_map(
+                |result: PyResult<PythonBulkRow>| match result {
+                    Ok(row) => Some(row),
                     Err(e) => {
                         // TODO: This only logs the error, should we propagate it instead?
                         error!("bulkcopy: Error reading row from Python iterator: {:?}", e);
                         None
                     }
-                });
-
-            // Convert to PythonRowAdapter for each row
-            let row_adapters = all_rows_iter.map(move |row| {
-                PythonRowAdapter::with_metadata(
-                    row,
-                    Arc::clone(&metadata_arc),
-                    Some(Arc::clone(&resolved_mappings_arc)),
-                    first_row_col_count,
-                )
-            });
+                },
+            );
 
             // Execute bulk copy with zero-copy streaming
             info!("bulkcopy: Calling write_to_server_zerocopy");
@@ -674,11 +759,34 @@ impl PyCoreCursor {
 
                 let plans = build_column_plans(&schema, &destination_metadata, &resolved_mappings)
                     .map_err(convert_tds_error)?;
+                // Arrow vectors are sent with their source base type and SQL Server
+                // converts them, as Microsoft.Data.SqlClient does for typed vectors.
+                let mut destination_metadata = destination_metadata;
+                for plan in &plans {
+                    let ColumnPlanKind::Vector { base_type } = plan.kind else {
+                        continue;
+                    };
+                    let destination = &destination_metadata[plan.destination_index];
+                    if VectorBaseType::try_from(destination.scale).map_err(convert_tds_error)?
+                        == base_type
+                    {
+                        continue;
+                    }
+                    let input = VectorBulkInput::Native(base_type);
+                    let incoming = destination
+                        .with_vector_bulk_input(input)
+                        .map_err(convert_tds_error)?;
+                    bulk_copy
+                        .set_vector_bulk_input(&incoming.column_name, input)
+                        .map_err(convert_tds_error)?;
+                    destination_metadata[plan.destination_index] = incoming;
+                }
                 let plans_arc = Arc::new(plans);
                 let dest_arc = Arc::new(destination_metadata);
 
                 let read_error = Arc::new(std::sync::Mutex::new(None::<String>));
-                let row_iter = ArrowRowIter::new(reader, plans_arc, dest_arc, read_error.clone());
+                let row_iter =
+                    ArrowRowIter::new(reader, schema, plans_arc, dest_arc, read_error.clone());
 
                 let bulk_result =
                     bulk_copy
@@ -1333,6 +1441,8 @@ fn read_schema_from_capsule(reader: &Py<PyAny>) -> PyResult<SchemaRef> {
 /// inside the write loop.
 struct ArrowRowIter {
     reader: Py<PyAny>,
+    /// Schema the plans were built from; later batches must agree on vector metadata.
+    schema: SchemaRef,
     plans: Arc<Vec<ColumnPlan>>,
     dest_metadata: Arc<Vec<mssql_tds::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata>>,
     current: Option<Arc<RecordBatch>>,
@@ -1343,23 +1453,49 @@ struct ArrowRowIter {
     /// after the write to surface the error instead of reporting a partial
     /// (silently truncated) success.
     read_error: Arc<std::sync::Mutex<Option<String>>>,
+    /// A batch rejected by validation. It is yielded as a failing row so the
+    /// in-flight bulk-copy batch is rolled back rather than committed.
+    rejected: Option<String>,
+}
+
+/// A row from [`ArrowRowIter`].
+enum ArrowRow {
+    Row(ArrowBatchRowAdapter),
+    Rejected(String),
+}
+
+#[async_trait::async_trait]
+impl BulkLoadRow for ArrowRow {
+    async fn write_to_packet(
+        &self,
+        writer: &mut mssql_tds::message::bulk_load::StreamingBulkLoadWriter<'_>,
+        column_index: &mut usize,
+    ) -> mssql_tds::core::TdsResult<()> {
+        match self {
+            Self::Row(row) => row.write_to_packet(writer, column_index).await,
+            Self::Rejected(message) => Err(mssql_tds::error::Error::UsageError(message.clone())),
+        }
+    }
 }
 
 impl ArrowRowIter {
     fn new(
         reader: Py<PyAny>,
+        schema: SchemaRef,
         plans: Arc<Vec<ColumnPlan>>,
         dest_metadata: Arc<Vec<mssql_tds::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata>>,
         read_error: Arc<std::sync::Mutex<Option<String>>>,
     ) -> Self {
         Self {
             reader,
+            schema,
             plans,
             dest_metadata,
             current: None,
             row_idx: 0,
             finished: false,
             read_error,
+            rejected: None,
         }
     }
 
@@ -1388,6 +1524,13 @@ impl ArrowRowIter {
                 }
                 Some(batch) if batch.num_rows() == 0 => continue,
                 Some(batch) => {
+                    if let Err(e) =
+                        validate_batch_vector_metadata(&self.schema, &batch.schema(), &self.plans)
+                    {
+                        self.rejected = Some(e.to_string());
+                        self.finished = true;
+                        return Ok(false);
+                    }
                     self.current = Some(batch);
                     self.row_idx = 0;
                     return Ok(true);
@@ -1398,7 +1541,7 @@ impl ArrowRowIter {
 }
 
 impl Iterator for ArrowRowIter {
-    type Item = ArrowBatchRowAdapter;
+    type Item = ArrowRow;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -1412,11 +1555,11 @@ impl Iterator for ArrowRowIter {
                     dest_metadata: Arc::clone(&self.dest_metadata),
                 };
                 self.row_idx += 1;
-                return Some(adapter);
+                return Some(ArrowRow::Row(adapter));
             }
             match self.pump_next_batch() {
                 Ok(true) => continue,
-                Ok(false) => return None,
+                Ok(false) => return self.rejected.take().map(ArrowRow::Rejected),
                 Err(e) => {
                     error!("ArrowRowIter::next: {}", e);
                     *self.read_error.lock().unwrap() = Some(e);

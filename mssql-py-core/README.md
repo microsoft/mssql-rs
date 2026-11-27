@@ -81,6 +81,40 @@ For contributors, the
 [async pool context guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/src/pool/README.md)
 maps internal types and ownership; it does not describe an enabled pooling API.
 
+## Vector bulk-copy bridge
+
+`BulkCopyVector(values, base_type="float32")` is the typed bridge used by host
+drivers to preserve vector dimensions and SQL base type through row bulk copy.
+Both base types hold float32 application values; the TDS core encodes FLOAT16.
+Dimensions must match the destination column.
+
+Like Microsoft.Data.SqlClient's SqlBulkCopy, the client never converts between
+FLOAT32 and FLOAT16. Each vector column is declared in INSERT BULK and
+COLMETADATA with its source base type, and SQL Server converts it to the
+destination (round-to-nearest; values outside the FLOAT16 range fail on the
+server). For row sources, each vector column's representation is fixed by its
+first non-NULL cell, looking ahead up to 1000 rows. A `BulkCopyVector` declares
+its own base type. JSON text in a FLOAT16 column is declared as
+`varchar(max) COLLATE Latin1_General_100_BIN2_UTF8` for SQL Server to parse. A
+list, JSON text in a FLOAT32 column, or no non-NULL cell in those rows keeps the
+destination base type. Later cells use that declaration: a `BulkCopyVector` must
+have the declared base type, lists are encoded with the declared base type, JSON
+text is parsed only for a FLOAT32 declaration, and a column declared as JSON
+text accepts only JSON text. So a list followed by a `BulkCopyVector` of the
+other base type is rejected, while lists after a cross-base `BulkCopyVector` are
+sent with that vector's base type. Host drivers can declare a representation
+directly with `BulkCopy::set_vector_bulk_input` in mssql-tds.
+
+Arrow bulk copy accepts `fixed_size_list<float32>` for both SQL vector base
+types. The list size must match destination dimensions. Field metadata
+`mssql.vector.base_type` (`float32` or `float16`) declares the source base type,
+converted by SQL Server as above; untagged fields are converted to the
+destination base type, like list cells. Parent NULLs are supported;
+NULL elements, non-finite elements and, for FLOAT16 sources, magnitudes
+above 65504 are rejected during serialization. Sliced lists and
+chunked inputs retain normal Arrow offsets. No Python row materialization or
+JSON/binary fallback is used for Arrow vectors.
+
 ## License
 
 Licensed under the [MIT License](https://github.com/microsoft/mssql-rs/blob/main/LICENSE).
