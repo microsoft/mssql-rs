@@ -145,6 +145,21 @@ impl IntegratedAuthConfig {
     }
 }
 
+/// What a security context reports about its negotiation, for connection
+/// diagnostics. It never holds key material.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Negotiation {
+    /// The package the context negotiated, as the platform names it
+    /// (`Kerberos`, `NTLM`), once the platform reports one.
+    pub package: Option<String>,
+    /// Whether the platform reports the negotiation complete. While it is
+    /// not, [`package`](Self::package) is the one being tried.
+    pub complete: bool,
+    /// Whether the context gave up its SPN and retried without one, which
+    /// lets Negotiate fall back to NTLM (Windows, loopback connections only).
+    pub retried_without_spn: bool,
+}
+
 /// Abstract trait for platform-specific security contexts.
 ///
 /// This trait defines the interface for SSPI (Windows) and GSSAPI (Linux/macOS)
@@ -217,6 +232,12 @@ pub trait SecurityContext: Send + Sync {
     /// GSSAPI's `service@host`.
     fn imported_name(&self) -> &str {
         self.spn()
+    }
+
+    /// What the context has negotiated so far. A context that cannot tell
+    /// reports nothing.
+    fn negotiation(&self) -> Negotiation {
+        Negotiation::default()
     }
 }
 

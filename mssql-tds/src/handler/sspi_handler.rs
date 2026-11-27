@@ -26,7 +26,8 @@
 //!
 //! ```rust,ignore
 //! let config = context.integrated_auth_config();
-//! let mut handler = SspiAuthHandler::new(&config, "server.domain.com", 1433, None)?;
+//! let mut handler =
+//!     SspiAuthHandler::new(&config, "server.domain.com", 1433, None, tracing::Span::none())?;
 //!
 //! // Get initial token for Login7
 //! let initial_token = handler.get_initial_token()?;
@@ -37,10 +38,11 @@
 //! }
 //! ```
 
+use crate::connection::connect_stage;
 use crate::core::TdsResult;
 use crate::error::Error;
 use crate::security::{
-    IntegratedAuthConfig, SecurityContext, SecurityContextProvider, SecurityError,
+    IntegratedAuthConfig, SecurityContext, SecurityContextProvider, SecurityError, SspiAuthToken,
     create_security_context,
 };
 
@@ -70,6 +72,9 @@ pub(crate) struct SspiAuthHandler {
     state: SspiAuthState,
     /// Target SPN, recorded on the login's connect stage.
     target_spn: String,
+    /// The login's connect stage, on which each round records what the
+    /// context negotiated.
+    stage: tracing::Span,
 }
 
 impl SspiAuthHandler {
@@ -81,6 +86,7 @@ impl SspiAuthHandler {
     /// * `server` - The server hostname or IP address
     /// * `port` - The server port
     /// * `provider` - Custom context provider; `None` uses the platform one
+    /// * `stage` - The login's connect stage
     ///
     /// # Returns
     ///
@@ -91,6 +97,7 @@ impl SspiAuthHandler {
         server: &str,
         port: u16,
         provider: Option<&dyn SecurityContextProvider>,
+        stage: tracing::Span,
     ) -> TdsResult<Self> {
         let security_context = match provider {
             Some(provider) => provider.create_context(config, server, port)?,
@@ -102,6 +109,7 @@ impl SspiAuthHandler {
             security_context,
             state: SspiAuthState::Initial,
             target_spn,
+            stage,
         })
     }
 
@@ -117,7 +125,30 @@ impl SspiAuthHandler {
             security_context,
             state: SspiAuthState::Initial,
             target_spn,
+            stage: tracing::Span::none(),
         }
+    }
+
+    /// Generates the next token, then records on the login's stage what the
+    /// context negotiated: after a failed round too, which it may explain.
+    fn generate_token(
+        &mut self,
+        server_token: Option<&[u8]>,
+    ) -> Result<SspiAuthToken, SecurityError> {
+        let result = self.security_context.generate_token(server_token);
+        if !self.stage.is_disabled() {
+            let negotiation = self.security_context.negotiation();
+            if let Some(package) = &negotiation.package {
+                self.stage
+                    .record(connect_stage::NEGOTIATED_PACKAGE, package.as_str());
+                self.stage
+                    .record(connect_stage::NEGOTIATION_COMPLETE, negotiation.complete);
+            }
+            if negotiation.retried_without_spn {
+                self.stage.record(connect_stage::SPN_RETRY, true);
+            }
+        }
+        result
     }
 
     /// Generates the initial SSPI token to include in the Login7 packet.
@@ -136,7 +167,7 @@ impl SspiAuthHandler {
             }));
         }
 
-        let result = self.security_context.generate_token(None)?;
+        let result = self.generate_token(None)?;
 
         if result.is_complete {
             // Single-round authentication (possible with Kerberos)
@@ -179,7 +210,7 @@ impl SspiAuthHandler {
 
         self.state = SspiAuthState::SendingResponse;
 
-        let result = match self.security_context.generate_token(Some(challenge)) {
+        let result = match self.generate_token(Some(challenge)) {
             Ok(r) => r,
             Err(e) => {
                 self.state = SspiAuthState::Failed;
@@ -313,9 +344,73 @@ mod tests {
     #[test]
     fn test_sspi_handler_uses_custom_provider() {
         let config = IntegratedAuthConfig::new();
-        let mut handler = SspiAuthHandler::new(&config, "host", 1433, Some(&MockProvider)).unwrap();
+        let mut handler = SspiAuthHandler::new(
+            &config,
+            "host",
+            1433,
+            Some(&MockProvider),
+            tracing::Span::none(),
+        )
+        .unwrap();
 
         assert_eq!(handler.get_initial_token().unwrap(), b"custom");
+    }
+
+    /// What the context negotiated is on the login's stage after each round,
+    /// a failed one included: Negotiate's fallback to NTLM explains a refused
+    /// login only if it survives the failure.
+    #[test]
+    fn each_round_records_what_the_context_negotiated() {
+        use crate::connection::connect_stage::tests::StageLog;
+        use crate::security::Negotiation;
+
+        let login = || {
+            tracing::info_span!(
+                target: connect_stage::TARGET,
+                connect_stage::LOGIN,
+                negotiated_package = tracing::field::Empty,
+                negotiation_complete = tracing::field::Empty,
+                spn_retry = tracing::field::Empty
+            )
+        };
+        let ntlm = Negotiation {
+            package: Some("NTLM".to_string()),
+            complete: false,
+            retried_without_spn: true,
+        };
+
+        let log = StageLog::default();
+        tracing::subscriber::with_default(log.clone(), || {
+            let mock = MockSecurityContext::multi_round(b"t1".to_vec(), b"t3".to_vec())
+                .with_negotiation(ntlm.clone())
+                .with_error_on_round(1, SecurityError::InvalidToken);
+            let mut handler =
+                SspiAuthHandler::with_context(Box::new(mock), "MSSQLSvc/server:1433".to_string());
+            handler.stage = login();
+            handler.get_initial_token().unwrap();
+            assert!(handler.process_challenge(b"t2").is_err());
+        });
+        let stage = &log.named(connect_stage::LOGIN)[0];
+        assert_eq!(stage.field(connect_stage::NEGOTIATED_PACKAGE), Some("NTLM"));
+        assert_eq!(
+            stage.field(connect_stage::NEGOTIATION_COMPLETE),
+            Some("false")
+        );
+        assert_eq!(stage.field(connect_stage::SPN_RETRY), Some("true"));
+
+        // A context that reports nothing records nothing.
+        let log = StageLog::default();
+        tracing::subscriber::with_default(log.clone(), || {
+            let mut handler = SspiAuthHandler::with_context(
+                Box::new(MockSecurityContext::single_round(b"t".to_vec())),
+                "MSSQLSvc/server:1433".to_string(),
+            );
+            handler.stage = login();
+            handler.get_initial_token().unwrap();
+        });
+        let stage = &log.named(connect_stage::LOGIN)[0];
+        assert_eq!(stage.field(connect_stage::NEGOTIATED_PACKAGE), None);
+        assert_eq!(stage.field(connect_stage::SPN_RETRY), None);
     }
 
     /// Records the thread each challenge round runs on.

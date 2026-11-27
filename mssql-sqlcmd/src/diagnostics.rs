@@ -44,6 +44,7 @@
 pub mod driver;
 pub mod driver_text;
 pub mod entra;
+mod kerberos;
 pub mod redact;
 pub mod report;
 pub mod stages;
@@ -455,7 +456,7 @@ impl Request {
 /// The version of the diagnostic coverage matrix this implementation follows
 /// (`docs/diagnose-coverage.md`): which phases are checked, with which signals,
 /// and which coverage states each can report.
-pub const COVERAGE_MATRIX_VERSION: &str = "1.5";
+pub const COVERAGE_MATRIX_VERSION: &str = "1.6";
 
 /// The link to driver-tracing guidance for `sqlcmd diagnose`, given when the
 /// client's own evidence cannot explain a failure. It is a Microsoft FWLink so
@@ -530,6 +531,15 @@ fn own_connection_not_tcp_skip() -> Skip {
 /// Kerberos rejects tickets whose clock differs from the server's by more than
 /// this, by default.
 const KERBEROS_CLOCK_TOLERANCE_MS: i64 = 5 * 60 * 1000;
+
+/// `spnSource` of an SPN a client recorded requesting at login.
+const SPN_REQUESTED: &str = "requested";
+/// `spnSource` of an SPN diagnose derived from the endpoint, as the
+/// diagnostic client would, without a login that requested it.
+const SPN_DERIVED: &str = "derived";
+/// `spnSource`, on the check of sqlcmd's own driver connection, of the SPN
+/// the diagnostic client requested in the login it made for evidence.
+const SPN_DIAGNOSTIC_CLIENT: &str = "diagnosticClient";
 
 /// A check of the connection path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1665,6 +1675,11 @@ struct Diagnosis {
     /// The SPN the client requested with integrated authentication, as it
     /// recorded it.
     spn: Option<String>,
+    /// Where [`spn`](Self::spn) came from: `requested`, as a client recorded
+    /// requesting it at login, or `derived` from the endpoint by diagnose.
+    spn_source: &'static str,
+    /// What the diagnostic client's security context reported at login.
+    login_security: Option<kerberos::LoginSecurity>,
     /// The transport the run ended on, for wording its errors: the last one
     /// the connection attempt used (a pipe the protocol order reached without
     /// a prefix, or TCP after a routing redirect), or the pipe that did not
@@ -1844,6 +1859,8 @@ impl Diagnosis {
             authentication: None,
             server: None,
             spn: None,
+            spn_source: SPN_REQUESTED,
+            login_security: None,
             transport: None,
             own_failure: None,
             access_token: None,
@@ -3895,6 +3912,9 @@ impl Diagnosis {
         });
         let refused_login = any_error(&LOGIN_ERRORS);
         let refused_database = any_error(&DATABASE_ERRORS);
+        if self.request.authentication == Authentication::Integrated && any_error(&[18452]) {
+            self.limitation_text(kerberos::login_18452_limitation());
+        }
         let (coverage, domain, auth) = if refused_login {
             (
                 Coverage::Diagnosed,
@@ -3976,22 +3996,16 @@ impl Diagnosis {
             // The driver's check keeps its own transport. Its SPN is the one
             // made for the endpoint, unless mssql-tds logged in: then the SPN
             // the client recorded requesting is the one shown.
-            let (transport, spn) = (self.transport, self.spn.take());
+            let (transport, spn, spn_source) = (self.transport, self.spn.take(), self.spn_source);
             let client = Box::pin(self.evidence_attempt(target)).await;
             self.transport = transport;
             match self.spn.take() {
                 Some(recorded) => {
-                    match check.fields.iter_mut().find(|f| f.key == "spn") {
-                        Some(field) => field.value.clone_from(&recorded),
-                        None => check.fields.push(Field::identifier(
-                            "spn",
-                            recorded.clone(),
-                            Category::Spn,
-                        )),
-                    }
+                    diagnostic_client_spn(&mut check, &recorded);
                     self.spn = Some(recorded);
+                    self.spn_source = SPN_DIAGNOSTIC_CLIENT;
                 }
-                None => self.spn = spn,
+                None => (self.spn, self.spn_source) = (spn, spn_source),
             }
             let tds = self.checks.drain(checks..).next();
             for error in &mut self.errors[errors..] {
@@ -4082,6 +4096,7 @@ impl Diagnosis {
         if let Some((host, port)) = endpoint {
             let spn = self.requested_spn(host, *port, budget).await;
             self.spn = Some(platform_spn(&spn));
+            self.spn_source = SPN_DERIVED;
         }
         self.kerberos_evidence(&mut check, budget).await;
         self.checks[index] = check;
@@ -4913,12 +4928,17 @@ impl Diagnosis {
         if let Some(last) = last {
             self.transport = Some(last.protocol());
         }
-        self.spn = all
+        let login = all
             .iter()
             .rev()
             .filter(|s| s.stage == Stage::Login)
-            .find_map(|s| s.detail(connect_stage::SPN))
+            .find(|s| s.detail(connect_stage::SPN).is_some())
+            .copied();
+        self.spn = login
+            .and_then(|s| s.detail(connect_stage::SPN))
             .map(str::to_string);
+        self.spn_source = SPN_REQUESTED;
+        self.login_security = login.and_then(kerberos::LoginSecurity::from_step);
         // When sqlcmd's own driver made the attempt, mssql-tds logged in only
         // for evidence.
         if self.request.driver.is_none() {
@@ -4962,6 +4982,9 @@ impl Diagnosis {
                 );
                 check.coverage = classified.coverage;
                 check.domain = Some(classified.domain);
+                for limitation in classified.limitations {
+                    self.limitation_text(limitation);
+                }
                 if let Some(phase) = failed_phase {
                     check.fields.push(Field::plain("failedPhase", phase.name()));
                 }
@@ -4979,10 +5002,18 @@ impl Diagnosis {
                         .push(Field::plain("entraStage", "serverRejection"));
                 }
                 let no_ticket_cache = check.field("kerberosTicketCache") == Some("notFound");
+                // A security failure whose codes explain it says more than
+                // where sqlcmd looked for a cache: it reached the KDC, or it
+                // says itself that there were no credentials.
+                let explained = matches!(
+                    error,
+                    Error::Security(security) if kerberos::SecuritySignal::of(security).is_some()
+                );
                 self.checks.push(check);
                 // A database the server would not open (4060, 4064) comes
                 // after a login that succeeded: no ticket was missing.
                 if no_ticket_cache
+                    && !explained
                     && failed_phase == Some(Stage::Login)
                     && classified.auth == AuthOutcome::Failed
                 {
@@ -5050,6 +5081,39 @@ impl Diagnosis {
             // Stopped: below this depth, so not reached.
             (_, None) => self.checks.push(check),
         }
+        if self.request.authentication == Authentication::Integrated {
+            self.note_negotiation();
+        }
+    }
+
+    /// What the diagnostic client's security context negotiated, when its
+    /// attempt is the one reported: a retry without an SPN, and Negotiate's
+    /// choice of NTLM, whose reason Windows does not give unless that retry
+    /// was it.
+    fn note_negotiation(&mut self) {
+        if self.request.driver.is_some() {
+            return;
+        }
+        let Some(security) = self.login_security.clone() else {
+            return;
+        };
+        if security.negotiate_chose_ntlm() {
+            self.finding(
+                Certainty::Confirmed,
+                CheckId::ConnectionAttempt,
+                kerberos::negotiate_chose_ntlm_finding(),
+            );
+            if !security.retried_without_spn {
+                self.limitation_text(kerberos::ntlm_reason_limitation());
+            }
+        }
+        if security.retried_without_spn {
+            self.finding(
+                Certainty::Informational,
+                CheckId::ConnectionAttempt,
+                kerberos::retried_without_spn_finding(),
+            );
+        }
     }
 
     /// The connection attempt with a Microsoft Entra method that needs a
@@ -5106,6 +5170,37 @@ impl Diagnosis {
             check
                 .fields
                 .push(Field::identifier("spn", spn, Category::Spn));
+            check
+                .fields
+                .push(Field::plain("spnSource", self.spn_source));
+        }
+        if self.request.driver.is_some() {
+            // The SPN and anything mssql-tds negotiated are its own, not what
+            // sqlcmd's driver requested or negotiated.
+            if self.spn.is_some() {
+                self.limitation_text(LocalizedText::new(
+                    "diagnose.limitation.spn_is_diagnostic_clients",
+                    "The SPN shown is the one the diagnostic client (mssql-tds) forms for this \
+                     endpoint; sqlcmd's ODBC driver forms its own SPN and does not report it, or \
+                     the package it negotiated.",
+                    vec![],
+                ));
+            }
+        } else if let Some(security) = &self.login_security {
+            check
+                .fields
+                .push(Field::plain("securityPackage", security.package.clone()));
+            if let Some((package, complete)) = &security.negotiated {
+                check
+                    .fields
+                    .push(Field::plain("negotiatedPackage", package.clone()));
+                check
+                    .fields
+                    .push(Field::plain("negotiationComplete", complete.to_string()));
+            }
+            if security.retried_without_spn {
+                check.fields.push(Field::plain("retriedWithoutSpn", "true"));
+            }
         }
         let mut looked_in = None;
         let found = match self.ticket_cache {
@@ -5167,10 +5262,14 @@ impl Diagnosis {
         // Decided before the clock starts: it validates the telemetry
         // destination, which is not part of what this check measures.
         let collect = crate::telemetry::enabled();
+        let columns = SessionColumns {
+            auth_scheme: self.request.authentication == Authentication::Integrated,
+            telemetry: collect,
+        };
         let sent_unix_ms = unix_ms_now();
         let started = Instant::now();
         let result =
-            tokio::time::timeout(self.request.timeout(), session_probe(client, collect)).await;
+            tokio::time::timeout(self.request.timeout(), session_probe(client, columns)).await;
         check.duration_ms = Some(millis(started));
         let received_unix_ms = unix_ms_now();
         let error = match result {
@@ -5200,10 +5299,33 @@ impl Diagnosis {
         received_unix_ms: i64,
     ) {
         session_fields(&mut check, true, Some(0));
+        if let Some(scheme) = &probe.auth_scheme {
+            check
+                .fields
+                .push(Field::plain("authScheme", scheme.clone()));
+        }
         // The server read its clock while the query was in flight: compare
         // it with the middle of the round trip.
         let client_ms = sent_unix_ms + (received_unix_ms - sent_unix_ms) / 2;
         self.note_session(check, probe.engine_edition, probe.server_unix_ms, client_ms);
+        // An integrated login the server authenticated with NTLM, which the
+        // client had not reported choosing.
+        let client_said_ntlm = self
+            .login_security
+            .as_ref()
+            .is_some_and(kerberos::LoginSecurity::negotiate_chose_ntlm);
+        if probe
+            .auth_scheme
+            .as_deref()
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("NTLM"))
+            && !client_said_ntlm
+        {
+            self.finding(
+                Certainty::Confirmed,
+                CheckId::SessionValidation,
+                kerberos::server_reports_ntlm_finding(),
+            );
+        }
     }
 
     /// Session validation failed: the minimal query's `error`, or no answer
@@ -5361,6 +5483,15 @@ impl Diagnosis {
             check
                 .fields
                 .push(Field::plain("clockOffsetMs", offset.to_string()));
+            if self.request.authentication == Authentication::Integrated {
+                self.limitation_text(LocalizedText::new(
+                    "diagnose.limitation.clock_offset_not_kdc_time",
+                    "The clock offset compares SQL Server's clock with this computer's; it is not \
+                     the KDC's time and does not show whether either computer keeps its time \
+                     synchronized.",
+                    vec![],
+                ));
+            }
             if offset.abs() > KERBEROS_CLOCK_TOLERANCE_MS {
                 self.finding(
                     Certainty::Informational,
@@ -5609,37 +5740,70 @@ struct SessionProbe {
     engine_edition: i32,
     /// The server's UTC clock, in milliseconds since the Unix epoch.
     server_unix_ms: Option<i64>,
+    /// The scheme SQL Server authenticated the login with
+    /// (`CONNECTIONPROPERTY('auth_scheme')`: `KERBEROS`, `NTLM`, `SQL`), when
+    /// the query asked for it.
+    auth_scheme: Option<String>,
+}
+
+/// The session query's column that reads the scheme SQL Server authenticated
+/// the login with. `CONNECTIONPROPERTY` returns a `sql_variant`.
+const AUTH_SCHEME_COLUMN: &str = "CONVERT(nvarchar(40), CONNECTIONPROPERTY('auth_scheme'))";
+
+/// The columns the diagnostic client's session query has after the probe's
+/// own: with integrated authentication, the scheme the server authenticated
+/// the login with; then, with usage telemetry, the server properties.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionColumns {
+    auth_scheme: bool,
+    telemetry: bool,
+}
+
+impl SessionColumns {
+    /// The query: [`driver::DRIVER_QUERY`] when there is nothing to add.
+    fn query(self) -> String {
+        let extra: Vec<&str> = [
+            self.auth_scheme.then_some(AUTH_SCHEME_COLUMN),
+            self.telemetry.then_some(crate::server_info::EXTRA_COLUMNS),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if extra.is_empty() {
+            driver::DRIVER_QUERY.to_string()
+        } else {
+            driver::session_query_with(&extra.join(", "))
+        }
+    }
+
+    /// Where the telemetry columns start.
+    fn telemetry_offset(self) -> usize {
+        SESSION_PROBE_COLUMNS + usize::from(self.auth_scheme)
+    }
 }
 
 /// The minimal session operation: the engine edition and the server's UTC
 /// clock, in one query. The clock is read as days plus milliseconds, which
 /// every supported version can compute (`DATEDIFF_BIG` needs 2016).
 ///
-/// With `collect`, the server properties for usage telemetry ride in the same
-/// query, so they cost no round trip; they are returned for the caller to
-/// record, so that nothing about telemetry happens inside the timed query.
-/// Without it the query is [`driver::DRIVER_QUERY`], unchanged.
+/// The scheme the server authenticated an integrated login with, and with
+/// telemetry on the server properties for usage telemetry, ride in the same
+/// query, so they cost no round trip ([`SessionColumns`]); the properties are
+/// returned for the caller to record, so that nothing about telemetry happens
+/// inside the timed query. With neither, the query is
+/// [`driver::DRIVER_QUERY`], unchanged.
 async fn session_probe(
     client: &mut TdsClient,
-    collect: bool,
+    columns: SessionColumns,
 ) -> Result<(SessionProbe, Option<RawServerInfo>), Error> {
-    let query = if collect {
-        driver::session_query_with(crate::server_info::EXTRA_COLUMNS)
-    } else {
-        driver::DRIVER_QUERY.to_string()
-    };
-    let mut result = client.execute(query, ()).await?;
-    let mut probe = None;
-    let mut server_info = None;
+    let mut result = client.execute(columns.query(), ()).await?;
+    let mut read = None;
     loop {
         match result {
             StatementResult::Rows => {
                 while let Some(row) = client.next_row().await? {
-                    if probe.is_none() {
-                        probe = probe_from_row(&row);
-                        if collect {
-                            server_info = raw_server_info_from_row(&row);
-                        }
+                    if read.is_none() {
+                        read = session_row(&row, columns);
                     }
                 }
             }
@@ -5648,10 +5812,30 @@ async fn session_probe(
         }
         result = client.advance().await?;
     }
-    let probe = probe.ok_or_else(|| {
+    read.ok_or_else(|| {
         Error::ProtocolError("the session validation query returned no row".to_string())
-    })?;
-    Ok((probe, server_info))
+    })
+}
+
+/// What the session query's `row` holds, laid out as `columns` says: the
+/// probe, with the scheme the server authenticated the login with when it
+/// was asked for, and the server properties when telemetry is on. A row
+/// without an edition is none.
+fn session_row(
+    row: &[ColumnValues],
+    columns: SessionColumns,
+) -> Option<(SessionProbe, Option<RawServerInfo>)> {
+    let mut probe = probe_from_row(row)?;
+    if columns.auth_scheme {
+        probe.auth_scheme = text_column(row.get(SESSION_PROBE_COLUMNS))
+            .map(|scheme| scheme.trim().to_string())
+            .filter(|scheme| !scheme.is_empty());
+    }
+    let server_info = columns
+        .telemetry
+        .then(|| raw_server_info_from_row(row, columns.telemetry_offset()))
+        .flatten();
+    Some((probe, server_info))
 }
 
 /// The text of a string column, or `None` for `NULL` or another type.
@@ -5662,23 +5846,24 @@ fn text_column(value: Option<&ColumnValues>) -> Option<String> {
     }
 }
 
-/// The columns before the telemetry ones: the engine edition and the two clock
-/// columns. The columns `server_info::EXTRA_COLUMNS` adds follow them, in the
-/// order of `RawServerInfo`: version, OS, architecture.
+/// The columns before the ones a query adds: the engine edition and the two
+/// clock columns. The ones [`SessionColumns`] adds follow them; the columns
+/// `server_info::EXTRA_COLUMNS` adds are, in the order of `RawServerInfo`,
+/// version, OS, architecture.
 const SESSION_PROBE_COLUMNS: usize = 3;
 
-/// The server properties that follow the probe's own columns, or `None` for a
+/// The server properties in the columns from `offset` on, or `None` for a
 /// row without an engine edition. A `NULL` column, as for the OS and
 /// architecture on Azure SQL Database, is an absent value.
-fn raw_server_info_from_row(row: &[ColumnValues]) -> Option<RawServerInfo> {
+fn raw_server_info_from_row(row: &[ColumnValues], offset: usize) -> Option<RawServerInfo> {
     let Some(ColumnValues::Int(edition)) = row.first() else {
         return None;
     };
     Some(RawServerInfo {
         engine_edition: *edition,
-        product_version: text_column(row.get(SESSION_PROBE_COLUMNS)),
-        os: text_column(row.get(SESSION_PROBE_COLUMNS + 1)),
-        arch: text_column(row.get(SESSION_PROBE_COLUMNS + 2)),
+        product_version: text_column(row.get(offset)),
+        os: text_column(row.get(offset + 1)),
+        arch: text_column(row.get(offset + 2)),
     })
 }
 
@@ -5715,6 +5900,7 @@ fn probe_from_row(row: &[ColumnValues]) -> Option<SessionProbe> {
     Some(SessionProbe {
         engine_edition: *edition,
         server_unix_ms,
+        auth_scheme: None,
     })
 }
 
@@ -5899,6 +6085,7 @@ fn error_records(error: &Error, text: &LocalizedText, check: CheckId) -> Vec<Err
             record.code = Some(TcpResult::from_io(io).name().to_string());
             vec![record]
         }
+        Error::Security(security) => kerberos::security_records(security, text, check),
         _ if is_tls_error(error) => worded("tls", None),
         // The server closed the connection: a read that found its end.
         Error::ConnectionClosed(_) => worded("client", Some("connectionClosed")),
@@ -5922,6 +6109,8 @@ struct Classified {
     from_message_text: bool,
     finding: LocalizedText,
     errors: Vec<ErrorRecord>,
+    /// What the evidence does not establish.
+    limitations: Vec<LocalizedText>,
 }
 
 fn authentication_domain(authentication: &Authentication) -> &'static str {
@@ -5964,12 +6153,22 @@ fn classify_connection_error(
             )
         };
         let identifiers = first.map(|e| (e.state, e.class));
+        // 18452 with integrated authentication is the server's rejection,
+        // but not of one cause.
+        let limitations = if *authentication == Authentication::Integrated
+            && diagnostics.errors.iter().any(|e| e.number == 18452)
+        {
+            vec![kerberos::login_18452_limitation()]
+        } else {
+            Vec::new()
+        };
         return Classified {
             coverage: Coverage::Diagnosed,
             domain,
             auth,
             tls_category: None,
             from_message_text: false,
+            limitations,
             finding: match identifiers {
                 Some((state, class)) => LocalizedText::new_with_args(
                     "diagnose.finding.server_ended_login_with_identifiers",
@@ -6001,18 +6200,41 @@ fn classify_connection_error(
     }
 
     if let Error::Security(security) = error {
-        return Classified {
-            coverage: Coverage::Diagnosed,
-            domain: Domain::specific(auth_domain),
-            auth: AuthOutcome::Failed,
-            tls_category: None,
-            from_message_text: false,
-            finding: LocalizedText::new(
-                "diagnose.finding.integrated_auth_client_failed",
-                format!("Integrated authentication failed on the client: {security}"),
-                vec![("error", security.to_string())],
-            ),
-            errors,
+        // The failure's codes say what they establish; a generic failure
+        // establishes no single cause.
+        return match kerberos::SecuritySignal::of(security) {
+            Some(signal) => {
+                let codes = kerberos::SecurityCodes::of(security);
+                let (coverage, domain) = signal.coverage(codes, auth_domain);
+                let code = codes
+                    .most_specific()
+                    .or_else(|| errors.iter().find_map(|record| record.code.clone()))
+                    .unwrap_or_default();
+                Classified {
+                    coverage,
+                    domain,
+                    auth: AuthOutcome::Failed,
+                    tls_category: None,
+                    from_message_text: false,
+                    finding: signal.finding(&code),
+                    errors,
+                    limitations: Vec::new(),
+                }
+            }
+            None => Classified {
+                coverage: Coverage::Inconclusive,
+                domain: Domain::specific(auth_domain),
+                auth: AuthOutcome::Failed,
+                tls_category: None,
+                from_message_text: false,
+                finding: LocalizedText::new(
+                    "diagnose.finding.integrated_auth_client_failed",
+                    format!("Integrated authentication failed on the client: {security}"),
+                    vec![("error", security.to_string())],
+                ),
+                errors,
+                limitations: vec![kerberos::generic_failure_limitation()],
+            },
         };
     }
 
@@ -6066,6 +6288,7 @@ fn classify_connection_error(
                 ),
             },
             errors,
+            limitations: Vec::new(),
         };
     }
 
@@ -6109,6 +6332,7 @@ fn classify_connection_error(
             ),
         },
         errors,
+        limitations: Vec::new(),
     }
 }
 
@@ -6255,6 +6479,24 @@ fn platform_spn(spn: &str) -> String {
         return format!("{service}@{host}");
     }
     spn.to_string()
+}
+
+/// Shows on the check of sqlcmd's own driver connection the SPN the
+/// diagnostic client requested in the login it made for evidence, as the
+/// diagnostic client's: the driver forms its own, which it does not report.
+fn diagnostic_client_spn(check: &mut Check, spn: &str) {
+    match check.fields.iter_mut().find(|f| f.key == "spn") {
+        Some(field) => spn.clone_into(&mut field.value),
+        None => check
+            .fields
+            .push(Field::identifier("spn", spn, Category::Spn)),
+    }
+    match check.fields.iter_mut().find(|f| f.key == "spnSource") {
+        Some(field) => SPN_DIAGNOSTIC_CLIENT.clone_into(&mut field.value),
+        None => check
+            .fields
+            .push(Field::plain("spnSource", SPN_DIAGNOSTIC_CLIENT)),
+    }
 }
 
 /// The pipe the client opens first for `target` before it has resolved
@@ -11735,6 +11977,7 @@ pub(crate) mod tests {
             let probe = SessionProbe {
                 engine_edition: 2,
                 server_unix_ms: Some(middle + offset),
+                auth_scheme: None,
             };
             diagnosis.session_probed(
                 Check::new(CheckId::SessionValidation, Coverage::Passed),
@@ -11768,6 +12011,523 @@ pub(crate) mod tests {
                 None => assert!(notes.is_empty(), "{offset}: {notes:#?}"),
             }
         }
+    }
+
+    /// An integrated login over TCP whose login stage recorded `details` and
+    /// ended as `ended`, without a ticket cache lookup.
+    fn integrated_login(details: &[(&'static str, &str)], ended: Ended) -> Report {
+        integrated_login_with_cache(details, ended, None)
+    }
+
+    /// [`integrated_login`], looking for the ticket cache with `cache`.
+    fn integrated_login_with_cache(
+        details: &[(&'static str, &str)],
+        ended: Ended,
+        cache: Option<fn() -> (&'static str, String)>,
+    ) -> Report {
+        let mut integrated = request("tcp:db01,1433", Depth::ConnectionAttempt);
+        integrated.authentication = Authentication::Integrated;
+        let ok = matches!(ended, Ended::Connected);
+        let stages = Stages::new()
+            .add(
+                Stage::Dns,
+                Some(true),
+                0,
+                1,
+                &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+            )
+            .add(
+                Stage::Tcp,
+                Some(true),
+                1,
+                2,
+                &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1433")],
+            )
+            .add(Stage::Prelogin, Some(true), 2, 3, &[])
+            .add(Stage::Login, Some(ok), 3, 4, details);
+        observed_with(integrated, stages, ended, |diagnosis| {
+            diagnosis.ticket_cache = cache;
+        })
+    }
+
+    /// The failure this platform's security package reports when the KDC has
+    /// no single account for the SPN.
+    fn spn_unknown_failure() -> Error {
+        #[cfg(unix)]
+        let error = mssql_tds::security::SecurityError::GssapiError {
+            major: 13 << 16,
+            minor: (-1_765_328_377_i32) as u32,
+            message: "Major: Unspecified GSS failure; Minor: Server not found in Kerberos \
+                      database"
+                .to_string(),
+        };
+        #[cfg(windows)]
+        let error = mssql_tds::security::SecurityError::InitContextFailed {
+            code: 0x8009_0303,
+            message: "Target unknown (SPN not found)".to_string(),
+        };
+        Error::Security(error)
+    }
+
+    /// A security package's code is kept, outer status first, and the finding
+    /// says what the code establishes and no more: a principal the KDC does
+    /// not know is a missing SPN, a duplicate one, or another one.
+    #[test]
+    fn a_kerberos_code_is_kept_and_says_no_more_than_it_establishes() {
+        let report = integrated_login(
+            &[
+                (cs::SPN, "MSSQLSvc/db01.contoso.com:1433"),
+                (cs::PACKAGE, "Kerberos"),
+            ],
+            Ended::Failed(spn_unknown_failure()),
+        );
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.coverage, Coverage::Diagnosed, "{attempt:#?}");
+        assert_eq!(
+            attempt.domain.as_ref().unwrap().primary,
+            "security.authentication.kerberos"
+        );
+        assert_eq!(attempt.field("spnSource"), Some("requested"));
+        assert_eq!(attempt.field("securityPackage"), Some("Kerberos"));
+        assert_eq!(report.authentication, Some(AuthOutcome::Failed));
+        let codes: Vec<(&str, Option<&str>)> = report
+            .errors
+            .iter()
+            .map(|e| (e.source, e.code.as_deref()))
+            .collect();
+        #[cfg(unix)]
+        assert_eq!(
+            codes,
+            [
+                ("gssapi", Some("GSS_S_FAILURE")),
+                ("kerberos", Some("KRB5KDC_ERR_S_PRINCIPAL_UNKNOWN"))
+            ]
+        );
+        #[cfg(windows)]
+        assert_eq!(codes, [("sspi", Some("SEC_E_TARGET_UNKNOWN"))]);
+        // GSSAPI's code is the KDC's own; SSPI's says the target is unknown
+        // or unreachable.
+        let says = if cfg!(windows) {
+            "unknown or unreachable"
+        } else {
+            "no single account"
+        };
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.text.contains(says))
+            .expect("the code's signal is a finding");
+        assert_eq!(finding.certainty, Certainty::Confirmed);
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.certainty == Certainty::Suspected),
+            "{:#?}",
+            report.findings
+        );
+        assert!(
+            !report
+                .limitations
+                .iter()
+                .any(|l| l.contains("generic SSPI")),
+            "{:#?}",
+            report.limitations
+        );
+
+        // Where sqlcmd looked for a cache says less than the KDC's answer: a
+        // client that reached the KDC had a ticket, whatever cache held it.
+        let report = integrated_login_with_cache(
+            &[(cs::SPN, "MSSQLSvc/db01.contoso.com:1433")],
+            Ended::Failed(spn_unknown_failure()),
+            Some(|| ("notFound", "default".to_string())),
+        );
+        assert_eq!(
+            checked(&report, CheckId::ConnectionAttempt).field("kerberosTicketCache"),
+            Some("notFound")
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.certainty == Certainty::Suspected),
+            "{:#?}",
+            report.findings
+        );
+    }
+
+    /// A failure whose codes establish nothing specific is inconclusive, and
+    /// the report says that it establishes no single cause.
+    #[test]
+    fn a_generic_security_failure_is_inconclusive() {
+        let report = integrated_login(
+            &[(cs::SPN, "MSSQLSvc/db01.contoso.com:1433")],
+            Ended::Failed(Error::Security(
+                mssql_tds::security::SecurityError::InternalError("unexpected".to_string()),
+            )),
+        );
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.coverage, Coverage::Inconclusive, "{attempt:#?}");
+        assert!(
+            report
+                .limitations
+                .iter()
+                .any(|l| l.contains("does not establish a missing or duplicate SPN")),
+            "{:#?}",
+            report.limitations
+        );
+    }
+
+    /// What the security context negotiated is reported: the package asked
+    /// for, the one negotiated and whether it completed. Negotiate's choice
+    /// of NTLM is a finding; why it chose NTLM is a limitation, unless the
+    /// retry without an SPN explains it.
+    #[test]
+    fn what_negotiate_chose_is_reported() {
+        let refused = || {
+            Ended::Failed(server_error(
+                18452,
+                "Login failed. The login is from an untrusted domain and cannot be used with \
+                 Integrated authentication.",
+            ))
+        };
+        let chose_ntlm = |report: &Report| {
+            report
+                .findings
+                .iter()
+                .any(|f| f.certainty == Certainty::Confirmed && f.text.contains("chose NTLM"))
+        };
+        let reason_unknown = |report: &Report| {
+            report
+                .limitations
+                .iter()
+                .any(|l| l.contains("does not report why Negotiate chose NTLM"))
+        };
+
+        let report = integrated_login(
+            &[
+                (cs::SPN, "MSSQLSvc/db01.contoso.com:1433"),
+                (cs::PACKAGE, "Negotiate"),
+                (cs::NEGOTIATED_PACKAGE, "NTLM"),
+                (cs::NEGOTIATION_COMPLETE, "false"),
+            ],
+            refused(),
+        );
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(attempt.field("securityPackage"), Some("Negotiate"));
+        assert_eq!(attempt.field("negotiatedPackage"), Some("NTLM"));
+        assert_eq!(attempt.field("negotiationComplete"), Some("false"));
+        assert_eq!(attempt.field("retriedWithoutSpn"), None);
+        assert!(chose_ntlm(&report), "{:#?}", report.findings);
+        assert!(reason_unknown(&report), "{:#?}", report.limitations);
+        // 18452 with integrated authentication is not one cause.
+        assert!(
+            report.limitations.iter().any(|l| l.contains("18452")),
+            "{:#?}",
+            report.limitations
+        );
+
+        let report = integrated_login(
+            &[
+                (cs::SPN, "MSSQLSvc/localhost:1433"),
+                (cs::PACKAGE, "Negotiate"),
+                (cs::NEGOTIATED_PACKAGE, "NTLM"),
+                (cs::NEGOTIATION_COMPLETE, "false"),
+                (cs::SPN_RETRY, "true"),
+            ],
+            refused(),
+        );
+        assert_eq!(
+            checked(&report, CheckId::ConnectionAttempt).field("retriedWithoutSpn"),
+            Some("true")
+        );
+        assert!(chose_ntlm(&report), "{:#?}", report.findings);
+        assert!(!reason_unknown(&report), "{:#?}", report.limitations);
+        assert!(
+            report.findings.iter().any(|f| {
+                f.certainty == Certainty::Informational && f.text.contains("retried without an SPN")
+            }),
+            "{:#?}",
+            report.findings
+        );
+
+        // Kerberos, completed: nothing to note.
+        let report = integrated_login(
+            &[
+                (cs::SPN, "MSSQLSvc/db01.contoso.com:1433"),
+                (cs::PACKAGE, "Negotiate"),
+                (cs::NEGOTIATED_PACKAGE, "Kerberos"),
+                (cs::NEGOTIATION_COMPLETE, "true"),
+            ],
+            Ended::Connected,
+        );
+        assert_eq!(
+            checked(&report, CheckId::ConnectionAttempt).field("negotiatedPackage"),
+            Some("Kerberos")
+        );
+        assert!(!chose_ntlm(&report), "{:#?}", report.findings);
+        assert!(!reason_unknown(&report), "{:#?}", report.limitations);
+    }
+
+    /// 18452 is the server's rejection of a login it could not authenticate
+    /// with Windows authentication; with a SQL login there is nothing to add.
+    #[test]
+    fn only_an_integrated_18452_is_said_to_have_more_than_one_cause() {
+        let stages = || {
+            Stages::new()
+                .add(
+                    Stage::Dns,
+                    Some(true),
+                    0,
+                    1,
+                    &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+                )
+                .add(
+                    Stage::Tcp,
+                    Some(true),
+                    1,
+                    2,
+                    &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1433")],
+                )
+                .add(Stage::Prelogin, Some(true), 2, 3, &[])
+                .add(Stage::Login, Some(false), 3, 4, &[])
+        };
+        let report = observed(
+            request("tcp:db01,1433", Depth::ConnectionAttempt),
+            stages(),
+            Ended::Failed(server_error(18452, "Login failed.")),
+        );
+        assert!(
+            !report.limitations.iter().any(|l| l.contains("18452")),
+            "{:#?}",
+            report.limitations
+        );
+    }
+
+    /// SQL Server's own word on the scheme it authenticated an integrated
+    /// login with is reported; NTLM is a finding, unless the client already
+    /// said Negotiate chose it. The clock offset is not the KDC's time.
+    #[test]
+    fn the_server_confirms_the_scheme_of_an_integrated_login() {
+        let probed = |scheme: &str, client_said_ntlm: bool| {
+            let mut integrated = request("tcp:db01,1433", Depth::SessionValidation);
+            integrated.authentication = Authentication::Integrated;
+            let mut diagnosis = Diagnosis::new(integrated);
+            if client_said_ntlm {
+                diagnosis.login_security = Some(kerberos::LoginSecurity {
+                    package: "Negotiate".to_string(),
+                    negotiated: Some(("NTLM".to_string(), true)),
+                    retried_without_spn: false,
+                });
+            }
+            diagnosis.session_probed(
+                Check::new(CheckId::SessionValidation, Coverage::Passed),
+                &SessionProbe {
+                    engine_edition: 2,
+                    server_unix_ms: Some(1_000_010),
+                    auth_scheme: Some(scheme.to_string()),
+                },
+                1_000_000,
+                1_000_020,
+            );
+            diagnosis.finish(0, 0)
+        };
+        let server_said_ntlm = |report: &Report| {
+            report
+                .findings
+                .iter()
+                .any(|f| f.check == CheckId::SessionValidation && f.text.contains("used NTLM"))
+        };
+        let report = probed("KERBEROS", false);
+        let session = checked(&report, CheckId::SessionValidation);
+        assert_eq!(session.coverage, Coverage::Passed);
+        assert_eq!(session.field("authScheme"), Some("KERBEROS"));
+        assert!(!server_said_ntlm(&report), "{:#?}", report.findings);
+        assert!(
+            report
+                .limitations
+                .iter()
+                .any(|l| l.contains("it is not the KDC's time")),
+            "{:#?}",
+            report.limitations
+        );
+
+        let report = probed("NTLM", false);
+        assert_eq!(
+            checked(&report, CheckId::SessionValidation).field("authScheme"),
+            Some("NTLM")
+        );
+        assert!(server_said_ntlm(&report), "{:#?}", report.findings);
+        assert!(!server_said_ntlm(&probed("NTLM", true)));
+
+        // A SQL login: no scheme was asked for, and the clock offset is not
+        // read as Kerberos evidence.
+        let mut diagnosis = Diagnosis::new(request("tcp:db01,1433", Depth::SessionValidation));
+        diagnosis.session_probed(
+            Check::new(CheckId::SessionValidation, Coverage::Passed),
+            &SessionProbe {
+                engine_edition: 2,
+                server_unix_ms: Some(1_000_010),
+                auth_scheme: None,
+            },
+            1_000_000,
+            1_000_020,
+        );
+        let report = diagnosis.finish(0, 0);
+        assert_eq!(
+            checked(&report, CheckId::SessionValidation).field("authScheme"),
+            None
+        );
+        assert!(
+            !report.limitations.iter().any(|l| l.contains("KDC's time")),
+            "{:#?}",
+            report.limitations
+        );
+    }
+
+    /// The scheme rides in the diagnostic client's session query, between
+    /// the probe's columns and the telemetry ones, which move after it; the
+    /// query is unchanged without it.
+    #[test]
+    fn the_auth_scheme_column_sits_between_the_probe_and_the_telemetry_columns() {
+        let plain = SessionColumns {
+            auth_scheme: false,
+            telemetry: false,
+        };
+        assert_eq!(plain.query(), driver::DRIVER_QUERY);
+        let both = SessionColumns {
+            auth_scheme: true,
+            telemetry: true,
+        };
+        let (columns, _) = driver::DRIVER_QUERY.split_once(" FROM ").unwrap();
+        let query = both.query();
+        assert!(
+            query.starts_with(&format!(
+                "{columns}, {AUTH_SCHEME_COLUMN}, {}",
+                crate::server_info::EXTRA_COLUMNS
+            )),
+            "{query}"
+        );
+        let row = [
+            ColumnValues::Int(2),
+            ColumnValues::Int(20_000),
+            ColumnValues::Int(1),
+            text("KERBEROS  "),
+            text("17.0.5015.4"),
+            text("linux"),
+            text("x64"),
+        ];
+        let (probe, server_info) = session_row(&row, both).unwrap();
+        assert_eq!(probe.auth_scheme.as_deref(), Some("KERBEROS"));
+        let server_info = server_info.unwrap();
+        assert_eq!(server_info.product_version.as_deref(), Some("17.0.5015.4"));
+        assert_eq!(server_info.arch.as_deref(), Some("x64"));
+        // Without the scheme, the same columns are the telemetry ones.
+        let (probe, server_info) = session_row(
+            &row,
+            SessionColumns {
+                auth_scheme: false,
+                telemetry: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(probe.auth_scheme, None);
+        assert_eq!(
+            server_info.unwrap().product_version.as_deref(),
+            Some("KERBEROS  ")
+        );
+        assert!(session_row(&[ColumnValues::Null], both).is_none());
+    }
+
+    /// When sqlcmd's own driver made the attempt, the SPN shown is the one
+    /// diagnose derives for the endpoint, said to be the diagnostic client's,
+    /// and nothing the diagnostic client negotiated is reported as the
+    /// driver's.
+    #[test]
+    fn the_drivers_check_does_not_take_the_diagnostic_clients_spn_as_its_own() {
+        let mut integrated = request("tcp:db01.contoso.com,1433", Depth::ConnectionAttempt);
+        integrated.authentication = Authentication::Integrated;
+        let (hook, _) = fake_driver(driver_failure(
+            "28000",
+            18452,
+            "Login failed. The login is from an untrusted domain and cannot be used with \
+             Integrated authentication.",
+        ));
+        integrated.driver = Some(hook.clone());
+        let mut diagnosis = Diagnosis::new(integrated);
+        diagnosis.ticket_cache = None;
+        diagnosis.login_security = Some(kerberos::LoginSecurity {
+            package: "Negotiate".to_string(),
+            negotiated: Some(("Kerberos".to_string(), true)),
+            retried_without_spn: false,
+        });
+        let target = input(&mut diagnosis).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(diagnosis.driver_attempt(
+            hook,
+            &target,
+            Some(("db01.contoso.com".to_string(), 1433)),
+        ));
+        let report = diagnosis.finish(0, 0);
+        let attempt = checked(&report, CheckId::ConnectionAttempt);
+        assert_eq!(
+            attempt.field("spn"),
+            Some(platform_spn("MSSQLSvc/db01.contoso.com:1433").as_str())
+        );
+        assert_eq!(attempt.field("spnSource"), Some("derived"));
+        for key in [
+            "securityPackage",
+            "negotiatedPackage",
+            "negotiationComplete",
+        ] {
+            assert_eq!(attempt.field(key), None, "{key}: {attempt:#?}");
+        }
+        assert!(
+            report
+                .limitations
+                .iter()
+                .any(|l| l.contains("forms its own SPN and does not report it")),
+            "{:#?}",
+            report.limitations
+        );
+        assert!(
+            report.limitations.iter().any(|l| l.contains("18452")),
+            "{:#?}",
+            report.limitations
+        );
+    }
+
+    /// When the diagnostic client logged in for evidence after the driver
+    /// failed, the SPN it requested replaces the derived one on the driver's
+    /// check, as the diagnostic client's, never as one the driver requested.
+    #[test]
+    fn the_evidence_logins_spn_is_the_diagnostic_clients() {
+        let mut check = Check::new(CheckId::ConnectionAttempt, Coverage::Inconclusive);
+        check.fields.push(Field::identifier(
+            "spn",
+            "MSSQLSvc/db01:1433",
+            Category::Spn,
+        ));
+        check.fields.push(Field::plain("spnSource", SPN_DERIVED));
+        diagnostic_client_spn(&mut check, "MSSQLSvc/db01.contoso.com:1433");
+        assert_eq!(check.field("spn"), Some("MSSQLSvc/db01.contoso.com:1433"));
+        assert_eq!(check.field("spnSource"), Some("diagnosticClient"));
+        assert_eq!(check.fields.len(), 2, "{check:#?}");
+
+        let mut bare = Check::new(CheckId::ConnectionAttempt, Coverage::Inconclusive);
+        diagnostic_client_spn(&mut bare, "MSSQLSvc/db01.contoso.com:1433");
+        assert_eq!(bare.field("spnSource"), Some("diagnosticClient"));
+        assert_eq!(
+            bare.fields
+                .iter()
+                .find(|f| f.key == "spn")
+                .unwrap()
+                .category,
+            Some(Category::Spn)
+        );
     }
 
     /// Every login error the server ends a login with is an authentication
@@ -13910,6 +14670,7 @@ pub(crate) mod tests {
             Some(SessionProbe {
                 engine_edition: 2,
                 server_unix_ms: Some(20_000 * 86_400_000 + 3_723_456),
+                auth_scheme: None,
             })
         );
         assert_eq!(
@@ -13917,6 +14678,7 @@ pub(crate) mod tests {
             Some(SessionProbe {
                 engine_edition: 5,
                 server_unix_ms: None,
+                auth_scheme: None,
             })
         );
         assert_eq!(probe_from_row(&[ColumnValues::Null]), None);
@@ -13942,7 +14704,7 @@ pub(crate) mod tests {
             text("x64"),
         ];
         assert_eq!(
-            raw_server_info_from_row(&row),
+            raw_server_info_from_row(&row, SESSION_PROBE_COLUMNS),
             Some(RawServerInfo {
                 engine_edition: 2,
                 product_version: Some("17.0.5015.4".to_string()),
@@ -13970,7 +14732,7 @@ pub(crate) mod tests {
             ColumnValues::Null,
         ];
         assert_eq!(
-            raw_server_info_from_row(&row),
+            raw_server_info_from_row(&row, SESSION_PROBE_COLUMNS),
             Some(RawServerInfo {
                 engine_edition: 5,
                 product_version: Some("12.0.2000.8".to_string()),
@@ -13982,22 +14744,31 @@ pub(crate) mod tests {
 
     #[test]
     fn a_row_without_an_edition_or_telemetry_columns_gives_no_properties_it_cannot_read() {
-        assert_eq!(raw_server_info_from_row(&[]), None);
-        assert_eq!(raw_server_info_from_row(&[ColumnValues::Null]), None);
+        assert_eq!(raw_server_info_from_row(&[], SESSION_PROBE_COLUMNS), None);
+        assert_eq!(
+            raw_server_info_from_row(&[ColumnValues::Null], SESSION_PROBE_COLUMNS),
+            None
+        );
         // A probe row without the extra columns (telemetry off) has none to read.
         assert_eq!(
-            raw_server_info_from_row(&[
-                ColumnValues::Int(2),
-                ColumnValues::Int(20_000),
-                ColumnValues::Int(1),
-            ]),
+            raw_server_info_from_row(
+                &[
+                    ColumnValues::Int(2),
+                    ColumnValues::Int(20_000),
+                    ColumnValues::Int(1),
+                ],
+                SESSION_PROBE_COLUMNS
+            ),
             Some(RawServerInfo {
                 engine_edition: 2,
                 ..RawServerInfo::default()
             })
         );
         // A string where a number is expected is not an edition.
-        assert_eq!(raw_server_info_from_row(&[text("2")]), None);
+        assert_eq!(
+            raw_server_info_from_row(&[text("2")], SESSION_PROBE_COLUMNS),
+            None
+        );
     }
 
     /// Native sqlcmd's own driver query gives the edition; the version native
@@ -14720,6 +15491,7 @@ pub(crate) mod tests {
             &SessionProbe {
                 engine_edition: 2,
                 server_unix_ms: None,
+                auth_scheme: None,
             },
             0,
             0,

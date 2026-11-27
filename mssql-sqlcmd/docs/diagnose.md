@@ -159,8 +159,7 @@ resolved, the operating system's result for every TCP connect (`refused`,
 `timedOut`, `hostUnreachable`, ...), the connection's phases (each `passed`,
 `failed`, or `abandoned` when the attempt ended elsewhere before it answered;
 a phase that ran out of time is the `failedPhase`, and failed), and with `-E` the
-SPN the client requests and, off Windows, whether a Kerberos ticket cache
-exists. Session validation reports how far the server's clock is from the
+Kerberos/SSPI evidence described below. Session validation reports how far the server's clock is from the
 client's, that the login completed (`loginCompleted`), the last operation that
 succeeded (`lastSuccessfulOperation`: `login`, or `query` once the query
 passed) and, for the diagnostic client, `retries: 0`: its
@@ -186,7 +185,44 @@ failed (`login completed; last successful operation: login; retries: 0;
 transport loss: reset (OS error 10054)`). When the resolver fails and the client goes on with addresses its
 DNS cache kept from an earlier resolution, `nameResolution` reports the
 resolver's failure, with `"source": "fallbackCache"` and the cached
-addresses, and `tcpConnect` is still checked with those addresses. The report adds:
+addresses, and `tcpConnect` is still checked with those addresses.
+
+With `-E`, the connection attempt reports `spn` with `spnSource`: `requested`,
+as the client recorded requesting it at login; `derived` from the endpoint
+when sqlcmd's own driver made the attempt; or `diagnosticClient` when the
+driver failed and the diagnostic client then logged in for evidence and
+requested it. The driver forms its own SPN and reports neither it nor the
+package it negotiated, and a limitation says so.
+For the diagnostic client's own attempt it reports `securityPackage`, the
+package asked for (`Negotiate` on Windows, `Kerberos` elsewhere), and, once the
+security context reports them, `negotiatedPackage` (Negotiate's choice of
+`Kerberos` or `NTLM`), `negotiationComplete`, and `retriedWithoutSpn` when it
+retried a connection to this computer without an SPN; off Windows, whether a
+ticket cache exists. Negotiate choosing NTLM is a confirmed finding, with a
+limitation that Windows does not say why unless that retry explains it. A
+security package's failure keeps its codes in the error chain, outer first:
+SSPI's `SECURITY_STATUS` (`"source": "sspi"`), or GSSAPI's major status
+(`gssapi`) and the Kerberos library's code beneath it (`kerberos`), each with
+its symbolic name as `code` and its value as `nativeError` (in hex in text).
+The codes decide the check: a KDC with no single account for the SPN (missing,
+duplicate or another SPN, which the code does not tell apart), SSPI's target
+unknown or unreachable, clock skew, no common encryption type, credentials that
+are missing, expired, unreadable or of a type the client's configuration does
+not allow, an unreachable KDC (area `undetermined` between Kerberos and the
+network) or a realm with no KDC are `diagnosed`; a key mismatch, whose causes
+the client cannot tell apart, SSPI's `SEC_E_NO_AUTHENTICATING_AUTHORITY` (a
+domain controller not reached, a wrong domain name or a failed trust, which the
+status does not tell apart; area `undetermined` between Windows authentication
+and the network), and a failure without a specific code are
+`inconclusive`. SQL Server's 18452 is reported with a limitation that it alone
+does not establish one cause.
+Session validation of an integrated login reads `authScheme`, the scheme SQL
+Server authenticated the login with (`CONNECTIONPROPERTY('auth_scheme')`:
+`KERBEROS`, `NTLM`), in the same query, so it costs no round trip; NTLM is a
+confirmed finding unless the client already reported it. sqlcmd's own driver
+connection runs native's fixed three-column query, so it reports no scheme. The
+clock offset compares SQL Server's clock with this computer's: a limitation
+says it is not the KDC's time. The report adds:
 
 - `executionStatus` (`completed`, `partial`, `canceled`, `failed`,
   `invalidInvocation`) and `diagnosticOutcome` (`passed`, `issueDetected`,
@@ -330,7 +366,8 @@ name> : ...`); the JSON report keeps every one, with its `sqlState`. They
 include the driver's own summaries, so diagnose adds none.
 Connection records are kept separate from query records: a login information
 message such as 5701 cannot replace a failed query's actual error. The deciding
-session query is the same edition/clock probe for ODBC and `mssql-tds`.
+session query is the same edition/clock probe for ODBC and `mssql-tds`;
+`mssql-tds` adds `authScheme` to it for an integrated login.
 Native sqlcmd runs only that minimal query; it does not issue another query
 for version, transport, server name or database metadata. Those details are
 unavailable unless the caller already knows and supplies them. A successful

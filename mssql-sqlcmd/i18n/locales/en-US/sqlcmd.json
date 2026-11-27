@@ -3528,6 +3528,375 @@
           "expr": "seconds"
         }
       ]
+    },
+    {
+      "id": "diagnose.finding.kerberos_spn_unknown",
+      "message": "The KDC has no single account for the SPN the client requested ({code}): no account has it, more than one does, or the service registered another SPN; this signal alone does not say which.",
+      "translation": "The KDC has no single account for the SPN the client requested ({code}): no account has it, more than one does, or the service registered another SPN; this signal alone does not say which.",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.kerberos_spn_not_unique",
+      "message": "The KDC reported more than one account for the SPN the client requested ({code}).",
+      "translation": "The KDC reported more than one account for the SPN the client requested ({code}).",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.kerberos_clock_skew",
+      "message": "Kerberos refused the request because two clocks differ by more than it allows ({code}); which clock is off is not established.",
+      "translation": "Kerberos refused the request because two clocks differ by more than it allows ({code}); which clock is off is not established.",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.kerberos_no_common_etype",
+      "message": "No encryption type is supported by both the client and the KDC or the service account ({code}).",
+      "translation": "No encryption type is supported by both the client and the KDC or the service account ({code}).",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.kerberos_credentials_expired",
+      "message": "The client's Kerberos credentials had expired ({code}).",
+      "translation": "The client's Kerberos credentials had expired ({code}).",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.kerberos_cache_unreadable",
+      "message": "The client's Kerberos credential cache could not be read ({code}).",
+      "translation": "The client's Kerberos credential cache could not be read ({code}).",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.kerberos_kdc_unreachable",
+      "message": "The client could not reach a KDC for the realm ({code}).",
+      "translation": "The client could not reach a KDC for the realm ({code}).",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.sspi_no_authenticating_authority",
+      "message": "Windows found no authority that could authenticate the login ({code}): a domain controller could not be reached, the domain name is wrong, or a trust relationship failed; this signal alone does not establish which.",
+      "translation": "Windows found no authority that could authenticate the login ({code}): a domain controller could not be reached, the domain name is wrong, or a trust relationship failed; this signal alone does not establish which.",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.kerberos_realm_unknown",
+      "message": "The client's Kerberos configuration names no KDC or realm for the request ({code}).",
+      "translation": "The client's Kerberos configuration names no KDC or realm for the request ({code}).",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.kerberos_key_mismatch",
+      "message": "A Kerberos key did not match ({code}): the SPN may be registered on an account other than the one SQL Server runs as, or that account's key may have changed; this signal alone does not establish which.",
+      "translation": "A Kerberos key did not match ({code}): the SPN may be registered on an account other than the one SQL Server runs as, or that account's key may have changed; this signal alone does not establish which.",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.kerberos_library_missing",
+      "message": "The Kerberos library could not be loaded, so integrated authentication could not start ({code}).",
+      "translation": "The Kerberos library could not be loaded, so integrated authentication could not start ({code}).",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.limitation.security_failure_generic",
+      "message": "A generic SSPI or GSSAPI failure, without a more specific status, does not establish a missing or duplicate SPN or any other single cause.",
+      "translation": "A generic SSPI or GSSAPI failure, without a more specific status, does not establish a missing or duplicate SPN or any other single cause.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.login_18452_not_one_cause",
+      "message": "SQL Server's error 18452 alone does not establish one cause: the login may come from a domain the server does not trust, or Kerberos may have failed on the server.",
+      "translation": "SQL Server's error 18452 alone does not establish one cause: the login may come from a domain the server does not trust, or Kerberos may have failed on the server.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.error.kerberos_status",
+      "message": "Kerberos error {code}",
+      "translation": "Kerberos error {code}",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.negotiate_chose_ntlm",
+      "message": "Negotiate chose NTLM, not Kerberos, for this login.",
+      "translation": "Negotiate chose NTLM, not Kerberos, for this login.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.retried_without_spn",
+      "message": "The client retried without an SPN, which it does only for a connection to this computer, so that Negotiate can use NTLM.",
+      "translation": "The client retried without an SPN, which it does only for a connection to this computer, so that Negotiate can use NTLM.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.server_reports_ntlm",
+      "message": "SQL Server reports that this login used NTLM, not Kerberos.",
+      "translation": "SQL Server reports that this login used NTLM, not Kerberos.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.ntlm_reason_not_reported",
+      "message": "Windows does not report why Negotiate chose NTLM: a KDC that could not be reached, an SPN the KDC does not know, or a connection to this computer can each lead to it.",
+      "translation": "Windows does not report why Negotiate chose NTLM: a KDC that could not be reached, an SPN the KDC does not know, or a connection to this computer can each lead to it.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.spn_is_diagnostic_clients",
+      "message": "The SPN shown is the one the diagnostic client (mssql-tds) forms for this endpoint; sqlcmd's ODBC driver forms its own SPN and does not report it, or the package it negotiated.",
+      "translation": "The SPN shown is the one the diagnostic client (mssql-tds) forms for this endpoint; sqlcmd's ODBC driver forms its own SPN and does not report it, or the package it negotiated.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.clock_offset_not_kdc_time",
+      "message": "The clock offset compares SQL Server's clock with this computer's; it is not the KDC's time and does not show whether either computer keeps its time synchronized.",
+      "translation": "The clock offset compares SQL Server's clock with this computer's; it is not the KDC's time and does not show whether either computer keeps its time synchronized.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.detail.spn_derived",
+      "message": "SPN {spn} (derived)",
+      "translation": "SPN {spn} (derived)",
+      "placeholders": [
+        {
+          "id": "spn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "spn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.security_package",
+      "message": "security package {package}",
+      "translation": "security package {package}",
+      "placeholders": [
+        {
+          "id": "package",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "package"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.negotiated_package",
+      "message": "negotiated {package}",
+      "translation": "negotiated {package}",
+      "placeholders": [
+        {
+          "id": "package",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "package"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.negotiated_package_incomplete",
+      "message": "negotiated {package} (incomplete)",
+      "translation": "negotiated {package} (incomplete)",
+      "placeholders": [
+        {
+          "id": "package",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "package"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.retried_without_spn",
+      "message": "retried without an SPN",
+      "translation": "retried without an SPN",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.detail.auth_scheme",
+      "message": "authentication scheme {scheme}",
+      "translation": "authentication scheme {scheme}",
+      "placeholders": [
+        {
+          "id": "scheme",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "scheme"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.kerberos_credentials_etype_not_allowed",
+      "message": "The client's Kerberos credentials use an encryption type that its Kerberos configuration does not allow for this request ({code}).",
+      "translation": "The client's Kerberos credentials use an encryption type that its Kerberos configuration does not allow for this request ({code}).",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.integrated_no_credentials",
+      "message": "The client had no credentials for integrated authentication ({code}).",
+      "translation": "The client had no credentials for integrated authentication ({code}).",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.sspi_target_unknown",
+      "message": "Windows reported the SPN's target unknown or unreachable ({code}); this signal alone does not establish whether the SPN is missing, registered on more than one account, or not reachable.",
+      "translation": "Windows reported the SPN's target unknown or unreachable ({code}); this signal alone does not establish whether the SPN is missing, registered on more than one account, or not reachable.",
+      "placeholders": [
+        {
+          "id": "code",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "code"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.spn_diagnostic_client",
+      "message": "SPN {spn} (the diagnostic client's)",
+      "translation": "SPN {spn} (the diagnostic client's)",
+      "placeholders": [
+        {
+          "id": "spn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "spn"
+        }
+      ]
     }
   ]
 }

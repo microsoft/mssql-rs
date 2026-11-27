@@ -76,8 +76,11 @@ pub const PRELOGIN: &str = "prelogin";
 pub const TLS: &str = "tls";
 
 /// LOGIN7 and the server's response, up to a successful login. Fields:
-/// [`REDIRECTED`] when the server routed the login elsewhere; [`SPN`] with
-/// integrated authentication; on failure [`OS_ERROR`] and [`ERROR`].
+/// [`REDIRECTED`] when the server routed the login elsewhere; with
+/// integrated authentication, [`SPN`] and [`PACKAGE`], and, once the
+/// security context reports them, [`NEGOTIATED_PACKAGE`],
+/// [`NEGOTIATION_COMPLETE`] and [`SPN_RETRY`]; on failure [`OS_ERROR`] and
+/// [`ERROR`].
 pub const LOGIN: &str = "login";
 
 /// The field the login stage records, as `true`, when the server ended the
@@ -114,6 +117,19 @@ pub const ENCRYPTION: &str = "encryption";
 /// The SPN integrated authentication requested, in the form the platform
 /// takes (SSPI's `service/host:port`, GSSAPI's `service@host`).
 pub const SPN: &str = "spn";
+/// The security package integrated authentication asked for: SSPI's
+/// `Negotiate`, `Kerberos` or `NTLM`, GSSAPI's `Kerberos`, or a custom
+/// context provider's.
+pub const PACKAGE: &str = "package";
+/// The package the security context reports negotiating: Negotiate's choice
+/// (`Kerberos` or `NTLM`) with SSPI, the mechanism GSSAPI used. While
+/// [`NEGOTIATION_COMPLETE`] is `false`, the one being tried.
+pub const NEGOTIATED_PACKAGE: &str = "negotiated_package";
+/// Whether the security context reports its negotiation complete.
+pub const NEGOTIATION_COMPLETE: &str = "negotiation_complete";
+/// `true` when the security context gave up the SPN and retried without one,
+/// which lets Negotiate fall back to NTLM (Windows, loopback only).
+pub const SPN_RETRY: &str = "spn_retry";
 /// The operating system's error code, as an integer.
 pub const OS_ERROR: &str = "os_error";
 /// The `std::io::ErrorKind` of a failed I/O operation, as `Debug` prints it.

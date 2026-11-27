@@ -12,11 +12,11 @@ use super::sspi_ffi::{
     InitializeSecurityContextW, PVOID, SEC_E_NO_CREDENTIALS, SEC_E_OK, SECBUFFER_CHANNEL_BINDINGS,
     SECBUFFER_TOKEN, SECBUFFER_VERSION, SECURITY_STATUS, STANDARD_CONTEXT_REQ, SecBuffer,
     SecBufferDesc, TimeStamp, acquire_credentials, get_sspi_error_message, is_success_status,
-    needs_complete, needs_continue, to_wide_string,
+    needs_complete, needs_continue, negotiation_info, to_wide_string,
 };
 use crate::security::{
-    IntegratedAuthConfig, SecurityContext, SecurityError, SecurityPackage, SspiAuthToken,
-    spn::make_spn_canonicalized,
+    IntegratedAuthConfig, Negotiation, SecurityContext, SecurityError, SecurityPackage,
+    SspiAuthToken, spn::make_spn_canonicalized,
 };
 
 /// Default maximum token size if we can't query the package
@@ -348,6 +348,23 @@ impl SecurityContext for WindowsSspiContext {
 
     fn spn(&self) -> &str {
         &self.spn
+    }
+
+    fn negotiation(&self) -> Negotiation {
+        let negotiated = self.ctx_handle.as_ref().and_then(|ctx| match self.package {
+            SecurityPackage::Negotiate => negotiation_info(&ctx.0),
+            // A context of one package uses that package.
+            package => Some((package.display_name().to_string(), self.is_complete)),
+        });
+        let (package, complete) = match negotiated {
+            Some((package, complete)) => (Some(package), complete),
+            None => (None, false),
+        };
+        Negotiation {
+            package,
+            complete,
+            retried_without_spn: self.tried_empty_spn,
+        }
     }
 }
 
