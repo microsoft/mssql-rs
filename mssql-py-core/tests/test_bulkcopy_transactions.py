@@ -32,6 +32,105 @@ Reference: .NET SqlBulkCopy behavior and Rust test_bulk_copy_transactions.rs
 import time
 import pytest
 import mssql_py_core
+import uuid
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("kind", ["rows", "arrow"])
+def test_source_callback_can_release_previous_connection(client_context, kind, monkeypatch):
+    import sys
+
+    pa = pytest.importorskip("pyarrow") if kind == "arrow" else None
+    retired = [mssql_py_core.PyCoreConnection(client_context)]
+    retired[0].close()
+    writer = mssql_py_core.PyCoreConnection(client_context)
+    cursor = writer.cursor()
+    cursor.execute("CREATE TABLE #SourceCollection (id INT)")
+    unraisable = []
+    monkeypatch.setattr(sys, "unraisablehook", unraisable.append)
+
+    def source():
+        retired.pop()
+        if kind == "rows":
+            yield (1,)
+        else:
+            yield pa.record_batch({"id": pa.array([1], type=pa.int32())})
+
+    try:
+        if kind == "rows":
+            cursor.bulkcopy("#SourceCollection", source())
+        else:
+            reader = pa.RecordBatchReader.from_batches(pa.schema([("id", pa.int32())]), source())
+            cursor.bulkcopy_arrow("#SourceCollection", reader)
+        assert not unraisable
+        assert not retired
+        cursor.execute("SELECT id FROM #SourceCollection")
+        assert cursor.fetchone() == (1,)
+    finally:
+        writer.close()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("kind", ["rows", "arrow", "c_stream"])
+@pytest.mark.parametrize("mappings", [None, [(0, "id")]])
+@pytest.mark.parametrize("batch_size", [0, 2])
+@pytest.mark.parametrize("good_rows", [0, 1, 2, 3, 4])
+def test_source_failure_aborts_only_current_batch(client_context, kind, mappings, batch_size, good_rows):
+    """A source error is neither EOF nor a retry, including boundary peeks."""
+    pa = pytest.importorskip("pyarrow") if kind != "rows" else None
+    table = "BulkSourceFailure_" + uuid.uuid4().hex
+    observer = mssql_py_core.PyCoreConnection(client_context)
+    writer = mssql_py_core.PyCoreConnection(client_context)
+    check = observer.cursor()
+    check.execute(f"CREATE TABLE {table} (id INT NOT NULL)")
+    failure = ValueError("intentional producer failure")
+    calls = []
+
+    class Source:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            index = len(calls)
+            calls.append(index)
+            if index == good_rows:
+                raise failure
+            if index > good_rows:
+                raise AssertionError("source resumed after failure")
+            if kind != "rows":
+                return pa.record_batch({"id": pa.array([index], type=pa.int32())})
+            return (index,)
+
+    try:
+        source = Source()
+        cursor = writer.cursor()
+        with pytest.raises(Exception, match="intentional producer failure") as caught:
+            if kind == "rows":
+                cursor.bulkcopy(
+                    table, source, batch_size=batch_size,
+                    use_internal_transaction=True, column_mappings=mappings,
+                )
+            else:
+                schema = pa.schema([("id", pa.int32())])
+                reader = pa.RecordBatchReader.from_batches(schema, source)
+                class CStream:
+                    def __arrow_c_stream__(self, requested_schema=None):
+                        return reader.__arrow_c_stream__(requested_schema)
+
+                cursor.bulkcopy_arrow(
+                    table, CStream() if kind == "c_stream" else reader, batch_size=batch_size,
+                    use_internal_transaction=True, column_mappings=mappings,
+                )
+        if kind == "rows":
+            assert caught.value is failure
+        assert calls == list(range(good_rows + 1))
+        committed = good_rows // batch_size * batch_size if batch_size else 0
+        check.execute(f"SELECT id FROM {table} ORDER BY id")
+        assert [row[0] for row in check.fetchall()] == list(range(committed))
+    finally:
+        writer.close()
+        check.execute(f"DROP TABLE {table}")
+        observer.close()
 
 
 def unique_table_name(prefix: str) -> str:

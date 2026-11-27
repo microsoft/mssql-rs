@@ -7,6 +7,122 @@ import mssql_py_core
 import json
 
 
+def test_snapshot_carrier_is_frozen_and_defers_encoding():
+    carrier = mssql_py_core.BulkCopyJson("\ud800")
+    with pytest.raises(AttributeError):
+        carrier.text = "{}"
+    for value in [None, {}, [], b"{}"]:
+        with pytest.raises(TypeError):
+            mssql_py_core.BulkCopyJson(value)
+
+
+@pytest.mark.integration
+def test_snapshot_carrier_mapped_json_and_unmapped_payload(connection, monkeypatch):
+    cursor = connection.cursor()
+    table = "#BulkJsonSnapshot"
+    cursor.execute(f"CREATE TABLE {table} (id INT, doc JSON NULL, tail NVARCHAR(20))")
+    text = ' {"duplicate":1,"duplicate":2,"text":"\u4e2d\U0001f600","number":1.000} '
+    carrier = mssql_py_core.BulkCopyJson(text)
+    hidden = mssql_py_core.BulkCopyJson("\ud800")
+
+    def unexpected_json_call(*args, **kwargs):
+        raise AssertionError("snapshot must not be parsed or dumped")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(json, "loads", unexpected_json_call)
+        patch.setattr(json, "dumps", unexpected_json_call)
+        result = cursor.bulkcopy(
+            table, iter([(carrier, "plain", i, hidden) for i in range(3)]),
+            column_mappings=[(2, "id"), (0, "doc"), (1, "tail")],
+            batch_size=2, use_internal_transaction=True,
+        )
+    assert result["rows_copied"] == 3
+    cursor.execute(f"SELECT id, JSON_VALUE(doc, '$.text'), tail FROM {table} ORDER BY id")
+    assert cursor.fetchall() == [(i, "\u4e2d\U0001f600", "plain") for i in range(3)]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("destination", ["INT", "NVARCHAR(MAX)", "XML"])
+def test_snapshot_carrier_rejects_non_json_mapping(connection, destination):
+    cursor = connection.cursor()
+    cursor.execute(f"CREATE TABLE #WrongJsonDestination (value {destination})")
+    with pytest.raises(ValueError, match="requires a JSON destination"):
+        cursor.bulkcopy(
+            "#WrongJsonDestination", iter([(mssql_py_core.BulkCopyJson("{}"),)]),
+            use_internal_transaction=True,
+        )
+
+
+@pytest.mark.integration
+def test_snapshot_carrier_large_unicode_and_null(connection):
+    cursor = connection.cursor()
+    cursor.execute("CREATE TABLE #LargeJsonSnapshot (id INT, doc JSON NULL)")
+    text = "\u4e2d\U0001f600" * 16000
+    snapshot = mssql_py_core.BulkCopyJson('{"text":"' + text + '"}')
+    cursor.bulkcopy(
+        "#LargeJsonSnapshot", iter([(1, snapshot), (2, None)]),
+        keep_nulls=True, use_internal_transaction=True,
+    )
+    cursor.execute("SELECT id, CAST(doc AS NVARCHAR(MAX)) FROM #LargeJsonSnapshot ORDER BY id")
+    rows = cursor.fetchall()
+    assert json.loads(rows[0][1])["text"] == text
+    assert rows[1] == (2, None)
+
+
+@pytest.mark.integration
+def test_snapshot_carrier_coexists_with_legacy_vector(connection):
+    cursor = connection.cursor()
+    cursor.execute("CREATE TABLE #JsonVectorSnapshot (id INT, doc JSON, embedding VECTOR(3))")
+    carrier = mssql_py_core.BulkCopyJson('{"value":1}')
+    result = cursor.bulkcopy(
+        "#JsonVectorSnapshot", iter([(1, carrier, [1.0, 2.0, 3.0])]),
+        use_internal_transaction=True,
+    )
+    assert result["rows_copied"] == 1
+    cursor.execute("SELECT id, JSON_VALUE(doc, '$.value'), embedding FROM #JsonVectorSnapshot")
+    row = cursor.fetchone()
+    assert row[:2] == (1, "1")
+    assert list(row[2]) == [1.0, 2.0, 3.0]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("batch_size", [0, 2])
+@pytest.mark.parametrize("container", [dict, list])
+def test_json_reused_mutable_cells_are_written_before_next_pull(connection, batch_size, container):
+    cursor = connection.cursor()
+    cursor.execute(
+        "CREATE TABLE #ReusedJsonCells (id INT, doc JSON, snapshot JSON, absent JSON NULL)"
+    )
+    cell = container()
+
+    def rows():
+        for index in range(5):
+            cell.clear()
+            if isinstance(cell, dict):
+                cell["index"] = index
+            else:
+                cell.append(index)
+            snapshot = mssql_py_core.BulkCopyJson(json.dumps({"index": index}))
+            yield (None, snapshot, cell, index)
+        cell.clear()
+
+    result = cursor.bulkcopy(
+        "#ReusedJsonCells", rows(),
+        column_mappings=[(3, "id"), (2, "doc"), (1, "snapshot"), (0, "absent")],
+        batch_size=batch_size, keep_nulls=True, use_internal_transaction=True,
+    )
+    assert result["rows_copied"] == 5
+    cursor.execute(
+        "SELECT id, CAST(doc AS NVARCHAR(MAX)), JSON_VALUE(snapshot, '$.index'), absent "
+        "FROM #ReusedJsonCells ORDER BY id"
+    )
+    assert [
+        (row[0], json.loads(row[1]), row[2], row[3]) for row in cursor.fetchall()
+    ] == [
+        (i, {"index": i} if container is dict else [i], str(i), None) for i in range(5)
+    ]
+
+
 @pytest.mark.integration
 def test_cursor_bulkcopy_json_basic(client_context):
     """Test cursor bulkcopy method with JSON column and explicit mappings."""

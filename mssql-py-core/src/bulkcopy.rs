@@ -240,6 +240,7 @@ enum SourcePythonType {
     Uuid,
     Dict,
     List,
+    JsonSnapshot,
     Other,
 }
 
@@ -270,6 +271,8 @@ impl SourcePythonType {
             SourcePythonType::Date
         } else if py_obj.is_instance_of::<PyTime>() {
             SourcePythonType::Time
+        } else if py_obj.is_instance_of::<crate::json::BulkCopyJson>() {
+            SourcePythonType::JsonSnapshot
         } else {
             let py = py_obj.py();
             // Check for decimal.Decimal
@@ -598,6 +601,23 @@ impl PythonRowAdapter {
             (SourcePythonType::Int, SqlDbType::Real) => {
                 let result = Self::coerce_int_to_real(py_obj)?;
                 Ok(Some(result))
+            }
+
+            (SourcePythonType::JsonSnapshot, destination) => {
+                if destination != SqlDbType::Json {
+                    return Err(Error::UsageError(format!(
+                        "BulkCopyJson requires a JSON destination, not {destination:?}"
+                    )));
+                }
+                let snapshot = py_obj
+                    .extract::<PyRef<'_, crate::json::BulkCopyJson>>()
+                    .map_err(|e| Error::UsageError(format!("Invalid BulkCopyJson carrier: {e}")))?;
+                let text = snapshot.text.bind(py_obj.py()).to_str().map_err(|_| {
+                    Error::UsageError("BulkCopyJson snapshot must contain valid Unicode".into())
+                })?;
+                Ok(Some(ColumnValues::Json(SqlJson::new(
+                    text.as_bytes().to_vec(),
+                ))))
             }
 
             // String → JSON: Parse string as JSON (validate it's valid JSON)
@@ -2107,6 +2127,126 @@ impl BulkLoadRow for PythonRowAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_snapshot_preserves_text_without_parsing() {
+        Python::attach(|py| {
+            let meta =
+                BulkCopyColumnMetadata::new("doc", SqlDbType::Json, SqlDbType::Json.to_tds_type());
+            for text in [
+                " {\"x\":1,\"x\":2,\"n\":1.000} ",
+                "not JSON",
+                "",
+                "{\"x\":\"\u{1f600}\"}",
+            ] {
+                let snapshot = PyString::new(py, text);
+                let carrier = Py::new(
+                    py,
+                    crate::json::BulkCopyJson {
+                        text: snapshot.clone().unbind(),
+                    },
+                )
+                .unwrap();
+                assert!(carrier.borrow(py).text.bind(py).is(&snapshot));
+                for _ in 0..3 {
+                    let value =
+                        PythonRowAdapter::convert_by_target_type(carrier.bind(py).as_any(), &meta)
+                            .unwrap();
+                    assert_eq!(
+                        value,
+                        ColumnValues::Json(SqlJson::new(text.as_bytes().to_vec()))
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn json_snapshot_rejects_wrong_destination_and_invalid_unicode_when_mapped() {
+        Python::attach(|py| {
+            let text = py
+                .eval(pyo3::ffi::c_str!("'\\ud800'"), None, None)
+                .unwrap()
+                .cast_into::<PyString>()
+                .unwrap();
+            let carrier = Py::new(
+                py,
+                crate::json::BulkCopyJson {
+                    text: text.unbind(),
+                },
+            )
+            .unwrap();
+            for ty in [
+                SqlDbType::Int,
+                SqlDbType::NVarChar,
+                SqlDbType::Xml,
+                SqlDbType::Vector,
+                SqlDbType::Json,
+            ] {
+                let meta = BulkCopyColumnMetadata::new("doc", ty, ty.to_tds_type());
+                let error =
+                    PythonRowAdapter::convert_by_target_type(carrier.bind(py).as_any(), &meta)
+                        .unwrap_err();
+                assert!(error.to_string().contains(if ty == SqlDbType::Json {
+                    "valid Unicode"
+                } else {
+                    "requires a JSON destination"
+                }));
+            }
+        });
+    }
+
+    #[test]
+    fn json_snapshot_lookalike_is_not_a_carrier() {
+        Python::attach(|py| {
+            let lookalike = py
+                .eval(
+                    pyo3::ffi::c_str!(
+                        "type('BulkCopyJson', (), {'__module__': 'mssql_py_core', 'text': '{}'})()"
+                    ),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let meta =
+                BulkCopyColumnMetadata::new("doc", SqlDbType::Json, SqlDbType::Json.to_tds_type());
+            assert!(matches!(
+                PythonRowAdapter::convert_by_target_type(&lookalike, &meta),
+                Err(Error::UsageError(_))
+            ));
+        });
+    }
+
+    #[test]
+    fn legacy_json_coercions_are_unchanged() {
+        Python::attach(|py| {
+            let meta =
+                BulkCopyColumnMetadata::new("doc", SqlDbType::Json, SqlDbType::Json.to_tds_type());
+            let text = " {\"a\": 1,\"a\": 2} ";
+            assert_eq!(
+                PythonRowAdapter::convert_by_target_type(PyString::new(py, text).as_any(), &meta)
+                    .unwrap(),
+                ColumnValues::Json(SqlJson::new(text.as_bytes().to_vec()))
+            );
+            assert!(
+                PythonRowAdapter::convert_by_target_type(
+                    PyString::new(py, "not JSON").as_any(),
+                    &meta
+                )
+                .is_err()
+            );
+            for expression in [
+                pyo3::ffi::c_str!("{'a': 1}"),
+                pyo3::ffi::c_str!("[1, None]"),
+            ] {
+                let value = py.eval(expression, None, None).unwrap();
+                assert!(matches!(
+                    PythonRowAdapter::convert_by_target_type(&value, &meta).unwrap(),
+                    ColumnValues::Json(_)
+                ));
+            }
+        });
+    }
 
     fn convert(value: &str, sql_type: SqlDbType, scale: u8) -> TdsResult<ColumnValues> {
         let metadata = BulkCopyColumnMetadata::new("event_time", sql_type, sql_type.to_tds_type())
