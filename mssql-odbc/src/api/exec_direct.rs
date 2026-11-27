@@ -594,8 +594,11 @@ mod tests {
     use crate::handles::DescHandle;
     use crate::test_support::TestHandles;
 
+    /// A canonical call whose fixed-row TVP has a cell supplied at execution
+    /// streams the table: every named parameter is declared and sent, and the
+    /// collected cell is written into its row.
     #[test]
-    fn canonical_call_with_child_dae_parks_complete_named_parameters() {
+    fn canonical_call_with_child_dae_streams_complete_named_parameters() {
         use crate::api::exports::{SQLBindParameter, SQLParamData, SQLPutData};
         use crate::api::odbc_types::*;
         use crate::handles::DbcHandle;
@@ -603,11 +606,11 @@ mod tests {
             let h = TestHandles::with_env_dbc_stmt();
             h.mark_dbc_connected();
             let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-            dbc.inner.lock().unwrap().wire.put_client_for_test(
-                mssql_tds::test_client_support::tds_client_from_tokens(vec![
+            let (client, sent) =
+                mssql_tds::test_client_support::tds_client_from_tokens_capturing(vec![
                     mssql_tds::test_client_support::done_no_more(),
-                ]),
-            );
+                ]);
+            dbc.inner.lock().unwrap().wire.put_client_for_test(client);
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             let ordinal = if returns_status { 2 } else { 1 };
             let mut rows = 1;
@@ -709,8 +712,8 @@ mod tests {
             {
                 let state = stmt.inner.lock().unwrap();
                 let dae = state.dae.as_ref().unwrap();
-                assert_eq!(dae.prebuilt.len(), if returns_status { 3 } else { 2 });
-                assert!(dae.deferred);
+                assert!(!dae.deferred, "the table streams into the open RPC");
+                assert!(dae.prebuilt.is_empty());
                 assert_eq!(dae.tvp_row_counts.get(&(ordinal as usize - 1)), Some(&1));
             }
             let mut token = std::ptr::null_mut();
@@ -721,6 +724,17 @@ mod tests {
                 SQL_SUCCESS
             );
             assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_SUCCESS);
+
+            let bytes = sent.lock().unwrap();
+            let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+            let declaration: Vec<u8> = format!("@P{ordinal} [dbo.test_table] READONLY")
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            assert!(contains(&declaration), "the table is declared");
+            // Row token, varchar(1) length and 'x', then the end of the rows.
+            assert!(contains(&[0x01, 0x01, 0x00, b'x', 0x00]), "the row is sent");
+            assert!(contains(&[0x26, 4, 4, 42, 0, 0, 0]), "the scalar follows");
         }
     }
 

@@ -70,9 +70,19 @@ parameters remain, subsequent PLP values stream normally. Validation that
 depends on the completed value can occur during `SQLPutData` or when
 `SQLParamData` closes the parameter rather than at bind time.
 
-TVP DAE cells are buffered until the complete table can be sent. Row-control
-staging grows with supplied batches rather than the bound row capacity; the
-collected table still requires memory proportional to its actual contents.
+TVP rows supplied at execution stream into the open request: bound cells are
+written as each batch is supplied, an `SQL_DATA_AT_EXEC` cell of an unbounded
+`varchar(max)`, `nvarchar(max)`, or `varbinary(max)` column (same-family C type)
+streams its chunks, and any other DAE cell is collected for that cell only and
+then written. For a table supplied in batches, the driver keeps only the current
+batch's row-control and cell tokens, so its memory follows the batch size rather
+than the table size. An error after rows have been sent withdraws the request;
+SQL Server never executes a partial table.
+
+The ordering rule above applies to tables too: a TVP before a buffered scalar
+DAE parameter is collected whole and sent with the deferred execute. A TVP
+whose type name or column metadata cannot be resolved at execute time is also
+collected, so its diagnostic is reported as before.
 
 See [Data-at-Execution Streaming](data-at-execution-streaming.md) for the call
 sequence, examples, and supported conversions.

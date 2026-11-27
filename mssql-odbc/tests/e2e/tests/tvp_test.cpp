@@ -8,6 +8,7 @@
 
 #include "odbc_test_fixture.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -1411,6 +1412,159 @@ TEST_F(TvpTest, DaeRefillsMultipleTvpBatchesBeforeScalarDae) {
                                  static_cast<SQLLEN>(actual_marker.size()), &indicator),
                       SQL_HANDLE_STMT, stmt_);
         EXPECT_EQ(std::string(actual_marker.data()), "done");
+    }
+    EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+}
+
+// The mssql-python shape for huge TVPs: one-row batches whose MAX cells arrive in
+// many SQLPutData chunks. Those cells are streamed, so the server must receive the
+// exact chunk concatenation, including NULL and empty cells.
+// Benefits-from-mock-tds: dae_tvp unit tests pin bounded token retention and early packet sends.
+TEST_F(TvpTest, DaeStreamsChunkedMaxCellsAcrossOneRowBatches) {
+    const std::string type = "big_type_" + suffix_;
+    const std::string proc = "big_proc_" + suffix_;
+    cleanup_sql_ = {"DROP PROCEDURE IF EXISTS dbo.[" + proc + "]",
+                    "DROP TYPE IF EXISTS dbo.[" + type + "]"};
+    ASSERT_SQL_OK(DirectRc("CREATE TYPE dbo.[" + type +
+                           "] AS TABLE (id INT, payload VARBINARY(MAX), note NVARCHAR(MAX))"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("CREATE PROCEDURE dbo.[" + proc + "] @t dbo.[" + type +
+                           "] READONLY AS SELECT id, payload, note FROM @t ORDER BY id"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc + "] ?"), SQL_HANDLE_STMT, stmt_);
+
+    constexpr SQLINTEGER kRows = 24;
+    static constexpr size_t kChunk = 8192;
+    BindTvp(1, type, kRows);
+    row_counts_.back() = SQL_DATA_AT_EXEC;
+    Focus(1);
+    SQLINTEGER id = 0;
+    SQLLEN id_length = 0;
+    unsigned char payload_token = 0;
+    SQLLEN payload_length = SQL_DATA_AT_EXEC;
+    SQLWCHAR note_token = 0;
+    SQLLEN note_length = SQL_DATA_AT_EXEC;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                   0, 0, &id, 0, &id_length),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_VARBINARY,
+                                   0, 0, &payload_token, 0, &payload_length),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 3, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                                   0, 0, &note_token, 0, &note_length),
+                  SQL_HANDLE_STMT, stmt_);
+    RestoreFocus();
+
+    // Row 0 has a NULL payload, row 1 an empty payload and NULL note, row 2 an
+    // empty note; every other cell spans several chunks with an odd tail.
+    auto payload = [](SQLINTEGER row) {
+        std::vector<unsigned char> bytes(row == 1 ? 0 : 7 * kChunk + 123 + row);
+        for (size_t i = 0; i < bytes.size(); ++i) {
+            bytes[i] = static_cast<unsigned char>((row * 31 + i) % 251);
+        }
+        return bytes;
+    };
+    auto note = [](SQLINTEGER row) {
+        std::vector<SQLWCHAR> text(row == 2 ? 0 : 3 * kChunk / sizeof(SQLWCHAR) + row);
+        for (size_t i = 0; i < text.size(); ++i) {
+            text[i] = i % 97 == 0 ? SQLWCHAR{0x00E9} : static_cast<SQLWCHAR>('A' + (row + i) % 26);
+        }
+        return text;
+    };
+    auto put_chunked = [&](const void* data, size_t bytes) {
+        if (bytes == 0) {
+            ASSERT_SQL_OK(SQLPutData(stmt_, &payload_token, 0), SQL_HANDLE_STMT, stmt_);
+            return;
+        }
+        const auto* cursor = static_cast<const unsigned char*>(data);
+        for (size_t sent = 0; sent < bytes; sent += kChunk) {
+            const size_t take = (std::min)(kChunk, bytes - sent);
+            ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<unsigned char*>(cursor + sent),
+                                     static_cast<SQLLEN>(take)),
+                          SQL_HANDLE_STMT, stmt_);
+        }
+    };
+
+    ASSERT_EQ(SQLExecute(stmt_), SQL_NEED_DATA)
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER rows_sent = 0;
+    size_t payload_cells = 0, note_cells = 0, closes = 0;
+    SQLPOINTER token = nullptr;
+    SQLRETURN rc;
+    while ((rc = SQLParamData(stmt_, &token)) == SQL_NEED_DATA) {
+        const SQLINTEGER row = rows_sent - 1;
+        if (token == type_bufs_.back().data()) {
+            if (rows_sent < kRows) {
+                id = rows_sent++;
+                ASSERT_SQL_OK(SQLPutData(stmt_, reinterpret_cast<SQLPOINTER>(1), 1),
+                              SQL_HANDLE_STMT, stmt_);
+            } else {
+                ASSERT_SQL_OK(SQLPutData(stmt_, nullptr, 0), SQL_HANDLE_STMT, stmt_);
+                ++closes;
+            }
+        } else if (token == &payload_token) {
+            if (row == 0) {
+                ASSERT_SQL_OK(SQLPutData(stmt_, nullptr, SQL_NULL_DATA), SQL_HANDLE_STMT, stmt_);
+            } else {
+                const auto bytes = payload(row);
+                put_chunked(bytes.data(), bytes.size());
+            }
+            ++payload_cells;
+        } else if (token == &note_token) {
+            if (row == 1) {
+                ASSERT_SQL_OK(SQLPutData(stmt_, nullptr, SQL_NULL_DATA), SQL_HANDLE_STMT, stmt_);
+            } else {
+                const auto text = note(row);
+                put_chunked(text.data(), text.size() * sizeof(SQLWCHAR));
+            }
+            ++note_cells;
+        } else {
+            FAIL() << "unexpected TVP token";
+        }
+        if (HasFatalFailure()) return;
+    }
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(rows_sent, kRows);
+    EXPECT_EQ(closes, 1u);
+    EXPECT_EQ(payload_cells, static_cast<size_t>(kRows));
+    EXPECT_EQ(note_cells, static_cast<size_t>(kRows));
+
+    for (SQLINTEGER row = 0; row < kRows; ++row) {
+        SCOPED_TRACE("row " + std::to_string(row));
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLINTEGER actual_id = -1;
+        SQLLEN indicator = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &actual_id, 0, &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(actual_id, row);
+
+        const auto expected_payload = payload(row);
+        std::vector<unsigned char> actual_payload(expected_payload.size() + 1);
+        ASSERT_EQ(SQLGetData(stmt_, 2, SQL_C_BINARY, actual_payload.data(),
+                             static_cast<SQLLEN>(actual_payload.size()), &indicator),
+                  SQL_SUCCESS)
+            << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        if (row == 0) {
+            EXPECT_EQ(indicator, SQL_NULL_DATA);
+        } else {
+            ASSERT_EQ(indicator, static_cast<SQLLEN>(expected_payload.size()));
+            actual_payload.pop_back();
+            EXPECT_TRUE(actual_payload == expected_payload);
+        }
+
+        const auto expected_note = note(row);
+        std::vector<SQLWCHAR> actual_note(expected_note.size() + 1);
+        ASSERT_EQ(SQLGetData(stmt_, 3, SQL_C_WCHAR, actual_note.data(),
+                             static_cast<SQLLEN>(actual_note.size() * sizeof(SQLWCHAR)), &indicator),
+                  SQL_SUCCESS)
+            << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        if (row == 1) {
+            EXPECT_EQ(indicator, SQL_NULL_DATA);
+        } else {
+            ASSERT_EQ(indicator, static_cast<SQLLEN>(expected_note.size() * sizeof(SQLWCHAR)));
+            actual_note.pop_back();
+            EXPECT_TRUE(actual_note == expected_note);
+        }
     }
     EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
 }

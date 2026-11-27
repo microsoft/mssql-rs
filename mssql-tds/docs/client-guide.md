@@ -94,3 +94,24 @@ Contributor test setup is in the
 materialized, empty, and NULL values. A streamed value can keep its legacy
 declaration through `RpcParameter::with_streamed_declaration` while sending a
 MAX/PLP payload, without buffering the whole value.
+
+## Streamed table-valued parameters
+
+`RpcParameter::data_at_exec_table` declares a table-valued parameter whose rows
+are written after the RPC opens, through `begin_sp_executesql` or
+`begin_execute_prepared`. Its type name and column metadata go out when the
+parameter opens; the client then holds only the cells of the current call, and
+full packets are sent while later rows are still being produced.
+
+- `write_streamed_tvp_cells` appends cells in column order. A cell in the first
+  column starts a row, and rows may span calls. Cells are validated against
+  their columns before any byte of the call is written.
+- `begin_streamed_tvp_cell` opens a `varchar(max)`, `nvarchar(max)` or
+  `varbinary(max)` cell for `write_streamed_chunk` or `write_streamed_null`;
+  `end_streamed_tvp_cell` closes it.
+- `end_streamed_param` closes the table between rows. A table closed with no
+  rows is an empty table.
+
+A failure after row bytes have been written withdraws the request, so SQL Server
+never executes a partial table. Streamed tables follow the same Always Encrypted
+restriction as other streamed parameters.

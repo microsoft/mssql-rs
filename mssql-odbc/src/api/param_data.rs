@@ -181,7 +181,7 @@ fn sql_param_data_operation(
     // The first call has no open parameter to close: it opens parameter 0 and
     // hands the application its token. Every later call closes the parameter
     // the cursor is on before advancing.
-    let (is_first_call, current_ptr, cell_error) = {
+    let (is_first_call, streaming_first, current_ptr, cell_error) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLParamData: stmt mutex poisoned");
             return SQL_ERROR;
@@ -203,7 +203,12 @@ fn sql_param_data_operation(
             return SQL_ERROR;
         };
         let first = dae.cursor.is_none();
-        let cell_error = if first {
+        let streaming_first = first && !dae.deferred;
+        let cell_error = if streaming_first {
+            // The RPC is already open: bound TVP cells are written, not kept.
+            dae.advance();
+            None
+        } else if first {
             let cells = dae
                 .params()
                 .iter()
@@ -228,7 +233,12 @@ fn sql_param_data_operation(
         } else {
             None
         };
-        (first, stmt_state.dae_current_value_ptr(), cell_error)
+        (
+            first,
+            streaming_first,
+            stmt_state.dae_current_value_ptr(),
+            cell_error,
+        )
     };
 
     if let Some(error) = cell_error {
@@ -238,6 +248,16 @@ fn sql_param_data_operation(
             super::exec_common::post_param_row_build_error(&mut state, &error, 0);
         }
         return rc;
+    }
+
+    if streaming_first {
+        return super::dae_tvp::drive_streaming(
+            dbc,
+            stmt,
+            statement_handle,
+            value_ptr_ptr,
+            Vec::new(),
+        );
     }
 
     // Write the current parameter's application token to *value_ptr_ptr.
@@ -369,54 +389,44 @@ fn sql_param_data_operation(
             let bytes = std::mem::take(&mut dae.progress.buffer);
             let is_null = dae.progress.is_null;
             match target {
-                DaeTarget::Parameter => dae.buffered.push((bound_index, bytes, is_null)),
+                DaeTarget::Parameter => {
+                    dae.buffered.push((bound_index, bytes, is_null));
+                    dae.advance();
+                }
                 DaeTarget::TvpCell {
                     tvp_index,
                     row_index,
                     column_index,
-                } => dae.tvp_cells.push(crate::handles::stmt::BufferedTvpCell {
-                    tvp_index,
-                    row_index,
-                    column_index,
-                    bytes,
-                    is_null,
-                    value: None,
-                }),
-                DaeTarget::TvpRowControl {
-                    tvp_index,
-                    row_index,
                 } => {
-                    let Some(batch_count) = dae.progress.tvp_row_batch_count else {
-                        error!("SQLParamData: TVP row-control value was not captured");
+                    dae.tvp_cells.push(crate::handles::stmt::BufferedTvpCell {
+                        tvp_index,
+                        row_index,
+                        column_index,
+                        bytes,
+                        is_null,
+                        value: None,
+                    });
+                    dae.advance();
+                }
+                DaeTarget::TvpRowControl { .. } => {
+                    if let Err(problem) = dae.close_tvp_row_control() {
+                        error!("SQLParamData: {problem}");
                         dae.return_client(client);
                         return SQL_ERROR;
-                    };
-                    if batch_count > 0 {
-                        let Some(batch_end) = row_index.checked_add(batch_count) else {
-                            error!("SQLParamData: TVP row batch count overflowed");
-                            dae.return_client(client);
-                            return SQL_ERROR;
-                        };
-                        let row_count = dae.tvp_row_counts.entry(tvp_index).or_default();
-                        let Some(total) = row_count.checked_add(batch_count) else {
-                            error!("SQLParamData: accumulated TVP row count overflowed");
-                            dae.return_client(client);
-                            return SQL_ERROR;
-                        };
-                        *row_count = total;
-                        dae.tvp_batches.insert(tvp_index, (row_index, batch_end));
-                        dae.advance();
-                    } else {
-                        dae.advance_past_tvp(tvp_index);
                     }
                 }
             }
-            if !matches!(target, DaeTarget::TvpRowControl { .. }) {
-                dae.advance();
-            }
-            let cell_error = collect_bound_tvp_cells(dae).err();
+            // Decided before collecting bound TVP cells: when every remaining
+            // token streams, those cells belong on the wire, not in the buffer.
+            let mut buffered_done = dae.buffered_phase_complete();
+            let cell_error = if buffered_done {
+                None
+            } else {
+                let error = collect_bound_tvp_cells(dae).err();
+                buffered_done = error.is_none() && dae.buffered_phase_complete();
+                error
+            };
             let has_more = dae.current_param().is_some();
-            let buffered_done = dae.buffered_phase_complete();
             dae.return_client(client);
             (
                 has_more,
@@ -438,8 +448,17 @@ fn sql_param_data_operation(
         // complete and the RPC can be opened now. The rest of the sequence goes
         // onto the wire as it arrives instead of being collected whole, which is
         // the whole point of data-at-execution for a LOB.
-        if buffered_phase_done && let Some(rc) = open_deferred_rpc(dbc, stmt, statement_handle) {
-            return rc;
+        if buffered_phase_done {
+            if let Some(rc) = open_deferred_rpc(dbc, stmt, statement_handle) {
+                return rc;
+            }
+            return super::dae_tvp::drive_streaming(
+                dbc,
+                stmt,
+                statement_handle,
+                value_ptr_ptr,
+                Vec::new(),
+            );
         }
 
         // More parameters to collect: hand back the next token.
@@ -450,7 +469,43 @@ fn sql_param_data_operation(
         return run_deferred_execute(dbc, stmt, statement_handle);
     }
 
-    // ── Subsequent calls: close current parameter and advance ───────────────
+    // ── Streaming: the RPC is open ──────────────────────────────────────────
+    // A TVP row count or a collected cell closes without a chunk tail; a
+    // streamed TVP cell closes inside its still-open table.
+    let streamed_cell = {
+        let Ok(stmt_state) = stmt.inner.lock() else {
+            error!("SQLParamData: stmt mutex poisoned reading the open parameter");
+            return SQL_ERROR;
+        };
+        match stmt_state
+            .dae
+            .as_ref()
+            .and_then(|dae| dae.current_param())
+            .map(|param| (param.target, param.collects()))
+        {
+            Some((DaeTarget::TvpRowControl { .. }, _)) => {
+                drop(stmt_state);
+                return super::dae_tvp::close_row_control(
+                    dbc,
+                    stmt,
+                    statement_handle,
+                    value_ptr_ptr,
+                );
+            }
+            Some((DaeTarget::TvpCell { .. }, true)) => {
+                drop(stmt_state);
+                return super::dae_tvp::close_collected_cell(
+                    dbc,
+                    stmt,
+                    statement_handle,
+                    value_ptr_ptr,
+                );
+            }
+            Some((DaeTarget::TvpCell { .. }, false)) => true,
+            _ => false,
+        }
+    };
+
     // Take the TDS client out of stmt_state while we do I/O.
     let (mut client, trailing) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -544,17 +599,56 @@ fn sql_param_data_operation(
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
+    if streamed_cell {
+        return super::dae_tvp::close_streamed_cell(
+            dbc,
+            stmt,
+            statement_handle,
+            value_ptr_ptr,
+            client,
+        );
+    }
+
+    match end_open_param(dbc, stmt, statement_handle, client, true) {
+        CloseOutcome::NextOpen => {
+            super::dae_tvp::drive_streaming(dbc, stmt, statement_handle, value_ptr_ptr, Vec::new())
+        }
+        CloseOutcome::Finished(rc) => rc,
+    }
+}
+
+/// What closing the streamed parameter open on the wire left behind.
+pub(super) enum CloseOutcome {
+    /// Another streamed parameter is open and the client is parked back on
+    /// the sequence.
+    NextOpen,
+    /// The call ends with this code: the request completed, or failed and the
+    /// sequence was torn down.
+    Finished(SqlReturn),
+}
+
+/// Closes the streamed parameter the open RPC is writing, using the checked-out
+/// `client`, and writes the values up to the next streamed one. When another
+/// opens, the client goes back on the sequence and `advance` moves the cursor
+/// in the same critical section; otherwise the execution completes or fails.
+pub(super) fn end_open_param(
+    dbc: &crate::handles::DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    mut client: crate::handles::wire::WireLease,
+    advance: bool,
+) -> CloseOutcome {
     let (mut prepared, mut orphaned) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLParamData: stmt mutex poisoned taking the streamed plan");
             return_client_idle(dbc, statement_handle, client);
-            return SQL_ERROR;
+            return CloseOutcome::Finished(SQL_ERROR);
         };
         let Some(dae) = stmt_state.dae.as_mut() else {
             error!("SQLParamData: DAE sequence vanished before closing the parameter");
             drop(stmt_state);
             return_client_idle(dbc, statement_handle, client);
-            return SQL_ERROR;
+            return CloseOutcome::Finished(SQL_ERROR);
         };
         (dae.take_prepared(), dae.take_orphaned())
     };
@@ -571,7 +665,7 @@ fn sql_param_data_operation(
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLParamData: stmt mutex poisoned restoring the streamed plan");
             return_client_idle(dbc, statement_handle, client);
-            return SQL_ERROR;
+            return CloseOutcome::Finished(SQL_ERROR);
         };
         let Some(dae) = stmt_state.dae.as_mut() else {
             error!("SQLParamData: DAE sequence vanished after closing the parameter");
@@ -579,7 +673,7 @@ fn sql_param_data_operation(
             stmt_state.pending_unprepare = orphaned;
             drop(stmt_state);
             return_client_idle(dbc, statement_handle, client);
-            return SQL_ERROR;
+            return CloseOutcome::Finished(SQL_ERROR);
         };
         dae.restore_plan(prepared, orphaned);
     }
@@ -588,46 +682,42 @@ fn sql_param_data_operation(
         Ok(StreamedParamStatus::NeedData { param_name: _ }) => {
             // Another parameter follows, so the request is still incomplete.
             pending.restore(stmt);
-            // Advance to the next DAE parameter.
-            let next_ptr = {
-                let mut stmt_state = match stmt.inner.lock() {
-                    Ok(guard) => guard,
-                    Err(_) => {
-                        error!("SQLParamData: stmt mutex poisoned advancing DAE index");
-                        // The RPC is still open on the next parameter and the
-                        // statement can no longer hold the client. Discard the
-                        // half-written request before the client goes back to
-                        // the idle pool, or the next command on it fails as
-                        // already executing.
-                        dbc.runtime.block_on(client.cancel_streamed_write());
-                        return_client_idle(dbc, statement_handle, client);
-                        return SQL_ERROR;
-                    }
-                };
-                match stmt_state.dae.as_mut() {
-                    Some(dae) => {
-                        dae.return_client(client);
-                        dae.advance();
-                        stmt_state.dae_current_value_ptr()
-                    }
-                    None => {
-                        // Drop the STMT guard before touching the DBC lock in
-                        // `return_client_idle`: `SQLFreeHandle(SQL_HANDLE_DESC)`
-                        // locks DBC then STMT (to reset any statement whose
-                        // active ARD/APD is the freed descriptor), so holding
-                        // STMT across a DBC-lock call here would be the
-                        // reverse order and risk an ABBA deadlock against it.
-                        drop(stmt_state);
-                        error!("SQLParamData: DAE sequence vanished while advancing");
-                        dbc.runtime.block_on(client.cancel_streamed_write());
-                        return_client_idle(dbc, statement_handle, client);
-                        return SQL_ERROR;
-                    }
+            let mut stmt_state = match stmt.inner.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    error!("SQLParamData: stmt mutex poisoned advancing DAE index");
+                    // The RPC is still open on the next parameter and the
+                    // statement can no longer hold the client. Discard the
+                    // half-written request before the client goes back to the
+                    // idle pool, or the next command on it fails as already
+                    // executing.
+                    dbc.runtime.block_on(client.cancel_streamed_write());
+                    return_client_idle(dbc, statement_handle, client);
+                    return CloseOutcome::Finished(SQL_ERROR);
                 }
             };
-
-            unsafe { write_if_some(value_ptr_ptr, next_ptr) };
-            SQL_NEED_DATA
+            match stmt_state.dae.as_mut() {
+                Some(dae) => {
+                    dae.return_client(client);
+                    if advance {
+                        dae.advance();
+                    }
+                    CloseOutcome::NextOpen
+                }
+                None => {
+                    // Drop the STMT guard before touching the DBC lock in
+                    // `return_client_idle`: `SQLFreeHandle(SQL_HANDLE_DESC)`
+                    // locks DBC then STMT (to reset any statement whose active
+                    // ARD/APD is the freed descriptor), so holding STMT across a
+                    // DBC-lock call here would be the reverse order and risk an
+                    // ABBA deadlock against it.
+                    drop(stmt_state);
+                    error!("SQLParamData: DAE sequence vanished while advancing");
+                    dbc.runtime.block_on(client.cancel_streamed_write());
+                    return_client_idle(dbc, statement_handle, client);
+                    CloseOutcome::Finished(SQL_ERROR)
+                }
+            }
         }
 
         Ok(StreamedParamStatus::Complete(_)) => {
@@ -641,7 +731,7 @@ fn sql_param_data_operation(
                 let Ok(mut stmt_state) = stmt.inner.lock() else {
                     error!("SQLParamData: stmt mutex poisoned on completion");
                     return_client_idle(dbc, statement_handle, client);
-                    return SQL_ERROR;
+                    return CloseOutcome::Finished(SQL_ERROR);
                 };
                 debug_assert!(
                     stmt_state.dae.is_some(),
@@ -657,14 +747,14 @@ fn sql_param_data_operation(
                 fractional_truncated
             };
 
-            finish_execute_with_param_warning(
+            CloseOutcome::Finished(finish_execute_with_param_warning(
                 dbc,
                 stmt,
                 statement_handle,
                 client,
                 "SQLParamData",
                 fractional_truncated,
-            )
+            ))
         }
 
         Err(e) => {
@@ -677,7 +767,7 @@ fn sql_param_data_operation(
                 debug_assert!(parked.is_none(), "the client is checked out by this call");
                 stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
             }
-            fail_with_tds(dbc, stmt, statement_handle, client, &e)
+            CloseOutcome::Finished(fail_with_tds(dbc, stmt, statement_handle, client, &e))
         }
     }
 }
@@ -716,6 +806,24 @@ fn open_deferred_rpc(
         let mut tvp_cells = std::mem::take(&mut dae.tvp_cells);
         let tvp_row_counts = std::mem::take(&mut dae.tvp_row_counts);
         let dae_params = dae.params().to_vec();
+        // Tables whose tokens are still ahead stream into the RPC opened here.
+        let streamed_tvps: std::collections::BTreeSet<usize> = dae
+            .cursor
+            .and_then(|cursor| dae_params.get(cursor..))
+            .into_iter()
+            .flatten()
+            .filter_map(|param| match param.target {
+                DaeTarget::TvpRowControl { tvp_index, .. }
+                | DaeTarget::TvpCell { tvp_index, .. } => Some(tvp_index),
+                DaeTarget::Parameter => None,
+            })
+            .collect();
+        debug_assert!(
+            tvp_cells
+                .iter()
+                .all(|cell| !streamed_tvps.contains(&cell.tvp_index)),
+            "a table is either collected or streamed, never split"
+        );
         let prebuilt = std::mem::take(&mut dae.prebuilt);
         let sql = dae.sql.take();
         let timeout_secs = dae.timeout_secs;
@@ -734,6 +842,7 @@ fn open_deferred_rpc(
             &dae_params,
             &mut tvp_cells,
             &tvp_row_counts,
+            &streamed_tvps,
             "SQLParamData",
         ) {
             Ok(params) => params,
@@ -911,6 +1020,7 @@ fn run_deferred_execute(
             &dae_params,
             &mut tvp_cells,
             &tvp_row_counts,
+            &std::collections::BTreeSet::new(),
             "SQLParamData",
         ) {
             Ok(params) => params,
@@ -1198,6 +1308,7 @@ mod tests {
             crate::api::odbc_types::SQL_BIND_BY_COLUMN,
             false,
             None,
+            false,
         )
         .unwrap();
         for param in &mut params {
@@ -1468,6 +1579,7 @@ mod tests {
             SQL_BIND_BY_COLUMN,
             false,
             Some(3),
+            false,
         )
         .unwrap();
         let mut trailing = DaeParam::unbounded(1, 0x1234usize as SqlPointer, None);

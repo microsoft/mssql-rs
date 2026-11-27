@@ -208,6 +208,23 @@ header or finalise and send the packet.
 Prepared ownership is restored to the sequence even on error: a final packet
 may reach the server before a timeout or response error is reported.
 
+### Table-Valued Parameters
+
+A TVP supplied at execution is a streamed table parameter
+(`RpcParameter::data_at_exec_table`) whose header and column metadata go out
+when the request reaches it. `dae_tvp.rs` then walks its tokens: bound cells are
+converted and written in short runs with `write_streamed_tvp_cells`; a DAE cell
+of an unbounded same-family MAX column is opened with `begin_streamed_tvp_cell`,
+receives `SQLPutData` chunks through `write_streamed_chunk`, and closes with
+`end_streamed_tvp_cell`; other DAE cells are collected and converted at close,
+like the materialized table. A zero row-control count, or the cursor leaving a
+fixed-row table, closes it with `end_streamed_param`. Tokens behind the cursor
+are discarded as each refilled batch begins.
+
+The table streams only once every earlier parameter is on the wire. When a later
+buffered scalar holds the request back, the table's tokens are collected and
+`rebuild_deferred_params` materializes it, exactly as before streaming.
+
 ### Parameter Order
 
 Any parameter may be data-at-execution, in any position, freely interleaved

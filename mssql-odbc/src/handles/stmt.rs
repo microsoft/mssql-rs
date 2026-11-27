@@ -884,6 +884,10 @@ pub(crate) struct DaeParam {
     pub(crate) expected_len: Option<usize>,
     /// Whether the value must be collected before the RPC can open.
     buffered: bool,
+    /// A TVP cell that cannot be written chunk by chunk: its bytes are
+    /// collected and converted when it closes, then written into the open
+    /// table. Unlike `buffered`, this never holds the RPC back.
+    collect_cell: bool,
     /// `ColumnSize` applied to the accumulated chunk total as the chunks
     /// arrive, so the `22001` lands on the same `SQLPutData` msodbcsql puts it
     /// on. `None` when the bound is left to the close-time conversion.
@@ -929,6 +933,7 @@ impl DaeParam {
             value_ptr: binding.parameter_value_ptr,
             expected_len,
             buffered,
+            collect_cell: false,
             length_limit,
             binding,
             long_as_max,
@@ -954,6 +959,13 @@ impl DaeParam {
 
     pub(crate) fn with_target(mut self, target: DaeTarget) -> Self {
         self.target = target;
+        self
+    }
+
+    /// Marks a TVP cell whose bytes are collected and written whole when it
+    /// closes. See [`DaeParam::collects`].
+    pub(crate) fn collecting_cell(mut self, collect: bool) -> Self {
+        self.collect_cell = collect;
         self
     }
 
@@ -1003,6 +1015,12 @@ impl DaeParam {
 
     pub(crate) fn is_buffered(&self) -> bool {
         self.buffered
+    }
+
+    /// Whether `SQLPutData` accumulates this value instead of sending each
+    /// chunk: a buffered parameter, or a TVP cell converted whole.
+    pub(crate) fn collects(&self) -> bool {
+        self.buffered || self.collect_cell
     }
 
     #[cfg(test)]
@@ -1138,6 +1156,9 @@ pub(crate) struct DaeState {
     /// A buffered conversion dropped non-zero fractional digits. Retained when
     /// a mixed sequence switches to streaming so its final call can report 01S07.
     pub(crate) fractional_truncated: bool,
+    /// The TVP whose rows are being written into the open RPC. Its header went
+    /// out when the RPC opened it; it closes when the cursor leaves its tokens.
+    pub(crate) open_tvp: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -1180,6 +1201,7 @@ impl DaeState {
             sql: None,
             timeout_secs: 0,
             fractional_truncated: false,
+            open_tvp: None,
         }
     }
 
@@ -1418,9 +1440,12 @@ impl DaeState {
         self.params
             .try_reserve(staged_len)
             .map_err(|_| TvpBatchStageError::MemoryAllocation)?;
-        self.tvp_cells
-            .try_reserve(buffered_cell_count)
-            .map_err(|_| TvpBatchStageError::MemoryAllocation)?;
+        // Only a deferred execute keeps the cells; an open RPC writes them.
+        if self.deferred {
+            self.tvp_cells
+                .try_reserve(buffered_cell_count)
+                .map_err(|_| TvpBatchStageError::MemoryAllocation)?;
+        }
         self.params.splice(segment_end + 1..segment_end + 1, staged);
         for (&cached_tvp, state) in &mut self.tvp_staging {
             if cached_tvp == tvp_index {
@@ -1550,6 +1575,70 @@ impl DaeState {
         self.progress = DaeProgress::default();
     }
 
+    /// Whether `SQLPutData` accumulates the open value rather than sending it:
+    /// everything does while the execute is deferred.
+    pub(crate) fn current_collects(&self) -> bool {
+        self.deferred || self.current_param().is_some_and(DaeParam::collects)
+    }
+
+    /// Closes the TVP row-control token the cursor is on with the row count
+    /// `SQLPutData` recorded. A positive count opens that batch's first row; zero
+    /// ends the table and moves past its remaining tokens. Returns `true` when
+    /// the table ended.
+    pub(crate) fn close_tvp_row_control(&mut self) -> Result<bool, &'static str> {
+        let Some(DaeTarget::TvpRowControl {
+            tvp_index,
+            row_index,
+        }) = self.current_param().map(|param| param.target)
+        else {
+            return Err("the open data-at-execution token is not a TVP row control");
+        };
+        let Some(batch_count) = self.progress.tvp_row_batch_count else {
+            return Err("TVP row-control value was not captured");
+        };
+        if batch_count == 0 {
+            self.advance_past_tvp(tvp_index);
+            return Ok(true);
+        }
+        let batch_end = row_index
+            .checked_add(batch_count)
+            .ok_or("TVP row batch count overflowed")?;
+        let row_count = self.tvp_row_counts.entry(tvp_index).or_default();
+        *row_count = row_count
+            .checked_add(batch_count)
+            .ok_or("accumulated TVP row count overflowed")?;
+        self.tvp_batches.insert(tvp_index, (row_index, batch_end));
+        self.advance();
+        Ok(false)
+    }
+
+    /// Drops the tokens behind the cursor. Once the RPC is open nothing reads
+    /// them again, so a TVP refilled batch by batch keeps only its current
+    /// batch instead of a token for every row it ever sent.
+    pub(crate) fn discard_consumed_tokens(&mut self) {
+        debug_assert!(
+            !self.deferred,
+            "a deferred execute rebuilds from every token"
+        );
+        let Some(consumed) = self.cursor.filter(|&cursor| cursor > 0) else {
+            return;
+        };
+        let consumed = consumed.min(self.params.len());
+        self.params.drain(..consumed);
+        self.cursor = self.cursor.map(|cursor| cursor - consumed);
+        self.tvp_staging
+            .retain(|_, state| state.segment_end >= consumed);
+        for state in self.tvp_staging.values_mut() {
+            state.segment_end -= consumed;
+        }
+    }
+
+    /// Number of tokens the sequence still holds.
+    #[cfg(test)]
+    pub(crate) fn token_count(&self) -> usize {
+        self.params.len()
+    }
+
     /// A false TVP row-control marker terminates that table. Its remaining
     /// pre-staged cell and row tokens must not be presented to the application.
     pub(crate) fn advance_past_tvp(&mut self, tvp_index: usize) {
@@ -1598,6 +1687,7 @@ impl DaeState {
             sql: None,
             timeout_secs: 0,
             fractional_truncated: false,
+            open_tvp: None,
         }
     }
 
