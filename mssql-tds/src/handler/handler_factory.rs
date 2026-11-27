@@ -230,6 +230,14 @@ pub(crate) struct SessionSettings {
 }
 
 impl SessionSettings {
+    pub(crate) fn json_version(&self) -> Option<u8> {
+        self.supported_features
+            .iter()
+            .find(|feature| feature.feature_identifier() == FeatureExtension::Json)
+            .map(|feature| feature.negotiated_version())
+            .filter(|version| *version != 0)
+    }
+
     /// Data Classification version the server enabled at login, which fixes
     /// the `0xA3` token layout for the connection. `None` when the feature was
     /// not requested, not acknowledged, or acknowledged as disabled.

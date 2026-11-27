@@ -131,6 +131,11 @@ represents an empty value.
 
 ### Testing with TdsClient and controlled shutdown
 
+`QueryRegistry::set_json_ack(Some(vec![1]))` enables the JSON login
+acknowledgement for subsequent connections. `None` (the default) omits it;
+`Some(vec![0])` declines support. Other payloads can exercise invalid
+acknowledgements. The mock sends this only when LOGIN7 requested JSON.
+
 For this example, also add `mssql-tds = "0.4"` under `[dev-dependencies]` and
 place the test in your project's `tests/` directory. It uses the default
 `SELECT 1` response and an unencrypted loopback connection:

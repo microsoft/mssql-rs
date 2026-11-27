@@ -4,10 +4,10 @@
 //! Mock TDS Server implementation
 
 use crate::protocol::{
-    FEATURE_EXT_DATA_CLASSIFICATION, FEATURE_EXT_ENHANCED_ROUTING, FEATURE_EXT_SESSION_RECOVERY,
-    PACKET_HEADER_SIZE, PacketHeader, PacketStatus, PacketType, ProtocolError, TM_BEGIN_XACT,
-    TM_COMMIT_XACT, TM_ROLLBACK_XACT, build_attention_ack_packet, build_done_token,
-    build_error_response, build_feature_ext_ack, build_feature_ext_ack_fedauth,
+    FEATURE_EXT_DATA_CLASSIFICATION, FEATURE_EXT_ENHANCED_ROUTING, FEATURE_EXT_JSON,
+    FEATURE_EXT_SESSION_RECOVERY, PACKET_HEADER_SIZE, PacketHeader, PacketStatus, PacketType,
+    ProtocolError, TM_BEGIN_XACT, TM_COMMIT_XACT, TM_ROLLBACK_XACT, build_attention_ack_packet,
+    build_done_token, build_error_response, build_feature_ext_ack, build_feature_ext_ack_fedauth,
     build_fedauth_challenge_response, build_login_ack, build_prelogin_response,
     build_prelogin_response_with_fedauth, build_query_results, build_routing_login_response,
     build_transaction_manager_response, parse_fedauth_token, parse_login7, parse_login7_auth,
@@ -307,6 +307,11 @@ impl ConnectionProcessor {
                     debug!("Acknowledging Data Classification v{version}");
                     acknowledged.push((FEATURE_EXT_DATA_CLASSIFICATION, vec![version, 1]));
                 }
+            }
+            if self.requested_feature_ids.contains(&FEATURE_EXT_JSON)
+                && let Some(payload) = registry.json_ack()
+            {
+                acknowledged.push((FEATURE_EXT_JSON, payload.to_vec()));
             }
         }
         if !acknowledged.is_empty() {

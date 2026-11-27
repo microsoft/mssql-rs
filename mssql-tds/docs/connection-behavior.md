@@ -11,6 +11,15 @@ match the expected hostname. `TrustServerCertificate` does not bypass validation
 in Strict mode. For TDS 7.4 with encrypted query traffic, set
 `context.encryption_options.mode = EncryptionSetting::On` before connecting.
 
+## JSON capability
+
+LOGIN7 always requests JSON feature version 1. Use
+`TdsClient::negotiated_json_version()` to inspect the current physical session:
+`Some(1)` means the server enabled JSON; `None` means it omitted the
+acknowledgement or returned version 0. Unsupported versions or invalid
+acknowledgement lengths fail login. The accessor reflects the latest login
+after routing or session recovery; a pool reset preserves it.
+
 ## Connection policy and migration
 
 Eligible TCP connections default to MultiSubnetFailover (MSF): attempt all

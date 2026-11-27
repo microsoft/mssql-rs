@@ -30,6 +30,30 @@ validation until connect; a successful cached set is not driver acceptance.
 [shared connection policy and migration guide](../../mssql-tds/docs/connection-behavior.md#connection-policy-and-migration)
 for the full precedence and applicability rules.
 
+## JSON feature negotiation
+
+ODBC connections advertise JSON feature version 1 in LOGIN7. A server
+acknowledgement of version 1 enables the capability; version 0 or an omitted
+acknowledgement leaves it disabled without failing the connection. Invalid
+acknowledgement lengths or versions fail login through the existing `08001`
+connection diagnostic path.
+
+The native driver's `feature/JsonFeature` test suite rejects version 0 and
+expects `HY000` for malformed acknowledgement payloads. This negotiation slice
+preserves the existing Rust disabled-version and login-diagnostic behavior;
+it does not establish full native negotiation parity. Those differences remain
+follow-up work under
+[the JSON capability task](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/50718).
+
+The negotiated value belongs to the TDS client's current physical session,
+not an independently cached ODBC flag. A new login after routing, reconnect,
+or session recovery supplies a fresh value. A connection-pool reset does not
+renegotiate it. Connection tracing includes `json_version`.
+
+Negotiation does not yet expose the native `SQL_SS_JSON` ODBC type or enable
+JSON-specific parameter bindings. Existing JSON result columns retain their
+character metadata and retrieval paths.
+
 ## Connection-operation timeouts
 
 `SQL_ATTR_CONNECTION_TIMEOUT` bounds connection-scoped network requests,

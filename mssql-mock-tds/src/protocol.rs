@@ -177,6 +177,8 @@ pub const FEATURE_EXT_SESSION_RECOVERY: u8 = 0x01;
 pub const FEATURE_EXT_FEDAUTH: u8 = 0x02;
 /// Data Classification feature extension ID
 pub const FEATURE_EXT_DATA_CLASSIFICATION: u8 = 0x09;
+/// JSON feature extension ID
+pub const FEATURE_EXT_JSON: u8 = 0x0D;
 /// Enhanced Routing feature extension ID
 pub const FEATURE_EXT_ENHANCED_ROUTING: u8 = 0x0F;
 pub const FEATURE_EXT_USER_AGENT: u8 = 0x10;

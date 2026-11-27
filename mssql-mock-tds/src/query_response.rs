@@ -426,6 +426,7 @@ pub struct QueryRegistry {
     /// Whether Login7's session-recovery request (feature `0x01`) is acknowledged.
     session_recovery: bool,
     data_classification_ack: DataClassificationAck,
+    json_ack: Option<Vec<u8>>,
 }
 
 /// How the mock answers a Login7 that requests Data Classification (feature `0x09`).
@@ -451,6 +452,7 @@ impl QueryRegistry {
             closing_queries: HashSet::new(),
             session_recovery: false,
             data_classification_ack: DataClassificationAck::default(),
+            json_ack: None,
         };
 
         // Add default responses
@@ -510,6 +512,16 @@ impl QueryRegistry {
     /// The Data Classification acknowledgement sent to the next login.
     pub fn data_classification_ack(&self) -> DataClassificationAck {
         self.data_classification_ack
+    }
+
+    /// JSON FEATUREEXTACK payload for subsequent logins, including reconnects.
+    /// `None` omits the acknowledgement; arbitrary bytes allow malformed-ACK tests.
+    pub fn set_json_ack(&mut self, payload: Option<Vec<u8>>) {
+        self.json_ack = payload;
+    }
+
+    pub(crate) fn json_ack(&self) -> Option<&[u8]> {
+        self.json_ack.as_deref()
     }
 
     /// Register a response of several result sets, each with optional raw
