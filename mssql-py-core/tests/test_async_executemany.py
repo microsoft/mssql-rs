@@ -1569,13 +1569,18 @@ def test_executemany_logs_cancellation_and_keeps_session_reusable(client_context
 
             assert not conn.closed
 
-            assert any(
-                level == 40
-                and "PyAsyncCursor::executemany: failed" in message
-                and "connection_marked_broken=false" in message
-                and module == "async_execute.rs"
-                for level, message, module in logger.events
-            )
+            for _ in range(100):
+                if any(
+                    level == 40
+                    and "PyAsyncCursor::executemany: failed" in message
+                    and "connection_marked_broken=false" in message
+                    and module == "async_execute.rs"
+                    for level, message, module in logger.events
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail(f"Missing cancellation failure log: {logger.events}")
         finally:
             await conn.close()
 
