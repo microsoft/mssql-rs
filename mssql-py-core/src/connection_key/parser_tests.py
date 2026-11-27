@@ -59,7 +59,7 @@ def verify_pool_keys(same_key):
         ("PacketSize", "16000", "packet_size", True),
     ]
     rejected_cases = (
-        [("VectorTypeSupport", "Native")]
+        [("VectorTypeSupport", "v1")]
         if "vectortypesupport" in _ALLOWED_CONNECTION_STRING_PARAMS
         else []
     )
