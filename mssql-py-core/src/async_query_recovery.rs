@@ -360,17 +360,6 @@ impl QueryDelivery {
             drop(state);
             if failed {
                 complete.call1((value,))?;
-            } else {
-                future.call_method1(
-                    "set_exception",
-                    (map_tds_error(
-                        self.control.operation,
-                        mssql_tds::error::Error::OperationCancelledError(
-                            "Async query was cancelled before result delivery".to_owned(),
-                        ),
-                        Vec::new(),
-                    ),),
-                )?;
             }
             return Ok(());
         }
@@ -565,8 +554,9 @@ where
         worker_control.delivery_finished.cancelled().await;
         if worker_control.cancelled.is_cancelled() {
             worker_control.recover_undelivered().await?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     };
     pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
         let result = run_query_in_background(
@@ -574,8 +564,21 @@ where
             Arc::clone(&control),
         )
         .await;
+        let result = match result {
+            Ok(true) => Err(map_tds_error(
+                control.operation,
+                mssql_tds::error::Error::OperationCancelledError(
+                    "Async query was cancelled before result delivery".to_owned(),
+                ),
+                Vec::new(),
+            )),
+            Ok(false) => Ok(()),
+            Err(error) => {
+                tracing::error!(%error, "Async query delivery or recovery failed");
+                Err(error)
+            }
+        };
         if let Err(error) = result {
-            tracing::error!(%error, "Async query delivery or recovery failed");
             if let Err(error) =
                 schedule_delivery::<()>(failure_loop, failure_future, failure_delivery, Err(error))
                     .await

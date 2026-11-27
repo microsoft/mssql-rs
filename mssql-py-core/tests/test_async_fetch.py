@@ -1747,6 +1747,94 @@ def test_cancelled_worker_on_closed_loop_preserves_replacement(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("terminate_session", [False, True], ids=["recover", "terminate"])
+def test_queued_fetch_success_preserves_cancellation_recovery_outcome(
+    client_context, monkeypatch, terminate_session,
+):
+    async def run():
+        conn = await connect(client_context)
+        actor = await connect(client_context)
+        loop = asyncio.get_running_loop()
+        original = loop.call_soon_threadsafe
+        entered = threading.Event()
+        held = []
+        target = []
+        pending = settlement = None
+
+        def hold_delivery(callback, *args, **kwargs):
+            if target and args and args[0] is target[0]:
+                held.append((callback, args, kwargs))
+                entered.set()
+                return None
+            return original(callback, *args, **kwargs)
+
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            await cursor.execute(
+                "SELECT value FROM (VALUES (1), (2), (3)) AS source(value); SELECT 99",
+                use_prepare=False,
+            )
+            monkeypatch.setattr(loop, "call_soon_threadsafe", hold_delivery)
+            pending = cursor.fetchone()
+            target.append(pending)
+            for _ in range(200):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("Fetch result delivery was not queued")
+            assert held[0][1][-1] is False
+            assert held[0][1][-2] == (1,)
+            assert not pending.done()
+
+            if terminate_session:
+                await actor.cursor().execute(f"KILL {session_id}", use_prepare=False)
+            settlement = asyncio.ensure_future(pending._cancel_and_settle())
+            monkeypatch.setattr(loop, "call_soon_threadsafe", original)
+            for callback, args, kwargs in held:
+                callback(*args, **kwargs)
+            held.clear()
+            assert not pending.done(), "Queued success completed before recovery"
+
+            if terminate_session:
+                with pytest.raises(mssql_py_core.InterfaceError, match="Connection is broken"):
+                    await asyncio.wait_for(asyncio.shield(settlement), 6)
+                with pytest.raises(mssql_py_core.Error) as failure:
+                    await asyncio.wait_for(asyncio.shield(pending), 2)
+                assert "cancelled before result delivery" not in str(failure.value)
+                assert "Fetch was cancelled" not in str(failure.value)
+                with pytest.raises(mssql_py_core.InterfaceError, match="Connection is broken"):
+                    await conn.cursor().execute("SELECT 3", use_prepare=False)
+            else:
+                await asyncio.wait_for(asyncio.shield(settlement), 2)
+                with pytest.raises(
+                    mssql_py_core.OperationalError,
+                    match="Async query was cancelled before result delivery",
+                ):
+                    await asyncio.wait_for(asyncio.shield(pending), 2)
+                probe = conn.cursor()
+                await probe.execute("SELECT 3, @@SPID", use_prepare=False)
+                assert await probe.fetchall() == [(3, session_id)]
+            assert cursor.description is None
+        finally:
+            monkeypatch.setattr(loop, "call_soon_threadsafe", original)
+            for callback, args, kwargs in held:
+                original(callback, *args, **kwargs)
+            if pending is not None and not pending.done():
+                pending.cancel()
+            if pending is not None and pending.done() and not pending.cancelled():
+                pending.exception()
+            if settlement is not None:
+                await asyncio.gather(settlement, return_exceptions=True)
+            await conn.close()
+            await actor.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "operation",
     ["execute", "executemany", "fetchone", "fetchmany", "nextset", "exhausted-fetchall"],

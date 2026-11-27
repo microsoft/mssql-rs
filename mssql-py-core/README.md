@@ -77,6 +77,9 @@ For SDK authors integrating the native runtime:
   result retains a batch, its worker and operation generation remain active
   until the Python event loop accepts the result or cancellation settles it.
   A settlement hook cannot cancel later work after result delivery wins.
+  If the original Future remains pending, cancellation of a queued successful
+  result is reported only after recovery finishes; failed recovery reports
+  its original error instead of a generic cancellation error.
   After cleanup and cursor-state publication release ownership, logging does
   not delay settlement. Timeout retirement checks the originating operation
   and fetch generation atomically, so stale waits cannot break newer work.
