@@ -161,6 +161,14 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
             async_fetch::_release_fetch_publication_pause,
             m
         )?)?;
+        m.add_function(wrap_pyfunction!(
+            async_fetch::_arm_fetch_materialized_pause,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(
+            async_fetch::_release_fetch_materialized_pause,
+            m
+        )?)?;
     }
     Ok(())
 }

@@ -1242,6 +1242,52 @@ def test_execute_cancellation_before_publication_keeps_connection_reusable(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("operation", ["fetchone", "fetchmany"])
+def test_fetch_cancellation_after_materialization_discards_converted_rows(
+    client_context, operation,
+):
+    if not hasattr(mssql_py_core, "_arm_fetch_materialized_pause"):
+        pytest.skip("requires a debug build with the post-materialization hook")
+
+    async def run():
+        conn = await connect(client_context)
+        pending = None
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            await cursor.execute(
+                "SELECT CAST(value AS decimal(10, 2)) "
+                "FROM (VALUES (1), (2)) AS source(value); SELECT 99",
+                use_prepare=False,
+            )
+            paused = mssql_py_core._arm_fetch_materialized_pause()
+            pending = cursor.fetchone() if operation == "fetchone" else cursor.fetchmany(1)
+            await asyncio.wait_for(paused, 2)
+            assert not pending.done()
+            probe = conn.cursor()
+            with pytest.raises(mssql_py_core.InterfaceError, match="busy"):
+                await probe.execute("SELECT 3", use_prepare=False)
+
+            await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), 2)
+            with pytest.raises(mssql_py_core.OperationalError, match="Fetch was cancelled"):
+                await asyncio.wait_for(asyncio.shield(pending), 2)
+            await probe.execute("SELECT 3, @@SPID", use_prepare=False)
+            assert await probe.fetchall() == [(3, session_id)]
+            await cursor.execute("SELECT 4", use_prepare=False)
+            assert await cursor.fetchall() == [(4,)]
+        finally:
+            mssql_py_core._release_fetch_materialized_pause()
+            if pending is not None and not pending.done():
+                pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("operation", ["fetchmany", "nextset"])
 @pytest.mark.parametrize("terminate_session", [False, True], ids=["recover", "terminate"])
 def test_materialization_cancellation_reports_recovery_outcome(

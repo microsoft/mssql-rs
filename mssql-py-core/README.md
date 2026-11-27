@@ -69,7 +69,9 @@ For SDK authors integrating the native runtime:
   `fetchone()` and `fetchmany()` loops, excluding connection and execute time.
   Streaming fetches retain exclusive session ownership during Python row
   conversion while rows or later result sets remain. Cancellation can settle
-  that batch without waiting for conversion. Fully exhausted batches release
+  that batch even after conversion succeeds: if cancellation wins before
+  fetch completion is accepted, converted rows are discarded rather than returned.
+  Recovery does not wait for conversion. Fully exhausted batches release
   ownership before conversion, so blocked conversion does not delay reuse.
   Native completion does not end cancellation recovery: while an undelivered
   result retains a batch, its worker and operation generation remain active

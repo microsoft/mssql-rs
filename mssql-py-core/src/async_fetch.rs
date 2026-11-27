@@ -51,6 +51,9 @@ struct PublicationState {
 static FETCH_PUBLICATION_HOOK: PublicationHook = PublicationHook::new();
 
 #[cfg(debug_assertions)]
+static FETCH_MATERIALIZED_HOOK: PublicationHook = PublicationHook::new();
+
+#[cfg(debug_assertions)]
 pub(crate) struct PublicationHook(StdMutex<PublicationState>);
 
 #[cfg(debug_assertions)]
@@ -128,6 +131,19 @@ async fn pause_fetch_publication_if_armed() {
 #[cfg(debug_assertions)]
 pub(crate) fn release_fetch_publication_pause() {
     FETCH_PUBLICATION_HOOK.release();
+    FETCH_MATERIALIZED_HOOK.release();
+}
+
+#[cfg(debug_assertions)]
+#[pyfunction]
+pub(crate) fn _arm_fetch_materialized_pause<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    FETCH_MATERIALIZED_HOOK.arm_python(py)
+}
+
+#[cfg(debug_assertions)]
+#[pyfunction]
+pub(crate) fn _release_fetch_materialized_pause() {
+    FETCH_MATERIALIZED_HOOK.release();
 }
 
 #[cfg(debug_assertions)]
@@ -655,6 +671,10 @@ fn fetch<'py>(
                 } else {
                     None
                 };
+                #[cfg(debug_assertions)]
+                if matches!(materialized, Some(Ok(_))) {
+                    FETCH_MATERIALIZED_HOOK.pause_if_armed().await;
+                }
                 let (materialized, cancelled) = match fetch_guard
                     .complete(batch.exhausted, has_open_batch)
                 {
