@@ -674,6 +674,7 @@ def test_executemany_preflight_cancellation_keeps_session_usable(request, contex
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
+            await asyncio.wait_for(asyncio.shield(task._cancel_and_settle()), timeout=6)
 
             await asyncio.wait_for(wait_for_interruption(), 5)
             assert await cursor.execute("SET NOCOUNT ON", use_prepare=False) is cursor
@@ -712,6 +713,7 @@ def test_cancelled_executemany_preflight_preserves_transaction(client_context, c
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await task
+                await asyncio.wait_for(asyncio.shield(task._cancel_and_settle()), timeout=6)
                 assert await execute(cursor, "SET NOCOUNT ON") is cursor
                 if completion == "commit":
                     await worker.commit()
@@ -1532,7 +1534,7 @@ def test_executemany_logs_description_materialization_failure(client_context):
 
 
 @pytest.mark.integration
-def test_executemany_logs_interruption_during_execution(client_context):
+def test_executemany_logs_cancellation_and_keeps_session_reusable(client_context):
     async def run():
         logger = RecordingLogger()
         conn = await connect(client_context, logger)
@@ -1556,40 +1558,29 @@ def test_executemany_logs_interruption_during_execution(client_context):
             else:
                 pytest.fail("ExecuteMany did not start wire execution")
 
-            probe = conn.cursor()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
+            await asyncio.wait_for(asyncio.shield(task._cancel_and_settle()), timeout=6)
 
-            for _ in range(100):
-                try:
-                    await probe.execute("SELECT 1", use_prepare=False)
-                except mssql_py_core.InterfaceError as error:
-                    if "busy" in str(error).lower():
-                        await asyncio.sleep(0.01)
-                        continue
-                    assert "broken" in str(error).lower()
-                    break
-                else:
-                    pytest.fail("Cancelled executemany left the connection reusable")
-            else:
-                pytest.fail("Cancelled executemany left the connection permanently busy")
+            probe = conn.cursor()
+            await probe.execute("SELECT 1", use_prepare=False)
+            assert await probe.fetchall() == [(1,)]
 
             assert not conn.closed
 
             for _ in range(100):
                 if any(
-                    level == 30
-                    and "PyAsyncCursor::executemany: interrupted" in message
-                    and "phase=execution" in message
-                    and "connection marked broken" in message
+                    level == 40
+                    and "PyAsyncCursor::executemany: failed" in message
+                    and "connection_marked_broken=false" in message
                     and module == "async_execute.rs"
                     for level, message, module in logger.events
                 ):
                     break
                 await asyncio.sleep(0.01)
             else:
-                pytest.fail(f"Missing execution interruption warning: {logger.events}")
+                pytest.fail(f"Missing cancellation failure log: {logger.events}")
         finally:
             await conn.close()
 

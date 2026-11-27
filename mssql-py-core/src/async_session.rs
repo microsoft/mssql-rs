@@ -5,6 +5,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::async_query_recovery::SETTLEMENT_TIMEOUT_SECONDS;
 use mssql_tds::core::CancelHandle;
 use pyo3::prelude::*;
 use tokio::sync::{oneshot, watch};
@@ -83,6 +84,13 @@ pub(crate) struct ActiveOperation {
     pub(crate) cancel_handle: Option<CancelHandle>,
     /// Prevents a detached fetch from publishing results after its Python awaitable was cancelled.
     cancel_requested: bool,
+    delivery_pending: bool,
+}
+
+impl ActiveOperation {
+    fn matches_query(&self, operation_id: OperationId, fetch_id: Option<FetchId>) -> bool {
+        self.operation_id == operation_id && self.fetch_id == fetch_id
+    }
 }
 
 /// Mutex-protected connection lifecycle and operation ownership state.
@@ -165,10 +173,11 @@ impl SessionOperationGuard {
         }
     }
 
-    pub(crate) fn finish_execute(&mut self, has_open_batch: bool) {
-        self.session_state
+    pub(crate) fn finish_execute(&mut self, has_open_batch: bool) -> bool {
+        self.completed = self
+            .session_state
             .finish_execute(self.operation_id, has_open_batch);
-        self.completed = true;
+        self.completed
     }
 
     pub(crate) fn settle(&mut self, has_open_batch: bool) {
@@ -384,7 +393,16 @@ impl AsyncConnectionState {
         };
 
         let operation_id = self.allocate_operation_id();
-        let cancel_handle = CancelHandle::new();
+        let mut cancel_handle = if drain_previous {
+            state
+                .active_operation
+                .as_mut()
+                .and_then(|active| active.cancel_handle.take())
+                .unwrap_or_default()
+        } else {
+            CancelHandle::new()
+        };
+        cancel_handle.set_cancel_timeout_secs(SETTLEMENT_TIMEOUT_SECONDS);
         state.active_operation = Some(ActiveOperation {
             cursor_id: Some(cursor_id),
             operation_id,
@@ -392,6 +410,7 @@ impl AsyncConnectionState {
             phase: OperationPhase::Executing,
             cancel_handle: Some(cancel_handle),
             cancel_requested: false,
+            delivery_pending: false,
         });
 
         let child_handle = state
@@ -433,6 +452,7 @@ impl AsyncConnectionState {
             phase: OperationPhase::Executing,
             cancel_handle: None,
             cancel_requested: false,
+            delivery_pending: false,
         });
         Ok((operation_id, previous))
     }
@@ -507,6 +527,7 @@ impl AsyncConnectionState {
             phase: OperationPhase::Closing,
             cancel_handle: None,
             cancel_requested: false,
+            delivery_pending: false,
         });
         Ok(CursorCloseClaim {
             operation_id,
@@ -514,20 +535,43 @@ impl AsyncConnectionState {
         })
     }
 
-    pub(crate) fn finish_execute(&self, operation_id: OperationId, has_open_batch: bool) {
+    pub(crate) fn finish_execute(&self, operation_id: OperationId, has_open_batch: bool) -> bool {
         let mut state = self.lock();
         let Some(active) = state.active_operation.as_mut() else {
-            return;
+            return true;
         };
         if active.operation_id != operation_id {
-            return;
+            return true;
+        }
+        if active.cancel_requested {
+            return false;
         }
 
-        if has_open_batch {
+        if has_open_batch && !active.delivery_pending {
             active.phase = OperationPhase::Fetching;
-        } else {
+        } else if !has_open_batch {
             state.active_operation = None;
         }
+        true
+    }
+
+    pub(crate) fn cancel_execute(&self, operation_id: OperationId) -> bool {
+        let cancel_handle = {
+            let mut state = self.lock();
+            let Some(active) = state.active_operation.as_mut() else {
+                return false;
+            };
+            if active.operation_id != operation_id || active.phase != OperationPhase::Executing {
+                return false;
+            }
+            let Some(cancel_handle) = active.cancel_handle.take() else {
+                return false;
+            };
+            active.cancel_requested = true;
+            cancel_handle
+        };
+        cancel_handle.cancel();
+        true
     }
 
     /// Publishes a completed fetch only while it still owns an uncancelled read.
@@ -556,13 +600,62 @@ impl AsyncConnectionState {
             return FetchCompletion::CancellationRequested;
         }
 
-        active.fetch_id = None;
         if !result_set_exhausted || has_open_batch {
-            active.phase = OperationPhase::Fetching;
+            if !active.delivery_pending {
+                active.fetch_id = None;
+                active.phase = OperationPhase::Fetching;
+            }
         } else {
             state.active_operation = None;
         }
         FetchCompletion::Published
+    }
+
+    pub(crate) fn defer_query_delivery(
+        &self,
+        operation_id: OperationId,
+        fetch_id: Option<FetchId>,
+    ) {
+        let mut state = self.lock();
+        if let Some(active) = state.active_operation.as_mut()
+            && active.matches_query(operation_id, fetch_id)
+        {
+            active.delivery_pending = true;
+        }
+    }
+
+    pub(crate) fn query_delivery_pending(
+        &self,
+        operation_id: OperationId,
+        fetch_id: Option<FetchId>,
+    ) -> bool {
+        self.lock().active_operation.as_ref().is_some_and(|active| {
+            active.matches_query(operation_id, fetch_id) && active.delivery_pending
+        })
+    }
+
+    pub(crate) fn owns_query(&self, operation_id: OperationId, fetch_id: Option<FetchId>) -> bool {
+        self.lock()
+            .active_operation
+            .as_ref()
+            .is_some_and(|active| active.matches_query(operation_id, fetch_id))
+    }
+
+    pub(crate) fn publish_query_delivery(
+        &self,
+        operation_id: OperationId,
+        fetch_id: Option<FetchId>,
+    ) {
+        let mut state = self.lock();
+        if let Some(active) = state.active_operation.as_mut()
+            && active.matches_query(operation_id, fetch_id)
+            && active.delivery_pending
+            && !active.cancel_requested
+        {
+            active.delivery_pending = false;
+            active.fetch_id = None;
+            active.phase = OperationPhase::Fetching;
+        }
     }
 
     pub(crate) fn restore_fetch(&self, operation_id: OperationId, fetch_id: FetchId) {
@@ -710,7 +803,28 @@ impl AsyncConnectionState {
 
     pub(crate) fn mark_broken(&self) {
         self.mark_for_discard();
+        Self::mark_broken_locked(&mut self.lock());
+    }
+
+    pub(crate) fn mark_broken_if_owned(
+        &self,
+        operation_id: OperationId,
+        fetch_id: Option<FetchId>,
+    ) -> bool {
         let mut state = self.lock();
+        if !state
+            .active_operation
+            .as_ref()
+            .is_some_and(|active| active.matches_query(operation_id, fetch_id))
+        {
+            return false;
+        }
+        self.mark_for_discard();
+        Self::mark_broken_locked(&mut state);
+        true
+    }
+
+    fn mark_broken_locked(state: &mut AsyncSessionState) {
         state.broken = true;
         if state.lifecycle == ConnectionLifecycle::Open {
             state.lifecycle = ConnectionLifecycle::Broken;
@@ -943,6 +1057,57 @@ mod tests {
         assert!(second.drain_previous);
         state.finish_execute(second.operation_id, false);
         assert!(state.lock().active_operation.is_none());
+    }
+
+    #[test]
+    fn undelivered_results_retain_cancellable_execute_and_fetch_generations() {
+        for fetching in [false, true] {
+            for cancelled in [false, true] {
+                let state = AsyncConnectionState::new();
+                let execute = state.claim_execute(1).unwrap();
+                let fetch_id = if fetching {
+                    assert!(state.finish_execute(execute.operation_id, true));
+                    Some(state.claim_fetch(1).unwrap().fetch_id)
+                } else {
+                    None
+                };
+                state.defer_query_delivery(execute.operation_id, fetch_id);
+                if let Some(fetch_id) = fetch_id {
+                    assert_eq!(
+                        state.finish_fetch(execute.operation_id, fetch_id, false, true),
+                        FetchCompletion::Published
+                    );
+                } else {
+                    assert!(state.finish_execute(execute.operation_id, true));
+                }
+                assert_eq!(state.claim_fetch(1).unwrap_err(), ClaimError::Busy);
+                assert_eq!(state.claim_execute(1).unwrap_err(), ClaimError::Busy);
+                assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Busy);
+                assert!(state.query_delivery_pending(execute.operation_id, fetch_id));
+                if cancelled {
+                    assert!(match fetch_id {
+                        Some(fetch_id) => state.cancel_fetch(execute.operation_id, fetch_id),
+                        None => state.cancel_execute(execute.operation_id),
+                    });
+                }
+                state.publish_query_delivery(execute.operation_id, fetch_id);
+                if cancelled {
+                    assert!(state.query_delivery_pending(execute.operation_id, fetch_id));
+                    assert_eq!(state.claim_fetch(1).unwrap_err(), ClaimError::Busy);
+                } else {
+                    assert!(!state.query_delivery_pending(execute.operation_id, fetch_id));
+                    let next = state.claim_fetch(1).unwrap();
+                    assert!(!match fetch_id {
+                        Some(fetch_id) => state.cancel_fetch(execute.operation_id, fetch_id),
+                        None => state.cancel_execute(execute.operation_id),
+                    });
+                    assert_eq!(
+                        state.finish_fetch(next.operation_id, next.fetch_id, true, false),
+                        FetchCompletion::Published
+                    );
+                }
+            }
+        }
     }
 
     #[test]

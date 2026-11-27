@@ -5,6 +5,7 @@
 
 import asyncio
 import datetime
+import threading
 import uuid
 import warnings
 from decimal import Decimal
@@ -21,6 +22,201 @@ async def connect(client_context, *, autocommit=True):
         )
 
 
+async def wait_for_server_wait(observer, session_id, pending):
+    cursor = observer.cursor()
+    async def poll():
+        while True:
+            await cursor.execute(
+                "SELECT wait_type FROM sys.dm_exec_requests WHERE session_id = ?",
+                session_id,
+                use_prepare=False,
+            )
+            rows = await cursor.fetchall()
+            assert not pending.done(), "Query ended before reaching its server-side WAITFOR"
+            if rows and rows[0][0] == "WAITFOR":
+                return
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(poll(), timeout=5)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("method", ["execute", "executemany"])
+@pytest.mark.parametrize("use_prepare", [False, True])
+def test_cancelled_query_settles_before_connection_reuse(client_context, method, use_prepare):
+    async def run():
+        conn = await connect(client_context)
+        observer = await connect(client_context)
+        pending = None
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            if method == "execute":
+                pending = cursor.execute(
+                    "WAITFOR DELAY '00:00:10'; SELECT 2", use_prepare=use_prepare
+                )
+            else:
+                pending = cursor.executemany(
+                    "WAITFOR DELAY '00:00:10'; SELECT ?", [(2,)], use_prepare=use_prepare
+                )
+            await wait_for_server_wait(observer, session_id, pending)
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), timeout=6)
+
+            probe = conn.cursor()
+            await probe.execute("SELECT 1, @@SPID", use_prepare=False)
+            assert await probe.fetchall() == [(1, session_id)]
+        finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+            await conn.close()
+            await observer.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("method", ["execute", "executemany"])
+@pytest.mark.parametrize("use_prepare", [False, True])
+def test_cancelled_settled_query_logging_cannot_break_replacement(
+    client_context, method, use_prepare,
+):
+    async def run():
+        entered = threading.Event()
+        release = threading.Event()
+
+        class Logger:
+            armed = False
+
+            def py_core_log(self, _level, message, _module, _line):
+                completed = (
+                    "query executed successfully" in message
+                    if method == "execute"
+                    else "PyAsyncCursor::executemany: completed" in message
+                )
+                if self.armed and completed:
+                    self.armed = False
+                    entered.set()
+                    release.wait(15)
+
+        logger = Logger()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            conn = await mssql_py_core.PyAsyncConnection.connect(
+                client_context, logger, autocommit=True
+            )
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            logger.armed = True
+            if method == "execute":
+                pending = cursor.execute("SET NOCOUNT ON", use_prepare=use_prepare)
+            else:
+                pending = cursor.executemany(
+                    "SET NOCOUNT ON", [()], use_prepare=use_prepare
+                )
+            for _ in range(500):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("Final query logging did not block")
+
+            replacement = conn.cursor()
+            await replacement.execute("SELECT 99, @@SPID", use_prepare=False)
+            assert pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), 6)
+            assert not release.is_set()
+            assert await replacement.fetchall() == [(99, session_id)]
+            await replacement.execute("SELECT 100", use_prepare=False)
+            await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), 1)
+            assert await replacement.fetchall() == [(100,)]
+        finally:
+            release.set()
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_cancel_and_settle_can_be_rejoined_after_waiter_cancellation(client_context):
+    async def run():
+        conn = await connect(client_context)
+        observer = await connect(client_context)
+        pending = None
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            pending = cursor.execute("WAITFOR DELAY '00:00:10'; SELECT 2", use_prepare=False)
+            await wait_for_server_wait(observer, session_id, pending)
+            settlement = pending._cancel_and_settle()
+            settlement.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await settlement
+            await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), timeout=6)
+            with pytest.raises(mssql_py_core.OperationalError, match="cancel"):
+                await pending
+
+            probe = conn.cursor()
+            await probe.execute("SELECT 1, @@SPID", use_prepare=False)
+            assert await probe.fetchall() == [(1, session_id)]
+        finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+            await conn.close()
+            await observer.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_cancelled_execute_recovers_while_draining_its_previous_batch(client_context):
+    async def run():
+        conn = await connect(client_context)
+        observer = await connect(client_context)
+        pending = None
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            await cursor.execute(
+                "SELECT 1; RAISERROR ('drain probe ready', 0, 1) WITH NOWAIT; "
+                "WAITFOR DELAY '00:00:10'; SELECT 2",
+                use_prepare=False,
+            )
+            assert await cursor.fetchall() == [(1,)]
+            pending = cursor.execute("SELECT 3", use_prepare=False)
+            await wait_for_server_wait(observer, session_id, pending)
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), timeout=6)
+
+            probe = conn.cursor()
+            await probe.execute("SELECT 1, @@SPID", use_prepare=False)
+            assert await probe.fetchall() == [(1, session_id)]
+        finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+            await conn.close()
+            await observer.close()
+
+    asyncio.run(run())
+
+
 def test_execute_returns_same_cursor(mock_client_context):
     async def run():
         conn = await connect(mock_client_context)
@@ -28,6 +224,27 @@ def test_execute_returns_same_cursor(mock_client_context):
             cursor = conn.cursor()
             result = await cursor.execute("SET NOCOUNT ON", use_prepare=False)
             assert result is cursor
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_cancelled_first_transactional_query_does_not_break_session(client_context):
+    async def run():
+        conn = await connect(client_context, autocommit=False)
+        try:
+            cursor = conn.cursor()
+            pending = cursor.execute(
+                "WAITFOR DELAY '00:00:10'; SELECT 1", use_prepare=False
+            )
+            await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), timeout=6)
+            with pytest.raises(mssql_py_core.OperationalError, match="cancel"):
+                await pending
+
+            await cursor.execute("SELECT 1", use_prepare=False)
+            assert await cursor.fetchall() == [(1,)]
         finally:
             await conn.close()
 

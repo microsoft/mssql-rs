@@ -30,6 +30,7 @@ use crate::async_handle::LogicalConnection;
 use crate::async_parameters::{
     ParameterBindingPlan, ParameterMetadata, bind_parameters, parse_input_sizes,
 };
+use crate::async_query_recovery::{QueryControl, query_future_into_py};
 use crate::async_session::{
     AsyncConnectionState, CursorId, ExecuteClaim, OperationId, PreflightTask, SessionOperationGuard,
 };
@@ -40,6 +41,28 @@ use crate::types::ParameterHint;
 const EXECUTEMANY_PREFLIGHT_CHUNK_SIZE: usize = 256;
 const EXECUTEMANY_EXECUTION_YIELD_INTERVAL: usize = 256;
 const EXECUTEMANY_BUFFER_YIELD_INTERVAL: usize = 256;
+
+#[cfg(debug_assertions)]
+// Process-global test seam: no unrelated execute may publish while it is armed.
+static EXECUTE_PUBLICATION_HOOK: crate::async_fetch::PublicationHook =
+    crate::async_fetch::PublicationHook::new();
+
+#[cfg(debug_assertions)]
+#[pyfunction]
+pub(crate) fn _arm_execute_publication_pause<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    EXECUTE_PUBLICATION_HOOK.arm_python(py)
+}
+
+#[cfg(debug_assertions)]
+#[pyfunction]
+pub(crate) fn _release_execute_publication_pause() {
+    release_execute_publication_pause();
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn release_execute_publication_pause() {
+    EXECUTE_PUBLICATION_HOOK.release();
+}
 
 async fn yield_at_interval(completed: usize, interval: usize, phase: &'static str) {
     if completed.is_multiple_of(interval) {
@@ -254,6 +277,13 @@ impl ExecuteFailure {
             break_connection: true,
         }
     }
+
+    fn breaks_session(&self, has_open_batch: bool, connection_dead: bool) -> bool {
+        // Provider cancellation leaves idle recovery retryable on the next request.
+        has_open_batch
+            || (!matches!(self.error, Error::TokenAcquisitionCancelled)
+                && (self.break_connection || connection_dead))
+    }
 }
 
 impl From<Error> for ExecuteFailure {
@@ -262,6 +292,17 @@ impl From<Error> for ExecuteFailure {
             error,
             break_connection: false,
         }
+    }
+}
+
+fn control_command_failure(client: &TdsClient, error: Error) -> ExecuteFailure {
+    if matches!(error, Error::OperationCancelledError(_))
+        && !client.has_open_batch()
+        && !client.is_connection_dead()
+    {
+        error.into()
+    } else {
+        ExecuteFailure::broken(error)
     }
 }
 
@@ -298,7 +339,7 @@ async fn execute_on_client(
                 options.clone(),
             )
             .await
-            .map_err(ExecuteFailure::broken)?;
+            .map_err(|error| control_command_failure(client, error))?;
     }
 
     let first = if use_prepare {
@@ -480,7 +521,7 @@ async fn execute_many_on_client(
         client
             .close_query()
             .await
-            .map_err(ExecuteFailure::broken)
+            .map_err(|error| control_command_failure(client, error))
             .map_err(|failure| ExecuteManyFailure {
                 failure,
                 row_index: 0,
@@ -679,6 +720,34 @@ fn map_execute_error(error: Error, info_messages: Vec<SqlInfoMessage>) -> PyErr 
     )
 }
 
+async fn settle_cancelled_execute(
+    connection: &LogicalConnection,
+    operation_id: OperationId,
+    guard: &mut SessionOperationGuard,
+    control: &QueryControl,
+) -> PyResult<()> {
+    let mut client = connection
+        .lock_operation(operation_id)
+        .await
+        .map_err(|error| {
+            guard.settle(false);
+            control.complete_if_released();
+            map_claim_error(error)
+        })?;
+    let result = control.settle_open_batch(&mut client).await;
+    drop(client);
+    guard.settle(result.is_err());
+    control.complete_if_released();
+    result
+}
+
+fn cancelled_execute_error() -> PyErr {
+    map_execute_error(
+        Error::OperationCancelledError("Async query was cancelled".to_string()),
+        Vec::new(),
+    )
+}
+
 pub(crate) fn set_input_sizes(
     cursor: &mut PyAsyncCursor,
     sizes: &Bound<'_, PyAny>,
@@ -745,6 +814,17 @@ pub(crate) fn execute<'py>(
     let previous_rowcount = rowcount.swap(-1, Ordering::AcqRel);
     let previous_buffered_results = buffered_results.replace(VecDeque::new());
     let future_rowcount = rowcount.clone();
+    let query_control = QueryControl::for_delivery(
+        session_state.clone(),
+        "execute",
+        client.clone(),
+        fetch_state.clone(),
+        description_state.clone(),
+        buffered_results.clone(),
+        cursor.clone_ref(py).into_any(),
+    );
+    query_control.register_execute(operation_id);
+    let worker_control = query_control.clone();
 
     let future = async move {
         let mut operation_guard = SessionOperationGuard::new(future_state, operation_id);
@@ -756,7 +836,7 @@ pub(crate) fn execute<'py>(
             request.reset_cursor
         );
 
-        let (result, info_messages, has_open_batch) = {
+        let (result, info_messages, has_open_batch, connection_dead) = {
             let mut client = client.lock_operation(operation_id).await.map_err(|error| {
                 operation_guard.settle(false);
                 map_claim_error(error)
@@ -774,17 +854,21 @@ pub(crate) fn execute<'py>(
                 Vec::new()
             };
             let has_open_batch = client.has_open_batch();
-            (result, info_messages, has_open_batch)
+            (
+                result,
+                info_messages,
+                has_open_batch,
+                client.is_connection_dead(),
+            )
         };
 
         match result {
             Ok(outcome) => {
-                future_rowcount.store(outcome.rowcount(), Ordering::Release);
+                let next_rowcount = outcome.rowcount();
                 let has_open_batch = outcome.has_open_batch();
                 let has_result_set = outcome.has_rows();
                 let fetch_status = outcome.fetch_status();
                 record_result_set_status(outcome.result_set_status());
-                operation_guard.finish_execute(has_open_batch);
                 let metadata = match outcome {
                     ExecuteOutcome::Rows(metadata) => Some(metadata),
                     ExecuteOutcome::NoRows(_) | ExecuteOutcome::TerminalNoRows(_) => None,
@@ -792,18 +876,53 @@ pub(crate) fn execute<'py>(
                 let column_count = metadata.as_ref().map_or(0, Vec::len);
                 consume_input_sizes(&cursor, input_sizes_generation);
                 let description_started = Instant::now();
-                let description = materialize(metadata).await.map_err(|error| {
-                    tracing::error!(
-                        "PyAsyncCursor::execute: cursor description materialization failed; column_count={column_count}; elapsed_ms={}; error={error}",
-                        description_started.elapsed().as_millis()
-                    );
-                    InternalError::new_err(format!(
-                        "Query executed but cursor description materialization failed: {error}"
-                    ))
-                })?;
+                let description = tokio::select! {
+                    result = materialize(metadata) => result,
+                    () = worker_control.cancelled() => {
+                        settle_cancelled_execute(&client, operation_id, &mut operation_guard, &worker_control).await?;
+                        return Err(cancelled_execute_error());
+                    }
+                };
+                #[cfg(debug_assertions)]
+                EXECUTE_PUBLICATION_HOOK.pause_if_armed().await;
+                let description = match description {
+                    Ok(description) => description,
+                    Err(error) => {
+                        if !operation_guard.finish_execute(has_open_batch) {
+                            settle_cancelled_execute(
+                                &client,
+                                operation_id,
+                                &mut operation_guard,
+                                &worker_control,
+                            )
+                            .await?;
+                            return Err(cancelled_execute_error());
+                        }
+                        worker_control.complete_if_released();
+                        tracing::error!(
+                            "PyAsyncCursor::execute: cursor description materialization failed; column_count={column_count}; elapsed_ms={}; error={error}",
+                            description_started.elapsed().as_millis()
+                        );
+                        return Err(InternalError::new_err(format!(
+                            "Query executed but cursor description materialization failed: {error}"
+                        )));
+                    }
+                };
+                if !operation_guard.finish_execute(has_open_batch) {
+                    settle_cancelled_execute(
+                        &client,
+                        operation_id,
+                        &mut operation_guard,
+                        &worker_control,
+                    )
+                    .await?;
+                    return Err(cancelled_execute_error());
+                }
                 let description_materialization_ms = description_started.elapsed().as_millis();
+                future_rowcount.store(next_rowcount, Ordering::Release);
                 future_description_state.replace(description);
                 future_fetch_state.set(fetch_status);
+                worker_control.complete_if_released();
                 tracing::info!(
                     "PyAsyncCursor::execute: query executed successfully; has_result_set={has_result_set}; column_count={column_count}; description_materialization_ms={description_materialization_ms}; has_open_batch={has_open_batch}"
                 );
@@ -811,7 +930,8 @@ pub(crate) fn execute<'py>(
             }
             Err(error) => {
                 record_result_set_status("error");
-                operation_guard.settle(error.break_connection || has_open_batch);
+                operation_guard.settle(error.breaks_session(has_open_batch, connection_dead));
+                worker_control.complete_if_released();
                 Err(map_execute_error(error.error, info_messages))
             }
         }
@@ -824,8 +944,7 @@ pub(crate) fn execute<'py>(
         }
     };
 
-    match pyo3_async_runtimes::tokio::future_into_py(py, session_state.clone().run_tracked(future))
-    {
+    match query_future_into_py(py, future, query_control) {
         Ok(awaitable) => Ok(awaitable),
         Err(error) => {
             session_state.release_operation(operation_id);
@@ -866,6 +985,16 @@ pub(crate) fn executemany<'py>(
     let seq_of_parameters = seq_of_parameters.clone().unbind();
     let trace_dispatch = dispatch.clone();
     let task_state = session_state.clone();
+    let query_control = QueryControl::for_delivery(
+        session_state.clone(),
+        "executemany",
+        client.clone(),
+        fetch_state.clone(),
+        description_state.clone(),
+        buffered_results.clone(),
+        cursor.clone_ref(py).into_any(),
+    );
+    let worker_control = Arc::clone(&query_control);
 
     let future = move |preflight_task: Arc<PreflightTask>| async move {
         let started = Instant::now();
@@ -875,7 +1004,12 @@ pub(crate) fn executemany<'py>(
             cursor_id,
             "PyAsyncCursor::executemany: parameter preflight started; cursor_id={cursor_id}"
         );
-        let preflight = bind_parameter_sets(operation, seq_of_parameters, input_sizes).await;
+        let preflight = tokio::select! {
+            result = bind_parameter_sets(operation, seq_of_parameters, input_sizes) => result,
+            () = worker_control.cancelled() => {
+                return Err(cancelled_execute_error());
+            }
+        };
         let preflight_ms = preflight_started.elapsed().as_millis();
         let (operation, parameter_sets) = match preflight {
             Ok(bound) => {
@@ -916,6 +1050,7 @@ pub(crate) fn executemany<'py>(
             .claim_execute(cursor_id)
             .map_err(map_claim_error)?;
         let operation_id = claim.operation_id;
+        worker_control.register_execute(operation_id);
         let execution = async move {
             fetch_state.set(FetchStatus::NoResultSet);
             description_state.replace(None);
@@ -935,10 +1070,11 @@ pub(crate) fn executemany<'py>(
             );
 
             let execution_started = Instant::now();
-            let (result, info_messages, has_open_batch) = {
+            let (result, info_messages, has_open_batch, connection_dead) = {
                 let mut client = client.lock_operation(operation_id).await.map_err(|error| {
                     operation_guard.settle(false);
                     interruption_guard.complete();
+                    worker_control.complete_if_released();
                     map_claim_error(error)
                 })?;
                 let result =
@@ -949,7 +1085,12 @@ pub(crate) fn executemany<'py>(
                     Vec::new()
                 };
                 let has_open_batch = client.has_open_batch();
-                (result, info_messages, has_open_batch)
+                (
+                    result,
+                    info_messages,
+                    has_open_batch,
+                    client.is_connection_dead(),
+                )
             };
             let execution_ms = execution_started.elapsed().as_millis();
 
@@ -969,12 +1110,25 @@ pub(crate) fn executemany<'py>(
                     let metadata = results.front().map(|result| result.metadata.clone());
                     interruption_guard.set_phase("description_materialization");
                     let description_started = Instant::now();
-                    let description = match materialize(metadata).await {
+                    let materialized = tokio::select! {
+                        result = materialize(metadata) => result,
+                        () = worker_control.cancelled() => {
+                            settle_cancelled_execute(&client, operation_id, &mut operation_guard, &worker_control).await?;
+                            interruption_guard.complete();
+                            return Err(cancelled_execute_error());
+                        }
+                    };
+                    #[cfg(debug_assertions)]
+                    EXECUTE_PUBLICATION_HOOK.pause_if_armed().await;
+                    let description = match materialized {
                         Ok(description) => description,
                         Err(error) => {
                             let description_materialization_ms =
                                 description_started.elapsed().as_millis();
                             record_result_set_status("error");
+                            operation_guard.settle(false);
+                            interruption_guard.complete();
+                            worker_control.complete_if_released();
                             tracing::error!(
                                 batch_count,
                                 result_set_count,
@@ -985,14 +1139,23 @@ pub(crate) fn executemany<'py>(
                                 error = %error,
                                 "PyAsyncCursor::executemany: cursor description materialization failed; batch_count={batch_count}; result_set_count={result_set_count}; buffered_row_count={buffered_row_count}; preflight_ms={preflight_ms}; execution_ms={execution_ms}; description_materialization_ms={description_materialization_ms}; error={error}"
                             );
-                            operation_guard.settle(false);
-                            interruption_guard.complete();
                             return Err(InternalError::new_err(format!(
                                 "ExecuteMany completed but cursor description materialization failed: {error}"
                             )));
                         }
                     };
                     let description_materialization_ms = description_started.elapsed().as_millis();
+                    if !operation_guard.finish_execute(produced_rows) {
+                        settle_cancelled_execute(
+                            &client,
+                            operation_id,
+                            &mut operation_guard,
+                            &worker_control,
+                        )
+                        .await?;
+                        interruption_guard.complete();
+                        return Err(cancelled_execute_error());
+                    }
                     buffered_results.replace(results);
                     description_state.replace(description);
                     fetch_state.set(if produced_rows {
@@ -1003,12 +1166,12 @@ pub(crate) fn executemany<'py>(
                         FetchStatus::NoResultSet
                     });
                     rowcount.store(total_rows_affected, Ordering::Release);
-                    operation_guard.finish_execute(produced_rows);
                     interruption_guard.complete();
                     // Empty input dispatches no operation, so preserve hints for the next execution.
                     if batch_count > 0 {
                         consume_input_sizes(&cursor, input_sizes_generation);
                     }
+                    worker_control.complete_if_released();
                     record_result_set_status(if produced_rows {
                         "rows_drained"
                     } else {
@@ -1031,9 +1194,16 @@ pub(crate) fn executemany<'py>(
                 }
                 Err(error) => {
                     record_result_set_status("error");
-                    let connection_marked_broken = error.failure.break_connection || has_open_batch;
+                    let connection_marked_broken = error
+                        .failure
+                        .breaks_session(has_open_batch, connection_dead);
                     operation_guard.settle(connection_marked_broken);
                     interruption_guard.complete();
+                    fetch_state.set(FetchStatus::NoResultSet);
+                    description_state.replace(None);
+                    rowcount.store(-1, Ordering::Release);
+                    buffered_results.replace(VecDeque::new());
+                    worker_control.complete_if_released();
                     let elapsed_ms = started.elapsed().as_millis();
                     tracing::error!(
                         failed_row_index = error.row_index,
@@ -1054,10 +1224,6 @@ pub(crate) fn executemany<'py>(
                         error.failure.error,
                         info_messages,
                     );
-                    fetch_state.set(FetchStatus::NoResultSet);
-                    description_state.replace(None);
-                    rowcount.store(-1, Ordering::Release);
-                    buffered_results.replace(VecDeque::new());
                     Err(error)
                 }
             }
@@ -1072,7 +1238,7 @@ pub(crate) fn executemany<'py>(
         }
     };
 
-    pyo3_async_runtimes::tokio::future_into_py(py, task_state.run_tracked_preflight(future))
+    query_future_into_py(py, task_state.run_tracked_preflight(future), query_control)
 }
 
 #[cfg(test)]
@@ -1082,15 +1248,61 @@ mod tests {
 
     use mssql_tds::connection::tds_client::PreparedStatement;
     use mssql_tds::error::Error;
+    use mssql_tds::test_client_support::tds_client_from_tokens_capturing;
 
     use super::{
         EXECUTEMANY_BUFFER_YIELD_INTERVAL, EXECUTEMANY_EXECUTION_YIELD_INTERVAL, ExecuteFailure,
         ParameterMetadata, PreparedState, accumulate_rowcount, get_or_create_binding_plan,
-        rowcount_from_rows_affected, should_replace_prepared_statement, yield_at_interval,
+        rowcount_from_rows_affected, settle_cancelled_execute, should_replace_prepared_statement,
+        yield_at_interval,
     };
+    use crate::async_handle::LogicalConnection;
+    use crate::async_query_recovery::QueryControl;
     use crate::async_session::{
         AsyncConnectionState, ClaimError, ConnectionLifecycle, SessionOperationGuard,
     };
+
+    #[test]
+    fn provider_cancellation_preserves_idle_recovery_but_not_an_open_batch() {
+        let failure = ExecuteFailure::broken(Error::TokenAcquisitionCancelled);
+        assert!(!failure.breaks_session(false, true));
+        assert!(failure.breaks_session(true, true));
+        let failure = ExecuteFailure::from(Error::OperationCancelledError("cancelled".into()));
+        assert!(failure.breaks_session(false, true));
+    }
+
+    #[tokio::test]
+    async fn cancelled_execute_settlement_rejects_stale_claim_without_breaking_replacement() {
+        let (client, _) = tds_client_from_tokens_capturing(Vec::new());
+        let connection = LogicalConnection::new(client);
+        let state = Arc::clone(&connection.state);
+        let original = state.claim_execute(1).unwrap();
+        let mut guard = SessionOperationGuard::new(Arc::clone(&state), original.operation_id);
+        let control = QueryControl::new(Arc::clone(&state), "execute");
+        control.register_execute(original.operation_id);
+        state.release_operation(original.operation_id);
+        let replacement = state.claim_execute(2).unwrap();
+
+        let error =
+            settle_cancelled_execute(&connection, original.operation_id, &mut guard, &control)
+                .await
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Connection is busy with another cursor operation")
+        );
+        drop(guard);
+        control.cancel();
+        assert!(!state.is_broken());
+        assert!(
+            connection
+                .lock_operation(replacement.operation_id)
+                .await
+                .is_ok()
+        );
+        assert!(state.finish_execute(replacement.operation_id, false));
+    }
 
     fn prepared_state(sql: &str, signature: Vec<ParameterMetadata>) -> PreparedState {
         PreparedState {

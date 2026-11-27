@@ -44,6 +44,51 @@ For SDK authors integrating the native runtime:
   logical owner discards any remaining direct client. After parent revocation,
   cursor close releases local results even if an earlier close attempt was
   interrupted by connection shutdown.
+- Native async execute, executemany, and streaming fetch/nextset awaitables
+  expose an internal `_cancel_and_settle()` hook for SDK integration. Buffered
+  and exhausted fetch/nextset paths and `fetchmany(size <= 0)` do not expose
+  the hook; SDKs must check for it before invoking it. The hook signals
+  only the originating operation and returns an awaitable that completes after
+  protocol recovery. Shield that awaitable from caller cancellation before
+  reusing the connection. Recovery is bounded to five seconds from the first
+  cancellation; repeated waits do not restart that budget. Failed or timed-out
+  recovery leaves the connection broken. Worker interruption, delivery-task
+  join failures, and cancellation timeouts raise `OperationalError`.
+  Cancelling the original Python future alone still returns immediately while
+  recovery runs in the background. The hook adds per-operation lifetime
+  bookkeeping, not per-row copies, and does not change synchronous or
+  connection/authentication APIs.
+  Streaming `fetchone()` repeats this bookkeeping for each row. Relative to
+  the `pyo3-async-runtimes` delivery bridge, successful delivery adds one
+  blocking task/GIL acquisition to release backup Python references after
+  delivery. This preserves their lifetime through worker failure and recovery,
+  but cleanup can contend with subsequent fetches. `fetchmany()` and
+  `fetchall()` amortize the per-call cost. A
+  [fetch-loop benchmark](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/benchmarks/fetchone_delivery.py)
+  uses the existing test connection settings to measure warmed native
+  `fetchone()` and `fetchmany()` loops, excluding connection and execute time.
+  Streaming fetches retain exclusive session ownership during Python row
+  conversion while rows or later result sets remain. Cancellation can settle
+  that batch even after conversion succeeds: if cancellation wins before
+  fetch completion is accepted, converted rows are discarded rather than returned.
+  Recovery does not wait for conversion. Fully exhausted batches release
+  ownership before conversion, so blocked conversion does not delay reuse.
+  Native completion does not end cancellation recovery: while an undelivered
+  result retains a batch, its worker and operation generation remain active
+  until the Python event loop accepts the result or cancellation settles it.
+  A settlement hook cannot cancel later work after result delivery wins.
+  If the original Future remains pending, cancellation of a queued successful
+  result is reported only after recovery finishes; failed recovery reports
+  its original error instead of a generic cancellation error.
+  After cleanup and cursor-state publication release ownership, logging does
+  not delay settlement. Timeout retirement checks the originating operation
+  and fetch generation atomically, so stale waits cannot break newer work.
+  Settled workers may outlive their event loop without retiring a connection
+  reused on another loop. Late results are not scheduled for already-cancelled
+  Futures.
+  Credential-provider cancellation during idle session recovery propagates
+  `CancelledError` without permanently breaking the logical connection when no
+  batch is open; a later query can retry recovery.
 - Concurrent async connection closes await one teardown outcome. Cancelling a
   close waiter does not stop cleanup. Direct close uses one five-second budget
   to settle operations, drain results, finalize transactions and close the
@@ -56,10 +101,11 @@ For SDK authors integrating the native runtime:
   Cleanup rechecks its original deadline after waiting for transaction
   authorization; an expired budget cannot start transaction finalization.
 - Cancelling `executemany` during parameter binding leaves the connection and
-  existing transaction usable. After execution claims the session, cancellation
-  before result delivery breaks the connection, even if native execution has
-  finished. Close rechecks this after draining and publishes its outcome
-  atomically with cancellation. Cancellation before commit authorization prevents
+  existing transaction usable. After execution claims the session, await its
+  cancellation settlement hook before reusing the connection. Query workers
+  remain registered with the connection so concurrent close can join them within
+  its cleanup budget. Close rechecks interruption after draining and publishes
+  its outcome atomically with cancellation. Cancellation before commit authorization prevents
   the request; cancellation afterward reports failure with a potentially unknown
   transaction outcome, without retrying commit.
 - A broken connection still needs `await connection.close()`. The `closed`

@@ -829,12 +829,14 @@ def test_nextset_asyncio_timeout_resynchronizes_connection(client_context):
                 use_prepare=False,
             )
 
+            nextset = cursor.nextset()
             with pytest.raises(asyncio.TimeoutError):
                 # wait_for requests cancellation of nextset when 10 ms elapse.
-                await asyncio.wait_for(cursor.nextset(), timeout=0.01)
+                await asyncio.wait_for(nextset, timeout=0.01)
+            await asyncio.wait_for(asyncio.shield(nextset._cancel_and_settle()), timeout=6)
 
             probe = conn.cursor()
-            await execute_after_cancellation_settles(probe, "SELECT 3")
+            await probe.execute("SELECT 3", use_prepare=False)
             assert await probe.fetchone() == (3,)
         finally:
             await conn.close()
@@ -1170,17 +1172,359 @@ def test_nextset_logs_result_transitions(client_context):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize(
+    "method, description_error",
+    [
+        pytest.param("execute", False, id="execute"),
+        pytest.param("execute", True, id="execute-description-error"),
+        pytest.param("executemany", False, id="executemany"),
+    ],
+)
+@pytest.mark.parametrize("use_prepare", [False, True], ids=["direct", "prepared"])
+def test_execute_cancellation_before_publication_keeps_connection_reusable(
+    client_context, method, description_error, use_prepare,
+):
+    if not hasattr(mssql_py_core, "_arm_execute_publication_pause"):
+        pytest.skip("requires a debug build with execute publication test hooks")
+
+    async def run():
+        conn = await connect(client_context)
+        pending = None
+        decimal_module = sys.modules["decimal"]
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            if description_error:
+                sys.modules["decimal"] = None
+            paused = mssql_py_core._arm_execute_publication_pause()
+            if method == "execute":
+                sql_type = "decimal(10, 2)" if description_error else "int"
+                pending = cursor.execute(
+                    f"SELECT CAST(? AS {sql_type}); SELECT 99",
+                    1,
+                    use_prepare=use_prepare,
+                )
+            else:
+                pending = cursor.executemany(
+                    "SELECT CAST(? AS int)", [(1,), (2,)], use_prepare=use_prepare
+                )
+            await asyncio.wait_for(paused, timeout=5)
+            assert not pending.done()
+            assert cursor.description is None
+            probe = conn.cursor()
+            with pytest.raises(
+                mssql_py_core.InterfaceError, match="busy with another cursor operation"
+            ):
+                await probe.execute("SELECT 2", use_prepare=False)
+
+            # Keep delivery alive so cancellation must also win the native result.
+            await asyncio.wait_for(
+                asyncio.shield(pending._cancel_and_settle()), timeout=6
+            )
+            with pytest.raises(mssql_py_core.OperationalError, match="cancel"):
+                await pending
+            assert cursor.description is None
+            await probe.execute("SELECT 2, @@SPID", use_prepare=False)
+            assert await probe.fetchall() == [(2, session_id)]
+            await cursor.execute("SELECT 3", use_prepare=use_prepare)
+            assert await cursor.fetchall() == [(3,)]
+        finally:
+            sys.modules["decimal"] = decimal_module
+            mssql_py_core._release_execute_publication_pause()
+            if pending is not None and not pending.done():
+                pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("operation", ["fetchone", "fetchmany"])
+def test_fetch_cancellation_after_materialization_discards_converted_rows(
+    client_context, operation,
+):
+    if not hasattr(mssql_py_core, "_arm_fetch_materialized_pause"):
+        pytest.skip("requires a debug build with the post-materialization hook")
+
+    async def run():
+        conn = await connect(client_context)
+        pending = None
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            await cursor.execute(
+                "SELECT CAST(value AS decimal(10, 2)) "
+                "FROM (VALUES (1), (2)) AS source(value); SELECT 99",
+                use_prepare=False,
+            )
+            paused = mssql_py_core._arm_fetch_materialized_pause()
+            pending = cursor.fetchone() if operation == "fetchone" else cursor.fetchmany(1)
+            await asyncio.wait_for(paused, 2)
+            assert not pending.done()
+            probe = conn.cursor()
+            with pytest.raises(mssql_py_core.InterfaceError, match="busy"):
+                await probe.execute("SELECT 3", use_prepare=False)
+
+            await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), 2)
+            with pytest.raises(mssql_py_core.OperationalError, match="Fetch was cancelled"):
+                await asyncio.wait_for(asyncio.shield(pending), 2)
+            await probe.execute("SELECT 3, @@SPID", use_prepare=False)
+            assert await probe.fetchall() == [(3, session_id)]
+            await cursor.execute("SELECT 4", use_prepare=False)
+            assert await cursor.fetchall() == [(4,)]
+        finally:
+            mssql_py_core._release_fetch_materialized_pause()
+            if pending is not None and not pending.done():
+                pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("operation", ["fetchmany", "nextset"])
+@pytest.mark.parametrize("terminate_session", [False, True], ids=["recover", "terminate"])
+def test_materialization_cancellation_reports_recovery_outcome(
+    client_context, operation, terminate_session,
+):
+    async def run():
+        conn = await connect(client_context)
+        actor = await connect(client_context)
+        entered = threading.Event()
+        release = threading.Event()
+        finder = BlockingDecimalFinder(entered, release)
+        decimal_module = None
+        pending = None
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            if operation == "fetchmany":
+                await cursor.execute(
+                    "SELECT CAST(value AS decimal(10, 2)) "
+                    "FROM (VALUES (1), (2)) AS source(value); SELECT 99",
+                    use_prepare=False,
+                )
+            else:
+                await cursor.execute(
+                    "SELECT 1; SELECT CAST(2 AS decimal(10, 2)); SELECT 99",
+                    use_prepare=False,
+                )
+                assert await cursor.fetchall() == [(1,)]
+            decimal_module = sys.modules.pop("decimal")
+            sys.meta_path.insert(0, finder)
+            pending = cursor.fetchmany(1) if operation == "fetchmany" else cursor.nextset()
+            for _ in range(200):
+                if entered.is_set():
+                    break
+                assert not pending.done(), "Fetch ended before materialization blocked"
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("Materialization did not start")
+
+            if terminate_session:
+                await actor.cursor().execute(f"KILL {session_id}", use_prepare=False)
+                with pytest.raises(mssql_py_core.InterfaceError, match="Connection is broken"):
+                    await asyncio.wait_for(
+                        asyncio.shield(pending._cancel_and_settle()), timeout=6
+                    )
+                with pytest.raises((mssql_py_core.DatabaseError, RuntimeError)) as failure:
+                    await pending
+                assert "was cancelled" not in str(failure.value)
+                with pytest.raises(mssql_py_core.InterfaceError, match="Connection is broken"):
+                    await conn.cursor().execute("SELECT 3", use_prepare=False)
+                if operation == "nextset":
+                    assert cursor.description is None
+            else:
+                await asyncio.wait_for(
+                    asyncio.shield(pending._cancel_and_settle()), timeout=6
+                )
+                message = (
+                    "Fetch was cancelled"
+                    if operation == "fetchmany"
+                    else "Result-set advance was cancelled"
+                )
+                with pytest.raises(mssql_py_core.OperationalError, match=message):
+                    await pending
+                probe = conn.cursor()
+                await probe.execute("SELECT 3, @@SPID", use_prepare=False)
+                assert await probe.fetchall() == [(3, session_id)]
+            assert not release.is_set()
+        finally:
+            release.set()
+            if finder in sys.meta_path:
+                sys.meta_path.remove(finder)
+            await asyncio.to_thread(__import__, "decimal")
+            if decimal_module is not None:
+                sys.modules["decimal"] = decimal_module
+            if pending is not None and not pending.done():
+                pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+            await conn.close()
+            await actor.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_nextset_cancellation_settles_before_blocked_error_logging(client_context):
+    async def run():
+        conversion_entered = threading.Event()
+        release_conversion = threading.Event()
+        logging_entered = threading.Event()
+        release_logging = threading.Event()
+        logging_returned = threading.Event()
+        finder = BlockingDecimalFinder(conversion_entered, release_conversion)
+
+        class Logger(RecordingLogger):
+            def py_core_log(self, level, message, module_name, line):
+                super().py_core_log(level, message, module_name, line)
+                if (
+                    "PyAsyncCursor::nextset: failed" in message
+                    and "Result-set advance was cancelled" in message
+                ):
+                    logging_entered.set()
+                    release_logging.wait(15)
+                    logging_returned.set()
+
+        conn = await connect(client_context, Logger())
+        decimal_module = None
+        pending = settlement = None
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            await cursor.execute(
+                "SELECT 1; SELECT CAST(2 AS decimal(10, 2)); SELECT 99",
+                use_prepare=False,
+            )
+            assert await cursor.fetchall() == [(1,)]
+            # Start the executor before the finder can hold Python's import lock.
+            await asyncio.to_thread(lambda: None)
+            decimal_module = sys.modules.pop("decimal")
+            sys.meta_path.insert(0, finder)
+            pending = cursor.nextset()
+            assert await asyncio.to_thread(conversion_entered.wait, 2)
+
+            assert pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            assert await asyncio.to_thread(logging_entered.wait, 2)
+            settlement = asyncio.ensure_future(pending._cancel_and_settle())
+            await asyncio.wait_for(asyncio.shield(settlement), 2)
+
+            assert cursor.description is None
+            assert pending.cancelled()
+            assert not logging_returned.is_set()
+            assert not release_conversion.is_set()
+            probe = conn.cursor()
+            await probe.execute("SELECT 3, @@SPID", use_prepare=False)
+            assert await probe.fetchall() == [(3, session_id)]
+            assert not logging_returned.is_set()
+            await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), 2)
+
+            release_logging.set()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        finally:
+            release_logging.set()
+            release_conversion.set()
+            if finder in sys.meta_path:
+                sys.meta_path.remove(finder)
+            await asyncio.to_thread(__import__, "decimal")
+            if decimal_module is not None:
+                sys.modules["decimal"] = decimal_module
+            if pending is not None and not pending.done():
+                pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+            if settlement is not None and not settlement.done():
+                await asyncio.wait_for(asyncio.shield(settlement), 6)
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("method", ["execute", "executemany"])
+@pytest.mark.parametrize("use_prepare", [False, True], ids=["direct", "prepared"])
+def test_execute_cancellation_during_description_materialization_keeps_connection_reusable(
+    client_context, method, use_prepare,
+):
+    async def run():
+        conn = await connect(client_context)
+        entered = threading.Event()
+        release = threading.Event()
+        finder = BlockingDecimalFinder(entered, release)
+        decimal_module = None
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            decimal_module = sys.modules.pop("decimal")
+            sys.meta_path.insert(0, finder)
+
+            if method == "execute":
+                pending = cursor.execute(
+                    "SELECT CAST(? AS decimal(10, 2)); SELECT 99",
+                    1,
+                    use_prepare=use_prepare,
+                )
+            else:
+                pending = cursor.executemany(
+                    "SELECT CAST(? AS decimal(10, 2))",
+                    [(1,), (2,)],
+                    use_prepare=use_prepare,
+                )
+            for _ in range(200):
+                if entered.is_set():
+                    break
+                assert not pending.done(), "Execute ended before description conversion"
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("Description materialization did not start")
+
+            assert pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            await asyncio.wait_for(
+                asyncio.shield(pending._cancel_and_settle()), timeout=6
+            )
+            assert not release.is_set()
+            assert cursor.description is None
+
+            probe = conn.cursor()
+            await probe.execute("SELECT 2, @@SPID", use_prepare=False)
+            assert await probe.fetchall() == [(2, session_id)]
+            release.set()
+            await asyncio.to_thread(__import__, "decimal")
+            assert cursor.description is None
+            await cursor.execute("SELECT 3", use_prepare=use_prepare)
+            assert await cursor.fetchall() == [(3,)]
+        finally:
+            release.set()
+            if finder in sys.meta_path:
+                sys.meta_path.remove(finder)
+            await asyncio.to_thread(__import__, "decimal")
+            if decimal_module is not None:
+                sys.modules["decimal"] = decimal_module
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_nextset_cancellation_during_description_materialization_does_not_publish_rows(
     client_context,
 ):
-    """Cancellation during description conversion cannot publish stale metadata.
-
-    1. Force decimal metadata conversion through a deliberately blocked worker.
-    2. Schedule ``nextset`` and yield until that worker reaches the block.
-    3. Cancel the Python Future, then release the worker.
-    4. Verify cancellation wins the publication race: description stays empty.
-    5. Wait for ATTENTION settlement and prove the connection remains reusable.
-    """
+    """Cancellation settles without waiting for blocked description conversion."""
 
     async def run():
         conn = await connect(client_context)
@@ -1197,7 +1541,8 @@ def test_nextset_cancellation_during_description_materialization_does_not_publis
                 use_prepare=False,
             )
             # ensure_future schedules the PyO3 Future on the current event loop.
-            task = asyncio.ensure_future(cursor.nextset())
+            native_nextset = cursor.nextset()
+            task = asyncio.ensure_future(native_nextset)
             for _ in range(200):
                 if entered.is_set():
                     break
@@ -1206,17 +1551,15 @@ def test_nextset_cancellation_during_description_materialization_does_not_publis
             else:
                 pytest.fail("Description materialization did not start")
 
-            # Cancellation is requested while the detached task still owns the
-            # session. Releasing the worker lets it observe that request and
-            # settle ATTENTION without publishing its completed description.
             task.cancel()
-            release.set()
             with pytest.raises(asyncio.CancelledError):
                 await task
+            await asyncio.wait_for(native_nextset._cancel_and_settle(), timeout=1)
 
             assert cursor.description is None
+            release.set()
             probe = conn.cursor()
-            await execute_after_cancellation_settles(probe, "SELECT 3")
+            await probe.execute("SELECT 3")
             assert await probe.fetchone() == (3,)
             assert cursor.description is None
         finally:
@@ -1231,17 +1574,35 @@ def test_nextset_cancellation_during_description_materialization_does_not_publis
 
 
 @pytest.mark.integration
-def test_fetchall_cancellation_during_row_materialization_keeps_connection_reusable(
-    client_context,
+@pytest.mark.parametrize(
+    "operation, sql",
+    [
+        pytest.param(
+            "fetchone",
+            "SELECT CAST(value AS decimal(10, 2)) FROM (VALUES (1), (2)) AS source(value)",
+            id="partial-fetchone",
+        ),
+        pytest.param(
+            "fetchmany",
+            "SELECT CAST(value AS decimal(10, 2)) FROM (VALUES (1), (2)) AS source(value)",
+            id="partial-fetchmany",
+        ),
+        pytest.param(
+            "fetchall",
+            "SELECT CAST(1 AS decimal(10, 2)); SELECT 99",
+            id="fetchall-with-later-results",
+        ),
+        pytest.param(
+            "fetchall",
+            "SELECT CAST(1 AS decimal(10, 2))",
+            id="exhausted-fetchall",
+        ),
+    ],
+)
+def test_fetch_cancellation_during_row_materialization_keeps_connection_reusable(
+    client_context, operation, sql,
 ):
-    """Row conversion cancellation does not reclaim already-released TDS ownership.
-
-    1. Fetch the complete SQL row, then block its Python decimal conversion.
-    2. Cancel the Python-facing Future while conversion remains blocked.
-    3. Run another query before releasing the worker to prove protocol ownership
-       was released as soon as the row read completed.
-    4. Release the worker and wait for its import to finish during cleanup.
-    """
+    """Cancellation settles an owned batch without waiting for row conversion."""
 
     async def run():
         conn = await connect(client_context)
@@ -1251,14 +1612,15 @@ def test_fetchall_cancellation_during_row_materialization_keeps_connection_reusa
         decimal_module = None
         try:
             cursor = conn.cursor()
-            await cursor.execute(
-                "SELECT CAST(1 AS decimal(10, 2)) AS value", use_prepare=False
-            )
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            await cursor.execute(sql, use_prepare=False)
             # Force row conversion through the blocking import hook.
             decimal_module = sys.modules.pop("decimal")
             sys.meta_path.insert(0, finder)
 
-            task = asyncio.ensure_future(cursor.fetchall())
+            pending = cursor.fetchmany(1) if operation == "fetchmany" else getattr(cursor, operation)()
+            task = asyncio.ensure_future(pending)
             for _ in range(200):
                 if entered.is_set():
                     break
@@ -1271,11 +1633,11 @@ def test_fetchall_cancellation_during_row_materialization_keeps_connection_reusa
             with pytest.raises(asyncio.CancelledError):
                 await task
 
-            # Do not release materialization yet: successful reuse here proves
-            # the completed TDS read no longer owns the session.
+            # Keep conversion blocked until the same SQL session can be reused.
+            await asyncio.wait_for(asyncio.shield(task._cancel_and_settle()), timeout=1)
             probe = conn.cursor()
-            await probe.execute("SELECT 2", use_prepare=False)
-            assert await probe.fetchone() == (2,)
+            await probe.execute("SELECT 2, @@SPID", use_prepare=False)
+            assert await probe.fetchall() == [(2, session_id)]
             release.set()
             # Wait outside the event-loop thread for the import lock to clear.
             await asyncio.to_thread(__import__, "decimal")
@@ -1286,6 +1648,285 @@ def test_fetchall_cancellation_during_row_materialization_keeps_connection_reusa
             await asyncio.to_thread(__import__, "decimal")
             if decimal_module is not None:
                 sys.modules["decimal"] = decimal_module
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("blocked_phase", ["logging", "exhausted-conversion"])
+def test_cancelled_worker_on_closed_loop_preserves_replacement(
+    client_context, blocked_phase,
+):
+    entered = threading.Event()
+    release = threading.Event()
+    finder = BlockingDecimalFinder(entered, release)
+    shared = {}
+    decimal_module = None
+
+    class Logger(RecordingLogger):
+        armed = False
+
+        def py_core_log(self, level, message, module_name, line):
+            super().py_core_log(level, message, module_name, line)
+            if self.armed and "query executed successfully" in message:
+                self.armed = False
+                entered.set()
+                release.wait(15)
+
+    logger = Logger()
+
+    async def original_loop():
+        nonlocal decimal_module
+        conn = await connect(client_context, logger)
+        shared["connection"] = conn
+        shared["loop"] = asyncio.get_running_loop()
+        cursor = conn.cursor()
+        await cursor.execute("SELECT @@SPID", use_prepare=False)
+        shared["session_id"] = (await cursor.fetchall())[0][0]
+        if blocked_phase == "logging":
+            logger.armed = True
+            pending = cursor.execute("SET NOCOUNT ON", use_prepare=False)
+        else:
+            await cursor.execute("SELECT CAST(1 AS decimal(10, 2))", use_prepare=False)
+            decimal_module = sys.modules.pop("decimal")
+            sys.meta_path.insert(0, finder)
+            pending = cursor.fetchall()
+        shared["pending"] = pending
+        for _ in range(500):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("The original worker did not block")
+        assert pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), 2)
+
+    async def replacement_loop():
+        conn = shared["connection"]
+        try:
+            replacement = conn.cursor()
+            await replacement.execute("SELECT 99, @@SPID", use_prepare=False)
+            release.set()
+            deadline = asyncio.get_running_loop().time() + 5
+            # Worker-held Future references disappear only after delivery handling finishes.
+            while sys.getrefcount(shared["pending"]) != 2:
+                if asyncio.get_running_loop().time() >= deadline:
+                    pytest.fail("The old worker still retains its cancelled Future")
+                await asyncio.wait_for(
+                    asyncio.shield(shared["pending"]._cancel_and_settle()), 2
+                )
+                await asyncio.sleep(0.01)
+            assert await replacement.fetchall() == [(99, shared["session_id"])]
+        finally:
+            release.set()
+            if finder in sys.meta_path:
+                sys.meta_path.remove(finder)
+            if decimal_module is not None:
+                await asyncio.to_thread(__import__, "decimal")
+                sys.modules["decimal"] = decimal_module
+            await conn.close()
+
+    try:
+        asyncio.run(original_loop())
+        assert shared["loop"].is_closed()
+        asyncio.run(replacement_loop())
+    finally:
+        release.set()
+        if finder in sys.meta_path:
+            sys.meta_path.remove(finder)
+        if decimal_module is not None:
+            sys.modules["decimal"] = decimal_module
+        if "connection" in shared and not shared["connection"].closed:
+            async def close_connection():
+                await shared["connection"].close()
+
+            asyncio.run(close_connection())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("terminate_session", [False, True], ids=["recover", "terminate"])
+def test_queued_fetch_success_preserves_cancellation_recovery_outcome(
+    client_context, monkeypatch, terminate_session,
+):
+    async def run():
+        conn = await connect(client_context)
+        actor = await connect(client_context)
+        loop = asyncio.get_running_loop()
+        original = loop.call_soon_threadsafe
+        entered = threading.Event()
+        held = []
+        target = []
+        pending = settlement = None
+
+        def hold_delivery(callback, *args, **kwargs):
+            if target and args and args[0] is target[0]:
+                held.append((callback, args, kwargs))
+                entered.set()
+                return None
+            return original(callback, *args, **kwargs)
+
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            await cursor.execute(
+                "SELECT value FROM (VALUES (1), (2), (3)) AS source(value); SELECT 99",
+                use_prepare=False,
+            )
+            monkeypatch.setattr(loop, "call_soon_threadsafe", hold_delivery)
+            pending = cursor.fetchone()
+            target.append(pending)
+            for _ in range(200):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("Fetch result delivery was not queued")
+            assert held[0][1][-1] is False
+            assert held[0][1][-2] == (1,)
+            assert not pending.done()
+
+            if terminate_session:
+                await actor.cursor().execute(f"KILL {session_id}", use_prepare=False)
+            settlement = asyncio.ensure_future(pending._cancel_and_settle())
+            monkeypatch.setattr(loop, "call_soon_threadsafe", original)
+            for callback, args, kwargs in held:
+                callback(*args, **kwargs)
+            held.clear()
+            assert not pending.done(), "Queued success completed before recovery"
+
+            if terminate_session:
+                with pytest.raises(mssql_py_core.InterfaceError, match="Connection is broken"):
+                    await asyncio.wait_for(asyncio.shield(settlement), 6)
+                with pytest.raises(mssql_py_core.Error) as failure:
+                    await asyncio.wait_for(asyncio.shield(pending), 2)
+                assert "cancelled before result delivery" not in str(failure.value)
+                assert "Fetch was cancelled" not in str(failure.value)
+                with pytest.raises(mssql_py_core.InterfaceError, match="Connection is broken"):
+                    await conn.cursor().execute("SELECT 3", use_prepare=False)
+            else:
+                await asyncio.wait_for(asyncio.shield(settlement), 2)
+                with pytest.raises(
+                    mssql_py_core.OperationalError,
+                    match="Async query was cancelled before result delivery",
+                ):
+                    await asyncio.wait_for(asyncio.shield(pending), 2)
+                probe = conn.cursor()
+                await probe.execute("SELECT 3, @@SPID", use_prepare=False)
+                assert await probe.fetchall() == [(3, session_id)]
+            assert cursor.description is None
+        finally:
+            monkeypatch.setattr(loop, "call_soon_threadsafe", original)
+            for callback, args, kwargs in held:
+                original(callback, *args, **kwargs)
+            if pending is not None and not pending.done():
+                pending.cancel()
+            if pending is not None and pending.done() and not pending.cancelled():
+                pending.exception()
+            if settlement is not None:
+                await asyncio.gather(settlement, return_exceptions=True)
+            await conn.close()
+            await actor.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "operation",
+    ["execute", "executemany", "fetchone", "fetchmany", "nextset", "exhausted-fetchall"],
+)
+@pytest.mark.parametrize("cancel_delivery", [True, False], ids=["cancel-wins", "delivery-wins"])
+def test_query_cancellation_after_native_completion(
+    client_context, monkeypatch, operation, cancel_delivery,
+):
+    """Pause event-loop delivery after native work finishes, not row conversion."""
+
+    async def run():
+        conn = await connect(client_context)
+        loop = asyncio.get_running_loop()
+        original = loop.call_soon_threadsafe
+        entered = threading.Event()
+        held = []
+        target = []
+
+        def hold_delivery(callback, *args, **kwargs):
+            if target and args and args[0] is target[0]:
+                held.append((callback, args, kwargs))
+                entered.set()
+                return None
+            return original(callback, *args, **kwargs)
+
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
+            if operation in ("fetchone", "fetchmany"):
+                await cursor.execute(
+                    "SELECT value FROM (VALUES (1), (2), (3)) AS source(value)",
+                    use_prepare=False,
+                )
+            elif operation == "nextset":
+                await cursor.execute("SELECT 1; SELECT 2", use_prepare=False)
+                await cursor.fetchall()
+            elif operation == "exhausted-fetchall":
+                await cursor.execute("SELECT 1", use_prepare=False)
+
+            monkeypatch.setattr(loop, "call_soon_threadsafe", hold_delivery)
+            if operation == "execute":
+                pending = cursor.execute("SELECT 1", use_prepare=False)
+            elif operation == "executemany":
+                pending = cursor.executemany("SELECT ?", [(1,)], use_prepare=False)
+            elif operation == "fetchmany":
+                pending = cursor.fetchmany(1)
+            elif operation == "exhausted-fetchall":
+                pending = cursor.fetchall()
+            else:
+                pending = getattr(cursor, operation)()
+            target.append(pending)
+            for _ in range(500):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("Native completion never scheduled result delivery")
+            assert not pending.done()
+            monkeypatch.setattr(loop, "call_soon_threadsafe", original)
+
+            if cancel_delivery:
+                assert pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+                await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), 2)
+                probe = conn.cursor()
+                await probe.execute("SELECT 99, @@SPID", use_prepare=False)
+                assert await probe.fetchall() == [(99, session_id)]
+                # The discarded result must not affect a newly owned batch.
+                await probe.execute("SELECT 100", use_prepare=False)
+                for callback, args, kwargs in held:
+                    original(callback, *args, **kwargs)
+                held.clear()
+                await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), 2)
+                assert await probe.fetchall() == [(100,)]
+            else:
+                for callback, args, kwargs in held:
+                    original(callback, *args, **kwargs)
+                held.clear()
+                await asyncio.wait_for(asyncio.shield(pending), 2)
+                if operation not in ("executemany", "exhausted-fetchall"):
+                    with pytest.raises(mssql_py_core.InterfaceError, match="busy"):
+                        conn.cursor().execute("SELECT 99", use_prepare=False)
+                await cursor.execute("SELECT 100", use_prepare=False)
+                await asyncio.wait_for(asyncio.shield(pending._cancel_and_settle()), 2)
+                assert await cursor.fetchall() == [(100,)]
+        finally:
+            monkeypatch.setattr(loop, "call_soon_threadsafe", original)
+            for callback, args, kwargs in held:
+                original(callback, *args, **kwargs)
+            await asyncio.sleep(0)
             await conn.close()
 
     asyncio.run(run())
@@ -1904,19 +2545,14 @@ def test_fetch_rejects_concurrent_read_on_same_cursor(client_context, operation)
 @pytest.mark.integration
 @pytest.mark.parametrize("operation", ["fetchone", "fetchmany", "fetchall"])
 def test_cancelling_blocked_fetch_resynchronizes_session(client_context, operation):
-    """Every fetch API resynchronizes when cancelled during a blocked row read.
-
-    1. Start a large result and choose one of the three fetch APIs.
-    2. Schedule its awaitable and yield one event-loop turn so reading begins.
-    3. Cancel it and verify Python receives ``CancelledError``.
-    4. Wait for the detached Rust task to finish ATTENTION settlement.
-    5. Execute another query to prove the shared session can be reused.
-    """
+    """Cancel a live large-row fetch, settle, and reuse the same SQL session."""
 
     async def run():
         conn = await connect(client_context)
         cursor = conn.cursor()
         try:
+            await cursor.execute("SELECT @@SPID", use_prepare=False)
+            session_id = (await cursor.fetchall())[0][0]
             await cursor.execute(
                 "SELECT REPLICATE(CAST('x' AS varchar(max)), 32000000)",
                 use_prepare=False,
@@ -1931,13 +2567,15 @@ def test_cancelling_blocked_fetch_resynchronizes_session(client_context, operati
             task = asyncio.ensure_future(awaitable)
             # Give the scheduled fetch one turn to enter the large row read.
             await asyncio.sleep(0)
+            assert not task.done(), "Large-row fetch completed before cancellation"
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
+            await asyncio.wait_for(asyncio.shield(awaitable._cancel_and_settle()), timeout=6)
 
             probe = conn.cursor()
-            await execute_after_cancellation_settles(probe, "SELECT 1")
-            assert await probe.fetchone() == (1,)
+            await probe.execute("SELECT 1, @@SPID", use_prepare=False)
+            assert await probe.fetchall() == [(1, session_id)]
         finally:
             await conn.close()
 
