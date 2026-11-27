@@ -370,6 +370,8 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
     .unwrap_or_else(|ret| ret)
 }
 
+/// Synchronizes the statement's TEXTSIZE and manual transaction on the leased
+/// connection, matching `CheckOptions` (msodbcsql `sqlccmd.cpp:10512-10656`).
 /// Begins a transaction on an already-claimed client when the connection is in
 /// manual-commit mode and the server has none active, then marks the connection
 /// as holding user work. Called immediately before every statement execution;
@@ -379,8 +381,10 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
 /// its use of the statement's query timeout: `CheckOptions` passes
 /// `GetQueryTimeOut(lpstmt)` to `ExecTMRImmediate` so this implicit begin
 /// cannot outlast `SQL_ATTR_QUERY_TIMEOUT` any more than the statement it
-/// precedes. `timeout_secs` is that budget (already deducted for any elapsed
-/// time from earlier steps in the same call); `0` means unlimited. Running it
+/// precedes. `budget` is the original, undeducted `SQL_ATTR_QUERY_TIMEOUT`
+/// (`0` means unlimited); `started` is the call's fixed start, taken before any
+/// deferred unprepare. Each internal request is charged cumulatively from
+/// `started`, so callers must not pre-deduct elapsed time. Running it
 /// per statement — rather than only at the autocommit switch — is what
 /// recovers from a transaction the server aborted or the application rolled
 /// back with raw T-SQL.
@@ -391,22 +395,25 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
 /// The owning statement's cancellation handle also bounds startup and settlement;
 /// standalone connection-scoped transaction operations do not use this helper.
 ///
-/// This runs before every statement, so it is a hot path: both steady states
+/// With an unchanged TEXTSIZE, both steady states
 /// (autocommit on, and manual-commit with a transaction already open and
 /// recorded) cost exactly one lock and no network round trip. The DBC lock is
 /// never held across the `begin_transaction` await.
-pub(super) fn begin_transaction_if_manual(
+pub(super) fn apply_statement_options(
     dbc: &DbcHandle,
+    stmt: &StmtHandle,
     client: &mut TdsClient,
     op: &str,
-    timeout_secs: u32,
+    budget: u32,
+    started: std::time::Instant,
     cancel: &CancelHandle,
 ) -> Result<(), mssql_tds::error::Error> {
-    let (autocommit, already_recorded, generation) = match dbc.inner.lock() {
+    let (autocommit, already_recorded, generation, applied) = match dbc.inner.lock() {
         Ok(state) => (
             state.autocommit,
             state.local_tran_started,
             state.session_generation,
+            state.applied_max_length,
         ),
         Err(_) => {
             error!("{op}: dbc mutex poisoned reading autocommit");
@@ -415,16 +422,62 @@ pub(super) fn begin_transaction_if_manual(
             ));
         }
     };
-    if autocommit {
+    let requested = stmt.max_length.load(std::sync::atomic::Ordering::Relaxed);
+    // Charge each request from the start of the statement, including any deferred unprepare.
+    let remaining = || {
+        super::exec_common::deduct_query_timeout(budget, started.elapsed())
+            .map_err(|()| super::exec_common::query_timeout_expired_error())
+    };
+    if !(autocommit || already_recorded && client.has_active_transaction()) {
+        begin_manual_transaction(dbc, client, op, remaining()?, cancel, generation)?;
+    }
+    if applied == Some(requested) {
         return Ok(());
     }
 
+    // CheckOptions sends one language batch for all changed SET options, after
+    // any separate transaction-manager BEGIN. TEXTSIZE is currently our only
+    // wire SET here (MAX_ROWS is enforced at fetch). Append future SET options
+    // to this batch rather than issuing more requests.
+    let remaining = remaining()?;
+    let sql = if requested == 0 {
+        String::from("SET TEXTSIZE -1")
+    } else {
+        format!("SET TEXTSIZE {requested}")
+    };
+    let result = dbc.runtime.block_on(async {
+        client
+            .execute(
+                sql,
+                ExecuteOptions::new().timeout_secs(remaining).cancel(cancel),
+            )
+            .await?;
+        client.close_query().await
+    });
+    let mut state = dbc.inner.lock().map_err(|_| {
+        mssql_tds::error::Error::ImplementationError("connection state is poisoned".to_owned())
+    })?;
+    if state.session_generation != generation
+        || state.connection_state != ConnectionState::Connected
+    {
+        return Err(mssql_tds::error::Error::ConnectionClosed(
+            "the session ended while setting TEXTSIZE".to_owned(),
+        ));
+    }
+    // A cancelled SET may already have been applied on the server.
+    state.applied_max_length = result.is_ok().then_some(requested);
+    result
+}
+
+fn begin_manual_transaction(
+    dbc: &DbcHandle,
+    client: &mut TdsClient,
+    op: &str,
+    timeout_secs: u32,
+    cancel: &CancelHandle,
+    generation: u64,
+) -> Result<(), mssql_tds::error::Error> {
     let result = if client.has_active_transaction() {
-        // Steady state: transaction already open and already recorded, so there
-        // is nothing to write back and no reason to retake the lock.
-        if already_recorded {
-            return Ok(());
-        }
         Ok(())
     } else {
         debug!("{op}: manual-commit mode with no active transaction — beginning one");
@@ -664,6 +717,7 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
         // The reset is armed; the server discards the transaction before it
         // processes the carrying request, so the driver's view catches up here.
         state.local_tran_started = false;
+        state.applied_max_length = Some(0);
         // The reset restores the login's defaults — security context included, so
         // an `EXECUTE AS` this borrower ran is undone — but the cached principal
         // would survive it. The catalog key cannot catch that: the reset returns
@@ -2189,6 +2243,93 @@ mod tests {
     }
 
     #[test]
+    fn textsize_changes_once_and_failed_set_does_not_cache_success() {
+        use mssql_tds::test_client_support::{done_no_more, tds_client_from_tokens_capturing};
+        use std::sync::atomic::Ordering;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        // One server response: any additional batch will run out of tokens.
+        let (mut client, sent) = tds_client_from_tokens_capturing(vec![done_no_more()]);
+        let mut apply = |length| {
+            stmt.max_length.store(length, Ordering::Relaxed);
+            apply_statement_options(
+                dbc,
+                stmt,
+                &mut client,
+                "test",
+                0,
+                Instant::now(),
+                &CancelHandle::new(),
+            )
+        };
+        apply(0).unwrap();
+        assert!(sent.lock().unwrap().is_empty());
+        apply(8000).unwrap();
+        let batch_size = sent.lock().unwrap().len();
+        assert!(batch_size > 0);
+        apply(8000).unwrap();
+        assert_eq!(sent.lock().unwrap().len(), batch_size);
+        assert!(apply(0).is_err());
+        assert_eq!(dbc.inner.lock().unwrap().applied_max_length, None);
+    }
+
+    #[test]
+    fn textsize_timeout_leaves_statement_and_connection_reusable() {
+        use crate::api::odbc_types::{SQL_ATTR_MAX_LENGTH, SQL_ATTR_QUERY_TIMEOUT, SQL_C_SLONG};
+        use crate::api::{SQLExecDirectW, SQLFetch, SQLGetData, SQLSetStmtAttrW};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let set = "SET TEXTSIZE 8000";
+        let server = connect_mock_server(
+            dbc,
+            set,
+            QueryResponse::new(Vec::new(), Vec::new()).with_delay(SLOW_RESPONSE),
+        );
+        for (attr, value) in [
+            (SQL_ATTR_QUERY_TIMEOUT, 1usize),
+            (SQL_ATTR_MAX_LENGTH, 8000),
+        ] {
+            assert_eq!(SQL_SUCCESS, unsafe {
+                SQLSetStmtAttrW(h.stmt, attr, value as SqlPointer, 0)
+            });
+        }
+        let execute = |sql: &str| {
+            let sql: Vec<u16> = sql.encode_utf16().collect();
+            unsafe { SQLExecDirectW(h.stmt, sql.as_ptr(), sql.len().try_into().unwrap()) }
+        };
+
+        assert_eq!(SQL_ERROR, execute("SELECT 0"));
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_eq!(
+            stmt.inner.lock().unwrap().diag_records()[0].sql_state,
+            *b"HYT00"
+        );
+        assert_eq!(dbc.inner.lock().unwrap().applied_max_length, None);
+
+        server.register_query(set, QueryResponse::new(Vec::new(), Vec::new()));
+        server.register_query("SELECT 1", QueryResponse::select_one());
+        assert_eq!(SQL_SUCCESS, execute("SELECT 1"));
+        assert_eq!(SQL_SUCCESS, unsafe { SQLFetch(h.stmt) });
+        let mut value = 0i32;
+        let mut length = 0;
+        assert_eq!(SQL_SUCCESS, unsafe {
+            SQLGetData(
+                h.stmt,
+                1,
+                SQL_C_SLONG,
+                std::ptr::from_mut(&mut value).cast(),
+                4,
+                &mut length,
+            )
+        });
+        assert_eq!((value, length), (1, 4));
+    }
+
+    #[test]
     fn implicit_begin_records_server_transaction_even_when_its_response_fails() {
         use mssql_tds::test_client_support::{
             env_change_begin_transaction, tds_client_from_tokens,
@@ -2198,7 +2339,16 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         dbc.inner.lock().unwrap().autocommit = false;
         let mut client = tds_client_from_tokens(vec![env_change_begin_transaction(42)]);
-        let result = begin_transaction_if_manual(dbc, &mut client, "test", 0, &CancelHandle::new());
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let result = apply_statement_options(
+            dbc,
+            stmt,
+            &mut client,
+            "test",
+            0,
+            Instant::now(),
+            &CancelHandle::new(),
+        );
         assert!(result.is_err(), "the response has no terminating DONE");
         assert!(client.has_active_transaction());
         assert!(dbc.inner.lock().unwrap().local_tran_started);

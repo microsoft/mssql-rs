@@ -17,7 +17,7 @@ use super::exec_common::{
     query_timeout_expired_error, snapshot_bound_params,
 };
 use super::sqlstate::*;
-use super::txn::begin_transaction_if_manual;
+use super::txn::apply_statement_options;
 use super::util::read_utf16_long;
 use crate::api::odbc_types::{
     SQL_BIND_BY_COLUMN, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_ROWCOUNT_TOTAL, SQL_NTS, SqlHandle,
@@ -417,24 +417,13 @@ fn sql_exec_direct_w_operation(
     // granularity deduction (`dwQueryTimeoutInMS` in `DropPrepHandle`). An
     // already-exhausted budget fails immediately with HYT00 rather than
     // sending the next step unbounded.
-    let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
-        Ok(remaining) => remaining,
-        Err(()) => {
-            return fail_with_tds(
-                dbc,
-                stmt,
-                statement_handle,
-                client,
-                &query_timeout_expired_error(),
-            );
-        }
-    };
-
-    if let Err(e) = begin_transaction_if_manual(
+    if let Err(e) = apply_statement_options(
         dbc,
+        stmt,
         &mut client,
         "SQLExecDirectW",
-        query_timeout,
+        budget,
+        started,
         &cancel_handle,
     ) {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
@@ -1528,7 +1517,7 @@ mod tests {
     /// blocked server-side (e.g. behind another session's row lock).
     ///
     /// Drives the real `SQLExecDirectW` code path (`claim_connection`,
-    /// `begin_transaction_if_manual`, the elapsed-time deduction, and the
+    /// `apply_statement_options`, the elapsed-time deduction, and the
     /// final `execute`) against a real `TdsClient` connected to a mock TDS
     /// server that holds its response for `RESPONSE_DELAY` — far longer than
     /// the statement's configured timeout. Reverting the timeout wiring back
@@ -1584,7 +1573,7 @@ mod tests {
     }
 
     /// `SQL_ATTR_QUERY_TIMEOUT` must also bound the implicit transaction begin
-    /// `begin_transaction_if_manual` sends before the statement itself when
+    /// `apply_statement_options` sends before the statement itself when
     /// the connection is in manual-commit mode — mirroring msodbcsql's
     /// `CheckOptions`/`ExecTMRImmediate` (`sqlccmd.cpp:10572-10585`), which
     /// passes the statement's own query timeout to that TM request. Unlike
@@ -1592,7 +1581,7 @@ mod tests {
     /// delays the query response), this delays only the server's answer to
     /// the Begin request, via the mock server's reserved
     /// `TM_BEGIN_DELAY_KEY`, so it fails if the timeout wiring into
-    /// `begin_transaction_if_manual` regresses even though the query step
+    /// `apply_statement_options` regresses even though the query step
     /// itself is untouched.
     #[test]
     fn exec_direct_query_timeout_bounds_a_delayed_implicit_transaction_begin() {
@@ -1614,7 +1603,7 @@ mod tests {
             crate::test_support::connect_mock_server(dbc, SELECT_SQL, QueryResponse::select_one());
         mock_server.set_tm_begin_delay(BEGIN_DELAY);
         // Manual-commit mode with no transaction open yet is what makes
-        // `begin_transaction_if_manual` send a real Begin request instead of
+        // `apply_statement_options` send a real Begin request instead of
         // returning immediately.
         dbc.inner.lock().unwrap().autocommit = false;
 
@@ -1637,6 +1626,45 @@ mod tests {
             state.diag_records[0].sql_state, *b"HYT00",
             "a query-timeout expiry must report HYT00, got {:?}",
             state.diag_records[0].sql_state
+        );
+    }
+
+    #[test]
+    fn unprepare_and_begin_exhaust_budget_before_textsize() {
+        use crate::handles::DbcHandle;
+        use crate::test_support::{arm_pending_unprepare, connect_mock_server};
+        use mssql_mock_tds::QueryResponse;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let server =
+            connect_mock_server(dbc, "SET TEXTSIZE 8000", QueryResponse::new(vec![], vec![]));
+        // Neither request exhausts the one-second timeout by itself.
+        let delay = Duration::from_millis(600);
+        server.set_rpc_delay(delay);
+        server.set_tm_begin_delay(delay);
+        arm_pending_unprepare(dbc, stmt);
+        dbc.inner.lock().unwrap().autocommit = false;
+        stmt.inner.lock().unwrap().query_timeout = 1;
+        stmt.max_length.store(8000, Ordering::Relaxed);
+
+        assert_eq!(
+            SQL_ERROR,
+            sql_exec_direct_w_safe(h.stmt, stmt, "SELECT 1".into())
+        );
+        assert_eq!(
+            stmt.inner.lock().unwrap().diag_records[0].sql_state,
+            *b"HYT00"
+        );
+        let state = dbc.inner.lock().unwrap();
+        assert!(state.local_tran_started);
+        assert_eq!(
+            state.applied_max_length,
+            Some(0),
+            "SET TEXTSIZE must not run"
         );
     }
 

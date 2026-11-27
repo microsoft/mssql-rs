@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 
 use tracing::error;
@@ -441,6 +441,8 @@ pub(crate) struct StmtHandle {
     /// the DBC owns the STMT's lifetime, not the other way around.
     /// Mirrors msodbcsql's statement→connection back-pointer.
     pub(crate) parent_dbc: *mut c_void,
+    /// Independently writable by SQLSetConnectAttr without locking child statements.
+    pub(crate) max_length: AtomicUsize,
     /// The four automatically-allocated implicit descriptors (ARD/APD/IRD/IPD),
     /// the permanent implicit allocations (cf. msodbcsql's embedded `lpstmt->ARD`
     /// / `cmdp.APD`, `sqlcfunc.cpp`). Set once in `new()`, freed in `Drop`, never
@@ -736,7 +738,6 @@ const INERT_STMT_ATTRS: &[(SqlInteger, SqlULen)] = &[
         odbc_types::SQL_INSENSITIVE,
     ),
     (odbc_types::SQL_ATTR_NOSCAN, 0),
-    (odbc_types::SQL_ATTR_MAX_LENGTH, 0),
     (odbc_types::SQL_ATTR_ASYNC_ENABLE, 0),
     (odbc_types::SQL_ATTR_KEYSET_SIZE, 0),
     (
@@ -2421,6 +2422,7 @@ impl StmtHandle {
             trace: mssql_tds::trace_context::enabled().then(std::sync::Arc::default),
             object_type: HandleType::Stmt,
             parent_dbc,
+            max_length: AtomicUsize::new(0),
             ard: handle_to_raw(Box::new(DescHandle::new(
                 DescKind::AppRow,
                 SQL_DESC_ALLOC_AUTO,

@@ -23,7 +23,7 @@ use super::exec_common::{
     snapshot_bound_params,
 };
 use super::sqlstate::*;
-use super::txn::begin_transaction_if_manual;
+use super::txn::apply_statement_options;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_ROWCOUNT_TOTAL, SQL_PARAM_ERROR, SQL_PARAM_IGNORE,
     SQL_PARAM_INPUT, SQL_PARAM_PROCEED, SQL_PARAM_SUCCESS, SQL_PARAM_SUCCESS_WITH_INFO,
@@ -260,11 +260,13 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             };
             let started = Instant::now();
 
-            if let Err(e) = begin_transaction_if_manual(
+            if let Err(e) = apply_statement_options(
                 dbc,
+                stmt,
                 &mut client,
                 "SQLExecute",
                 query_timeout,
+                started,
                 &cancel_handle,
             ) {
                 // Nothing ran, so put the staged statement (and any pending orphan)
@@ -371,11 +373,13 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             };
             let started = Instant::now();
 
-            if let Err(e) = begin_transaction_if_manual(
+            if let Err(e) = apply_statement_options(
                 dbc,
+                stmt,
                 &mut client,
                 "SQLExecute",
                 query_timeout,
+                started,
                 &cancel_handle,
             ) {
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
@@ -524,11 +528,13 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 }
             };
             let started = Instant::now();
-            if let Err(e) = begin_transaction_if_manual(
+            if let Err(e) = apply_statement_options(
                 dbc,
+                stmt,
                 &mut client,
                 "SQLExecute",
                 query_timeout,
+                started,
                 &cancel_handle,
             ) {
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
@@ -4338,7 +4344,7 @@ mod tests {
     /// blocked server-side (e.g. behind another session's row lock).
     ///
     /// Drives the real `SQLExecute` code path (`stage_execution`,
-    /// `begin_transaction_if_manual`, the elapsed-time deduction, and
+    /// `apply_statement_options`, the elapsed-time deduction, and
     /// `execute_prepared`'s `sp_prepexec` RPC) against a real `TdsClient`
     /// connected to a mock TDS server that holds its response for
     /// `RESPONSE_DELAY` — far longer than the statement's configured timeout.

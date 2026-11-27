@@ -10,11 +10,29 @@
 //   6. NoRecordsReturnsNoData       - record field on clean handle → SQL_NO_DATA
 //   7. DiagNumberAfterSuccessIsZero - successful call clears prior diag
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 
 #include <cstring>
+#include <iterator>
 #include <string>
 #include <vector>
+
+namespace {
+
+std::basic_string<SQLWCHAR> ToSqlWString(const std::u16string& value) {
+    return {value.begin(), value.end()};
+}
+
+std::u16string FromSqlWString(const SQLWCHAR* value, size_t capacity) {
+    std::u16string result;
+    for (size_t i = 0; i < capacity && value[i] != 0; ++i) {
+        result.push_back(static_cast<char16_t>(value[i]));
+    }
+    return result;
+}
+
+} // namespace
 
 class GetDiagFieldTest : public ::testing::Test {
 protected:
@@ -200,6 +218,55 @@ protected:
         Connect();
     }
 };
+
+class DiagFieldUnicodeLiveTest : public ODBCTest {
+protected:
+    void SetUp() override {
+        ODBCTest::SetUp();
+        if (!ODBCTestConfig::Instance().HasConnection()) {
+            FAIL() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
+        }
+        Connect();
+    }
+};
+
+// Benefits-from-mock-tds: a mock could emit an ERROR token with an exact UTF-16
+// message and isolate SQL_DIAG_MESSAGE_TEXT from SQL Server's own diagnostics.
+ODBC_TEST_F_MODES(DiagFieldUnicodeLiveTest, UnicodeMessageTextAndByteLength,
+                  odbc_concurrency::kSingle | odbc_concurrency::kCrossThread |
+                      odbc_concurrency::kSharedEnv | odbc_concurrency::kSharedDbc) {
+    const std::string token = WorkerToken("diag");
+    const std::u16string message =
+        u"Unicode diagnostic: \u4E2D" + std::u16string(token.begin(), token.end()) + u"\U0001F600";
+    const std::u16string sql = u"THROW 50000, N'" + message + u"', 1;";
+    std::basic_string<SQLWCHAR> wide_sql = ToSqlWString(sql);
+    ASSERT_EQ(SQL_ERROR, SQLExecDirectW(stmt_, wide_sql.data(), SQL_NTS));
+
+    SQLWCHAR fullTextBuffer[512] = {};
+    SQLSMALLINT fullLength = 0;
+    ASSERT_SQL_OK(SQLGetDiagFieldW(SQL_HANDLE_STMT, stmt_, 1, SQL_DIAG_MESSAGE_TEXT,
+                                   fullTextBuffer, sizeof(fullTextBuffer), &fullLength),
+                  SQL_HANDLE_STMT, stmt_);
+    const std::u16string fullText = FromSqlWString(fullTextBuffer, std::size(fullTextBuffer));
+    ASSERT_GE(fullText.size(), message.size());
+    EXPECT_EQ(message, fullText.substr(fullText.size() - message.size()));
+    EXPECT_EQ(static_cast<SQLSMALLINT>(fullText.size() * sizeof(SQLWCHAR)), fullLength);
+
+    const size_t prefixLength = fullText.size() - message.size();
+    const size_t shortBufferUnits = prefixLength + message.size();
+    const SQLSMALLINT shortBytes =
+        static_cast<SQLSMALLINT>(shortBufferUnits * sizeof(SQLWCHAR));
+    std::vector<SQLWCHAR> shortText(shortBufferUnits, 0);
+    SQLSMALLINT reportedLength = 0;
+    const SQLRETURN rc = SQLGetDiagFieldW(SQL_HANDLE_STMT, stmt_, 1, SQL_DIAG_MESSAGE_TEXT,
+                                          shortText.data(), shortBytes, &reportedLength);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+    EXPECT_EQ(fullLength, reportedLength);
+    const std::u16string truncated = FromSqlWString(shortText.data(), shortText.size());
+    ASSERT_EQ(prefixLength + message.size() - 1, truncated.size());
+    EXPECT_EQ(message.substr(0, message.size() - 1), truncated.substr(prefixLength));
+    EXPECT_EQ(static_cast<char16_t>(0xD83D), truncated.back());
+}
 
 // This driver doesn't track per-row batch failures yet (see divergence 9 in
 // docs/parameters_plan.md, tracked by microsoft/mssql-rs#541), so it always

@@ -240,6 +240,9 @@ pub(crate) struct DbcState {
     /// to the connection's existing statements and records it here for future
     /// ones (msodbcsql `sqlcmisc.cpp:2879-2922`, `sqlcfunc.cpp:173`).
     pub(crate) stmt_query_timeout: u32,
+    pub(crate) stmt_max_length: usize,
+    /// Last driver-issued TEXTSIZE (ODBC 0 = server -1); unknown after a failed SET.
+    pub(crate) applied_max_length: Option<usize>,
     /// Non-secret identity of the current session, answering `SQLGetInfo`'s
     /// `SQL_DATA_SOURCE_NAME` and `SQL_SERVER_NAME` without a round trip.
     /// Populated on a successful connect, cleared on disconnect.
@@ -483,6 +486,8 @@ impl DbcHandle {
                 reset_generation: 0,
                 current_catalog: None,
                 stmt_query_timeout: 0,
+                stmt_max_length: 0,
+                applied_max_length: Some(0),
                 identity: ConnectionIdentity::default(),
                 session_generation: 0,
                 database_user_name: None,

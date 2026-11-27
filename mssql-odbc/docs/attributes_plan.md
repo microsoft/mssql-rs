@@ -65,6 +65,7 @@ mssql-python, so `SQL_ATTR_CONNECTION_POOLING` is out of scope.
 | `SQL_COPT_SS_ACCESS_TOKEN` | ✅ | — | pre-connect only |
 | `SQL_ATTR_ANSI_APP` | ✅ no-op | ✗ `HYC00` | deliberate |
 | `SQL_ATTR_QUERY_TIMEOUT` | ✅ fan-out | ✗ `HY092` | write-only on a connection |
+| `SQL_ATTR_MAX_LENGTH` | ✅ fan-out | ✗ `HY092` | sets the limit on existing statements and the default for new statements; read it on the statement |
 | **`SQL_ATTR_CURRENT_CATALOG`** | ✅ | ✅ | **delivered by S3** |
 | `SQL_COPT_SS_INTEGRATED_SECURITY` | ✅ | ✅ | attribute overrides keyword |
 | `SQL_COPT_SS_ENCRYPT` | ✅ | ✅ | attribute overrides keyword |
@@ -481,7 +482,7 @@ ideal rather than what this driver does.
 |---|---|---|---|
 | 1 | `MAX_ROWS` | 0 | **enforced**: bounds each result set; 0 is unlimited |
 | 2 | `NOSCAN` | 0 | stored, round-trips |
-| 3 | `MAX_LENGTH` | 0 | 0 and 8000 → success; any other non-zero → `01S02` and the stored value is substituted with 8000 |
+| 3 | `MAX_LENGTH` | 0 | 0 is unlimited; other values clamp to 8000–2147483647 with `01S02` on substitution. Applied on execution via `SET TEXTSIZE`. |
 | 4 | `ASYNC_ENABLE` | 0 | stored |
 | 8 | `KEYSET_SIZE` | 0 | 0 → success; non-zero → `01S02`, stays 0 |
 | 9 | `SQL_ROWSET_SIZE` | 1 | stored on the effective ARD, **independent of `ROW_ARRAY_SIZE`** |
@@ -825,7 +826,7 @@ the remaining follow-up under AB#47526.
 ## 6. Risks & open questions
 
 1. **Statement-option fan-out (F3)** remains a structural S5b change to
-   `SQLSetConnectAttrW`; S2 implements only the measured `QUERY_TIMEOUT` case.
+   `SQLSetConnectAttrW` beyond `QUERY_TIMEOUT` and `MAX_LENGTH`.
 2. **Attribute vs. keyword precedence** is measured for S5a's three attributes.
    Every S5b keyword-equivalent attribute still needs its own measurement because
    the `CURRENT_CATALOG` result proves there is no safe global rule.

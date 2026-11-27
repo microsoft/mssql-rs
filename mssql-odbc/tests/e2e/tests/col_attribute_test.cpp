@@ -43,6 +43,7 @@
 //   36. NameIsReportedOnceTheRowsAreRead  - the idle session reads the names
 //   37. TypeCreatedAfterTheReadIsNamedAfterADatabaseChange - re-read on a database change
 //   38. LookupOnTheSessionBeginsNoImplicitTransaction - the application's setting is kept
+//   39. UnicodeNamesAndByteLengths - Unicode metadata fields and byte-counted lengths
 
 #include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
@@ -52,8 +53,25 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <iterator>
 #include <string>
 #include <vector>
+
+namespace {
+
+std::basic_string<SQLWCHAR> ToSqlWString(const std::u16string& value) {
+    return {value.begin(), value.end()};
+}
+
+std::u16string FromSqlWString(const SQLWCHAR* value, size_t capacity) {
+    std::u16string result;
+    for (size_t i = 0; i < capacity && value[i] != 0; ++i) {
+        result.push_back(static_cast<char16_t>(value[i]));
+    }
+    return result;
+}
+
+} // namespace
 
 class ColAttributeLiveTest : public ODBCTest {
 protected:
@@ -63,6 +81,21 @@ protected:
             FAIL() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
         }
         Connect();
+    }
+};
+
+class UnicodeColAttributeLiveTest : public ColAttributeLiveTest {
+protected:
+    std::u16string table_name_;
+
+    void TearDown() override {
+        if (stmt_ != SQL_NULL_HSTMT && !table_name_.empty()) {
+            SQLCloseCursor(stmt_);
+            std::basic_string<SQLWCHAR> drop =
+                ToSqlWString(u"DROP TABLE IF EXISTS [" + table_name_ + u"]");
+            SQLExecDirectW(stmt_, drop.data(), SQL_NTS);
+        }
+        ColAttributeLiveTest::TearDown();
     }
 };
 
@@ -687,6 +720,58 @@ ODBC_TEST_F_MODES(ColAttributeLiveTest, NameTruncationReturnsInfo, odbc_concurre
         SQLColAttribute(stmt_, 1, SQL_DESC_NAME, name, sizeof(name), &nameLen, nullptr);
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    SQLCloseCursor(stmt_);
+}
+
+// Benefits-from-mock-tds: a mock could return COLMETADATA with non-ASCII names
+// directly, isolating SQLColAttributeW from server DDL behavior.
+ODBC_TEST_F_MODES(UnicodeColAttributeLiveTest, UnicodeNamesAndByteLengths,
+                  odbc_concurrency::kSingle | odbc_concurrency::kCrossThread |
+                      odbc_concurrency::kSharedEnv | odbc_concurrency::kSharedDbc) {
+    const std::string token = WorkerToken("unicode");
+    const std::u16string table =
+        u"#colattr_" + std::u16string(token.begin(), token.end()) + u"_\u8868";
+    table_name_ = table;
+    const std::u16string column = u"column_\u5217\U0001F600";
+    const std::u16string label = u"label_\u540D\U0001F600";
+    std::u16string create = u"DROP TABLE IF EXISTS [" + table + u"]; CREATE TABLE [" + table +
+                            u"] ([" + column + u"] INT NOT NULL)";
+    std::basic_string<SQLWCHAR> wide_sql = ToSqlWString(create);
+    ASSERT_SQL_OK(SQLExecDirectW(stmt_, wide_sql.data(), SQL_NTS), SQL_HANDLE_STMT, stmt_);
+
+    std::u16string select =
+        u"SELECT [" + column + u"] AS [" + label + u"] FROM [" + table + u"]";
+    wide_sql = ToSqlWString(select);
+    ASSERT_SQL_OK(SQLExecDirectW(stmt_, wide_sql.data(), SQL_NTS), SQL_HANDLE_STMT, stmt_);
+
+    const struct {
+        SQLUSMALLINT field;
+        const std::u16string* expected;
+    } textFields[] = {
+        {SQL_DESC_NAME, &label},
+        {SQL_DESC_LABEL, &label},
+    };
+    for (const auto& test : textFields) {
+        SQLWCHAR value[128] = {};
+        SQLSMALLINT length = 0;
+        ASSERT_SQL_OK(SQLColAttributeW(stmt_, 1, test.field, value, sizeof(value), &length,
+                                       nullptr),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(*test.expected, FromSqlWString(value, std::size(value))) << test.field;
+        EXPECT_EQ(static_cast<SQLSMALLINT>(test.expected->size() * sizeof(SQLWCHAR)), length)
+            << test.field;
+    }
+
+    SQLWCHAR shortName[9] = {};
+    SQLSMALLINT length = 0;
+    SQLRETURN rc = SQLColAttributeW(stmt_, 1, SQL_DESC_NAME, shortName, sizeof(shortName),
+                                    &length, nullptr);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+    EXPECT_EQ(static_cast<SQLSMALLINT>(label.size() * sizeof(SQLWCHAR)), length);
+    EXPECT_EQ(label.substr(0, 8), FromSqlWString(shortName, std::size(shortName)));
+    EXPECT_EQ(static_cast<SQLWCHAR>(0xD83D), shortName[7]);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+
     SQLCloseCursor(stmt_);
 }
 

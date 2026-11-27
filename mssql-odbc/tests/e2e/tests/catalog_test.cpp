@@ -9,11 +9,29 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <iterator>
 #include <random>
 #include <string>
 #include <vector>
 
 namespace {
+
+std::basic_string<SQLWCHAR> ToSqlWString(const std::u16string& value) {
+    return {value.begin(), value.end()};
+}
+
+std::u16string FromSqlWString(const SQLWCHAR* value, size_t capacity) {
+    std::u16string result;
+    for (size_t i = 0; i < capacity && value[i] != 0; ++i) {
+        result.push_back(static_cast<char16_t>(value[i]));
+    }
+    return result;
+}
+
+SQLRETURN ExecDirectW(SQLHSTMT stmt, const std::u16string& sql) {
+    std::basic_string<SQLWCHAR> wide_sql = ToSqlWString(sql);
+    return SQLExecDirectW(stmt, wide_sql.data(), SQL_NTS);
+}
 
 // Reads a column's name via SQLDescribeCol and returns it as a narrow string.
 std::string DescribeColName(SQLHSTMT stmt, SQLUSMALLINT column) {
@@ -148,6 +166,7 @@ protected:
     // creates and wants dropped in TearDown() regardless of how the test
     // exits, same rationale as pending_db_to_drop_.
     std::vector<std::string> pending_tables_to_drop_;
+    std::vector<std::u16string> pending_unicode_tables_to_drop_;
 
     void SetUp() override {
         ODBCTest::SetUp();
@@ -182,6 +201,9 @@ protected:
             DropTestTables();
             for (const auto& table : pending_tables_to_drop_) {
                 ExecDirectIgnoreError("DROP TABLE IF EXISTS " + table);
+            }
+            for (const auto& table : pending_unicode_tables_to_drop_) {
+                ExecDirectW(stmt_, u"DROP TABLE IF EXISTS [" + table + u"]");
             }
             if (!pending_db_to_drop_.empty()) {
                 ExecDirectIgnoreError("DROP DATABASE IF EXISTS " + pending_db_to_drop_);
@@ -380,6 +402,51 @@ TEST_F(CatalogLiveTest, ColumnsReportsOdbc3ColumnNamesAndAllColumns) {
     EXPECT_EQ(SQL_NO_NULLS, DescribeColNullable(stmt_, 11)); // NULLABLE
     EXPECT_EQ(3, DrainRows(stmt_)); // id, name, note
 
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// Benefits-from-mock-tds: a mock could verify the exact Unicode catalog RPC
+// arguments as well as return identifiers that SQL Server may normalize.
+TEST_F(CatalogLiveTest, TablesAndColumnsFindUnicodeIdentifiers) {
+    const std::string suffix = UniqueSuffix();
+    const std::u16string table = u"odbc_e2e_unicode_" +
+                                 std::u16string(suffix.begin(), suffix.end()) + u"_\u8868";
+    const std::u16string column = u"\u5217\U0001F600";
+    pending_unicode_tables_to_drop_.push_back(table);
+
+    ASSERT_SQL_OK(ExecDirectW(stmt_, u"CREATE TABLE [dbo].[" + table + u"] ([" +
+                                            column + u"] INT NOT NULL)"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    std::basic_string<SQLWCHAR> wide_table = ToSqlWString(table);
+    SQLRETURN rc = SQLTablesW(stmt_, nullptr, 0, nullptr, 0, wide_table.data(), SQL_NTS, nullptr, 0);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLWCHAR tableName[256] = {};
+    SQLLEN indicator = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 3, SQL_C_WCHAR, tableName, sizeof(tableName), &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(table, FromSqlWString(tableName, std::size(tableName)));
+    EXPECT_EQ(static_cast<SQLLEN>(table.size() * sizeof(SQLWCHAR)), indicator);
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    std::basic_string<SQLWCHAR> wide_column = ToSqlWString(column);
+    rc = SQLColumnsW(stmt_, nullptr, 0, nullptr, 0, wide_table.data(), SQL_NTS,
+                     wide_column.data(), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    std::fill(std::begin(tableName), std::end(tableName), 0);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 3, SQL_C_WCHAR, tableName, sizeof(tableName), &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(table, FromSqlWString(tableName, std::size(tableName)));
+    EXPECT_EQ(static_cast<SQLLEN>(table.size() * sizeof(SQLWCHAR)), indicator);
+    SQLWCHAR columnName[256] = {};
+    ASSERT_SQL_OK(SQLGetData(stmt_, 4, SQL_C_WCHAR, columnName, sizeof(columnName), &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(column, FromSqlWString(columnName, std::size(columnName)));
+    EXPECT_EQ(static_cast<SQLLEN>(column.size() * sizeof(SQLWCHAR)), indicator);
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
