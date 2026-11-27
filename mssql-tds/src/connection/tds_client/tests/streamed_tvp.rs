@@ -366,6 +366,59 @@ async fn a_mismatched_cell_rejects_the_whole_call() {
     assert_eq!(take_sent(&sent), materialized_request(vec![first]).await);
 }
 
+/// Column templates pass the vector-version check when the table opens, but a
+/// cell carries its own vector header, so a float16 cell needs the same check.
+#[tokio::test]
+async fn a_float16_cell_needs_vector_version_two() {
+    use crate::datatypes::sql_vector::SqlVector;
+    use crate::datatypes::sqldatatypes::VectorBaseType;
+
+    let float16 = || {
+        SqlType::Vector(
+            Some(SqlVector::try_from_f16(vec![1.0, 2.0]).unwrap()),
+            2,
+            VectorBaseType::Float32,
+        )
+    };
+    for acknowledgement in [Some((1, true)), Some((2, true))] {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        set_vector_ack(&mut client, acknowledgement);
+        let columns = vec![TvpColumnDef::new(SqlType::Vector(
+            None,
+            2,
+            VectorBaseType::Float32,
+        ))];
+        client
+            .begin_sp_executesql(SQL.to_string(), vec![streamed_table(columns)], ())
+            .await
+            .unwrap();
+        let before = sent.lock().unwrap().len();
+
+        let result = client.write_streamed_tvp_cells(&[float16()]).await;
+
+        if acknowledgement == Some((2, true)) {
+            result.unwrap();
+            continue;
+        }
+        let error = result.unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                Error::TvpCellSerialization {
+                    parameter: TvpParameterRef::Name(name),
+                    row: 1,
+                    column: 1,
+                    ..
+                } if name == "@t"
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("vector version 2"), "{error}");
+        assert_eq!(sent.lock().unwrap().len(), before);
+        assert_active(&client);
+    }
+}
+
 /// A cell rejected while it is being written may already have earlier rows
 /// on the wire, so the request is withdrawn rather than resumed.
 #[tokio::test]

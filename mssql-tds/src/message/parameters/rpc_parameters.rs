@@ -271,6 +271,32 @@ fn utf16_byte_len(text: &str) -> usize {
     units * 2
 }
 
+/// Whether `value` needs vector version 2 on the wire: a float16 vector, or a
+/// table whose columns or rows hold one.
+pub(crate) fn contains_float16(value: &SqlType) -> bool {
+    match value {
+        SqlType::Vector(value, _, base_type) => {
+            *base_type == VectorBaseType::Float16
+                || value
+                    .as_ref()
+                    .is_some_and(|v| v.base_type() == VectorBaseType::Float16)
+        }
+        SqlType::Table(_, Some(table)) => table
+            .columns
+            .iter()
+            .map(|column| &column.column_type)
+            .chain(table.rows.iter().flatten())
+            .any(contains_float16),
+        _ => false,
+    }
+}
+
+pub(crate) fn float16_vector_version_error(version: u8) -> Error {
+    Error::UsageError(format!(
+        "Vector float16 parameters require negotiated vector version 2; current version is {version}."
+    ))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct NumericDeclaration {
     precision: u8,
@@ -483,41 +509,20 @@ impl RpcParameter {
     }
 
     pub(crate) fn ensure_vector_version_supported(&self, version: u8) -> TdsResult<()> {
-        fn contains_float16(value: &SqlType) -> bool {
-            match value {
-                SqlType::Vector(value, _, base_type) => {
-                    *base_type == VectorBaseType::Float16
-                        || value
-                            .as_ref()
-                            .is_some_and(|v| v.base_type() == VectorBaseType::Float16)
-                }
-                SqlType::Table(_, Some(table)) => table
-                    .columns
-                    .iter()
-                    .map(|column| &column.column_type)
-                    .chain(table.rows.iter().flatten())
-                    .any(contains_float16),
-                _ => false,
-            }
-        }
-
-        let vector_version_error = || {
-            Error::UsageError(format!(
-                "Vector float16 parameters require negotiated vector version 2; current version is {version}."
-            ))
-        };
         if version >= 2 {
             return Ok(());
         }
         match &self.value {
-            RpcValue::Materialized(value) if contains_float16(value) => Err(vector_version_error()),
+            RpcValue::Materialized(value) if contains_float16(value) => {
+                Err(float16_vector_version_error(version))
+            }
             RpcValue::StreamedTable(table)
                 if table
                     .columns
                     .iter()
                     .any(|column| contains_float16(&column.column_type)) =>
             {
-                Err(vector_version_error())
+                Err(float16_vector_version_error(version))
             }
             _ => Ok(()),
         }

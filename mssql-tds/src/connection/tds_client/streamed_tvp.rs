@@ -20,6 +20,7 @@ use crate::datatypes::sql_tvp::{
     TVP_ROW_TOKEN, TvpColumnDef, is_plp_tvp_column, validate_tvp_cell, write_tvp_cell,
 };
 use crate::error::{Error, TvpParameterRef};
+use crate::message::parameters::rpc_parameters::{contains_float16, float16_vector_version_error};
 
 /// Position inside the table-valued parameter a streamed RPC has open.
 #[derive(Debug)]
@@ -104,7 +105,7 @@ impl TdsClient {
                 "write_streamed_tvp_cells called while a table cell is open.".to_string(),
             ))
         } else {
-            validate_cells(table, cells)
+            validate_cells(table, cells, self.negotiated_settings.vector_version())
         };
         if rejection.is_err() || cells.is_empty() {
             self.park_streamed(ctx);
@@ -295,13 +296,28 @@ fn open_table(ctx: &mut StreamedWriteContext) -> &mut StreamedTableCursor {
 }
 
 /// Validates `cells` from the table's current position without moving it.
-fn validate_cells(table: &StreamedTableCursor, cells: &[SqlType]) -> TdsResult<()> {
+///
+/// Column templates were checked against the negotiated vector version when
+/// the parameter opened; cells can still carry their own float16 vector.
+fn validate_cells(
+    table: &StreamedTableCursor,
+    cells: &[SqlType],
+    vector_version: u8,
+) -> TdsResult<()> {
     let mut column = table.next_column;
     let mut rows = table.rows;
     for cell in cells {
         let row = table.row_for(column, rows);
         rows += usize::from(column == 0);
         validate_tvp_cell(&table.columns[column], cell, row, column)
+            .and_then(|()| {
+                if vector_version < 2 && contains_float16(cell) {
+                    Err(float16_vector_version_error(vector_version)
+                        .with_tvp_cell_context(row, column))
+                } else {
+                    Ok(())
+                }
+            })
             .map_err(|error| error.with_tvp_parameter_context(table.parameter.clone()))?;
         column = (column + 1) % table.columns.len();
     }
