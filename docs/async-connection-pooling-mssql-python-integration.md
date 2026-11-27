@@ -573,23 +573,46 @@ Do not change the caller's allowed principal/authority under an existing key.
 
 ### 6.3 Bridge shape and lifetime
 
-The bridge owns an async callable and `pyo3_async_runtimes::TaskLocals` captured
+The operation bridge owns an async callable and `pyo3_async_runtimes::TaskLocals` captured
 while executing on the caller's running Python loop, including required
-contextvars. It uses `into_future_with_locals`, not bare `into_future` from an
-arbitrary Tokio worker.
+contextvars. The existing native async credential adapter explicitly schedules
+tracked Python Tasks on that loop with the captured context; it does not call bare
+`into_future` from an arbitrary Tokio worker or introduce a second task dispatcher.
 
 Only short callable construction/result extraction runs under the GIL. Awaiting
 credential/network work runs without it. Require an awaitable result from the
 async adapter and validate token/expiry types before use.
 
-For a TDS-retained callback, store only a weak reference to the per-open bridge.
-The physical-open future holds the strong reference until login and metadata
-extraction finish. The resulting idle client must not retain a strong Python
-callable/credential/loop reference. Pooled transparent recovery is disabled per
-Doc 1, so a later callback would be an invariant failure, not a reason to call
-into a stale loop.
+**Approved recovery revision (AB#50759):** a TDS-retained callback stores only a
+weak reference to the active operation bridge. Each physical open or application
+operation owns a new strong scope built on the current caller's running loop and
+context. Scope drop deactivates the callback; invocation outside a scope fails
+explicitly. An idle client retains no strong Python callable/credential/loop
+reference. Never install a mutable current provider on a per-key manager.
 
-Authentication metadata is per open, not a global mutable "last expiry". If login
+The private native seam is `RecoveryAuth::activate` / `OperationAuth`. Its
+`ConnectionFactory` implementation installs only the weak callback in the cloned
+TDS context. The opened connection retains the Rust callback handle (no Python
+references); `PoolLease::activate_auth` activates that same handle on a cache hit
+or subsequent operation. `run_authenticated` rejects a scope belonging to a
+different physical context and retains the operation scope through
+tracked execution. The scope owns the trusted identity/credential binding reader
+and checks it before/after token acquisition, before each work poll and at result
+publication. Callers must supply a real binding-epoch reader,
+not decoded JWT claims or a constant standing in for account-switch detection.
+The reader runs synchronously on the native polling path and must read cheap,
+nonblocking identity/epoch metadata. Production integration must not invoke
+Python or credential/network I/O from this reader on each poll.
+Authority, concrete tenant and Azure Public SQL resource are validated before
+credential use. Credential-backed results require integer UTC `expires_on`;
+invalid/near-expiry results fail closed. Both UTC and conservative monotonic
+validity are checked before metadata publication.
+Expiry detected after application work completes makes the session ineligible
+for reuse; discard it with a redacted diagnostic without converting an already
+completed write into an apparent failure. Identity/credential-epoch mismatch
+still prevents successful result delivery. Preserve original operation failures.
+
+Authentication metadata is per operation/login attempt, not a global mutable "last expiry". If login
 routes/retries internally, the returned metadata must belong to the successful
 physical login. Provider errors preserve cause for the caller but are redacted
 in telemetry; raw Python exception strings can themselves contain secrets.
@@ -630,13 +653,24 @@ Driver-created credentials are closed by `pool.aclose()` after their tracked aut
 tasks settle. Caller-owned credentials/providers are never closed implicitly.
 Direct opens use scoped driver-owned credentials and close them after login;
 for an explicit disabled pool, its owned cache may be used instead and is closed
-by that pool. **New credential-backed async Entra flows disable transparent
-session recovery in v1 even when direct.** They retain only the same weak per-open
-callback, never a strong bridge to an expired login task. Reject an explicitly
-requested nonzero recovery count for these flows; when omitted, supply zero.
-Already-supported direct SQL/trusted flows keep their existing recovery policy.
-This is a definite v1 restriction, not an unspecified fallback. Raw caller tokens
-have no automatic token-refresh guarantee.
+by that pool. The approved recovery revision replaces the earlier blanket
+nonzero-retry rejection: credential-backed recovery may use the supported async
+adapter under the **same verified binding**, recording the successful login's
+expiry. The active application operation, not the idle client, owns its bridge.
+SQL-password recovery uses the validated retained lease configuration; trusted
+recovery must preserve its bound identity and remains platform-gated until
+nonblocking-login and identity evidence exists. Raw caller tokens are reused
+exactly as supplied under exact-token binding, with no automatic refresh guarantee.
+No recovery path may switch principal or silently acquire a new token under an
+old exact-token key.
+
+AB#50759 provides the private operation bridge, expiry capture and tracked-lease
+seam, not public AQE wiring or canonical key preparation. Native pooled admission
+still explicitly permits SQL-password authentication only. Trusted, raw-token
+and credential-backed Entra pooling stay gated until their preparation, caller
+binding contract, AQE operation activation and relevant live/platform evidence
+exist. Existing direct async authentication behavior is unchanged; it does not
+become proof of pooled recovery support.
 
 There is no general automatic async "event loop teardown" callback that the
 design can rely on. Explicit closure is required. A cancelled/timed-out aclose

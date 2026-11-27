@@ -178,6 +178,7 @@ unsafe fn alloc_dbc_with_encoding(
         input_handle,
         Arc::clone(&env.runtime),
         client_encoding,
+        env_state.odbc_version,
     ));
     let raw = handle_to_raw(dbc);
     env_state.connections.push(raw);
@@ -394,6 +395,27 @@ mod tests {
             let h = TestHandles::with_env_dbc_version(version);
             assert!(!h.dbc.is_null(), "{version} must allocate a connection");
         }
+    }
+
+    /// Each connection keeps the version declared when it was allocated, so
+    /// connections under one ENV can hold different versions at once, as with
+    /// msodbcsql's per-connection copy in `wStatus` (`sqlcconn.cpp:618`).
+    #[test]
+    fn connections_on_one_env_keep_their_own_odbc_version() {
+        let h = TestHandles::with_env_dbc_version(SQL_OV_ODBC3);
+        h.declare_odbc_version(SQL_OV_ODBC3_80);
+        let other = h.alloc_other_connection();
+
+        assert_eq!(
+            unsafe { handle_from_raw::<DbcHandle>(h.dbc) }.odbc_version(),
+            OdbcVersion::Odbc3,
+            "allocated under 3.0"
+        );
+        assert_eq!(
+            unsafe { handle_from_raw::<DbcHandle>(other.dbc) }.odbc_version(),
+            OdbcVersion::Odbc3_80,
+            "allocated under 3.8"
+        );
     }
 
     #[test]

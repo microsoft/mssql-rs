@@ -11,9 +11,8 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::Instant;
 
-use crate::async_errors::{OperationalError, map_connection_claim, map_tds_error};
+use crate::async_errors::{OperationalError, map_connection_claim, map_pool_error, map_tds_error};
 use crate::async_handle::{CloseMode, CloseResult, check_cleanup_deadline};
-use crate::async_pool::map_pool_error;
 use crate::pool::error::PoolResult;
 
 pub(crate) type CursorId = u64;

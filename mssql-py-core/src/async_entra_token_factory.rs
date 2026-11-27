@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use mssql_tds::connection::client_context::{EntraIdTokenFactory, TdsAuthenticationMethod};
 use mssql_tds::core::TdsResult;
 use mssql_tds::error::Error;
@@ -24,14 +25,19 @@ use pyo3::exceptions::{
     PyAttributeError, PyRuntimeError, PyTimeoutError, PyTypeError, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyInt};
 use pyo3_async_runtimes::TaskLocals;
 use tokio::sync::oneshot;
 
-use crate::async_entra_credentials::BuiltInEntraCredential;
+use crate::async_entra_credentials::{BuiltInEntraCredential, validate_public_target};
 use crate::async_errors::InterfaceError;
 
 const CREDENTIAL_CLOSE_TIMEOUT_SECS: f64 = 5.0;
+
+pub(crate) struct AcquiredToken {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) expires_on: Option<DateTime<Utc>>,
+}
 
 #[derive(Clone)]
 enum TokenProvider {
@@ -87,7 +93,28 @@ impl AsyncPythonEntraIdTokenFactory {
         )
     }
 
-    async fn acquire_token(&self, spn: &str, sts_url: &str) -> PyResult<Vec<u8>> {
+    pub(crate) async fn acquire_login_token(
+        &self,
+        spn: &str,
+        sts_url: &str,
+        tenant: &str,
+    ) -> PyResult<AcquiredToken> {
+        let scope = token_scope(spn)?;
+        Python::attach(|py| {
+            if validate_public_target(py, &scope, sts_url)? != tenant {
+                return Err(PyValueError::new_err("Entra authority tenant changed"));
+            }
+            Ok(())
+        })?;
+        self.acquire_token(spn, sts_url, true).await
+    }
+
+    async fn acquire_token(
+        &self,
+        spn: &str,
+        sts_url: &str,
+        require_expiry: bool,
+    ) -> PyResult<AcquiredToken> {
         let scope = token_scope(spn)?;
         let (sender, receiver) = oneshot::channel();
         let mut cancellation = Python::attach(|py| {
@@ -99,6 +126,7 @@ impl AsyncPythonEntraIdTokenFactory {
                     task: None,
                     dispatch: self.dispatch.clone(),
                     connect_cancellation: self.connect_cancellation.clone(),
+                    require_expiry,
                 },
             )?;
             let request = Py::new(
@@ -142,29 +170,30 @@ impl EntraIdTokenFactory for AsyncPythonEntraIdTokenFactory {
         sts_url: String,
         _auth_method: TdsAuthenticationMethod,
     ) -> TdsResult<Vec<u8>> {
-        // TODO: TdsClient::reconnect should also stop retrying terminal authentication failures.
-        let result = self.acquire_token(&spn, &sts_url).await;
+        let result = self.acquire_token(&spn, &sts_url, false).await;
         // The caller loop can observe cancellation before Tokio drops this future.
         if self.connect_cancellation.cancelled.load(Ordering::Acquire) {
             return Err(Error::OperationCancelledError(
                 "Async Entra token acquisition cancelled".into(),
             ));
         }
-        result.map_err(|error| {
-            let cancelled = Python::attach(|py| {
-                py.import("asyncio")
-                    .and_then(|module| module.getattr("CancelledError"))
-                    .is_ok_and(|class| error.is_instance(py, &class))
-            });
-            if cancelled {
-                Error::TokenAcquisitionCancelled
-            } else {
-                // Provider messages can contain credentials or tokens.
-                Error::Security(SecurityError::AuthenticationDenied(
-                    "Async Entra token acquisition failed".into(),
-                ))
-            }
-        })
+        result.map(|token| token.bytes).map_err(token_error)
+    }
+}
+
+pub(crate) fn token_error(error: PyErr) -> Error {
+    let cancelled = Python::attach(|py| {
+        py.import("asyncio")
+            .and_then(|module| module.getattr("CancelledError"))
+            .is_ok_and(|class| error.is_instance(py, &class))
+    });
+    if cancelled {
+        Error::TokenAcquisitionCancelled
+    } else {
+        // Provider messages can contain credentials or tokens.
+        Error::Security(SecurityError::AuthenticationDenied(
+            "Async Entra token acquisition failed".into(),
+        ))
     }
 }
 
@@ -176,7 +205,11 @@ struct ConnectCancellationState {
 }
 
 impl ConnectCancellationState {
-    fn before_publish(&self, py: Python<'_>, result: PyResult<Vec<u8>>) -> PyResult<Vec<u8>> {
+    fn before_publish(
+        &self,
+        py: Python<'_>,
+        result: PyResult<AcquiredToken>,
+    ) -> PyResult<AcquiredToken> {
         result.and_then(|bytes| {
             if let Some(reference) = self.future.get() {
                 let future = reference.bind(py).call0()?;
@@ -342,16 +375,17 @@ impl TokenRequest {
 
 #[pyclass]
 struct TokenCompletion {
-    sender: Option<oneshot::Sender<PyResult<Vec<u8>>>>,
+    sender: Option<oneshot::Sender<PyResult<AcquiredToken>>>,
     owned_provider: Option<Py<PyAny>>,
     // asyncio keeps only weak references to tasks, including cancelled ones.
     task: Option<Py<PyAny>>,
     dispatch: tracing::Dispatch,
     connect_cancellation: Arc<ConnectCancellationState>,
+    require_expiry: bool,
 }
 
 impl TokenCompletion {
-    fn complete(&mut self, py: Python<'_>, result: PyResult<Vec<u8>>) {
+    fn complete(&mut self, py: Python<'_>, result: PyResult<AcquiredToken>) {
         if let Some(provider) = self.owned_provider.take() {
             tracing::debug!("Closing driver-owned async Entra credential");
             let cleanup = (|| {
@@ -402,7 +436,7 @@ impl TokenCompletion {
         self.send(py, result);
     }
 
-    fn send(&mut self, py: Python<'_>, result: PyResult<Vec<u8>>) {
+    fn send(&mut self, py: Python<'_>, result: PyResult<AcquiredToken>) {
         if let Some(sender) = self.sender.take() {
             // A dropped receiver means the native operation was cancelled.
             let _ = sender.send(self.connect_cancellation.before_publish(py, result));
@@ -441,7 +475,29 @@ impl TokenCompletion {
                     "Async token provider returned an empty token",
                 ));
             }
-            Ok(token.encode_utf16().flat_map(u16::to_le_bytes).collect())
+            let expires_on = if self.require_expiry {
+                let expiry = value.getattr("expires_on").map_err(|error| {
+                    if error.is_instance_of::<PyAttributeError>(py) {
+                        PyTypeError::new_err("Async token provider must return integer expires_on")
+                    } else {
+                        error
+                    }
+                })?;
+                if expiry.is_instance_of::<PyBool>() || !expiry.is_instance_of::<PyInt>() {
+                    return Err(PyTypeError::new_err(
+                        "Async token provider must return integer expires_on",
+                    ));
+                }
+                Some(DateTime::from_timestamp(expiry.extract::<i64>()?, 0).ok_or_else(|| {
+                    PyValueError::new_err("Async token provider returned invalid expires_on")
+                })?)
+            } else {
+                None
+            };
+            Ok(AcquiredToken {
+                bytes: token.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+                expires_on,
+            })
         });
         if result.is_err() {
             tracing::debug!("Async Entra token acquisition failed or was cancelled");
@@ -454,8 +510,8 @@ impl TokenCompletion {
 
 #[pyclass]
 struct CredentialCloseCompletion {
-    sender: Option<oneshot::Sender<PyResult<Vec<u8>>>>,
-    result: Option<PyResult<Vec<u8>>>,
+    sender: Option<oneshot::Sender<PyResult<AcquiredToken>>>,
+    result: Option<PyResult<AcquiredToken>>,
     provider: Option<Py<PyAny>>,
     task: Option<Py<PyAny>>,
     timer: Option<Py<PyAny>>,
@@ -555,7 +611,7 @@ pub(crate) fn _invoke_async_entra_id_token_factory<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let factory = AsyncPythonEntraIdTokenFactory::new(py, provider)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let bytes = factory.acquire_token(&spn, "").await?;
-        Python::attach(|py| Ok(PyBytes::new(py, &bytes).unbind()))
+        let token = factory.acquire_token(&spn, "", false).await?;
+        Python::attach(|py| Ok(PyBytes::new(py, &token.bytes).unbind()))
     })
 }

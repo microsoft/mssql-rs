@@ -14,8 +14,7 @@ use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard, watch};
 use tokio::time::{Instant, timeout_at};
 use tracing::instrument::WithSubscriber;
 
-use crate::async_errors::{OperationalError, map_tds_error};
-use crate::async_pool::map_pool_error;
+use crate::async_errors::{OperationalError, map_pool_error, map_tds_error};
 use crate::async_session::{AsyncConnectionState, ClaimError, OperationId};
 use crate::pool::session::PoolLease;
 

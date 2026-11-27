@@ -5,10 +5,12 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::*;
+use crate::async_errors::OperationalError;
 use crate::async_handle::{CLOSE_TIMEOUT, CloseMode};
 use crate::pool::connection::{
     AuthBinding, AuthMetadata, ConnectSpec, OpenedConnection, PoolKey, TokenExpiry,
 };
+use crate::pool::error::OpenError;
 use async_trait::async_trait;
 use mssql_tds::connection::client_context::ClientContext;
 use mssql_tds::core::CancelHandle;

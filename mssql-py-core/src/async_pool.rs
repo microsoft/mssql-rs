@@ -17,13 +17,13 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::async_connection::PyAsyncConnection;
-use crate::async_errors::{InterfaceError, InternalError, OperationalError};
+use crate::async_errors::{InterfaceError, InternalError, map_pool_error};
 use crate::async_handle::{ConnHandle, LogicalConnection};
 use crate::pool::config::PoolConfig;
 use crate::pool::connection::{ConnectionFactory, SqlConnectionFactory};
 use crate::pool::control::AcquireControl;
 use crate::pool::error::AcquireStage;
-use crate::pool::error::{OpenError, PoolError};
+use crate::pool::error::PoolError;
 use crate::pool::manager::AsyncPoolManager;
 use crate::pool::session::Isolation;
 use mssql_tds::message::transaction_management::TransactionIsolationLevel;
@@ -401,7 +401,13 @@ pub(crate) fn connect<'py>(
         let cancel = control.cancellation().clone();
         let handle = match pool
             .manager
-            .acquire(key, &spec, &SqlConnectionFactory, requested, control)
+            .acquire(
+                key,
+                &spec,
+                &SqlConnectionFactory,
+                requested.clone(),
+                control,
+            )
             .await
             .map_err(map_pool_error)?
         {
@@ -452,40 +458,6 @@ pub(crate) fn connect<'py>(
             future_dispatch,
         )),
     )
-}
-
-pub(crate) fn map_pool_error(error: PoolError) -> PyErr {
-    let message = error.to_string();
-    let reason = match &error {
-        PoolError::WaitQueueFull => "WaitQueueFull",
-        PoolError::Closed => "Closed",
-        PoolError::AcquireTimeout { .. } => "AcquireTimeout",
-        PoolError::CleanupTimeout => "CleanupTimeout",
-        PoolError::ShutdownTimeout => "ShutdownTimeout",
-        _ => "PoolError",
-    };
-    let mapped = match error {
-        PoolError::InvalidConfig { .. } | PoolError::InvalidRequest { .. } | PoolError::Closed => {
-            InterfaceError::new_err(message)
-        }
-        PoolError::Cancelled => Python::attach(|py| {
-            py.import("asyncio")?
-                .getattr("CancelledError")?
-                .call0()
-                .map(PyErr::from_value)
-        })
-        .unwrap_or_else(|error| error),
-        PoolError::Open(OpenError::Tds(error))
-        | PoolError::Initialize(error)
-        | PoolError::Cleanup(error) => {
-            crate::async_errors::map_tds_error("Async pool operation failed", *error, Vec::new())
-        }
-        PoolError::Internal { .. } | PoolError::InvalidSession => InternalError::new_err(message),
-        _ => OperationalError::new_err(message),
-    };
-    Python::attach(|py| mapped.value(py).setattr("pool_reason", reason))
-        .unwrap_or_else(|error| tracing::warn!(%error, "Could not attach pool error reason"));
-    mapped
 }
 
 pub(crate) fn duration(

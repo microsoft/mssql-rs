@@ -3,6 +3,7 @@
 
 //! Internal pool lifecycle, SQL checkout and safe return. AQE integration remains gated.
 
+pub(crate) mod auth;
 pub(crate) mod config;
 pub(crate) mod connection;
 pub(crate) mod control;

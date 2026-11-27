@@ -259,7 +259,7 @@ impl PyAsyncConnection {
         let control = budget
             .map(|budget| {
                 AcquireControl::from_timeout(started, budget, delivery.cancel.clone())
-                    .map_err(async_pool::map_pool_error)
+                    .map_err(crate::async_errors::map_pool_error)
             })
             .transpose()?;
         let isolation = isolation_level
@@ -322,7 +322,7 @@ impl PyAsyncConnection {
                 isolation
                     .apply(&mut client)
                     .await
-                    .map_err(async_pool::map_pool_error)?;
+                    .map_err(crate::async_errors::map_pool_error)?;
             }
 
             tracing::info!("PyAsyncConnection::connect: connection established");
@@ -339,17 +339,19 @@ impl PyAsyncConnection {
             if let Some(control) = control {
                 control
                     .check(AcquireStage::Admission)
-                    .map_err(async_pool::map_pool_error)?;
+                    .map_err(crate::async_errors::map_pool_error)?;
                 let result = tokio::time::timeout_at(control.deadline(), connect)
                     .await
                     .map_err(|_| {
-                        async_pool::map_pool_error(crate::pool::error::PoolError::AcquireTimeout {
-                            stage: AcquireStage::Open,
-                        })
+                        crate::async_errors::map_pool_error(
+                            crate::pool::error::PoolError::AcquireTimeout {
+                                stage: AcquireStage::Open,
+                            },
+                        )
                     })?;
                 control
                     .check(AcquireStage::Delivery)
-                    .map_err(async_pool::map_pool_error)?;
+                    .map_err(crate::async_errors::map_pool_error)?;
                 result
             } else {
                 connect.await

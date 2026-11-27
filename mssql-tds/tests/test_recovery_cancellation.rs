@@ -80,7 +80,7 @@ async fn recovery_stops_on_cancellation_but_retries_connection_errors() {
         for retry_count in [1, 3] {
             let failure_call =
                 if matches!(failure, RecoveryFailure::FinalAttemptCommandCancellation) {
-                    retry_count as usize + 1
+                    retry_count as usize
                 } else {
                     1
                 };
@@ -164,13 +164,18 @@ async fn recovery_stops_on_cancellation_but_retries_connection_errors() {
             } else {
                 execute.await
             };
-            let retried = matches!(failure, RecoveryFailure::ConnectionError);
+            let retried = matches!(failure, RecoveryFailure::ConnectionError) && retry_count > 1;
             if retried {
                 result.unwrap();
                 client.close_query().await.unwrap();
             } else {
                 let error = result.unwrap_err();
-                if matches!(failure, RecoveryFailure::ProviderCancellation) {
+                if matches!(failure, RecoveryFailure::ConnectionError) {
+                    assert!(
+                        matches!(error, Error::SessionRecoveryFailed { attempts: 1, .. }),
+                        "{failure:?}, retry_count={retry_count}: {error:?}"
+                    );
+                } else if matches!(failure, RecoveryFailure::ProviderCancellation) {
                     assert!(
                         matches!(error, Error::TokenAcquisitionCancelled),
                         "{failure:?}, retry_count={retry_count}: {error:?}"
