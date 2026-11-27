@@ -22,7 +22,7 @@ use crate::api::sqlstate::DiagMsg;
 use crate::error::DiagRecord;
 use crate::handles::dbc::ConnectionState;
 use crate::handles::wire::{ClaimPolicy, WireLease, WireOwner};
-use crate::handles::{DbcHandle, handle_from_raw};
+use crate::handles::{DbcHandle, EnvHandle, handle_from_raw};
 
 /// Asserts the last record's SQLSTATE and message text (the driver prefixes the
 /// message, so the text is matched as a substring).
@@ -181,9 +181,53 @@ impl TestHandles {
         h
     }
 
+    /// Declares `SQL_ATTR_ODBC_VERSION` through `SQLSetEnvAttr`. Legal after a
+    /// DBC exists when no Driver Manager stands in front of the driver, as with
+    /// mssql-python.
+    pub(crate) fn declare_odbc_version(&self, version: u32) {
+        assert_eq!(
+            unsafe {
+                sql_set_env_attr(
+                    self.env,
+                    SQL_ATTR_ODBC_VERSION,
+                    version as usize as *mut c_void,
+                    0,
+                )
+            },
+            SQL_SUCCESS,
+            "SQL_OV version {version} must be accepted"
+        );
+    }
+
+    /// Runs `f` on another thread while this thread holds the ENV state mutex,
+    /// returning `None` if `f` has not finished within 10 seconds. The mutex is
+    /// released before joining, so an `f` blocked on it still completes.
+    pub(crate) fn run_while_env_locked(
+        &self,
+        f: impl FnOnce() -> SqlReturn + Send + 'static,
+    ) -> Option<SqlReturn> {
+        let env = unsafe { handle_from_raw::<EnvHandle>(self.env) };
+        let env_guard = env.inner.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        let rc = rx.recv_timeout(std::time::Duration::from_secs(10)).ok();
+        drop(env_guard);
+        worker.join().unwrap();
+        rc
+    }
+
     /// Allocate ENV + DBC + STMT.
     pub(crate) fn with_env_dbc_stmt() -> Self {
         Self::with_env_dbc_stmt_encoding(crate::conversion::client_encoding::ClientEncoding::UTF8)
+    }
+
+    /// Allocate ENV + DBC + STMT with the DBC allocated under `version`.
+    pub(crate) fn with_env_dbc_stmt_version(version: u32) -> Self {
+        let mut h = Self::with_env_dbc_version(version);
+        h.stmt = h.alloc_stmt_under_dbc();
+        h
     }
 
     pub(crate) fn with_env_dbc_stmt_encoding(
@@ -195,14 +239,18 @@ impl TestHandles {
             .lock()
             .unwrap()
             .client_encoding = encoding;
+        h.stmt = h.alloc_stmt_under_dbc();
+        h
+    }
+
+    fn alloc_stmt_under_dbc(&self) -> SqlHandle {
         let mut stmt: SqlHandle = SQL_NULL_HANDLE;
         assert_eq!(
-            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, h.dbc, &mut stmt) },
+            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, self.dbc, &mut stmt) },
             SQL_SUCCESS
         );
         assert!(!stmt.is_null());
-        h.stmt = stmt;
-        h
+        stmt
     }
 
     /// Allocate an additional STMT under the same DBC. The returned handle is
@@ -253,9 +301,9 @@ impl TestHandles {
     }
 
     /// Allocates a second, independent connection under the same ENV, with
-    /// one explicit descriptor already allocated on it — for
-    /// cross-connection rejection tests. Both are freed by
-    /// [`OtherConnection`]'s own `Drop`, before this `TestHandles`'s ENV.
+    /// one explicit descriptor already allocated on it — for cross-connection
+    /// tests. Both are freed by [`OtherConnection`]'s own `Drop`, before this
+    /// `TestHandles`'s ENV.
     pub(crate) fn alloc_other_connection(&self) -> OtherConnection {
         let mut dbc: SqlHandle = SQL_NULL_HANDLE;
         assert_eq!(
@@ -344,7 +392,7 @@ impl Drop for TestHandles {
 /// cross-connection rejection tests. Frees the descriptor, then the DBC, on
 /// drop.
 pub(crate) struct OtherConnection {
-    dbc: SqlHandle,
+    pub(crate) dbc: SqlHandle,
     pub(crate) desc: SqlHandle,
 }
 
