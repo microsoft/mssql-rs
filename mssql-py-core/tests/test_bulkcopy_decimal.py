@@ -4,7 +4,7 @@
 """Bulk copy tests for DECIMAL data type."""
 import pytest
 import mssql_py_core
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN, localcontext
 
 
 @pytest.mark.integration
@@ -404,61 +404,90 @@ def test_cursor_bulkcopy_decimal_precision_overflow(client_context):
 
 
 @pytest.mark.integration
-def test_cursor_bulkcopy_decimal_scale_overflow(client_context):
-    """Test cursor bulkcopy with decimal value exceeding scale.
-
-    When a decimal value has more digits after the decimal point than the column scale allows,
-    it should be rejected or rounded during type coercion (depending on implementation).
-
-    Expected behavior:
-    - Decimal value with scale <= column scale converts successfully
-    - Decimal value with scale > column scale may trigger validation error or be rounded
-    """
+@pytest.mark.parametrize("sql_type", ["DECIMAL", "NUMERIC"])
+@pytest.mark.parametrize("source_type", [Decimal, str])
+def test_cursor_bulkcopy_decimal_rounds_to_destination(
+    client_context, sql_type, source_type
+):
+    """Scale reduction is exact and independent of Python's decimal context."""
     conn = mssql_py_core.PyCoreConnection(client_context)
     cursor = conn.cursor()
-
-    # Create a temp table with DECIMAL(10, 2) column (2 digits after decimal point)
-    table_name = "#BulkCopyDecimalScaleOverflowTable"
-    cursor.execute(f"CREATE TABLE {table_name} (id DECIMAL(10, 2), value DECIMAL(10, 2))")
-
-    # Prepare test data with decimal value exceeding scale
-    # DECIMAL(10, 2) allows max 2 digits after decimal point
-    data = [
-        (Decimal("1.00"), Decimal("100.50")),
-        (Decimal("2.00"), Decimal("200.999")),  # 3 digits after decimal, exceeds scale of 2
-        (Decimal("3.00"), Decimal("300.99")),
+    table_name = "#BulkCopyDecimalRounding"
+    cases = [
+        ("123.456", "123.46", "2.5", "3", "1.2", "1.2000"),
+        ("-123.456", "-123.46", "-2.5", "-3", "-1.2", "-1.2000"),
+        ("123.455", "123.46", "2.49", "2", "1.2345", "1.2345"),
+        ("-123.455", "-123.46", "-2.49", "-2", "0", "0.0000"),
+        ("123.454", "123.45", "0.5", "1", "-0", "0.0000"),
+        ("-123.454", "-123.45", "-0.5", "-1", "1E+2", "100.0000"),
+        ("1.230000", "1.23", "0.49", "0", "1.0000", "1.0000"),
+        ("-0.000", "0.00", "-0.49", "0", "0.0000", "0.0000"),
+        ("99.995", "100.00", "9.999", "10", "0.00005", "0.0001"),
     ]
-
-    # Execute bulk copy and expect scale validation error or rounding
-    error_raised = False
-    error_message = ""
     try:
-        result = cursor.bulkcopy(
-            table_name, iter(data), batch_size=1000, timeout=30
+        cursor.execute(
+            f"CREATE TABLE {table_name} (id INT, value {sql_type}(10,2), "
+            f"whole {sql_type}(10,0), padded {sql_type}(10,4), "
+            f"wide {sql_type}(38,2))"
         )
-        # If we get here, check if rounding occurred
-        cursor.execute(f"SELECT id, value FROM {table_name} WHERE id = 2")
-        rows = cursor.fetchall()
-        if len(rows) > 0:
-            # Rounding occurred - verify it was rounded correctly
-            assert rows[0][1] == Decimal("201.00"), f"Expected rounding to 201.00, got: {rows[0][1]}"
-            print(f"Decimal was rounded to fit scale: {rows[0][1]}")
-    except (ValueError, RuntimeError) as e:
-        error_raised = True
-        error_message = str(e).lower()
-        print(f"Expected error caught: {e}")
+        data = [
+            (i, source_type(value), source_type(whole), source_type(padded),
+             source_type("123456789012345678901234567890123456.785"))
+            for i, (value, _, whole, _, padded, _) in enumerate(cases)
+        ] + [(len(cases), None, None, None, None)]
+        expected = [
+            (i, Decimal(value), Decimal(whole), Decimal(padded),
+             Decimal("123456789012345678901234567890123456.79"))
+            for i, (_, value, _, whole, _, padded) in enumerate(cases)
+        ] + [(len(cases), None, None, None, None)]
+        with localcontext() as context:
+            context.prec = 6
+            context.rounding = ROUND_DOWN
+            result = cursor.bulkcopy(
+                table_name, iter(data), batch_size=3, timeout=30
+            )
+        assert result["rows_copied"] == len(data)
+        assert result["batch_count"] == 4
+        cursor.execute(f"SELECT * FROM {table_name} ORDER BY id")
+        assert [tuple(row) for row in cursor.fetchall()] == expected
+    finally:
+        conn.close()
 
-    # If error was raised, verify it's about scale overflow
-    if error_raised:
-        assert (
-            "scale" in error_message or "exceeds" in error_message
-        ), f"Expected scale error, got: {error_message}"
-        assert (
-            "decimal" in error_message
-        ), f"Expected DECIMAL column type in error, got: {error_message}"
 
-    # Close connection - temp table will be automatically dropped
-    conn.close()
+@pytest.mark.integration
+@pytest.mark.parametrize("use_internal_transaction", [False, True])
+@pytest.mark.parametrize("overflow", ["999.995", "-999.995"])
+def test_cursor_bulkcopy_decimal_rounded_overflow(
+    client_context, use_internal_transaction, overflow
+):
+    """A rounding carry must fail without undoing previously completed batches."""
+    conn = mssql_py_core.PyCoreConnection(client_context)
+    cursor = conn.cursor()
+    table_name = "#BulkCopyDecimalRoundedOverflow"
+    try:
+        cursor.execute(f"CREATE TABLE {table_name} (id INT, value DECIMAL(5,2))")
+        with pytest.raises(ValueError, match="exceeds target precision"):
+            cursor.bulkcopy(
+                table_name,
+                iter([(0, Decimal("1.005")), (1, Decimal("-1.005")),
+                      (2, Decimal("2.345")), (3, Decimal(overflow))]),
+                batch_size=2,
+                use_internal_transaction=use_internal_transaction,
+            )
+        cursor.execute(f"SELECT * FROM {table_name} ORDER BY id")
+        assert [tuple(row) for row in cursor.fetchall()] == [
+            (0, Decimal("1.01")), (1, Decimal("-1.01"))
+        ]
+        result = cursor.bulkcopy(
+            table_name,
+            iter([(3, Decimal("2.345"))]),
+            use_internal_transaction=use_internal_transaction,
+        )
+        assert result["rows_copied"] == 1
+        cursor.execute(f"SELECT value FROM {table_name} WHERE id = 3")
+        assert cursor.fetchall()[0][0] == Decimal("2.35")
+    finally:
+        conn.close()
 
 
 @pytest.mark.integration
