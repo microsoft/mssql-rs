@@ -74,10 +74,13 @@ Arrow JSON output remain separate `mssql-python` integration work.
 
 ### Contributor checks
 
-The Rust cursor importer tests exercise real PyArrow, not a replacement importer.
+The Rust cursor importer tests exercise real PyArrow (19.0.1 or newer), not a replacement importer.
 Install the `dev` extra in the Python environment used by `PYO3_PYTHON`; when
-embedding a virtual environment on Windows, also set `PYTHONPATH` to its
-`Lib\site-packages`. Run `cargo nextest run --manifest-path mssql-py-core/Cargo.toml
+embedding a virtual environment, also set `PYTHONPATH` to its site-packages
+directory (`Lib\site-packages` on Windows, or the result of
+`python -c 'import sysconfig; print(sysconfig.get_path("purelib"))'` on Linux).
+The Linux native-test pipeline provisions this environment before running Cargo.
+Run `cargo nextest run --manifest-path mssql-py-core/Cargo.toml
 --frozen --lib` for native tests. Build/install the local wheel with maturin before running
 the JSON and source-failure Python tests. Live tests require the normal
 `tests/conftest.py` SQL configuration and a native JSON-capable test server.
