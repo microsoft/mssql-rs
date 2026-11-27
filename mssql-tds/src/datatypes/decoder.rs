@@ -3375,7 +3375,7 @@ impl DecimalParts {
     /// Create a DecimalParts from a decimal string using BigDecimal.
     ///
     /// Supports SQL Server's full 38-digit precision using arbitrary-precision arithmetic.
-    /// More efficient and robust than manual parsing.
+    /// Rejects inputs with more fractional digits than `scale`.
     ///
     /// # Arguments
     /// * `s` - String like "123.45", "-0.01", "99999999999999999999999999999999999999"
@@ -3385,8 +3385,18 @@ impl DecimalParts {
     /// # Returns
     /// DecimalParts or Error if parsing fails or precision/scale validation fails
     pub fn from_string(s: &str, precision: u8, scale: u8) -> TdsResult<Self> {
+        Self::parse_string(s, precision, scale, false)
+    }
+
+    /// Parses at the destination scale, rounding ties away from zero as SQL Server
+    /// does for DECIMAL/NUMERIC conversions. Precision is checked after rounding.
+    pub fn from_string_rounded(s: &str, precision: u8, scale: u8) -> TdsResult<Self> {
+        Self::parse_string(s, precision, scale, true)
+    }
+
+    fn parse_string(s: &str, precision: u8, scale: u8, round: bool) -> TdsResult<Self> {
         use bigdecimal::num_bigint::{BigInt, Sign};
-        use bigdecimal::{BigDecimal, Zero};
+        use bigdecimal::{BigDecimal, RoundingMode, Zero};
         use std::str::FromStr;
 
         let trimmed = s.trim();
@@ -3406,7 +3416,7 @@ impl DecimalParts {
         // Check if input has more fractional digits than target scale
         // Get the scale of the input decimal
         let input_scale = decimal.fractional_digit_count();
-        if input_scale > scale as i64 {
+        if !round && input_scale > scale as i64 {
             return Err(crate::error::Error::TypeConversionError(format!(
                 "Input decimal scale {} exceeds target scale {}",
                 input_scale, scale
@@ -3427,7 +3437,7 @@ impl DecimalParts {
         let scaled = abs_decimal * scale_factor;
 
         // Round to nearest integer
-        let rounded = scaled.round(0);
+        let rounded = scaled.with_scale_round(0, RoundingMode::HalfUp);
 
         // Extract as BigInt, handling any remaining exponent
         let (bigint, exponent) = rounded.into_bigint_and_exponent();
@@ -4358,6 +4368,83 @@ mod test {
         assert!(result.is_err());
         let error_msg = format!("{:?}", result.unwrap_err());
         assert!(error_msg.contains("scale") && error_msg.contains("exceeds"));
+    }
+
+    #[test]
+    fn test_from_string_rounded_destination_scale() {
+        for (input, scale, expected) in [
+            ("123.456", 2, "123.46"),
+            ("123.455", 2, "123.46"),
+            ("123.454", 2, "123.45"),
+            ("-123.456", 2, "-123.46"),
+            ("-123.455", 2, "-123.46"),
+            ("-123.454", 2, "-123.45"),
+            ("2.5", 0, "3"),
+            ("-2.5", 0, "-3"),
+            ("2.49", 0, "2"),
+            ("-2.49", 0, "-2"),
+            ("99.995", 2, "100.00"),
+            ("1.23000", 2, "1.23"),
+            ("1.23", 2, "1.23"),
+            ("1.2", 4, "1.2000"),
+            ("1E+2", 2, "100.00"),
+            ("5E-3", 2, "0.01"),
+            ("-5E-3", 2, "-0.01"),
+            ("0.000", 2, "0.00"),
+            ("-0.000", 2, "-0.00"),
+            ("-0.004", 2, "-0.00"),
+        ] {
+            let parts = DecimalParts::from_string_rounded(input, 10, scale).unwrap();
+            assert_eq!(parts.to_string(), expected, "{input}");
+            assert_eq!(parts.scale, scale);
+        }
+    }
+
+    #[test]
+    fn test_from_string_rounded_full_precision() {
+        for (input, scale, expected) in [
+            (
+                "123456789012345678901234567890123456.785",
+                2,
+                "123456789012345678901234567890123456.79",
+            ),
+            (
+                "-123456789012345678901234567890123456.785",
+                2,
+                "-123456789012345678901234567890123456.79",
+            ),
+            (
+                "99999999999999999999999999999999999999.4",
+                0,
+                "99999999999999999999999999999999999999",
+            ),
+            (
+                "0.999999999999999999999999999999999999994",
+                38,
+                "0.99999999999999999999999999999999999999",
+            ),
+        ] {
+            let parts = DecimalParts::from_string_rounded(input, 38, scale).unwrap();
+            assert_eq!(parts.to_string(), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn test_from_string_rounded_precision_overflow() {
+        for (input, precision, scale) in [
+            ("999.995", 5, 2),
+            ("-999.995", 5, 2),
+            ("99999999999999999999999999999999999999.5", 38, 0),
+            ("0.999999999999999999999999999999999999995", 38, 38),
+        ] {
+            let error = DecimalParts::from_string_rounded(input, precision, scale).unwrap_err();
+            assert!(
+                error.to_string().contains("exceeds target precision"),
+                "{input}"
+            );
+        }
+        assert!(DecimalParts::from_string_rounded("NaN", 10, 2).is_err());
+        assert!(DecimalParts::from_string_rounded("Infinity", 10, 2).is_err());
     }
 
     #[test]
