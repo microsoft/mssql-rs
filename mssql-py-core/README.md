@@ -76,7 +76,8 @@ For SDK authors integrating the native runtime:
   for native connection options and defaults.
 - [Bulk-copy behavior](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/docs/bulk-copy.md)
   for the internal JSON snapshot bridge, Arrow text/schema boundaries,
-  fail-fast source handling, and datetime string precision and validation.
+  fail-fast source handling, decimal rounding, and datetime string precision,
+  offsets, and validation.
 
 For contributors, the
 [async pool context guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/src/pool/README.md)

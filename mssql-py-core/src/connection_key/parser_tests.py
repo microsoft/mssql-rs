@@ -58,11 +58,26 @@ def verify_pool_keys(same_key):
         ("Packet Size", "16000", "packet_size", True),
         ("PacketSize", "16000", "packet_size", True),
     ]
+    rejected_cases = (
+        [("VectorTypeSupport", "v1")]
+        if "vectortypesupport" in _ALLOWED_CONNECTION_STRING_PARAMS
+        else []
+    )
     check.assertEqual(
-        {keyword.lower() for keyword, *_ in cases},
+        {keyword.lower() for keyword, *_ in cases + rejected_cases},
         set(_ALLOWED_CONNECTION_STRING_PARAMS) - {"driver"},
         "Every accepted keyword spelling needs an explicit key-contract case",
     )
+    for keyword, value in rejected_cases:
+        for spelling in (keyword, keyword.upper(), keyword.lower()):
+            with check.assertRaises(ValueError) as raised:
+                _context(spelling, value)
+            check.assertEqual(
+                str(raised.exception),
+                "Connection parameters are not supported for mssql-py-core connections: "
+                + keyword.lower(),
+                spelling,
+            )
     for keyword, value, field, partitions in cases:
         actual = _context(keyword, value, field)
         check.assertIn(field, actual, keyword)
