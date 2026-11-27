@@ -136,9 +136,8 @@ fn sql_col_attribute_w_safe(
     string_length_ptr: *mut SqlSmallInt,
     numeric_attribute_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    // Cleared in a scope of its own, released before the DBC and ENV locks
-    // below, so a call that fails at one of them does not report a previous
-    // call's records.
+    // Cleared in a scope of its own, released before the DBC lock below, so a
+    // call that fails there does not report a previous call's records.
     {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLColAttributeW: stmt mutex poisoned");
@@ -163,18 +162,9 @@ fn sql_col_attribute_w_safe(
         None
     };
 
-    // The declared ODBC version selects the temporal sql_variant C types. Read
-    // it before the stmt lock to preserve parent-before-child lock ordering.
-    let variant_uses_3_80_types = if field_identifier == SQL_CA_SS_VARIANT_TYPE {
-        let env = stmt.parent_dbc().parent_env();
-        let Ok(env_state) = env.inner.lock() else {
-            error!("SQLColAttributeW: env mutex poisoned");
-            return SQL_ERROR;
-        };
-        env_state.odbc_version.uses_3_80_types()
-    } else {
-        false
-    };
+    // The declared ODBC version selects the temporal sql_variant C types.
+    let variant_uses_3_80_types = field_identifier == SQL_CA_SS_VARIANT_TYPE
+        && stmt.parent_dbc().odbc_version().uses_3_80_types();
 
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLColAttributeW: stmt mutex poisoned");
@@ -1461,29 +1451,23 @@ mod tests {
 
     #[test]
     fn temporal_variant_type_honors_the_declared_odbc_version() {
-        let h = TestHandles::with_env_dbc_stmt();
-        stmt_with_int_columns(&h, 1);
-        retype_column(&h, 1, TdsDataType::SsVariant, 8);
-        {
-            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-            stmt_handle.inner.lock().unwrap().last_variant_base = Some((1, TdsDataType::TimeN));
+        for (version, expected) in [
+            (OdbcVersion::Odbc3_80, SQL_C_SS_TIME2),
+            (OdbcVersion::Odbc3, SQL_C_BINARY),
+        ] {
+            let h = TestHandles::with_env_dbc_stmt_version(version as u32);
+            stmt_with_int_columns(&h, 1);
+            retype_column(&h, 1, TdsDataType::SsVariant, 8);
+            {
+                let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                stmt_handle.inner.lock().unwrap().last_variant_base = Some((1, TdsDataType::TimeN));
+            }
+            assert_eq!(
+                numeric(&h, 1, SQL_CA_SS_VARIANT_TYPE),
+                SqlLen::from(expected),
+                "{version:?}"
+            );
         }
-
-        assert_eq!(
-            numeric(&h, 1, SQL_CA_SS_VARIANT_TYPE),
-            SqlLen::from(SQL_C_SS_TIME2)
-        );
-
-        {
-            // Directly mutating the ENV after DBC allocation is test-only; a
-            // Driver Manager rejects this state transition.
-            let env_handle = unsafe { handle_from_raw::<crate::handles::EnvHandle>(h.env) };
-            env_handle.inner.lock().unwrap().odbc_version = OdbcVersion::Odbc3;
-        }
-        assert_eq!(
-            numeric(&h, 1, SQL_CA_SS_VARIANT_TYPE),
-            SqlLen::from(SQL_C_BINARY)
-        );
     }
 
     /// A base type captured for one column must not answer for another.

@@ -894,24 +894,10 @@ fn fetch_scroll_operation(
     stmt: &StmtHandle,
     fetch_orientation: SqlSmallInt,
 ) -> SqlReturn {
-    // The declared ODBC version selects the SQL_C_DEFAULT table. Read it before
-    // the stmt lock to preserve parent-before-child lock ordering (the same
-    // order as `bind_param.rs` and `catalog.rs`).
-    //
-    // Read per fetch, deliberately, not cached on the DBC at alloc. Gating it on
-    // "does any binding use SQL_C_DEFAULT" would need the bindings first, which
-    // inverts the lock order; caching at alloc would instead bake in a value
-    // that `SQLSetEnvAttr` can still overwrite afterwards. It is an uncontended
-    // read of one `Copy` field, taken before validation so there is exactly one
-    // acquisition site rather than one per early-return path.
-    let odbc_version = {
-        let env = stmt.parent_dbc().parent_env();
-        let Ok(env_state) = env.inner.lock() else {
-            error!("SQLFetchScroll: env mutex poisoned");
-            return SQL_ERROR;
-        };
-        env_state.odbc_version
-    };
+    // The declared ODBC version selects the SQL_C_DEFAULT table. It is fixed on
+    // the DBC at allocation (see `DbcHandle::odbc_version`), so the read takes
+    // no lock and costs nothing to do before validation.
+    let odbc_version = stmt.parent_dbc().odbc_version();
 
     // Under the STMT lock: validate, resolve the effective ARD and claim the
     // statement. The lock is released before any DESC lock (§7.1) and before
@@ -3091,7 +3077,6 @@ mod tests {
     };
     use crate::api::sqlstate::SQLSTATE_HY106;
     use crate::api::sqlstate::{ERR_CONNECTION_BUSY, SQLSTATE_24000, SQLSTATE_HY000};
-    use crate::handles::EnvHandle;
     use crate::handles::dbc::DbcHandle;
     use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
     use crate::test_support::TestHandles;
@@ -5434,12 +5419,18 @@ mod tests {
     /// int, `HYC00` for the binary 3.0 one. Hardcoding either version in
     /// `fetch_scroll_safe` flips one of these and fails the test.
     fn fetch_time_column_row_state(version: OdbcVersion) -> (SqlReturn, [u8; 5]) {
-        let h = TestHandles::with_env_dbc_stmt();
+        fetch_time_column_row_state_with(version, |h| unsafe {
+            sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0)
+        })
+    }
+
+    /// Allocates the DBC under `version`, then fetches through `fetch`.
+    fn fetch_time_column_row_state_with(
+        version: OdbcVersion,
+        fetch: impl FnOnce(&TestHandles) -> SqlReturn,
+    ) -> (SqlReturn, [u8; 5]) {
+        let h = TestHandles::with_env_dbc_stmt_version(version as u32);
         h.mark_dbc_connected();
-        {
-            let env = unsafe { handle_from_raw::<EnvHandle>(h.env) };
-            env.inner.lock().unwrap().odbc_version = version;
-        }
 
         let mut metadata = int_columns(1);
         metadata[0].data_type = TdsDataType::TimeN;
@@ -5477,7 +5468,7 @@ mod tests {
             state.wire.set_owner_for_test(Some(h.stmt));
         }
 
-        let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+        let rc = fetch(&h);
         (rc, last_state(&h))
     }
 
@@ -5496,6 +5487,38 @@ mod tests {
             (SQL_ERROR, *b"HYC00"),
             "3.0 resolves SQL_SS_TIME2 to SQL_C_BINARY, which is not delivered yet"
         );
+    }
+
+    /// msodbcsql copies the version onto the connection at `SQLAllocConnect`
+    /// (`sqlcconn.cpp:618`) and `Sql2CDefault` reads only that copy, so a
+    /// version declared after the DBC exists does not reach it. Only reachable
+    /// without a Driver Manager, which refuses the call with `HY010`.
+    #[test]
+    fn a_version_declared_after_dbc_allocation_does_not_reach_the_dbc() {
+        let state = fetch_time_column_row_state_with(OdbcVersion::Odbc3, |h| {
+            h.declare_odbc_version(OdbcVersion::Odbc3_80 as u32);
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) }
+        });
+        assert_eq!(
+            state,
+            (SQL_ERROR, *b"HYC00"),
+            "the DBC keeps the 3.0 it was allocated under"
+        );
+    }
+
+    /// Every connection pooled under one ENV reads the version on each fetch,
+    /// so the read must not wait on the ENV mutex that `SQLSetEnvAttr`,
+    /// `SQLAllocHandle` and diagnostics share.
+    #[test]
+    fn a_default_binding_fetch_does_not_wait_on_the_env_lock() {
+        let state = fetch_time_column_row_state_with(OdbcVersion::Odbc3, |h| {
+            let stmt = h.stmt as usize;
+            h.run_while_env_locked(move || unsafe {
+                sql_fetch_scroll(stmt as SqlHandle, SQL_FETCH_NEXT, 0)
+            })
+            .expect("SQLFetchScroll blocked on the ENV mutex")
+        });
+        assert_eq!(state, (SQL_ERROR, *b"HYC00"));
     }
 
     /// A `SQL_C_DEFAULT` binding names no C type, so it carries no width
