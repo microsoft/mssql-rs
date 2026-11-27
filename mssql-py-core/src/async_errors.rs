@@ -10,6 +10,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use crate::async_session::ClaimError;
+use crate::pool::error::{OpenError, PoolError};
 
 create_exception!(mssql_py_core, Error, PyException);
 create_exception!(mssql_py_core, Warning, PyException);
@@ -30,6 +31,62 @@ pub(crate) fn map_connection_claim(error: ClaimError, busy_message: &str) -> PyE
         ClaimError::Busy => InterfaceError::new_err(busy_message.to_owned()),
         ClaimError::NoResultSet => ProgrammingError::new_err("No active result set"),
     }
+}
+
+pub(crate) fn map_pool_error(error: PoolError) -> PyErr {
+    let message = error.to_string();
+    let reason = match &error {
+        PoolError::WaitQueueFull => "WaitQueueFull",
+        PoolError::Closed => "Closed",
+        PoolError::AcquireTimeout { .. } => "AcquireTimeout",
+        PoolError::CleanupTimeout => "CleanupTimeout",
+        PoolError::ShutdownTimeout => "ShutdownTimeout",
+        _ => "PoolError",
+    };
+    let mapped = match error {
+        PoolError::InvalidConfig { .. } | PoolError::InvalidRequest { .. } | PoolError::Closed => {
+            InterfaceError::new_err(message)
+        }
+        PoolError::Cancelled => Python::attach(|py| {
+            py.import("asyncio")?
+                .getattr("CancelledError")?
+                .call0()
+                .map(PyErr::from_value)
+        })
+        .unwrap_or_else(|error| error),
+        PoolError::Open(OpenError::Tds(error))
+        | PoolError::Initialize(error)
+        | PoolError::Cleanup(error) => {
+            map_tds_error("Async pool operation failed", *error, Vec::new())
+        }
+        PoolError::Internal { .. } | PoolError::InvalidSession => InternalError::new_err(message),
+        _ => OperationalError::new_err(message),
+    };
+    Python::attach(|py| mapped.value(py).setattr("pool_reason", reason))
+        .unwrap_or_else(|error| tracing::warn!(%error, "Could not attach pool error reason"));
+    mapped
+}
+
+pub(crate) fn finish_cleanup(
+    result: PyResult<()>,
+    block_error: Option<Py<PyAny>>,
+    diagnostic: &'static str,
+) -> PyResult<()> {
+    let Some(block_error) = block_error else {
+        return result;
+    };
+    if result.is_err() {
+        tracing::warn!("{diagnostic}");
+        Python::attach(|py| {
+            let error = block_error.bind(py);
+            if error.hasattr("add_note")? {
+                error.call_method1("add_note", (diagnostic,))?;
+            }
+            Ok::<(), PyErr>(())
+        })
+        .unwrap_or_else(|_| tracing::warn!("Could not annotate block exception"));
+    }
+    Ok(())
 }
 
 pub(crate) fn add_exceptions(module: &Bound<'_, PyModule>) -> PyResult<()> {

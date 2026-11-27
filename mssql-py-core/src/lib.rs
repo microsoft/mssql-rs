@@ -17,6 +17,7 @@ mod async_execute;
 mod async_fetch;
 mod async_handle;
 mod async_parameters;
+mod async_pool;
 mod async_runtime;
 mod async_session;
 mod async_tracing;
@@ -29,7 +30,7 @@ mod odbc_auth;
     not(test),
     expect(
         dead_code,
-        reason = "Pool contracts are not wired into AQE until A2/B2/B3"
+        reason = "Pool contracts include authentication and configuration seams beyond the SQL-password adapter"
     )
 )]
 mod pool;
@@ -118,6 +119,7 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(set_default_multi_subnet_failover, m)?)?;
     m.add_class::<cursor::PyCoreCursor>()?;
     m.add_class::<async_connection::PyAsyncConnection>()?;
+    m.add_class::<async_pool::PyAsyncPool>()?;
     m.add_class::<async_cursor::PyAsyncCursor>()?;
     m.add_class::<async_parameters::PyTableValuedParameter>()?;
     async_errors::add_exceptions(m)?;

@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Run the live Python lifecycle cases required on Windows and macOS CI."""
+"""Run Python lifecycle and native pool contracts on Windows and macOS CI."""
 
 import pytest
 
@@ -10,6 +10,7 @@ TEST_FILES = (
     "test_async_platform_lifecycle.py",
     "test_async_connection.py",
     "test_async_cursor.py",
+    "test_async_pool.py",
 )
 
 TEST_NAMES = (
@@ -27,10 +28,8 @@ if __name__ == "__main__":
         pytest.main(
             [
                 *(f"tests/{file}" for file in TEST_FILES),
-                "-m",
-                "integration",
                 "-k",
-                " or ".join(TEST_NAMES),
+                " or ".join((*TEST_NAMES, "test_async_pool")),
                 "-q",
                 "--tb=short",
                 "--junitxml=pytest-platform-lifecycle-results.xml",

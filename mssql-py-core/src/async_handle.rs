@@ -14,8 +14,9 @@ use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard, watch};
 use tokio::time::{Instant, timeout_at};
 use tracing::instrument::WithSubscriber;
 
-use crate::async_errors::{OperationalError, map_tds_error};
+use crate::async_errors::{OperationalError, map_pool_error, map_tds_error};
 use crate::async_session::{AsyncConnectionState, ClaimError, OperationId};
+use crate::pool::session::PoolLease;
 
 pub(crate) const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -56,9 +57,10 @@ impl Drop for CloseCompletion {
     }
 }
 
-/// Unique physical ownership; pooled handles are a separate implementation slice.
+/// Unique physical ownership behind one revocable logical cell.
 pub(crate) enum ConnHandle {
-    Direct(TdsClient),
+    Direct(Box<TdsClient>),
+    Pooled(Box<PoolLease>),
 }
 
 impl ConnHandle {
@@ -66,6 +68,7 @@ impl ConnHandle {
     pub(crate) fn client_mut(&mut self) -> &mut TdsClient {
         match self {
             Self::Direct(client) => client,
+            Self::Pooled(lease) => lease.client_mut(),
         }
     }
 }
@@ -75,15 +78,36 @@ pub(crate) struct LogicalConnection {
     handle: Mutex<Option<ConnHandle>>,
     pub(crate) state: Arc<AsyncConnectionState>,
     close: StdMutex<Option<CloseReceiver>>,
+    pub(crate) cleanup_timeout: Duration,
 }
 
 impl LogicalConnection {
     /// Create fresh logical state owning one direct client; no pool checkout occurs.
     pub(crate) fn new(client: TdsClient) -> Self {
+        Self::from_handle(ConnHandle::Direct(Box::new(client)), CLOSE_TIMEOUT)
+    }
+
+    pub(crate) fn from_handle(handle: ConnHandle, cleanup_timeout: Duration) -> Self {
         Self {
-            handle: Mutex::new(Some(ConnHandle::Direct(client))),
+            handle: Mutex::new(Some(handle)),
             state: Arc::new(AsyncConnectionState::new()),
             close: StdMutex::new(None),
+            cleanup_timeout,
+        }
+    }
+
+    /// Only used before Python delivery, when no application operation can hold access.
+    pub(crate) fn discard_undelivered(&self) {
+        self.state.mark_broken();
+        match self.handle.try_lock() {
+            Ok(mut handle) => {
+                drop(handle.take());
+            }
+            Err(error) => {
+                // Do not panic: publication guards also call this during Drop.
+                // Broken state prevents reuse; final-owner drop discards any retained handle.
+                tracing::error!(%error, "Undelivered connection unexpectedly has an active borrower")
+            }
         }
     }
 
@@ -135,14 +159,14 @@ impl LogicalConnection {
             } else {
                 let handle = connection.handle.lock().await.take();
                 match handle {
-                    None => Ok(()),
+                    None => Ok(None),
                     Some(handle) if connection.state.is_broken() => {
                         drop(handle);
                         match mode {
                             CloseMode::Commit => Err(OperationalError::new_err(
                                 "Cannot commit a broken connection; connection discarded",
                             )),
-                            CloseMode::Rollback => Ok(()),
+                            CloseMode::Rollback => Ok(None),
                         }
                     }
                     Some(handle) => {
@@ -160,9 +184,21 @@ impl LogicalConnection {
                     }
                 }
             };
-            connection
-                .state
-                .complete_close(mode, deadline, result, &completion.sender);
+            connection.state.complete_close(
+                mode,
+                deadline,
+                result,
+                |returned, discard| {
+                    if let Some((mut lease, deadline)) = returned {
+                        if discard {
+                            lease.mark_discard();
+                        }
+                        lease.finish_release(deadline)?;
+                    }
+                    Ok(())
+                },
+                &completion.sender,
+            );
             completion.completed = true;
             tracing::info!(
                 discard = connection.state.must_discard(),
@@ -186,7 +222,7 @@ impl LogicalConnection {
                     Python::attach(|py| {
                         let original = error.value(py);
                         let value = original.get_type().call1((original.str()?,))?;
-                        for attribute in ["sql_errors", "info_messages"] {
+                        for attribute in ["sql_errors", "info_messages", "pool_reason"] {
                             if original.hasattr(attribute)? {
                                 value.setattr(attribute, original.getattr(attribute)?)?;
                             }
@@ -220,7 +256,7 @@ impl LogicalConnection {
         state: &AsyncConnectionState,
         mode: CloseMode,
         deadline: Instant,
-    ) -> PyResult<()> {
+    ) -> PyResult<Option<(Box<PoolLease>, Instant)>> {
         let client = handle.client_mut();
         let result = async {
             check_cleanup_deadline(deadline)?;
@@ -247,7 +283,7 @@ impl LogicalConnection {
                 CloseMode::Commit => Err(OperationalError::new_err(
                     "Cannot commit a broken connection; connection discarded",
                 )),
-                CloseMode::Rollback => Ok(()),
+                CloseMode::Rollback => Ok(None),
             };
         }
         let result = async {
@@ -257,8 +293,6 @@ impl LogicalConnection {
                     CloseMode::Rollback => client.rollback_transaction(None, None).await?,
                 }
             }
-            check_cleanup_deadline(deadline)?;
-            client.close_connection().await?;
             check_cleanup_deadline(deadline)
         }
         .await;
@@ -268,7 +302,37 @@ impl LogicalConnection {
                 error,
                 client.take_info_messages(),
             )
-        })
+        })?;
+        match handle {
+            ConnHandle::Direct(mut client) => {
+                client.close_connection().await.map_err(|error| {
+                    map_tds_error(
+                        "Connection cleanup failed",
+                        error,
+                        client.take_info_messages(),
+                    )
+                })?;
+                check_cleanup_deadline(deadline)
+                    .map(|()| None)
+                    .map_err(|error| {
+                        map_tds_error(
+                            "Connection cleanup failed",
+                            error,
+                            client.take_info_messages(),
+                        )
+                    })
+            }
+            ConnHandle::Pooled(mut lease) => {
+                if state.must_discard() {
+                    lease.mark_discard();
+                }
+                let deadline = lease
+                    .prepare_release(deadline)
+                    .await
+                    .map_err(map_pool_error)?;
+                Ok(Some((lease, deadline)))
+            }
+        }
     }
 
     #[cfg(test)]
@@ -722,7 +786,7 @@ mod tests {
                 Ok(())
             };
             let (sender, receiver) = watch::channel(None);
-            state.complete_close(mode, deadline, result, &sender);
+            state.complete_close(mode, deadline, result, |(), _| Ok(()), &sender);
             assert_eq!(state.lifecycle(), ConnectionLifecycle::Closed);
             let outcome = receiver.borrow().clone().unwrap();
             if failed || expired || cancelled && matches!(mode, CloseMode::Commit) {
@@ -832,12 +896,13 @@ mod tests {
         let initial_bytes = transport.lock().unwrap().len();
         tokio::time::advance(Duration::from_secs(2)).await;
         let error = LogicalConnection::finalize_handle(
-            ConnHandle::Direct(client),
+            ConnHandle::Direct(Box::new(client)),
             &AsyncConnectionState::new(),
             CloseMode::Commit,
             deadline,
         )
         .await
+        .map(|_| ())
         .unwrap_err();
         assert!(error.to_string().contains("timed out"));
         assert_eq!(transport.lock().unwrap().len(), initial_bytes);

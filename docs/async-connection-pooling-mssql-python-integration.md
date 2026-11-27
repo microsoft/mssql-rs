@@ -415,6 +415,13 @@ native release passes its remaining budget rather than restarting a full cleanup
 budget. Use Doc 1 section 9.1's `release_with_deadline` with the original close
 deadline; plain `release` uses the configured default.
 
+The native adapter prepares release asynchronously, then performs its synchronous
+return and terminal logical-state transition under the operation-cancellation lock.
+Cancellation after native work finishes but before its waiter receives the result
+must still discard the lease if it wins that terminal close boundary.
+Python error normalization and waiter notification happen after unlocking; error
+construction can execute Python and re-enter the logical connection.
+
 The slot stays checked out through the entire close/return sequence. On reuse,
 update the return timestamp and make the clean client available only after the
 generation/acceptance check. On discard, destroy the client before releasing the
@@ -779,3 +786,79 @@ These are areas of responsibility, not independent ownership silos: a release
 requires evidence across all rows. Deadpool supplies generic pooling mechanisms,
 not DB-API behavior, identity isolation, TDS reset correctness or cross-platform
 certification.
+
+### 8.4 Native SQL-password integration (AB#50008)
+
+The internal native seam is `mssql_py_core._AsyncPool`. It is not a public
+`mssql_python.AsyncPool` API. Construct it on its owning running asyncio loop,
+with explicit positive `acquire_timeout`, `cleanup_timeout`, and
+`shutdown_timeout` budgets in seconds. Defaults for these budgets remain
+unapproved. Other settings are `max_size=100`, `max_waiting=None` and
+`idle_timeout=600`; limits are per effective key, not manager-wide.
+It supports `enable()`, `disable()`, `await aclose()` and async context management.
+Wrong-loop and post-fork access is rejected. Shutdown is terminal; checked-out
+application leases must still be closed. An unsuccessful shutdown may be awaited
+again.
+
+Shutdown rejects pending connects with `InterfaceError` and `pool_reason="Closed"`;
+it does not cancel application tasks. Caller cancellation remains cancellation.
+An exceptional pool context exit preserves the block exception and reports
+shutdown failure through a redacted diagnostic (and an exception note on Python
+versions supporting `add_note`). A clean exit propagates shutdown failure.
+Shutdown checks its original deadline before reporting completion, including when
+all work was already settled when the native future was first polled.
+The budget starts before synchronous admission stop. Closed-pool error
+normalization also runs after releasing attempt tracking, so Python exception
+construction cannot re-enter a held pool mutex.
+
+`PyAsyncConnection.connect(context, python_logger=None, autocommit=False, *,
+token_provider=None, pool=None, acquire_timeout=None, isolation_level=None)`
+preserves the original positional slots. Supply the native manager as `pool`.
+Isolation accepts exactly `READ UNCOMMITTED`, `READ COMMITTED`, `REPEATABLE READ`,
+`SERIALIZABLE`, or `SNAPSHOT`; omission selects READ COMMITTED for pooled checkout.
+Direct connect without new options retains its existing initialization policy.
+A direct per-call acquisition override adds a total-connect deadline without
+changing the login timeout. Explicit direct isolation is applied and drained.
+
+Pooled options go through Rust's private key/spec preparation, not a Python key.
+SQL-password authentication is the only enabled pooled mode. Unsupported fields,
+trusted/token/provider authentication, MARS, and Always Encrypted are rejected
+before network I/O, including when a manager is disabled. Omitted pooled recovery
+count is zero; explicit nonzero values are rejected. The adapter resolves omitted
+or zero packet size to the existing async default, 4096, before key preparation.
+Other packet sizes must be in 512–32768; unlike direct legacy adaptation,
+out-of-range values are rejected rather than silently defaulted.
+
+Only disabled-at-admission acquisition opens directly, using the same prepared
+specification, requested isolation and original deadline. Queue saturation,
+closure and failures after admission never bypass the pool. Acquired handles use
+the existing tracked logical ownership barrier; close preserves its original
+cleanup deadline through native release, and last-owner destruction discards.
+The delivery bridge retains the attempt and lease until publication on the
+owning Python loop; cancelled or failed delivery revokes the undelivered handle.
+Publication owns a discard guard and checks scheduling failures itself, so a
+closed loop rejecting or dropping its queued callback settles the lease and
+attempt even if the application retains the pending public future.
+Native work starts after the delivery callbacks are installed. Publication cancels
+the private bridge bookkeeping future before completing the public future, so
+normal loop teardown need not deliver another bookkeeping result.
+
+Configuration, lifecycle and closed-pool errors use `InterfaceError`; saturation
+and deadlines use `OperationalError`. Pool errors carry `pool_reason` such as
+`WaitQueueFull`, `AcquireTimeout`, `Closed`, or `ShutdownTimeout`. SQL errors retain
+native diagnostics. Python cancellation remains `asyncio.CancelledError`.
+
+**AB#50009 handoff:** retain the existing connection-string parser and parent
+cursor reference. Wrap this native manager, forward keyword-only options, and
+translate native DB-API exceptions. Start the total deadline before Python
+parsing/preparation, pass only its remaining acquisition budget to native code,
+and keep the outer deadline active through wrapper/result construction.
+Do not implement another key builder or enable unsupported auth modes.
+
+**AB#50053/release gates:** native/Python-boundary tests are in
+`tests/test_async_pool.py`, with scripted ownership/delivery tests in
+`src/async_pool/tests.rs`. Record live SQL and platform results separately.
+Windows execution does not qualify Linux/macOS, all server topologies, or
+benchmarks. Agree timeout defaults, complete release/license and integration
+checks, publish the native runtime, then update the consumer's dependency pin
+together with its wrapper. This implementation alone is not release sign-off.

@@ -19,6 +19,7 @@ use super::lifecycle::SlotGuard;
 use super::manager::{AsyncPoolManager, check_runtime};
 
 /// A concrete isolation level; the protocol's NoChange is not valid at checkout.
+#[derive(Clone)]
 pub(crate) struct Isolation(TransactionIsolationLevel);
 
 impl TryFrom<TransactionIsolationLevel> for Isolation {
@@ -32,6 +33,16 @@ impl TryFrom<TransactionIsolationLevel> for Isolation {
             });
         }
         Ok(Self(level))
+    }
+}
+
+impl Isolation {
+    pub(crate) async fn apply(&self, client: &mut TdsClient) -> PoolResult<()> {
+        let cancel = OperationCancel::new();
+        client
+            .initialize_session(self.0.clone(), ExecuteOptions::new().cancel(&cancel.handle))
+            .await
+            .map_err(|error| PoolError::Initialize(Box::new(error)))
     }
 }
 
@@ -286,12 +297,17 @@ impl PoolLease {
     }
 
     pub(crate) async fn release_with_deadline(mut self, deadline: Instant) -> PoolResult<()> {
+        let deadline = self.prepare_release(deadline).await?;
+        self.finish_release(deadline)
+    }
+
+    pub(crate) async fn prepare_release(&mut self, deadline: Instant) -> PoolResult<Instant> {
         let deadline = deadline.min(self.slot.cleanup_deadline()?);
         if Instant::now() >= deadline {
             return Err(PoolError::CleanupTimeout);
         }
         if self.discard {
-            return Ok(());
+            return Ok(deadline);
         }
         let runtime = tokio::runtime::Handle::current().id();
         {
@@ -339,6 +355,13 @@ impl PoolLease {
             })
             .await?;
         }
+        Ok(deadline)
+    }
+
+    pub(crate) fn finish_release(self, deadline: Instant) -> PoolResult<()> {
+        if self.discard {
+            return Ok(());
+        }
         self.slot.return_before(deadline)
     }
 
@@ -376,17 +399,10 @@ async fn initialize(
     if !quiescent(client) {
         return Err(PoolError::InvalidSession);
     }
-    let cancel = OperationCancel::new();
     if reuse {
         client.prepare_reset_connection(false);
     }
-    client
-        .initialize_session(
-            isolation.0.clone(),
-            ExecuteOptions::new().cancel(&cancel.handle),
-        )
-        .await
-        .map_err(|error| PoolError::Initialize(Box::new(error)))?;
+    isolation.apply(client).await?;
     if !quiescent(client) {
         return Err(PoolError::InvalidSession);
     }
