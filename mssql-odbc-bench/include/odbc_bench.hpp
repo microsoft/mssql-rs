@@ -55,8 +55,8 @@ struct Config {
     std::string packet_size_keyword;
     std::string scenario;
     std::string write_mode;
-    /// Calls per latency sample; 0 keeps each latency workload's catalog size.
-    std::size_t latency_calls = 0;
+    /// Calls per `latency`/`py*` sample; 0 keeps each workload's catalog size.
+    std::size_t calls_override = 0;
 
     /// Read and validate the cross-platform perf-lab environment contract.
     static Config from_environment();
@@ -178,6 +178,45 @@ inline constexpr std::size_t kLatencyWorkloadCount = 3;
 
 /// Return the fixed small-call latency catalog (scenario `latency`).
 const std::array<LatencySpec, kLatencyWorkloadCount>& latency_workloads();
+
+/// `mssql-python` `performance/` workloads replayed as ODBC call sequences.
+enum class PyCursorWorkload {
+    /// `query_scalar`: `SELECT CAST(? AS INT)` with a new `int` per call.
+    query_scalar,
+    /// `param_count_int_N`: N `int` markers in one `VALUES` aggregate.
+    param_count_int,
+    /// `param_count_nvarchar_100`: 20-character ASCII `str` markers.
+    param_count_nvarchar,
+    /// `param_types_mixed_10`: ten Python types bound and selected back.
+    param_types_mixed,
+    /// `insert_lob_varbinary_*`: one `bytes` value streamed with `SQLPutData`.
+    insert_lob_varbinary,
+    /// `insert_lob_nvarchar_*`: one ASCII `str` value streamed with `SQLPutData`.
+    insert_lob_nvarchar,
+    /// `fetchmany_mixed_1000_batch100`.
+    fetchmany_mixed,
+    /// `fetch_arrow_mixed8_10000`: `cursor.arrow()`.
+    fetch_arrow_mixed,
+};
+
+/// One `mssql-python` benchmark workload and the ODBC calls its sample repeats.
+struct PyCursorSpec {
+    const char* benchmark_name;
+    /// `pyparam`, `pylob`, or `pyfetch`.
+    const char* scenario;
+    /// The `mssql-python` `performance/` workload this replays.
+    const char* python_name;
+    PyCursorWorkload kind;
+    /// Parameter count, or streamed payload bytes for the LOB inserts.
+    std::size_t size;
+    /// `cursor.execute` (plus fetch) operations per sample.
+    std::size_t operations_per_sample;
+};
+
+inline constexpr std::size_t kPyCursorWorkloadCount = 11;
+
+/// Return the fixed `pyparam`/`pylob`/`pyfetch` catalog.
+const std::array<PyCursorSpec, kPyCursorWorkloadCount>& py_cursor_workloads();
 
 /// Owns one ODBC handle chain so every workload uses the same connection lifecycle.
 class OdbcSession {
@@ -369,6 +408,32 @@ public:
 
     /// Time one batch. Every call still checks its fetched value, which costs a
     /// compare against a round trip.
+    RetrievalMetrics execute();
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+/// Replays `mssql-python` `Cursor.execute`/`fetchone`/`fetchmany`/`arrow` on one
+/// statement handle with the ODBC calls, entry points, and binding rules of
+/// `cursor.py` and `ddbc_bindings.cpp`. Python-side conversion is not measured.
+class PyCursorRunner {
+public:
+    /// `operations_override` replaces the catalog sample size when non-zero.
+    PyCursorRunner(OdbcSession& session, const PyCursorSpec& spec,
+                   std::size_t operations_override);
+    ~PyCursorRunner();
+
+    PyCursorRunner(const PyCursorRunner&) = delete;
+    PyCursorRunner& operator=(const PyCursorRunner&) = delete;
+
+    const char* name() const;
+
+    /// Create the workload's temporary table, then run validated warm-up operations.
+    void preflight();
+
+    /// Time one sample of `operations_per_sample` validated operations.
     RetrievalMetrics execute();
 
 private:

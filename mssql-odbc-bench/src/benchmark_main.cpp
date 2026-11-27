@@ -14,6 +14,7 @@
 namespace {
 
 using mssql::odbc::bench::LatencyRunner;
+using mssql::odbc::bench::PyCursorRunner;
 using mssql::odbc::bench::RetrievalMetrics;
 using mssql::odbc::bench::WorkloadRunner;
 
@@ -145,7 +146,7 @@ int main(int argc, char** argv) {
         if (config.scenario.empty() || config.scenario == "latency") {
             for (const auto& spec : mssql::odbc::bench::latency_workloads()) {
                 auto runner =
-                    std::make_unique<LatencyRunner>(session, spec, config.latency_calls);
+                    std::make_unique<LatencyRunner>(session, spec, config.calls_override);
                 runner->preflight();
                 auto* const current = runner.get();
                 latency_runners.push_back(std::move(runner));
@@ -153,6 +154,19 @@ int main(int argc, char** argv) {
                     current->name(), [current] { return current->execute(); },
                     benchmark_error);
             }
+        }
+
+        std::vector<std::unique_ptr<PyCursorRunner>> py_cursor_runners;
+        for (const auto& spec : mssql::odbc::bench::py_cursor_workloads()) {
+            if (!config.scenario.empty() && config.scenario != spec.scenario) {
+                continue;
+            }
+            auto runner = std::make_unique<PyCursorRunner>(session, spec, config.calls_override);
+            runner->preflight();
+            auto* const current = runner.get();
+            py_cursor_runners.push_back(std::move(runner));
+            register_measurement(
+                current->name(), [current] { return current->execute(); }, benchmark_error);
         }
 
         benchmark::RunSpecifiedBenchmarks();

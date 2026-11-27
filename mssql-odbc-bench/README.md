@@ -25,9 +25,9 @@ Manager; the harness never links to the Rust driver.
 | `ODBC_BENCH_ENCRYPT` | `Mandatory` | `Encrypt` value |
 | `ODBC_BENCH_PACKET_SIZE` | `16192` | Cross-platform encrypted-lab value honored exactly by Microsoft ODBC 18.6.2.1 and both Rust builds; set through both ODBC attribute and connection keyword, then read back |
 | `ODBC_BENCH_PACKET_SIZE_KEYWORD` | `PacketSize` | `PacketSize` or Microsoft driver spelling `Packet Size` |
-| `ODBC_BENCH_SCENARIO` | all | Run only `narrow`, `wide`, `rowset`, `varwidth`, `getdata`, `write`, `pywrite`, or `latency` |
+| `ODBC_BENCH_SCENARIO` | all | Run only `narrow`, `wide`, `rowset`, `varwidth`, `getdata`, `write`, `pywrite`, `latency`, `pyparam`, `pylob`, or `pyfetch` |
 | `ODBC_BENCH_WRITE_MODE` | `parameter_array` | Use one parameter-array execute, or `sequential` for a driver without array support. Applies to `write` only; `pywrite` always uses one parameter-array execute |
-| `ODBC_BENCH_LATENCY_CALLS` | catalog size | Override calls per `latency` sample (1-1000000) for short local runs; the perf lab leaves it unset |
+| `ODBC_BENCH_CALLS` | catalog size | Override calls/operations per `latency`, `pyparam`, `pylob`, and `pyfetch` sample (1-1000000) for short local runs; the perf lab leaves it unset |
 
 Missing required values, connection errors, absent/invalid tables, ODBC
 warnings during retrieval, and correctness failures make the process fail.
@@ -109,8 +109,9 @@ After both legs:
 
 ## Workloads
 
-Nineteen measurements, all of them C++ calls into the driver: sixteen over eleven
-tables, and three `latency` ones that need no table.
+Thirty measurements, all of them C++ calls into the driver: sixteen over eleven
+tables, three `latency` ones that need no table, and eleven `pyparam`/`pylob`/
+`pyfetch` ones on temporary tables of the measuring connection.
 Every id encodes the data shape, the row and column counts, and the access shape,
 and is identical on all three driver legs. The shapes are drawn from what
 `mssql-python` asks a driver to do; nothing here runs Python.
@@ -299,10 +300,71 @@ These are microsecond-scale on a shared lab VM, and the regression gate covers
 every benchmark. Measure their run-to-run noise on `main` before relying on them
 to gate.
 
+### `pyparam`, `pylob`, `pyfetch` — `mssql-python` performance workloads
+
+Each benchmark replays one workload of the `mssql-python` performance suite
+(`performance/workloads.py` and `performance/scenarios/odbc_path_workloads.py`)
+as the ODBC calls `cursor.py` and `ddbc_bindings.cpp` (mssql-python `239f79fd`)
+make for it, on one statement handle per benchmark, so mssql-odbc can be compared
+with msodbcsql18 on that suite without Python in the measurement.
+
+| Benchmark | `mssql-python` workload | One operation |
+|---|---|---|
+| `param/scalar_int_pyshape/execute_fetchone` | `query_scalar` | `SELECT CAST(? AS INT)` with the next `int`, `fetchone` |
+| `param/count_int_{10,100,1000}_pyshape/execute_fetchone` | `param_count_int_*` | `SELECT SUM(v) FROM (VALUES (?), ...)` with 10/100/1,000 `int` markers, `fetchone` |
+| `param/count_nvarchar_100_pyshape/execute_fetchone` | `param_count_nvarchar_100` | 100 20-character ASCII `str` markers, `SUM(LEN(v))`, `fetchone` |
+| `param/types_mixed_10_pyshape/execute_fetchone` | `param_types_mixed_10` | `int`, big `int`, `float`, `Decimal`, non-ASCII `str`, `bytes`, `bool`, `datetime`, `date`, `None`; `fetchone` of all ten |
+| `write/insert_lob_varbinary_{1,10}mb_pyshape/execute_dae` | `insert_lob_varbinary_*` | `INSERT` of one `bytes` value streamed with `SQLParamData`/`SQLPutData` |
+| `write/insert_lob_nvarchar_1mb_pyshape/execute_dae` | `insert_lob_nvarchar_1mb` | the same with a 1 MiB (UTF-16) ASCII `str` |
+| `fetch/mixed_1000_c4_pyshape/fetchmany_100` | `fetchmany_mixed_1000_batch100` | `SELECT` of 1,000 `INT`/`DECIMAL(18,4)`/`NVARCHAR(100)`/`VARBINARY(64)` rows, `fetchmany(100)` until empty |
+| `fetch/arrow_10000_c8_pyshape/arrow_8192` | `fetch_arrow_mixed8_10000` | `SELECT` of 10,000 eight-type rows, `cursor.arrow()` |
+
+The replayed sequence, per Python call:
+
+- **`execute`**: `SQLFreeStmt(SQL_CLOSE)` and
+  `SQLSetStmtAttrW(SQL_ATTR_PARAMSET_SIZE, 1)`. Without parameters,
+  `SQLExecDirectW`. With parameters, `SQLPrepareW` only when the text differs
+  from the previous execute (preceded once per handle by the forward-only,
+  read-only cursor attributes and always by `SQLFreeStmt(SQL_RESET_PARAMS)`),
+  then one `SQLBindParameter` per parameter to freshly addressed buffers, a
+  `SQL_RESET_PARAMS` first only when a binding's types changed, and
+  `SQLExecute` with the `SQLParamData`/`SQLPutData` loop in 8,192-byte chunks.
+  Then `SQLRowCount`, `SQLNumResultCols`, and `SQLDescribeColW` per column, plus a
+  second `SQLRowCount` when there is no result set.
+- **Parameter binding**: Python type detection's choices. `int` is the narrowest of
+  `SQL_TINYINT`/`SQL_SMALLINT`/`SQL_INTEGER`/`SQL_BIGINT`; `str` is always
+  `SQL_C_WCHAR`, declared `SQL_VARCHAR` when ASCII and `SQL_WVARCHAR` otherwise;
+  `str` above 4,000 UTF-16 units and `bytes` above 8,000 bytes stream with
+  column size 0; `Decimal` is `SQL_C_NUMERIC` plus four `SQLSetDescFieldW` calls
+  on the APD; `None` is `SQL_C_DEFAULT`, typed by `SQLDescribeParam` once per
+  prepare, falling back to `VARCHAR(1)`.
+- **`fetchone`**: `SQLFetch`, `SQLNumResultCols`, then per column `SQLDescribeColW`
+  and one `SQLGetData` with the C type and buffer `GetRowData` picks.
+- **`fetchmany`** and **`arrow`**: per call, column-wise `SQLBindCol` into newly
+  allocated arrays, `SQL_ATTR_ROW_ARRAY_SIZE` and `SQL_ATTR_ROWS_FETCHED_PTR`, then
+  `SQLFetchScroll` (one 100-row rowset) or repeated `SQLFetch` with 64-row
+  rowsets up to 8,192 rows, then both attributes reset and `SQLFreeStmt(SQL_UNBIND)`.
+  `fetchmany` describes the result once; every `arrow` batch describes it again.
+
+As in the Python workloads, the `TRUNCATE` before each LOB insert and the stored
+row check after it run on the same cursor but outside the timer, so every insert
+re-prepares. Each sample closes the cursor outside the timer, so other
+benchmarks can use the connection. Every operation checks its result: fetched
+values, the insert's row count and the stored length, and row order and NULL
+count for the fetch workloads. Preflight additionally compares every fetched
+cell with its generator and reads each streamed value back byte for byte, where
+the Python suite checks a SHA-256.
+
+Not replayed: Python-side type detection, value conversion, and Arrow buffer
+construction. These cost CPU in `mssql-python` but make no driver call. The
+`SQLGetDiagFieldW` record count that `mssql-python` reads on `SQL_NO_DATA` is
+replayed, and any record found fails the run.
+
 ## Measurement boundaries
 
 Each Google Benchmark sample is one full result-set retrieval
-(`Iterations(1)`), or one fixed batch of calls for `latency/*`.
+(`Iterations(1)`), or one fixed batch of calls or operations for `latency` and
+the `py*` scenarios.
 `--benchmark_repetitions` controls the sample count.
 Steady-clock timing starts immediately before `SQLExecDirect` and ends after the
 result is exhausted and the row count is checked. What is inside depends on the
@@ -316,6 +378,7 @@ access shape:
 | `write/insert_2000_c3/*` | one parameter-array `SQLExecute`, or 2,000 sequential `SQLExecute` calls on the pinned Rust baseline |
 | `write/*_pyshape/*` | the whole `executemany` call: statement free and allocate, prepare, bind, one parameter-array `SQLExecute`, diagnostics, and row/column counts |
 | `latency/*` | the whole batch: per call `SQLExecDirectW` or `SQLExecute`, `SQLFetch`, the value check, and `SQLCloseCursor`; no per-phase timestamps |
+| `param/*`, `write/insert_lob_*`, `fetch/*_pyshape/*` | each operation's `execute` and fetch calls listed above, summed over the sample; the LOB `TRUNCATE` and stored-row check are excluded |
 
 The per-cell `SQLDescribeCol` in the row-at-a-time shape is not an accident: it
 mirrors `SQLGetData_wrap`, which re-describes every column on every row, so it is
@@ -331,8 +394,8 @@ JSON results include rows, cells, logical bytes, `SQLGetData` call count, and
 execute, metadata-plus-bind (absent for `bind_cycle_*`), and fetch phase
 counters, plus rows/s, cells/s, and logical bytes/s. Logical bytes are the
 generator's own byte total, so all three drivers are credited with identical
-payload regardless of representation. `latency/*` emit `calls` and
-`us_per_call` instead of the phase counters, and count one row per call.
+payload regardless of representation. `latency/*` and the `py*` scenarios emit
+`calls` and `us_per_call` (per operation) instead of the phase counters.
 
 Preflight checks all indicators, row identity/coverage, an order-independent
 checksum, representative values for every generated type, the exact generated
