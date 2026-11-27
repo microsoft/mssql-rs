@@ -1571,6 +1571,7 @@ TEST_F(TvpTest, DaeStreamsChunkedMaxCellsAcrossOneRowBatches) {
 
 // The mssql-python schema-mismatch shape: a DAE table that binds fewer columns
 // than its server type. The server rejects it, and the session must survive.
+// Benefits-from-mock-tds: assert the server error is read in-band (no ATTENTION/IGNORE, no reconnect); pinned meanwhile by mssql-tds a_server_error_after_the_table_keeps_the_connection.
 TEST_F(TvpTest, DaeTableWithTooFewColumnsFailsAndKeepsTheSession) {
     const std::string proc = "count_" + suffix_;
     cleanup_sql_ = {"DROP PROCEDURE IF EXISTS dbo.[" + proc + "]"};
