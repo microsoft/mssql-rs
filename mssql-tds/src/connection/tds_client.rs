@@ -438,7 +438,9 @@ enum ResetAckState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamedParamStatus {
     /// The server still expects a streamed parameter value. Stream its chunks
-    /// next via [`TdsClient::write_streamed_chunk`], then call
+    /// next via [`TdsClient::write_streamed_chunk`], or its rows via
+    /// [`TdsClient::write_streamed_tvp_cells`] when `param_name` is a
+    /// [`RpcParameter::data_at_exec_table`], then call
     /// [`TdsClient::end_streamed_param`] (or
     /// [`TdsClient::end_execute_prepared_param`] for a prepared stream).
     NeedData {
@@ -2554,7 +2556,9 @@ impl TdsClient {
     /// This is the additive streaming counterpart to
     /// [`TdsClient::execute_sp_executesql`]. Existing materialized-parameter
     /// callers should continue using that method; this method is for
-    /// [`RpcParameter::data_at_exec`] parameters.
+    /// [`RpcParameter::data_at_exec`] parameters and for table-valued
+    /// parameters built with [`RpcParameter::data_at_exec_table`], whose rows
+    /// are written with [`TdsClient::write_streamed_tvp_cells`].
     ///
     /// Supported streamed types are listed by [`StreamedSqlType`]. Chunks are
     /// raw wire bytes, so the caller owns the encoding: `nvarchar(max)` chunks
@@ -2573,7 +2577,8 @@ impl TdsClient {
     /// after a streamed one are written when it closes.
     ///
     /// Streamed parameters must be named and must use one of the
-    /// [`StreamedSqlType`] variants. Streaming is not supported when Always
+    /// [`StreamedSqlType`] variants or be a streamed table. Streaming is not
+    /// supported when Always
     /// Encrypted is active. Chunk bytes must use the representation required by
     /// the selected variant: XML is UTF-16LE (a BOM is optional and the client
     /// ensures exactly one) and UDT is the opaque CLR-serialized payload.
@@ -2850,8 +2855,12 @@ impl TdsClient {
     /// Empty chunks are ignored: a zero-length PLP chunk header is the value
     /// terminator, so it must never be emitted mid-value.
     ///
+    /// Inside a streamed table, chunks go to the cell opened by
+    /// [`begin_streamed_tvp_cell`](Self::begin_streamed_tvp_cell).
+    ///
     /// # Errors
-    /// Returns a usage error if no streamed parameter is currently open, if the
+    /// Returns a usage error if no streamed parameter is currently open, if a
+    /// streamed table has no cell open, if the
     /// parameter was already marked NULL via
     /// [`write_streamed_null`](Self::write_streamed_null), or if `chunk` is longer
     /// than [`u32::MAX`] bytes (the PLP chunk-length field is 32-bit).
@@ -3364,10 +3373,13 @@ impl TdsClient {
     /// or [`end_execute_prepared_param`](Self::end_execute_prepared_param)
     /// the driver emits `PLP_NULL` instead of an unknown-length opener +
     /// terminator. Mirrors msodbcsql, which writes `VARMAX_LENGTH_NULL` with no
-    /// chunks for a DAE parameter that resolves to NULL.
+    /// chunks for a DAE parameter that resolves to NULL. Inside a streamed
+    /// table it marks the open cell, written when
+    /// [`end_streamed_tvp_cell`](Self::end_streamed_tvp_cell) closes it.
     ///
     /// # Errors
-    /// Returns a usage error if no streamed parameter is currently open, or if
+    /// Returns a usage error if no streamed parameter is currently open, if a
+    /// streamed table has no cell open, or if
     /// value chunks have already been written for this parameter (a value that
     /// has begun streaming cannot become NULL).
     pub fn write_streamed_null(&mut self) -> TdsResult<()> {
@@ -3445,6 +3457,10 @@ impl TdsClient {
     /// - if neither (an untouched parameter), the unknown-length opener +
     ///   terminator are written, encoding a present, zero-length value.
     ///
+    /// A streamed table closes with its end-of-rows token instead; it can only
+    /// close between rows, with no cell open, and closing it before any row
+    /// sends an empty table.
+    ///
     /// If more streamed parameters remain, the next one's header is written and
     /// [`StreamedParamStatus::NeedData`] is returned (stream its chunks next).
     /// When the last streamed parameter closes, the RPC message is finalized and
@@ -3454,8 +3470,8 @@ impl TdsClient {
     /// [`end_execute_prepared_param`](Self::end_execute_prepared_param) instead.
     ///
     /// # Errors
-    /// Returns a usage error if no streamed parameter is currently open, or an
-    /// I/O error if sending fails.
+    /// Returns a usage error if no streamed parameter is currently open or a
+    /// streamed table is mid-row, or an I/O error if sending fails.
     pub async fn end_streamed_param(&mut self) -> TdsResult<StreamedParamStatus> {
         self.end_streamed_param_inner(None).await
     }
