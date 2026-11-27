@@ -88,8 +88,10 @@ At a high level, mssql-python performs the following, identical to msodbcsql18:
   Shared application descriptors compare their projected child records, so
   statement-local IPD differences do not prevent APD reads.
 - **Supply TVP content with data-at-execution** — the driver returns the table token, then
-  row-control and cell tokens in the order expected by the ODBC TVP protocol. Cell bytes are
-  buffered and converted into the table value before execution. Only columns marked
+  row-control and cell tokens in the order expected by the ODBC TVP protocol. Once the
+  request is open, rows are written as they are supplied: cells of unbounded MAX columns
+  stream chunk by chunk, and other cells are converted when they close. A table that must
+  wait for a later buffered scalar is collected and materialized instead. Only columns marked
   data-at-execution produce cell tokens; ordinary bound values and NULLs are captured from
   their positioned row buffers when the application supplies that row. Positive row-control
   counts may describe multiple batches; their cumulative row count must not exceed the focused

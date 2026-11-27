@@ -208,6 +208,21 @@ header or finalise and send the packet.
 Prepared ownership is restored to the sequence even on error: a final packet
 may reach the server before a timeout or response error is reported.
 
+### Table-Valued Parameters
+
+A TVP supplied at execution is a streamed table parameter
+(`RpcParameter::data_at_exec_table`) whose header and column metadata go out
+when the request reaches it. `dae_tvp.rs` then walks its tokens: bound cells are
+converted and written in short runs with `write_streamed_tvp_cells`; a DAE cell
+of an unbounded same-family MAX column is opened with `begin_streamed_tvp_cell`,
+receives `SQLPutData` chunks through `write_streamed_chunk`, and closes with
+`end_streamed_tvp_cell`; other DAE cells are collected and converted at close,
+like the materialized table. A zero row-control count, or the cursor leaving a
+fixed-row table, closes it with `end_streamed_param`. Tokens behind the cursor
+are discarded as each refilled batch begins. A table that must wait for a later
+buffered parameter is collected and materialized by `rebuild_deferred_params`
+instead (see [Driver Guide](driver-guide.md)).
+
 ### Parameter Order
 
 Any parameter may be data-at-execution, in any position, freely interleaved
@@ -241,9 +256,11 @@ other statements see the connection as busy.
 
 Write failures end the streamed request. A failure while closing a parameter
 retracts an incomplete message where possible; an unrecoverable write or
-response failure closes the transport. Usage errors leave the stream available
-for correction or cancellation. For errors propagated to the application, the
-ODBC layer:
+response failure closes the transport. A server error answering the completed
+request, such as a TVP that does not match its table type, is read like any
+response and keeps the session, as it does for a materialized execute. Usage
+errors leave the stream available for correction or cancellation. For errors
+propagated to the application, the ODBC layer:
 
 1. Clears all DAE state (`take_dae`).
 2. Restores the prepared plan and any unconsumed orphan so `SQLExecute` can be

@@ -9,7 +9,10 @@ use bitflags::bitflags;
 use crate::datatypes::column_values::{ColumnValues, DEFAULT_VARTIME_SCALE};
 use crate::datatypes::encoder::SqlValueEncoder;
 use crate::datatypes::sql_string::{EncodingType, SqlString};
-use crate::datatypes::sql_tvp::TvpTypeName;
+use crate::datatypes::sql_tvp::{
+    TvpColumnDef, TvpTypeName, validate_tvp_columns, write_tvp_column_metadata,
+    write_tvp_order_unique, write_tvp_type_name,
+};
 use crate::datatypes::sql_udt::UdtTypeName;
 use crate::datatypes::sqldatatypes::VectorBaseType;
 use crate::datatypes::sqltypes::{RpcInlineValue, SqlType};
@@ -159,10 +162,42 @@ impl StreamedSqlType {
 enum RpcValue {
     Materialized(SqlType),
     Streamed(StreamedSqlType),
+    /// A table-valued parameter whose rows are written after its metadata.
+    StreamedTable(Box<StreamedTable>),
     /// Statement or `@params` text of a system procedure. Built only by
     /// [`RpcParameter::request_text`], so it is always positional, unnamed,
     /// unencrypted and never declared in `@params`.
     Text(RequestText),
+}
+
+/// The type and column metadata of a table-valued parameter streamed by row.
+#[derive(Debug, Clone)]
+struct StreamedTable {
+    type_name: TvpTypeName,
+    columns: Vec<TvpColumnDef>,
+}
+
+impl StreamedTable {
+    fn validate(&self) -> TdsResult<()> {
+        self.type_name.validate()?;
+        validate_tvp_columns(&self.columns)
+    }
+
+    /// Writes everything that precedes the first row: the table type, its
+    /// column metadata, and the end of the (empty) optional metadata. Callers
+    /// validate first, before any part of the request is written.
+    async fn write_header(
+        &self,
+        packet_writer: &mut PacketWriter<'_>,
+        db_collation: &SqlCollation,
+    ) -> TdsResult<()> {
+        packet_writer
+            .write_byte_async(TdsDataType::SqlTable as u8)
+            .await?;
+        write_tvp_type_name(packet_writer, &self.type_name).await?;
+        write_tvp_column_metadata(packet_writer, &self.columns, db_collation).await?;
+        write_tvp_order_unique(packet_writer, &[]).await
+    }
 }
 
 /// Request text - a statement or an `@params` declaration - sent as an
@@ -234,6 +269,32 @@ fn utf16_byte_len(text: &str) -> usize {
             .sum()
     };
     units * 2
+}
+
+/// Whether `value` needs vector version 2 on the wire: a float16 vector, or a
+/// table whose columns or rows hold one.
+pub(crate) fn contains_float16(value: &SqlType) -> bool {
+    match value {
+        SqlType::Vector(value, _, base_type) => {
+            *base_type == VectorBaseType::Float16
+                || value
+                    .as_ref()
+                    .is_some_and(|v| v.base_type() == VectorBaseType::Float16)
+        }
+        SqlType::Table(_, Some(table)) => table
+            .columns
+            .iter()
+            .map(|column| &column.column_type)
+            .chain(table.rows.iter().flatten())
+            .any(contains_float16),
+        _ => false,
+    }
+}
+
+pub(crate) fn float16_vector_version_error(version: u8) -> Error {
+    Error::UsageError(format!(
+        "Vector float16 parameters require negotiated vector version 2; current version is {version}."
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -320,10 +381,37 @@ impl RpcParameter {
         options: StatusFlags,
         sql_type: StreamedSqlType,
     ) -> Self {
+        Self::with_value(name, options, RpcValue::Streamed(sql_type))
+    }
+
+    /// Creates a table-valued parameter whose rows are supplied after the RPC
+    /// opens, rather than materialized as a [`TvpTableData`](crate::datatypes::sql_tvp::TvpTableData).
+    ///
+    /// The type name and column metadata are written when the parameter opens.
+    /// Rows then follow through
+    /// [`TdsClient::write_streamed_tvp_cells`](crate::connection::tds_client::TdsClient::write_streamed_tvp_cells)
+    /// and
+    /// [`TdsClient::begin_streamed_tvp_cell`](crate::connection::tds_client::TdsClient::begin_streamed_tvp_cell),
+    /// so client memory is bounded by the rows being written rather than by the
+    /// whole table. Closing the parameter with no rows sends an empty table.
+    pub fn data_at_exec_table(
+        name: Option<String>,
+        options: StatusFlags,
+        type_name: TvpTypeName,
+        columns: Vec<TvpColumnDef>,
+    ) -> Self {
+        Self::with_value(
+            name,
+            options,
+            RpcValue::StreamedTable(Box::new(StreamedTable { type_name, columns })),
+        )
+    }
+
+    fn with_value(name: Option<String>, options: StatusFlags, value: RpcValue) -> Self {
         Self {
             name,
             options,
-            value: RpcValue::Streamed(sql_type),
+            value,
             type_metadata: None,
             numeric_declaration: None,
             streamed_declaration: None,
@@ -406,37 +494,44 @@ impl RpcParameter {
     /// Returns `true` if this parameter's value is supplied via the
     /// data-at-execution (streamed) path.
     pub(crate) fn is_data_at_exec(&self) -> bool {
-        matches!(self.value, RpcValue::Streamed(_))
+        matches!(
+            self.value,
+            RpcValue::Streamed(_) | RpcValue::StreamedTable(_)
+        )
+    }
+
+    /// Column metadata and diagnostic identity of a streamed table-valued
+    /// parameter, or `None` for any other parameter.
+    pub(crate) fn into_streamed_table(self) -> Option<(Vec<TvpColumnDef>, TvpParameterRef)> {
+        let ordinal = self.odbc_ordinal();
+        let RpcValue::StreamedTable(table) = self.value else {
+            return None;
+        };
+        // Streamed parameters are validated as named before they open.
+        let parameter = ordinal
+            .map(TvpParameterRef::OdbcOrdinal)
+            .unwrap_or_else(|| TvpParameterRef::Name(self.name.unwrap_or_default()));
+        Some((table.columns, parameter))
     }
 
     pub(crate) fn ensure_vector_version_supported(&self, version: u8) -> TdsResult<()> {
-        fn contains_float16(value: &SqlType) -> bool {
-            match value {
-                SqlType::Vector(value, _, base_type) => {
-                    *base_type == VectorBaseType::Float16
-                        || value
-                            .as_ref()
-                            .is_some_and(|v| v.base_type() == VectorBaseType::Float16)
-                }
-                SqlType::Table(_, Some(table)) => table
+        if version >= 2 {
+            return Ok(());
+        }
+        match &self.value {
+            RpcValue::Materialized(value) if contains_float16(value) => {
+                Err(float16_vector_version_error(version))
+            }
+            RpcValue::StreamedTable(table)
+                if table
                     .columns
                     .iter()
-                    .map(|column| &column.column_type)
-                    .chain(table.rows.iter().flatten())
-                    .any(contains_float16),
-                _ => false,
+                    .any(|column| contains_float16(&column.column_type)) =>
+            {
+                Err(float16_vector_version_error(version))
             }
+            _ => Ok(()),
         }
-
-        if let RpcValue::Materialized(value) = &self.value
-            && version < 2
-            && contains_float16(value)
-        {
-            return Err(Error::UsageError(format!(
-                "Vector float16 parameters require negotiated vector version 2; current version is {version}."
-            )));
-        }
-        Ok(())
     }
 
     pub(crate) fn validate_streamed_configuration(&self) -> TdsResult<()> {
@@ -453,7 +548,7 @@ impl RpcParameter {
     pub(crate) fn streamed_sql_type(&self) -> Option<&StreamedSqlType> {
         match &self.value {
             RpcValue::Streamed(sql_type) => Some(sql_type),
-            RpcValue::Materialized(_) | RpcValue::Text(_) => None,
+            RpcValue::Materialized(_) | RpcValue::StreamedTable(_) | RpcValue::Text(_) => None,
         }
     }
 
@@ -546,6 +641,10 @@ impl RpcParameter {
             }
             RpcValue::Streamed(streamed) => {
                 Self::write_sql_name(&streamed.as_sql_type(), None, out)
+            }
+            RpcValue::StreamedTable(table) => {
+                Self::write_tvp_sql_name(&table.type_name, out);
+                Ok(())
             }
             RpcValue::Text(_) => Self::write_sql_name(&SqlType::NVarcharMax(None), None, out),
         }
@@ -795,6 +894,7 @@ impl RpcParameter {
                 value.validate_for_send(db_collation, self.narrow_string_byte_limit)
             }
             RpcValue::Streamed(streamed) => streamed.validate(),
+            RpcValue::StreamedTable(table) => table.validate(),
             // Measured when built, before any RPC could write.
             RpcValue::Text(_) => Ok(()),
         }
@@ -929,6 +1029,19 @@ impl RpcParameter {
             return Ok(());
         }
 
+        // A streamed table stops after its metadata, where the first row token
+        // would follow; the rows and the end token are written by the streaming
+        // driver.
+        if let RpcValue::StreamedTable(table) = &self.value {
+            if self.encrypted.is_some() {
+                return Err(Error::UsageError(
+                    "Encrypted parameters cannot be streamed incrementally.".to_string(),
+                ));
+            }
+            packet_writer.write_byte_async(self.options.bits()).await?;
+            return table.write_header(packet_writer, db_collation).await;
+        }
+
         // Encrypted parameters bypass the normal value encoder: the ciphertext
         // is sent as a BIGVARBINARY with the ENCRYPTED status flag and a
         // trailing CryptoMetaData block (Always Encrypted).
@@ -946,7 +1059,9 @@ impl RpcParameter {
         let value = match &self.value {
             RpcValue::Materialized(value) => value,
             RpcValue::Text(text) => return text.write(packet_writer, db_collation).await,
-            RpcValue::Streamed(_) => unreachable!("streamed value handled above"),
+            RpcValue::Streamed(_) | RpcValue::StreamedTable(_) => {
+                unreachable!("streamed value handled above")
+            }
         };
         encoder
             .encode_sqlvalue(
@@ -991,7 +1106,7 @@ impl RpcParameter {
             RpcValue::Text(_) => Err(Error::ImplementationError(
                 "Request text has no SqlType value.".to_string(),
             )),
-            RpcValue::Streamed(_) => Err(Error::UsageError(
+            RpcValue::Streamed(_) | RpcValue::StreamedTable(_) => Err(Error::UsageError(
                 "Data-at-execution parameters are only supported via begin_sp_executesql."
                     .to_string(),
             )),

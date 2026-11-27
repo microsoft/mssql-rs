@@ -274,16 +274,17 @@ unsafe fn sql_put_data_operation(
             }
         }
 
-        // A deferred sequence has no open request to signal NULL on: the flag is
-        // recorded and `SQLParamData` builds a typed NULL from it, exactly as a
-        // materialized parameter with a `SQL_NULL_DATA` indicator produces one.
+        // A collected value has no open request position to signal NULL on: the
+        // flag is recorded and `SQLParamData` builds a typed NULL from it,
+        // exactly as a materialized parameter with a `SQL_NULL_DATA` indicator
+        // produces one.
         {
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLPutData: stmt mutex poisoned marking a buffered parameter NULL");
                 return SQL_ERROR;
             };
             if let Some(dae) = stmt_state.dae.as_mut()
-                && dae.deferred
+                && dae.current_collects()
             {
                 if dae.call_in_flight() {
                     error!("SQLPutData: DAE sequence is in use by another call");
@@ -450,14 +451,12 @@ unsafe fn sql_put_data_operation(
             return abort_dae_with_diag(dbc, stmt, statement_handle, ERR_DAE_LENGTH_MISMATCH);
         }
 
-        let Some(will_buffer) = dae
-            .current_param()
-            .map(|param| param.is_buffered() || dae.deferred)
-        else {
+        let will_buffer = dae.current_collects();
+        if dae.current_param().is_none() {
             error!("SQLPutData: no open data-at-execution parameter");
             post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
             return SQL_ERROR;
-        };
+        }
 
         // `SQL_DATA_AT_EXEC` declares no total, so nothing bounds how large a
         // chunk can claim to be, and every allocation that follows --

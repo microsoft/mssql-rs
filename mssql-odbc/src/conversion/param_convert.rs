@@ -2370,20 +2370,17 @@ pub(crate) fn build_tvp_param_from_dae(
             let column = column
                 .as_ref()
                 .ok_or(ParamBuildError::TvpColumnUnbound(column_index))?;
-            let value = (|| {
-                let value = match cell.value.take() {
-                    Some(value) => value,
-                    None => buffered_dae_to_value(column, &cell.bytes, cell.is_null)?.0,
-                };
-                normalize_tvp_cell(column, value)
-            })()
-            .map_err(|error: ParamBuildError| {
-                ParamBuildError::TvpCellConversion {
+            let value = match cell.value.take() {
+                Some(value) => normalize_tvp_cell(column, value),
+                None => buffered_tvp_cell_to_value(column, &cell.bytes, cell.is_null),
+            }
+            .map_err(
+                |error: ParamBuildError| ParamBuildError::TvpCellConversion {
                     row: row_index,
                     column: column_index,
                     diagnostic: error.diag(),
-                }
-            })?;
+                },
+            )?;
             row.push(value);
         }
         rows.push(row);
@@ -2394,6 +2391,61 @@ pub(crate) fn build_tvp_param_from_dae(
         StatusFlags::NONE,
         SqlType::Table(type_name, Some(TvpTableData::new(column_defs, rows))),
     ))
+}
+
+/// Converts a TVP cell `SQLPutData` collected, exactly as the materialized
+/// table converts it.
+pub(crate) fn buffered_tvp_cell_to_value(
+    column: &BoundParam,
+    bytes: &[u8],
+    is_null: bool,
+) -> Result<SqlType, ParamBuildError> {
+    normalize_tvp_cell(column, buffered_dae_to_value(column, bytes, is_null)?.0)
+}
+
+/// The type name and column definitions a data-at-execution TVP streams with:
+/// its header goes out when the RPC opens and its rows follow as the
+/// application supplies them.
+///
+/// `None` when the type name or a column's metadata cannot be resolved up
+/// front. Such a table is collected instead, and the problem is reported when
+/// it is materialized.
+pub(crate) fn streamed_tvp_definition(
+    udt_names: Option<&UdtNames>,
+    columns: &[Option<BoundParam>],
+) -> Option<(TvpTypeName, Vec<TvpColumnDef>)> {
+    let type_name = tvp_type_name(udt_names).ok()?;
+    if columns.is_empty() {
+        return None;
+    }
+    let mut definitions = Vec::new();
+    definitions.try_reserve_exact(columns.len()).ok()?;
+    for column in columns {
+        definitions.push(tvp_column_def(column.as_ref()?).ok()?);
+    }
+    Some((type_name, definitions))
+}
+
+/// Whether a TVP cell supplied at execution can go to the wire chunk by chunk.
+///
+/// Only an unbounded MAX column with a C type of the same family qualifies:
+/// there the materialized conversion applies no length bound and the
+/// per-chunk [`DaeTranscode`] produces the bytes it would. Every other cell is
+/// collected and converted whole, so its truncation and conversion rules are
+/// unchanged; it is bounded by one cell, not the table.
+pub(crate) fn tvp_cell_streams(column: &BoundParam) -> bool {
+    let same_family = match column.sql_type {
+        SQL_VARCHAR | SQL_WVARCHAR => matches!(column.c_type, SQL_C_CHAR | SQL_C_WCHAR),
+        SQL_VARBINARY => column.c_type == SQL_C_BINARY,
+        _ => false,
+    };
+    same_family
+        && tvp_column_def(column).is_ok_and(|definition| {
+            matches!(
+                definition.column_type,
+                SqlType::VarcharMax(_) | SqlType::NVarcharMax(_) | SqlType::VarBinaryMax(_)
+            )
+        })
 }
 
 /// # Safety

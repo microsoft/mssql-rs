@@ -947,6 +947,7 @@ pub(super) struct ParamsWithDae {
     pub(super) fractional_truncated: bool,
 }
 
+#[derive(Debug)]
 pub(super) enum ParamRowBuildError {
     Unbound {
         parameter: usize,
@@ -1323,6 +1324,10 @@ pub(super) unsafe fn build_named_params_for_row(
                     })?
             };
             if parent_dae || fixed_dae_rows.is_some() {
+                let streamed = crate::conversion::param_convert::streamed_tvp_definition(
+                    snapshot.udt_names.as_deref(),
+                    columns,
+                );
                 let staged = build_tvp_dae_params(
                     i,
                     &tvp_binding,
@@ -1332,6 +1337,7 @@ pub(super) unsafe fn build_named_params_for_row(
                     layout.bind_type,
                     snapshot.long_as_max,
                     fixed_dae_rows,
+                    streamed.is_some(),
                 )
                 .map_err(|source| ParamRowBuildError::Conversion {
                     parameter: i + 1,
@@ -1348,10 +1354,15 @@ pub(super) unsafe fn build_named_params_for_row(
                 } else {
                     StatusFlags::NONE
                 };
-                params.push(
-                    RpcParameter::data_at_exec(name, status, StreamedSqlType::VarBinaryMax)
-                        .with_odbc_ordinal(ordinal),
-                );
+                // A collected table keeps a placeholder until
+                // `rebuild_deferred_params` materializes it.
+                let param = match streamed {
+                    Some((type_name, definitions)) => {
+                        RpcParameter::data_at_exec_table(name, status, type_name, definitions)
+                    }
+                    None => RpcParameter::data_at_exec(name, status, StreamedSqlType::VarBinaryMax),
+                };
+                params.push(param.with_odbc_ordinal(ordinal));
             } else {
                 let rpc = unsafe {
                     // The parent binding already includes the outer bind offset.
@@ -1552,6 +1563,13 @@ pub(super) unsafe fn tvp_dae_cell_rows(
     Ok(None)
 }
 
+/// Stages the data-at-execution tokens of a TVP: a row-control token per row
+/// for a table supplied in batches, and a cell token per column of each row.
+///
+/// `streamed` marks a table whose rows go into the open RPC as they arrive.
+/// Its tokens never hold the RPC back, and a cell that cannot be chunked is
+/// collected for that cell alone. A table that is not streamed is collected
+/// whole and materialized when its execute runs.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_tvp_dae_params(
     tvp_index: usize,
@@ -1562,7 +1580,9 @@ pub(super) fn build_tvp_dae_params(
     bind_type: SqlULen,
     long_as_max: bool,
     fixed_rows: Option<usize>,
+    streamed: bool,
 ) -> Result<Vec<DaeParam>, ParamBuildError> {
+    let buffered = !streamed;
     let row_capacity = fixed_rows.unwrap_or(tvp.column_size.min(1));
     let controls = usize::from(fixed_rows.is_none());
     let per_row = columns
@@ -1584,7 +1604,7 @@ pub(super) fn build_tvp_dae_params(
                 DaeParam::new(
                     tvp_index,
                     None,
-                    true,
+                    buffered,
                     None,
                     *tvp,
                     udt_names.clone(),
@@ -1604,7 +1624,7 @@ pub(super) fn build_tvp_dae_params(
                 DaeParam::new(
                     tvp_index,
                     None,
-                    true,
+                    buffered,
                     None,
                     *binding,
                     udt_names.clone(),
@@ -1615,18 +1635,28 @@ pub(super) fn build_tvp_dae_params(
                     row_index,
                     column_index,
                 })
-                .with_tvp_cell_binding(*binding, bind_offset, bind_type),
+                .with_tvp_cell_binding(*binding, bind_offset, bind_type)
+                .collecting_cell(
+                    streamed && !crate::conversion::param_convert::tvp_cell_streams(binding),
+                ),
             );
         }
     }
     if fixed_rows.is_none() {
         staged.push(
-            DaeParam::new(tvp_index, None, true, None, *tvp, udt_names, long_as_max).with_target(
-                DaeTarget::TvpRowControl {
-                    tvp_index,
-                    row_index: row_capacity,
-                },
-            ),
+            DaeParam::new(
+                tvp_index,
+                None,
+                buffered,
+                None,
+                *tvp,
+                udt_names,
+                long_as_max,
+            )
+            .with_target(DaeTarget::TvpRowControl {
+                tvp_index,
+                row_index: row_capacity,
+            }),
         );
     }
     Ok(staged)
@@ -1672,6 +1702,10 @@ pub(super) fn finish_execute_with_param_warning(
 /// it describes, so an application that resets its parameters mid-sequence --
 /// which this driver explicitly supports -- would have freed buffers
 /// dereferenced here.
+///
+/// A TVP in `streamed_tvps` has not been reached yet: it keeps its streamed
+/// slot and its rows go into the RPC this rebuild opens.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn rebuild_deferred_params(
     stmt_state: &mut StmtState,
     prebuilt: Vec<RpcParameter>,
@@ -1679,6 +1713,7 @@ pub(super) fn rebuild_deferred_params(
     dae_params: &[DaeParam],
     tvp_cells: &mut [BufferedTvpCell],
     tvp_row_counts: &std::collections::BTreeMap<usize, usize>,
+    streamed_tvps: &BTreeSet<usize>,
     op: &str,
 ) -> Result<(Vec<RpcParameter>, bool), SqlReturn> {
     let mut params = prebuilt;
@@ -1734,7 +1769,7 @@ pub(super) fn rebuild_deferred_params(
             }
             DaeTarget::Parameter => continue,
         };
-        if !rebuilt_tvps.insert(tvp_index) {
+        if streamed_tvps.contains(&tvp_index) || !rebuilt_tvps.insert(tvp_index) {
             continue;
         }
 
@@ -3694,6 +3729,7 @@ mod tests {
                         &built.dae_params,
                         &mut [],
                         &BTreeMap::new(),
+                        &BTreeSet::new(),
                         "test",
                     )
                     .unwrap();
@@ -3932,6 +3968,7 @@ mod tests {
             &dae_params,
             &mut [],
             &BTreeMap::new(),
+            &BTreeSet::new(),
             "test",
         )
         .unwrap();
@@ -3954,6 +3991,7 @@ mod tests {
             &[],
             &mut [],
             &BTreeMap::new(),
+            &BTreeSet::new(),
             "test",
         );
         assert_eq!(missing_binding.unwrap_err(), SQL_ERROR);
@@ -3970,6 +4008,7 @@ mod tests {
             &[buffered_decimal_param(0)],
             &mut [],
             &BTreeMap::new(),
+            &BTreeSet::new(),
             "test",
         );
         assert_eq!(missing_slot.unwrap_err(), SQL_ERROR);
@@ -3992,6 +4031,7 @@ mod tests {
             &[buffered_decimal_param(0)],
             &mut [],
             &BTreeMap::new(),
+            &BTreeSet::new(),
             "test",
         );
 
@@ -4017,6 +4057,7 @@ mod tests {
                 &dae_params,
                 &mut [],
                 &BTreeMap::new(),
+                &BTreeSet::new(),
                 "test",
             );
             assert!(
@@ -4107,6 +4148,7 @@ mod tests {
             crate::api::odbc_types::SQL_BIND_BY_COLUMN,
             false,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(staged.len(), 4);
@@ -4160,6 +4202,7 @@ mod tests {
             crate::api::odbc_types::SQL_BIND_BY_COLUMN,
             false,
             None,
+            false,
         )
         .unwrap();
         let mut dae = DaeState::for_test(staged, Some(0));
@@ -4614,6 +4657,7 @@ mod tests {
                     &built.dae_params,
                     &mut [],
                     &std::collections::BTreeMap::new(),
+                    &BTreeSet::new(),
                     "test",
                 )
                 .unwrap();

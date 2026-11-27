@@ -94,3 +94,65 @@ Contributor test setup is in the
 materialized, empty, and NULL values. A streamed value can keep its legacy
 declaration through `RpcParameter::with_streamed_declaration` while sending a
 MAX/PLP payload, without buffering the whole value.
+
+## Streamed table-valued parameters
+
+`RpcParameter::data_at_exec_table` declares a table-valued parameter whose rows
+are written after the RPC opens, through `begin_sp_executesql` or
+`begin_execute_prepared`. Its type name and column metadata go out when the
+parameter opens; the client then holds only the cells of the current call, and
+full packets are sent while later rows are still being produced.
+
+- `write_streamed_tvp_cells` appends cells in column order. A cell in the first
+  column starts a row, and rows may span calls. Cells are validated against
+  their columns before any byte of the call is written.
+- `begin_streamed_tvp_cell` opens a `varchar(max)`, `nvarchar(max)` or
+  `varbinary(max)` cell for `write_streamed_chunk` or `write_streamed_null`;
+  `end_streamed_tvp_cell` closes it.
+- `end_streamed_param` closes the table between rows. A table closed with no
+  rows is an empty table.
+
+A failure after row bytes have been written withdraws the request, so SQL Server
+never executes a partial table. Streamed tables follow the same Always Encrypted
+restriction as other streamed parameters.
+
+```rust
+use mssql_tds::connection::tds_client::{StreamedParamStatus, TdsClient};
+use mssql_tds::core::TdsResult;
+use mssql_tds::datatypes::sql_string::SqlString;
+use mssql_tds::datatypes::sql_tvp::{TvpColumnDef, TvpTypeName};
+use mssql_tds::datatypes::sqltypes::SqlType;
+use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+// CREATE TYPE dbo.Items AS TABLE (id int, note nvarchar(max))
+async fn send_items(client: &mut TdsClient, notes: &[&str]) -> TdsResult<StreamedParamStatus> {
+    let items = RpcParameter::data_at_exec_table(
+        Some("@items".to_string()),
+        StatusFlags::NONE,
+        TvpTypeName::new(Some("dbo".to_string()), "Items".to_string()),
+        vec![
+            TvpColumnDef::new(SqlType::Int(None)),
+            TvpColumnDef::new(SqlType::NVarcharMax(None)),
+        ],
+    );
+    client
+        .begin_sp_executesql("SELECT COUNT(*) FROM @items".to_string(), vec![items], ())
+        .await?;
+    for (id, note) in (1..).zip(notes) {
+        // Whole cells...
+        client.write_streamed_tvp_cells(&[SqlType::Int(Some(id))]).await?;
+        // ...or a MAX cell in chunks of UTF-16LE bytes.
+        client.begin_streamed_tvp_cell().await?;
+        let bytes: Vec<u8> = note.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        for chunk in bytes.chunks(8192) {
+            client.write_streamed_chunk(chunk).await?;
+        }
+        client.end_streamed_tvp_cell().await?;
+    }
+    client.end_streamed_param().await // Complete(result): the request has run
+}
+```
+
+A short `note` could equally be passed whole, as
+`SqlType::NVarcharMax(Some(SqlString::from_utf8_string(note.to_string())))`, in
+the same `write_streamed_tvp_cells` call as its `id`.

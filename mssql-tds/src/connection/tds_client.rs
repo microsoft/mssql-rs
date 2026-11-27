@@ -10,6 +10,7 @@ use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
 use crate::datatypes::encoder::GenericEncoder;
 use crate::datatypes::row_writer::{DefaultRowWriter, DiscardRowWriter, RowWriter};
 use crate::datatypes::sql_string::SqlString;
+use crate::datatypes::sql_tvp::TVP_END_TOKEN;
 use crate::datatypes::sqldatatypes::TdsDataType;
 use crate::datatypes::sqltypes::SqlType;
 use crate::datatypes::tds_value_serializer::{PLP_NULL, PLP_TERMINATOR, PLP_UNKNOWN_LEN};
@@ -54,6 +55,8 @@ use crate::{
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+mod streamed_tvp;
 
 /// Prefix for the synthetic parameter names given to positional stored-procedure
 /// parameters when building the `sp_describe_parameter_encryption` request.
@@ -435,7 +438,9 @@ enum ResetAckState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamedParamStatus {
     /// The server still expects a streamed parameter value. Stream its chunks
-    /// next via [`TdsClient::write_streamed_chunk`], then call
+    /// next via [`TdsClient::write_streamed_chunk`], or its rows via
+    /// [`TdsClient::write_streamed_tvp_cells`] when `param_name` is a
+    /// [`RpcParameter::data_at_exec_table`], then call
     /// [`TdsClient::end_streamed_param`] (or
     /// [`TdsClient::end_execute_prepared_param`] for a prepared stream).
     NeedData {
@@ -571,6 +576,9 @@ struct StreamedWriteContext {
     /// Configured timeout reused for each resumed streaming operation.
     timeout_sec: Option<u32>,
     prepared: Option<StreamedPreparedContext>,
+    /// Row position when the open parameter is a table-valued parameter. The
+    /// PLP fields above then describe its open cell, if any.
+    table: Option<Box<streamed_tvp::StreamedTableCursor>>,
 }
 
 #[derive(Debug)]
@@ -2548,7 +2556,9 @@ impl TdsClient {
     /// This is the additive streaming counterpart to
     /// [`TdsClient::execute_sp_executesql`]. Existing materialized-parameter
     /// callers should continue using that method; this method is for
-    /// [`RpcParameter::data_at_exec`] parameters.
+    /// [`RpcParameter::data_at_exec`] parameters and for table-valued
+    /// parameters built with [`RpcParameter::data_at_exec_table`], whose rows
+    /// are written with [`TdsClient::write_streamed_tvp_cells`].
     ///
     /// Supported streamed types are listed by [`StreamedSqlType`]. Chunks are
     /// raw wire bytes, so the caller owns the encoding: `nvarchar(max)` chunks
@@ -2567,7 +2577,8 @@ impl TdsClient {
     /// after a streamed one are written when it closes.
     ///
     /// Streamed parameters must be named and must use one of the
-    /// [`StreamedSqlType`] variants. Streaming is not supported when Always
+    /// [`StreamedSqlType`] variants or be a streamed table. Streaming is not
+    /// supported when Always
     /// Encrypted is active. Chunk bytes must use the representation required by
     /// the selected variant: XML is UTF-16LE (a BOM is optional and the client
     /// ensures exactly one) and UDT is the opaque CLR-serialized payload.
@@ -2820,6 +2831,7 @@ impl TdsClient {
             null_signaled: false,
             timeout_sec,
             prepared: None,
+            table: streamed_tvp::StreamedTableCursor::open(first),
         }));
 
         Ok(StreamedParamStatus::NeedData {
@@ -2843,8 +2855,12 @@ impl TdsClient {
     /// Empty chunks are ignored: a zero-length PLP chunk header is the value
     /// terminator, so it must never be emitted mid-value.
     ///
+    /// Inside a streamed table, chunks go to the cell opened by
+    /// [`begin_streamed_tvp_cell`](Self::begin_streamed_tvp_cell).
+    ///
     /// # Errors
-    /// Returns a usage error if no streamed parameter is currently open, if the
+    /// Returns a usage error if no streamed parameter is currently open, if a
+    /// streamed table has no cell open, if the
     /// parameter was already marked NULL via
     /// [`write_streamed_null`](Self::write_streamed_null), or if `chunk` is longer
     /// than [`u32::MAX`] bytes (the PLP chunk-length field is 32-bit).
@@ -2852,6 +2868,13 @@ impl TdsClient {
         if matches!(self.streamed_write_state, StreamedWriteState::Idle) {
             return Err(UsageError(
                 "write_streamed_chunk called with no active streamed parameter.".to_string(),
+            ));
+        }
+        if self.streamed_table_without_open_cell() {
+            return Err(UsageError(
+                "write_streamed_chunk requires an open table-valued parameter cell; call \
+                 begin_streamed_tvp_cell first."
+                    .to_string(),
             ));
         }
         if chunk.len() > u32::MAX as usize {
@@ -2881,6 +2904,7 @@ impl TdsClient {
             null_signaled,
             timeout_sec,
             prepared,
+            table,
         } = *ctx;
         self.remaining_request_timeout = timeout_sec.map(|s| Duration::from_secs(u64::from(s)));
 
@@ -2901,6 +2925,7 @@ impl TdsClient {
                     null_signaled,
                     timeout_sec,
                     prepared,
+                    table,
                 }));
             return Err(UsageError(
                 "write_streamed_chunk called after the parameter was marked NULL.".to_string(),
@@ -2923,6 +2948,7 @@ impl TdsClient {
                     null_signaled,
                     timeout_sec,
                     prepared,
+                    table,
                 }));
             return Ok(());
         }
@@ -2952,6 +2978,7 @@ impl TdsClient {
                         null_signaled,
                         timeout_sec,
                         prepared,
+                        table,
                     }));
                 return Ok(());
             }
@@ -3011,6 +3038,7 @@ impl TdsClient {
                         null_signaled: false,
                         timeout_sec,
                         prepared,
+                        table,
                     }));
                 Ok(())
             }
@@ -3345,13 +3373,23 @@ impl TdsClient {
     /// or [`end_execute_prepared_param`](Self::end_execute_prepared_param)
     /// the driver emits `PLP_NULL` instead of an unknown-length opener +
     /// terminator. Mirrors msodbcsql, which writes `VARMAX_LENGTH_NULL` with no
-    /// chunks for a DAE parameter that resolves to NULL.
+    /// chunks for a DAE parameter that resolves to NULL. Inside a streamed
+    /// table it marks the open cell, written when
+    /// [`end_streamed_tvp_cell`](Self::end_streamed_tvp_cell) closes it.
     ///
     /// # Errors
-    /// Returns a usage error if no streamed parameter is currently open, or if
+    /// Returns a usage error if no streamed parameter is currently open, if a
+    /// streamed table has no cell open, or if
     /// value chunks have already been written for this parameter (a value that
     /// has begun streaming cannot become NULL).
     pub fn write_streamed_null(&mut self) -> TdsResult<()> {
+        if self.streamed_table_without_open_cell() {
+            return Err(UsageError(
+                "write_streamed_null requires an open table-valued parameter cell; call \
+                 begin_streamed_tvp_cell first."
+                    .to_string(),
+            ));
+        }
         let ctx = match std::mem::replace(&mut self.streamed_write_state, StreamedWriteState::Idle)
         {
             StreamedWriteState::Active(ctx) => ctx,
@@ -3371,6 +3409,7 @@ impl TdsClient {
             null_signaled: _,
             timeout_sec,
             prepared,
+            table,
         } = *ctx;
 
         if value_opened || xml_bom_state.has_pending_bytes() {
@@ -3387,6 +3426,7 @@ impl TdsClient {
                     null_signaled: false,
                     timeout_sec,
                     prepared,
+                    table,
                 }));
             return Err(UsageError(
                 "write_streamed_null called after value chunks were already written.".to_string(),
@@ -3403,6 +3443,7 @@ impl TdsClient {
             null_signaled: true,
             timeout_sec,
             prepared,
+            table,
         }));
         Ok(())
     }
@@ -3416,6 +3457,10 @@ impl TdsClient {
     /// - if neither (an untouched parameter), the unknown-length opener +
     ///   terminator are written, encoding a present, zero-length value.
     ///
+    /// A streamed table closes with its end-of-rows token instead; it can only
+    /// close between rows, with no cell open, and closing it before any row
+    /// sends an empty table.
+    ///
     /// If more streamed parameters remain, the next one's header is written and
     /// [`StreamedParamStatus::NeedData`] is returned (stream its chunks next).
     /// When the last streamed parameter closes, the RPC message is finalized and
@@ -3425,8 +3470,8 @@ impl TdsClient {
     /// [`end_execute_prepared_param`](Self::end_execute_prepared_param) instead.
     ///
     /// # Errors
-    /// Returns a usage error if no streamed parameter is currently open, or an
-    /// I/O error if sending fails.
+    /// Returns a usage error if no streamed parameter is currently open or a
+    /// streamed table is mid-row, or an I/O error if sending fails.
     pub async fn end_streamed_param(&mut self) -> TdsResult<StreamedParamStatus> {
         self.end_streamed_param_inner(None).await
     }
@@ -3458,6 +3503,17 @@ impl TdsClient {
                     .to_string(),
             ));
         }
+        if let StreamedWriteState::Active(ctx) = &self.streamed_write_state
+            && ctx
+                .table
+                .as_deref()
+                .is_some_and(|table| !table.at_row_boundary())
+        {
+            return Err(UsageError(
+                "A table-valued parameter can only be closed between rows, with no cell open."
+                    .to_string(),
+            ));
+        }
         let ctx = match std::mem::replace(&mut self.streamed_write_state, StreamedWriteState::Idle)
         {
             StreamedWriteState::Active(ctx) => ctx,
@@ -3477,6 +3533,7 @@ impl TdsClient {
             null_signaled,
             timeout_sec,
             prepared,
+            table,
         } = *ctx;
         self.remaining_request_timeout = timeout_sec.map(|s| Duration::from_secs(u64::from(s)));
 
@@ -3486,7 +3543,10 @@ impl TdsClient {
         // streamed one, then either open that one's header or finalize the
         // send. Anything that fails mid-message aborts the whole streamed write.
         let write_outcome = async {
-            if null_signaled {
+            if table.is_some() {
+                // The rows are complete (checked above); end the row set.
+                packet_writer.write_byte_async(TVP_END_TOKEN).await?;
+            } else if null_signaled {
                 // NULL: the length field is PLP_NULL and no chunks/terminator
                 // follow.
                 packet_writer.write_u64_async(PLP_NULL).await?;
@@ -3533,7 +3593,8 @@ impl TdsClient {
                     &encoder,
                 )
                 .await?;
-                return Ok(Some((next_name, next_xml_bom_state)));
+                let next_table = streamed_tvp::StreamedTableCursor::open(next);
+                return Ok(Some((next_name, next_xml_bom_state, next_table)));
             }
             packet_writer.finalize().await?;
             Ok(None)
@@ -3561,7 +3622,7 @@ impl TdsClient {
             write_outcome.and_then(|next| message.check_cancellation().map(|()| next));
         match write_outcome {
             // Another streamed parameter is now open for data.
-            Ok(Some((next_name, xml_bom_state))) => {
+            Ok(Some((next_name, xml_bom_state, table))) => {
                 self.streamed_write_state =
                     StreamedWriteState::Active(Box::new(StreamedWriteContext {
                         message,
@@ -3575,6 +3636,7 @@ impl TdsClient {
                         null_signaled: false,
                         timeout_sec,
                         prepared,
+                        table,
                     }));
                 Ok(StreamedParamStatus::NeedData {
                     param_name: next_name,
@@ -3592,6 +3654,13 @@ impl TdsClient {
                 drop(message);
                 match self.position_on_first_result().await {
                     Ok(result) => Ok(StreamedParamStatus::Complete(result)),
+                    // The server's error tokens were read like any response,
+                    // so the stream is in sync and the session survives, as
+                    // it does for a materialized execute.
+                    Err(e @ crate::error::Error::SqlServerError { .. }) => {
+                        self.abort_pending_prepare_capture();
+                        Err(e)
+                    }
                     Err(e) => {
                         if !self.take_settled_drain_interruption(&e) {
                             self.abort_streamed_write().await;
@@ -27192,6 +27261,7 @@ mod tests {
     }
 
     mod request_text;
+    mod streamed_tvp;
 }
 
 #[cfg(test)]

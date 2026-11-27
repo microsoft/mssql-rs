@@ -360,21 +360,7 @@ impl TvpTableData {
     /// already sent - the same partial-request shape `validate_parameters`
     /// exists to avoid for scalar parameters.
     pub(crate) fn validate(&self) -> TdsResult<()> {
-        if self.columns.is_empty() {
-            return Err(Error::UsageError(
-                "TVP must have at least one column".to_string(),
-            ));
-        }
-        if self.columns.len() > MAX_TVP_COLUMNS {
-            return Err(Error::UsageError(format!(
-                "TVP has {} columns but SQL Server allows at most {MAX_TVP_COLUMNS}",
-                self.columns.len()
-            )));
-        }
-
-        for column in &self.columns {
-            column.validate()?;
-        }
+        validate_tvp_columns(&self.columns)?;
 
         for (row_idx, row) in self.rows.iter().enumerate() {
             if row.len() != self.columns.len() {
@@ -386,45 +372,82 @@ impl TvpTableData {
             }
 
             for (col_idx, (column, cell)) in self.columns.iter().zip(row.iter()).enumerate() {
-                let cell_result = (|| -> TdsResult<()> {
-                    if std::mem::discriminant(cell) != std::mem::discriminant(&column.column_type) {
-                        return Err(Error::UsageError(format!(
-                            "TVP row {row_idx} column {col_idx} type mismatch: cell is {cell:?} \
-                             but the column is declared as {:?}",
-                            column.column_type
-                        )));
-                    }
-
-                    let temporal_value = match cell {
-                        SqlType::Time(Some(value)) => Some(value),
-                        SqlType::DateTime2(Some(value)) => Some(&value.time),
-                        SqlType::DateTimeOffset(Some(value)) => Some(&value.datetime2.time),
-                        _ => None,
-                    };
-                    if let (Some(scale), Some(value)) = (column.temporal_scale(), temporal_value)
-                        && !temporal_value_fits_scale(value, scale)
-                    {
-                        return Err(Error::UsageError(format!(
-                            "TVP row {row_idx} column {col_idx} value cannot be represented at \
-                             temporal scale {scale}"
-                        )));
-                    }
-
-                    if let Some((precision, scale)) = column.decimal_metadata()
-                        && let SqlType::Decimal(Some(value)) | SqlType::Numeric(Some(value)) = cell
-                    {
-                        // Preflight the same rescale that row serialization performs.
-                        let mut value = *value;
-                        apply_decimal_metadata(&mut value, precision, scale)?;
-                    }
-                    Ok(())
-                })();
-                cell_result.map_err(|error| error.with_tvp_cell_context(row_idx, col_idx))?;
+                validate_tvp_cell(column, cell, row_idx, col_idx)?;
             }
         }
 
         Ok(())
     }
+}
+
+/// Validates a table type's column metadata before any of it is written.
+pub(crate) fn validate_tvp_columns(columns: &[TvpColumnDef]) -> TdsResult<()> {
+    if columns.is_empty() {
+        return Err(Error::UsageError(
+            "TVP must have at least one column".to_string(),
+        ));
+    }
+    if columns.len() > MAX_TVP_COLUMNS {
+        return Err(Error::UsageError(format!(
+            "TVP has {} columns but SQL Server allows at most {MAX_TVP_COLUMNS}",
+            columns.len()
+        )));
+    }
+    columns.iter().try_for_each(TvpColumnDef::validate)
+}
+
+/// Checks one cell against its column with the rules row serialization later
+/// relies on, so a rejection happens before the cell's row reaches the wire.
+/// `row` and `column` are zero-based.
+pub(crate) fn validate_tvp_cell(
+    column: &TvpColumnDef,
+    cell: &SqlType,
+    row: usize,
+    column_index: usize,
+) -> TdsResult<()> {
+    let cell_result = (|| -> TdsResult<()> {
+        if std::mem::discriminant(cell) != std::mem::discriminant(&column.column_type) {
+            return Err(Error::UsageError(format!(
+                "TVP row {row} column {column_index} type mismatch: cell is {cell:?} \
+                 but the column is declared as {:?}",
+                column.column_type
+            )));
+        }
+
+        let temporal_value = match cell {
+            SqlType::Time(Some(value)) => Some(value),
+            SqlType::DateTime2(Some(value)) => Some(&value.time),
+            SqlType::DateTimeOffset(Some(value)) => Some(&value.datetime2.time),
+            _ => None,
+        };
+        if let (Some(scale), Some(value)) = (column.temporal_scale(), temporal_value)
+            && !temporal_value_fits_scale(value, scale)
+        {
+            return Err(Error::UsageError(format!(
+                "TVP row {row} column {column_index} value cannot be represented at \
+                 temporal scale {scale}"
+            )));
+        }
+
+        if let Some((precision, scale)) = column.decimal_metadata()
+            && let SqlType::Decimal(Some(value)) | SqlType::Numeric(Some(value)) = cell
+        {
+            // Preflight the same rescale that row serialization performs.
+            let mut value = *value;
+            apply_decimal_metadata(&mut value, precision, scale)?;
+        }
+        Ok(())
+    })();
+    cell_result.map_err(|error| error.with_tvp_cell_context(row, column_index))
+}
+
+/// Whether a column's values are PLP-framed, so one can be written as chunks
+/// of unknown total length.
+pub(crate) fn is_plp_tvp_column(column: &TvpColumnDef) -> bool {
+    matches!(
+        column.column_type,
+        SqlType::NVarcharMax(_) | SqlType::VarcharMax(_) | SqlType::VarBinaryMax(_)
+    )
 }
 
 /// Writes the three-part TVP type name (`db.schema.type`) as B_VARCHARs.
@@ -577,39 +600,48 @@ pub(crate) async fn write_tvp_rows(
         packet_writer.write_byte_async(TVP_ROW_TOKEN).await?;
 
         for (column_index, (column, cell)) in columns.iter().zip(row.iter()).enumerate() {
-            let (mut value, cell_ctx) = cell.to_column_value_and_context(db_collation);
-            let ctx = if matches!(column.column_type, SqlType::Variant(_)) {
-                cell_ctx
-            } else {
-                // Context from the column definition keeps ordinary values aligned
-                // with the declared metadata. Variant cells carry their own inner
-                // type metadata, which can differ from the column template.
-                column
-                    .column_type
-                    .to_column_value_and_context(db_collation)
-                    .1
-            };
             // Callers must have run `TvpTableData::validate` first: this can
             // reject a value after `TVP_ROW_TOKEN` and earlier cells are already
             // buffered, which would leave a half-written TVP on the wire.
-            let result = async {
-                apply_column_metadata(column, &mut value)?;
-                TdsValueSerializer::serialize_value_with_narrow_string_byte_limit(
-                    packet_writer,
-                    &value,
-                    &ctx,
-                    None,
-                )
+            write_tvp_cell(packet_writer, column, cell, db_collation)
                 .await
-            }
-            .await;
-            result.map_err(|source| source.with_tvp_cell_context(row_index, column_index))?;
+                .map_err(|source| source.with_tvp_cell_context(row_index, column_index))?;
         }
     }
 
     // End of the row set.
     packet_writer.write_byte_async(TVP_END_TOKEN).await?;
     Ok(())
+}
+
+/// Writes one cell's value bytes, without location context.
+///
+/// The [`TdsTypeContext`](crate::datatypes::tds_value_serializer::TdsTypeContext)
+/// comes from the column definition, so every row agrees with the column
+/// metadata; only `sql_variant` cells carry their own inner type metadata.
+pub(crate) async fn write_tvp_cell(
+    packet_writer: &mut PacketWriter<'_>,
+    column: &TvpColumnDef,
+    cell: &SqlType,
+    db_collation: &SqlCollation,
+) -> TdsResult<()> {
+    let (mut value, cell_ctx) = cell.to_column_value_and_context(db_collation);
+    let ctx = if matches!(column.column_type, SqlType::Variant(_)) {
+        cell_ctx
+    } else {
+        column
+            .column_type
+            .to_column_value_and_context(db_collation)
+            .1
+    };
+    apply_column_metadata(column, &mut value)?;
+    TdsValueSerializer::serialize_value_with_narrow_string_byte_limit(
+        packet_writer,
+        &value,
+        &ctx,
+        None,
+    )
+    .await
 }
 
 #[cfg(test)]
