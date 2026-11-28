@@ -57,7 +57,9 @@ use mssql_tds::datatypes::sql_string::SqlString;
 use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::bulk_load::StreamingBulkLoadWriter;
 
-use crate::bulk::{BulkCopyResult, BulkInsert, BulkLoadRow, write_adapter_value};
+use crate::bulk::{
+    BulkCopyResult, BulkInsert, BulkLoadRow, DecimalScaleReduction, write_adapter_value,
+};
 use crate::error::{Error, Result};
 
 /// Days from 0001-01-01 (SQL Server DATE epoch) to 1970-01-01 (Arrow Date32 epoch).
@@ -93,7 +95,13 @@ impl BulkLoadRow for ArrowBulkRow {
         for array in self.batch.columns() {
             let value = arrow_value_to_column_value(array.as_ref(), self.row_idx)
                 .map_err(|e| TdsError::UsageError(e.to_string()))?;
-            write_adapter_value(writer, *column_index, value).await?;
+            write_adapter_value(
+                writer,
+                *column_index,
+                value,
+                DecimalScaleReduction::RoundHalfAwayFromZero,
+            )
+            .await?;
             *column_index += 1;
         }
         Ok(())
@@ -327,6 +335,8 @@ impl<'a> BulkInsert<'a> {
     /// unless explicit [`ColumnMapping`](crate::bulk::ColumnMapping)s have
     /// been added (e.g. via [`Client::bulk_insert_with_columns`](crate::Client::bulk_insert_with_columns)).
     /// Explicit source ordinals must be consecutive in destination order.
+    /// Decimal values are rescaled to destination metadata, rounding scale
+    /// reductions half away from zero and rejecting destination precision overflow.
     ///
     /// See [the module example](self) for end-to-end usage.
     ///

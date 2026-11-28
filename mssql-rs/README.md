@@ -114,8 +114,9 @@ destination column order. Streaming rows cannot reorder or skip source values,
 and source-name mappings are unsupported; unsupported mappings return an error.
 Arrow batch iterators are consumed lazily, without buffering a wrapper per row.
 Arrow and compatibility bulk rows use the destination temporal and decimal
-scales. Decimal values that cannot be represented exactly at the destination
-scale or precision return an error.
+scales. Arrow decimal scale reductions round half away from zero; compatibility
+bulk rows still require exact rescaling. Both reject destination precision
+overflow, including a rounding carry.
 
 ## Cancellation and timeouts
 

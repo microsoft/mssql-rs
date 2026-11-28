@@ -4,14 +4,17 @@
 //! Live-test configuration using the repository's shared test environment:
 //! `DB_HOST`, `DB_PORT`, `DB_USERNAME`, `SQL_PASSWORD` (or `/tmp/password`),
 //! `DB_DATABASE`, `TRUST_SERVER_CERTIFICATE`, and `CERT_HOST_NAME`, optionally
-//! loaded from a `.env` file. Live tests skip when no password is available.
+//! loaded from a `.env` file. `DB_INTEGRATED_SECURITY=true` selects integrated
+//! authentication instead; otherwise live tests skip when no password is available.
+//! `DB_NAMED_PIPE` optionally selects an explicit named-pipe endpoint.
+//! `DB_ENCRYPT=false` permits servers without TLS, such as LocalDB.
 //!
 //! Test crates declare this as `pub mod common;` so helpers unused by a given
 //! test binary are not reported as dead code.
 
 use std::env;
 
-use mssql_rs::{AuthMethod, Config};
+use mssql_rs::{AuthMethod, Config, EncryptionLevel};
 
 pub fn load_env() {
     if let Err(err) = dotenv::dotenv() {
@@ -36,10 +39,22 @@ pub fn database() -> String {
     env::var("DB_DATABASE").unwrap_or_else(|_| "master".into())
 }
 
-/// Host, port, database, and SQL authentication without TLS trust settings,
+/// Endpoint, database, and authentication without TLS trust settings,
 /// for tests that control certificate validation themselves.
 pub fn base_config() -> Option<Config> {
-    let password = password()?;
+    load_env();
+    let integrated = env::var("DB_INTEGRATED_SECURITY")
+        .map(|value| {
+            value
+                .parse::<bool>()
+                .expect("DB_INTEGRATED_SECURITY must be true or false")
+        })
+        .unwrap_or(false);
+    let authentication = if integrated {
+        AuthMethod::integrated()
+    } else {
+        AuthMethod::sql_server(user_name(), password()?)
+    };
     let port = env::var("DB_PORT")
         .map(|port| port.parse().expect("DB_PORT must be a valid port"))
         .unwrap_or(1433);
@@ -48,7 +63,10 @@ pub fn base_config() -> Option<Config> {
         .host(env::var("DB_HOST").unwrap_or_else(|_| "localhost".into()))
         .port(port)
         .database(database())
-        .authentication(AuthMethod::sql_server(user_name(), password));
+        .authentication(authentication);
+    if let Ok(pipe) = env::var("DB_NAMED_PIPE") {
+        config.named_pipe(Some(pipe));
+    }
     Some(config)
 }
 
@@ -59,6 +77,13 @@ pub fn trust_server_certificate() -> bool {
 }
 
 pub fn apply_certificate_settings(config: &mut Config) {
+    if let Ok(encrypt) = env::var("DB_ENCRYPT")
+        && !encrypt
+            .parse::<bool>()
+            .expect("DB_ENCRYPT must be true or false")
+    {
+        config.encryption(EncryptionLevel::Off);
+    }
     if trust_server_certificate() {
         config.trust_cert();
     }
@@ -76,7 +101,7 @@ pub fn live_config() -> Option<Config> {
 /// Exits the test process successfully when no password is configured.
 pub fn live_config_or_exit() -> Config {
     live_config().unwrap_or_else(|| {
-        eprintln!("SQL_PASSWORD not set and /tmp/password unreadable; skipping live test");
+        eprintln!("No SQL password or integrated authentication configured; skipping live test");
         std::process::exit(0);
     })
 }
