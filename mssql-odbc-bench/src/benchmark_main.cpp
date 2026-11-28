@@ -13,8 +13,6 @@
 
 namespace {
 
-using mssql::odbc::bench::LatencyRunner;
-using mssql::odbc::bench::PyCursorRunner;
 using mssql::odbc::bench::RetrievalMetrics;
 using mssql::odbc::bench::WorkloadRunner;
 
@@ -31,7 +29,8 @@ void set_counters(benchmark::State& state, const RetrievalMetrics& metrics) {
     state.counters["logical_bytes_per_second"] =
         static_cast<double>(metrics.logical_bytes) / metrics.total_seconds;
     if (metrics.calls != 0) {
-        // A latency sample has no phase timestamps; per-call time is its headline.
+        // Batched small operations have no phase timestamps; per-call time is the
+        // headline instead.
         state.counters["calls"] = static_cast<double>(metrics.calls);
         state.counters["us_per_call"] =
             metrics.total_seconds * 1e6 / static_cast<double>(metrics.calls);
@@ -53,13 +52,12 @@ void set_counters(benchmark::State& state, const RetrievalMetrics& metrics) {
     state.SetBytesProcessed(static_cast<std::int64_t>(metrics.logical_bytes));
 }
 
-// One sample per iteration with manual time, so only the runner's own timing
-// boundary counts. After the first failure every later benchmark is skipped.
-template <typename Measure>
-void register_measurement(const char* name, Measure measure, std::string& benchmark_error) {
+// Register a runner that owns its own timing; `execute()` is one sample.
+template <typename Runner>
+void register_runner(Runner* runner, std::string& benchmark_error) {
     benchmark::RegisterBenchmark(
-        name,
-        [measure, &benchmark_error](benchmark::State& state) {
+        runner->name(),
+        [runner, &benchmark_error](benchmark::State& state) {
             if (!benchmark_error.empty()) {
                 state.SkipWithError(benchmark_error.c_str());
                 return;
@@ -67,7 +65,7 @@ void register_measurement(const char* name, Measure measure, std::string& benchm
             try {
                 for (auto _ : state) {
                     (void)_;
-                    const auto metrics = measure();
+                    const auto metrics = runner->execute();
                     state.SetIterationTime(metrics.total_seconds);
                     set_counters(state, metrics);
                 }
@@ -109,9 +107,28 @@ int main(int argc, char** argv) {
         std::string benchmark_error;
         for (auto& runner : runners) {
             WorkloadRunner* const current = runner.get();
-            register_measurement(
-                current->spec().benchmark_name, [current] { return current->retrieve(); },
-                benchmark_error);
+            benchmark::RegisterBenchmark(
+                current->spec().benchmark_name,
+                [current, &benchmark_error](benchmark::State& state) {
+                    if (!benchmark_error.empty()) {
+                        state.SkipWithError(benchmark_error.c_str());
+                        return;
+                    }
+                    try {
+                        for (auto _ : state) {
+                            (void)_;
+                            const auto metrics = current->retrieve();
+                            state.SetIterationTime(metrics.total_seconds);
+                            set_counters(state, metrics);
+                        }
+                    } catch (const std::exception& error) {
+                        benchmark_error = error.what();
+                        state.SkipWithError(benchmark_error.c_str());
+                    }
+                })
+                ->Iterations(1)
+                ->UseManualTime()
+                ->Unit(benchmark::kMillisecond);
         }
 
         std::unique_ptr<mssql::odbc::bench::ParameterArrayWriteRunner> write_runner;
@@ -120,9 +137,7 @@ int main(int argc, char** argv) {
                 std::make_unique<mssql::odbc::bench::ParameterArrayWriteRunner>(
                     session, config.write_mode);
             write_runner->preflight();
-            auto* const current = write_runner.get();
-            register_measurement(
-                current->name(), [current] { return current->execute(); }, benchmark_error);
+            register_runner(write_runner.get(), benchmark_error);
         }
 
         std::vector<std::unique_ptr<mssql::odbc::bench::ExecuteManyWriteRunner>>
@@ -134,39 +149,32 @@ int main(int argc, char** argv) {
                 auto runner = std::make_unique<mssql::odbc::bench::ExecuteManyWriteRunner>(
                     session, shape);
                 runner->preflight();
-                auto* const current = runner.get();
+                register_runner(runner.get(), benchmark_error);
                 execute_many_runners.push_back(std::move(runner));
-                register_measurement(
-                    current->name(), [current] { return current->execute(); },
-                    benchmark_error);
             }
         }
 
-        std::vector<std::unique_ptr<LatencyRunner>> latency_runners;
+        std::vector<std::unique_ptr<mssql::odbc::bench::LatencyRunner>> latency_runners;
         if (config.scenario.empty() || config.scenario == "latency") {
             for (const auto& spec : mssql::odbc::bench::latency_workloads()) {
-                auto runner =
-                    std::make_unique<LatencyRunner>(session, spec, config.calls_override);
+                auto runner = std::make_unique<mssql::odbc::bench::LatencyRunner>(
+                    session, spec, config.calls_override);
                 runner->preflight();
-                auto* const current = runner.get();
+                register_runner(runner.get(), benchmark_error);
                 latency_runners.push_back(std::move(runner));
-                register_measurement(
-                    current->name(), [current] { return current->execute(); },
-                    benchmark_error);
             }
         }
 
-        std::vector<std::unique_ptr<PyCursorRunner>> py_cursor_runners;
+        std::vector<std::unique_ptr<mssql::odbc::bench::PyCursorRunner>> py_cursor_runners;
         for (const auto& spec : mssql::odbc::bench::py_cursor_workloads()) {
             if (!config.scenario.empty() && config.scenario != spec.scenario) {
                 continue;
             }
-            auto runner = std::make_unique<PyCursorRunner>(session, spec, config.calls_override);
+            auto runner = std::make_unique<mssql::odbc::bench::PyCursorRunner>(
+                session, spec, config.calls_override);
             runner->preflight();
-            auto* const current = runner.get();
+            register_runner(runner.get(), benchmark_error);
             py_cursor_runners.push_back(std::move(runner));
-            register_measurement(
-                current->name(), [current] { return current->execute(); }, benchmark_error);
         }
 
         benchmark::RunSpecifiedBenchmarks();

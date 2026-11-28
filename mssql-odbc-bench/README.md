@@ -305,12 +305,14 @@ to gate.
 Each benchmark replays one workload of the `mssql-python` performance suite
 (`performance/workloads.py` and `performance/scenarios/odbc_path_workloads.py`)
 as the ODBC calls `cursor.py` and `ddbc_bindings.cpp` (mssql-python `239f79fd`)
-make for it, on one statement handle per benchmark, so mssql-odbc can be compared
-with msodbcsql18 on that suite without Python in the measurement.
+make for it, on one statement handle per benchmark, so mssql-odbc can be
+compared with msodbcsql18 on that suite without Python in the measurement.
 
 Each id names what is bound, streamed, or fetched, and the payload one operation
-moves (`4b` … `730kb` … `10mb`), so small-call and bulk-data costs read apart at a
-glance. The size is the logical value bytes, not the TDS bytes on the wire.
+moves, rounded (`4b` … `730kb` … `10mb`), so small-call and bulk-data costs read
+apart at a glance. That size is what `logical_bytes` reports per operation:
+bound parameter buffer bytes, streamed bytes, or the SQL Server storage size of
+fetched values, not TDS bytes on the wire.
 
 | Benchmark | `mssql-python` workload | One operation |
 |---|---|---|
@@ -326,29 +328,32 @@ glance. The size is the logical value bytes, not the TDS bytes on the wire.
 The replayed sequence, per Python call:
 
 - **`execute`**: `SQLFreeStmt(SQL_CLOSE)` and
-  `SQLSetStmtAttrW(SQL_ATTR_PARAMSET_SIZE, 1)`. Without parameters,
-  `SQLExecDirectW`. With parameters, `SQLPrepareW` only when the text differs
-  from the previous execute (preceded once per handle by the forward-only,
-  read-only cursor attributes and always by `SQLFreeStmt(SQL_RESET_PARAMS)`),
-  then one `SQLBindParameter` per parameter to freshly addressed buffers, a
-  `SQL_RESET_PARAMS` first only when a binding's types changed, and
-  `SQLExecute` with the `SQLParamData`/`SQLPutData` loop in 8,192-byte chunks.
-  Then `SQLRowCount`, `SQLNumResultCols`, and `SQLDescribeColW` per column, plus a
-  second `SQLRowCount` when there is no result set.
-- **Parameter binding**: Python type detection's choices. `int` is the narrowest of
-  `SQL_TINYINT`/`SQL_SMALLINT`/`SQL_INTEGER`/`SQL_BIGINT`; `str` is always
+  `SQLSetStmtAttrW(SQL_ATTR_PARAMSET_SIZE, 1)`; the forward-only, read-only
+  cursor attributes once per handle. Without parameters,
+  `SQLFreeStmt(SQL_RESET_PARAMS)` if an earlier execute left parameters bound,
+  then `SQLExecDirectW`. With parameters, `SQL_RESET_PARAMS` and `SQLPrepareW`
+  only when the text differs from the previous execute, then one
+  `SQLBindParameter` per parameter to freshly addressed buffers (after a
+  `SQL_RESET_PARAMS` when a binding's types changed), and `SQLExecute` with the
+  `SQLParamData`/`SQLPutData` loop in 8,192-byte chunks. Then `SQLRowCount`,
+  `SQLNumResultCols`, and `SQLDescribeColW` per column, plus a second
+  `SQLRowCount` when there is no result set.
+- **Parameter binding**: Python type detection's choices. `int` is the narrowest
+  of `SQL_TINYINT`/`SQL_SMALLINT`/`SQL_INTEGER`/`SQL_BIGINT`; `str` is always
   `SQL_C_WCHAR`, declared `SQL_VARCHAR` when ASCII and `SQL_WVARCHAR` otherwise;
   `str` above 4,000 UTF-16 units and `bytes` above 8,000 bytes stream with
   column size 0; `Decimal` is `SQL_C_NUMERIC` plus four `SQLSetDescFieldW` calls
   on the APD; `None` is `SQL_C_DEFAULT`, typed by `SQLDescribeParam` once per
   prepare, falling back to `VARCHAR(1)`.
-- **`fetchone`**: `SQLFetch`, `SQLNumResultCols`, then per column `SQLDescribeColW`
-  and one `SQLGetData` with the C type and buffer `GetRowData` picks.
+- **`fetchone`**: `SQLFetch`, `SQLNumResultCols`, then per column
+  `SQLDescribeColW` and one `SQLGetData` with the C type and buffer `GetRowData`
+  picks.
 - **`fetchmany`** and **`arrow`**: per call, column-wise `SQLBindCol` into newly
-  allocated arrays, `SQL_ATTR_ROW_ARRAY_SIZE` and `SQL_ATTR_ROWS_FETCHED_PTR`, then
-  `SQLFetchScroll` (one 100-row rowset) or repeated `SQLFetch` with 64-row
-  rowsets up to 8,192 rows, then both attributes reset and `SQLFreeStmt(SQL_UNBIND)`.
-  `fetchmany` describes the result once; every `arrow` batch describes it again.
+  allocated arrays, `SQL_ATTR_ROW_ARRAY_SIZE` and `SQL_ATTR_ROWS_FETCHED_PTR`,
+  then `SQLFetchScroll` (one 100-row rowset) or repeated `SQLFetch` with 64-row
+  rowsets up to 8,192 rows, then both attributes reset and
+  `SQLFreeStmt(SQL_UNBIND)`. `fetchmany` describes the result once; every
+  `arrow` batch describes it again.
 
 As in the Python workloads, the `TRUNCATE` before each LOB insert and the stored
 row check after it run on the same cursor but outside the timer, so every insert

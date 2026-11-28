@@ -893,9 +893,7 @@ const std::array<WorkloadSpec, kWorkloadCount>& workloads() {
 }
 
 // Small calls where per-call driver overhead, not payload, decides latency. Batch
-// sizes put one sample at roughly 0.8-2 s locally on both msodbcsql18 and
-// mssql-odbc: long enough to average scheduler jitter, short enough that the
-// scenario adds about a minute to an initial pass.
+// sizes put one sample at 0.9-2.4 s locally on msodbcsql18 and mssql-odbc.
 const std::array<LatencySpec, kLatencyWorkloadCount>& latency_workloads() {
     static const std::array<LatencySpec, kLatencyWorkloadCount> specs = {{
         // The shortest non-prepared round trip.
@@ -1147,13 +1145,6 @@ SQLHSTMT OdbcSession::admin_statement() const {
     return admin_stmt_;
 }
 
-SQLHSTMT OdbcSession::allocate_statement() {
-    SQLHSTMT stmt = SQL_NULL_HSTMT;
-    require_exact_success(SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &stmt),
-                          "SQLAllocHandle(SQL_HANDLE_STMT owned)", SQL_HANDLE_DBC, dbc_);
-    return stmt;
-}
-
 // Drain all results so the administrative statement is clean for its next use.
 void OdbcSession::execute_non_query(const std::string& sql) {
     auto text = to_sql_string(sql);
@@ -1301,25 +1292,6 @@ void print_benchmark_sql(std::ostream& output) {
         output << select_sql(*workload.table, columns_for(*workload.table))
                << ";\nGO\n";
     }
-    for (const auto& workload : latency_workloads()) {
-        output << "-- workload " << workload.benchmark_name
-               << " (scenario latency, no table): " << workload.calls_per_sample
-               << " calls per sample of "
-               << (workload.call == LatencyCall::prepared_param
-                       ? "prepared SELECT ? with one INT parameter"
-                       : "SELECT 1");
-        if (workload.text_chars != 0) {
-            output << " padded by a block comment to " << workload.text_chars
-                   << " characters";
-        }
-        output << '\n';
-    }
-    for (const auto& workload : py_cursor_workloads()) {
-        output << "-- workload " << workload.benchmark_name << " (scenario "
-               << workload.scenario << ", mssql-python " << workload.python_name
-               << ", temporary table created on the measuring connection): "
-               << workload.operations_per_sample << " operations per sample\n";
-    }
 }
 
 namespace {
@@ -1332,6 +1304,16 @@ void require_succeeded(SQLRETURN rc, const char* operation, SQLHSTMT stmt) {
     if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
         throw_odbc_error(operation, rc, SQL_HANDLE_STMT, stmt);
     }
+}
+
+// A statement whose prepared plan and bindings persist across samples. The
+// caller frees it; its runner is destroyed before the session disconnects.
+SQLHSTMT allocate_statement(OdbcSession& session) {
+    SQLHSTMT stmt = SQL_NULL_HSTMT;
+    require_exact_success(SQLAllocHandle(SQL_HANDLE_STMT, session.connection(), &stmt),
+                          "SQLAllocHandle(SQL_HANDLE_STMT)", SQL_HANDLE_DBC,
+                          session.connection());
+    return stmt;
 }
 
 // Fold whatever SQL_CA_SS_VARIANT_TYPE reports onto the C type the value is read
@@ -2734,11 +2716,8 @@ public:
         : spec_(spec),
           calls_(calls_override != 0 ? calls_override : spec.calls_per_sample),
           text_(statement_text(spec)),
-          stmt_(session.allocate_statement()) {
+          stmt_(allocate_statement(session)) {
         try {
-            if (calls_ == 0) {
-                throw std::logic_error("latency workload has no calls per sample");
-            }
             // Bindings survive SQLCloseCursor, so binding once is what an
             // application that reuses a cursor does.
             require_exact_success(
@@ -2788,18 +2767,13 @@ private:
     // Enough to fault in driver code, settle the server plan cache, and warm the
     // socket path before the first timed sample; capped at one sample.
     static constexpr std::size_t kWarmupCalls = 500;
-    static constexpr SQLINTEGER kMaxParameter = 1'000'000'000;
 
     static std::vector<SQLWCHAR> statement_text(const LatencySpec& spec) {
         std::string text =
             spec.call == LatencyCall::prepared_param ? "SELECT ?" : "SELECT 1";
         if (spec.text_chars != 0) {
-            if (spec.call != LatencyCall::exec_direct ||
-                spec.text_chars < text.size() + 5) {
-                throw std::logic_error("latency padding needs a direct SELECT 1 and room");
-            }
-            // The filler the local r7 measurements used, so lab and local per-call
-            // numbers describe the same text. It contains no '?', '{', or "*/".
+            // The filler contains no '?', '{', or "*/", so the driver has nothing
+            // to rewrite and the server nothing to parse beyond `SELECT 1`.
             constexpr std::string_view kFiller = "padding-text-0123456789abcdef ";
             text += " /*";
             while (text.size() < spec.text_chars - 2) {
@@ -2826,8 +2800,7 @@ private:
             return 1;
         }
         // A new value per call, so a stale buffer or a reused result cannot pass.
-        parameter_ = next_parameter_;
-        next_parameter_ = next_parameter_ == kMaxParameter ? 1 : next_parameter_ + 1;
+        parameter_ = next_parameter_++;
         require_exact_success(SQLExecute(stmt_), "SQLExecute(latency)", SQL_HANDLE_STMT,
                               stmt_);
         return parameter_;
@@ -3611,7 +3584,7 @@ bool wide_equals(const unsigned char* data, SQLLEN indicator, std::u16string_vie
 // `cursor.py` and `ddbc_bindings.cpp` at 239f79fd.
 class PyCursor {
 public:
-    explicit PyCursor(OdbcSession& session) : stmt_(session.allocate_statement()) {}
+    explicit PyCursor(OdbcSession& session) : stmt_(allocate_statement(session)) {}
 
     ~PyCursor() {
         SQLFreeHandle(SQL_HANDLE_STMT, stmt_);
@@ -3628,10 +3601,10 @@ public:
         return row_count_;
     }
 
-    // `Cursor.execute`: soft reset, then a cached prepare + bind + SQLExecute
-    // (with the DAE loop) when there are parameters, SQLExecDirectW otherwise,
-    // then the row count and `description`.
-    SQLSMALLINT execute(const std::vector<SQLWCHAR>& sql, std::vector<PyParameter>& params) {
+    // `Cursor.execute`: soft reset; SQLExecDirectW without parameters, otherwise a
+    // cached prepare, bind, and SQLExecute with the DAE loop; then the row count
+    // and `description`.
+    void execute(const std::vector<SQLWCHAR>& sql, std::vector<PyParameter>& params) {
         metadata_.clear();
         metadata_complete_ = false;
         check(SQLFreeStmt(stmt_, SQL_CLOSE), "SQLFreeStmt(SQL_CLOSE)");
@@ -3642,17 +3615,15 @@ public:
             prepared_ = false;
         }
         if (params.empty()) {
+            apply_cursor_attrs();
+            if (params_bound_) {
+                reset_params();
+            }
             check(SQLExecDirectW(stmt_, const_cast<SQLWCHAR*>(sql.data()), SQL_NTS),
                   "SQLExecDirectW");
         } else {
             if (!prepared_) {
-                if (!cursor_attrs_applied_) {
-                    const SQLRETURN type_rc = SQLSetStmtAttrW(
-                        stmt_, SQL_ATTR_CURSOR_TYPE, attribute_value(SQL_CURSOR_FORWARD_ONLY), 0);
-                    const SQLRETURN concurrency_rc = SQLSetStmtAttrW(
-                        stmt_, SQL_ATTR_CONCURRENCY, attribute_value(SQL_CONCUR_READ_ONLY), 0);
-                    cursor_attrs_applied_ = SQL_SUCCEEDED(type_rc) && SQL_SUCCEEDED(concurrency_rc);
-                }
+                apply_cursor_attrs();
                 reset_params();
                 check(SQLPrepareW(stmt_, const_cast<SQLWCHAR*>(sql.data()), SQL_NTS),
                       "SQLPrepareW");
@@ -3668,11 +3639,9 @@ public:
         }
         last_sql_ = sql;
         check(SQLRowCount(stmt_, &row_count_), "SQLRowCount");
-        const SQLSMALLINT columns = describe_columns(nullptr);
-        if (columns == 0) {
+        if (describe_columns(nullptr) == 0) {
             check(SQLRowCount(stmt_, &row_count_), "SQLRowCount(no result)");
         }
-        return columns;
     }
 
     // `Cursor.fetchone` -> `FetchSingleRow` -> `GetRowData`.
@@ -3711,10 +3680,8 @@ public:
     // `Cursor.fetchmany` -> `FetchMany_wrap` on a result with no LOB columns.
     template <typename Sink>
     std::size_t fetchmany(std::size_t size, Sink&& sink) {
-        const auto count = metadata_complete_ ? static_cast<SQLSMALLINT>(metadata_.size())
-                                              : num_result_cols();
-        if (!metadata_complete_ || metadata_.size() != static_cast<std::size_t>(count)) {
-            metadata_.clear();
+        if (!metadata_complete_) {
+            num_result_cols();
             describe_columns(&metadata_);
             metadata_complete_ = true;
         }
@@ -3792,6 +3759,18 @@ public:
 private:
     void check(SQLRETURN rc, const char* operation) const {
         require_exact_success(rc, operation, SQL_HANDLE_STMT, stmt_);
+    }
+
+    // `ApplyForwardOnlyCursorAttrs`: once per handle; failures are ignored.
+    void apply_cursor_attrs() {
+        if (cursor_attrs_applied_) {
+            return;
+        }
+        const SQLRETURN type_rc = SQLSetStmtAttrW(
+            stmt_, SQL_ATTR_CURSOR_TYPE, attribute_value(SQL_CURSOR_FORWARD_ONLY), 0);
+        const SQLRETURN concurrency_rc = SQLSetStmtAttrW(
+            stmt_, SQL_ATTR_CONCURRENCY, attribute_value(SQL_CONCUR_READ_ONLY), 0);
+        cursor_attrs_applied_ = SQL_SUCCEEDED(type_rc) && SQL_SUCCEEDED(concurrency_rc);
     }
 
     // `ResetParamBindings`.
@@ -4189,9 +4168,6 @@ public:
                                                : spec.operations_per_sample),
           cursor_(session),
           table_(std::string("#mssql_odbc_bench_") + spec.python_name) {
-        if (operations_ == 0) {
-            throw std::logic_error("py-cursor workload has no operations per sample");
-        }
         build();
     }
 
@@ -4300,11 +4276,45 @@ private:
             check_sql_ = wide_text(ascii_u16("SELECT COUNT_BIG(*), MAX(DATALENGTH(v)) FROM " +
                                              table_));
         }
+        // Throughput counters: values and bytes one operation binds, streams, or
+        // fetches. Fetched bytes are SQL Server storage sizes of the generated values.
+        switch (spec_.kind) {
+        case PyCursorWorkload::insert_lob_varbinary:
+        case PyCursorWorkload::insert_lob_nvarchar:
+            cells_per_operation_ = 1;
+            bytes_per_operation_ = spec_.size;
+            break;
+        case PyCursorWorkload::fetchmany_mixed:
+            cells_per_operation_ = spec_.size * 4;
+            for (std::size_t id = 0; id < spec_.size; ++id) {
+                bytes_per_operation_ +=
+                    4 + 9 + 2 * std::to_string(id).size() + 2 * std::strlen("value-") + 32;
+            }
+            break;
+        case PyCursorWorkload::fetch_arrow_mixed:
+            cells_per_operation_ = spec_.size * 8;
+            for (std::size_t id = 0; id < spec_.size; ++id) {
+                bytes_per_operation_ += 4 + 8 + 8 + 9 + 2 * std::strlen("label-") +
+                                        2 * std::to_string(id).size() + 8 + 1 +
+                                        (id % 17 == 0 ? 0 : 16);
+            }
+            break;
+        default:
+            cells_per_operation_ = params_.size();
+            for (const auto& parameter : params_) {
+                bytes_per_operation_ += parameter.value[0].size();
+            }
+            break;
+        }
     }
 
     // The Python workloads build these tables in `_prepare` on the same
     // connection; here the generators are set-based T-SQL with the same values.
     void create_table() {
+        if (!is_lob() && spec_.kind != PyCursorWorkload::fetchmany_mixed &&
+            spec_.kind != PyCursorWorkload::fetch_arrow_mixed) {
+            return;
+        }
         session_.execute_non_query("DROP TABLE IF EXISTS " + table_);
         switch (spec_.kind) {
         case PyCursorWorkload::insert_lob_varbinary:
@@ -4371,8 +4381,8 @@ private:
         }
         RetrievalMetrics metrics;
         metrics.rows = rows;
-        metrics.cells = rows * std::max<std::size_t>(params_.size(), 1);
-        metrics.logical_bytes = is_lob() ? operations * spec_.size : 0;
+        metrics.cells = operations * cells_per_operation_;
+        metrics.logical_bytes = operations * bytes_per_operation_;
         metrics.total_seconds = timed;
         metrics.metadata_bind_seconds = -1.0;
         metrics.calls = operations;
@@ -4629,6 +4639,8 @@ private:
     std::vector<PyParameter> no_params_;
     std::vector<PyCell> row_;
     std::int64_t expected_ = 0;
+    std::uint64_t cells_per_operation_ = 0;
+    std::uint64_t bytes_per_operation_ = 0;
     bool verify_everything_ = false;
 };
 

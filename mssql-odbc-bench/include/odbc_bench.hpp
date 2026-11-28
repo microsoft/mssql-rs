@@ -55,7 +55,8 @@ struct Config {
     std::string packet_size_keyword;
     std::string scenario;
     std::string write_mode;
-    /// Calls per `latency`/`params`/`lobwrite`/`cursorfetch` sample; 0 keeps each workload's catalog size.
+    /// Operations per `latency`, `params`, `lobwrite`, and `cursorfetch` sample;
+    /// 0 keeps the catalog size.
     std::size_t calls_override = 0;
 
     /// Read and validate the cross-platform perf-lab environment contract.
@@ -237,11 +238,6 @@ public:
     /// Separate statement used for setup and validation outside timed regions.
     SQLHSTMT admin_statement() const;
 
-    /// Allocate a statement the caller owns, for workloads whose prepared and bound
-    /// state must survive across samples. Free it before this session is destroyed:
-    /// `SQLDisconnect` releases it implicitly.
-    SQLHSTMT allocate_statement();
-
     /// Execute setup/cleanup SQL and drain every result before reusing the statement.
     void execute_non_query(const std::string& sql);
 
@@ -299,8 +295,8 @@ struct RetrievalMetrics {
     double fetch_seconds = 0.0;
     /// Number of SQLExecute calls used to submit a write workload.
     std::uint64_t execute_calls = 0;
-    /// Complete call cycles in a latency sample; zero for every other workload.
-    /// Latency samples take no per-phase timestamps, so the phase fields stay unset.
+    /// Operations in a `LatencyRunner` or `PyCursorRunner` sample, which record no
+    /// phase timestamps; zero for every other workload.
     std::uint64_t calls = 0;
 };
 
@@ -406,8 +402,7 @@ public:
     /// Check the result shape once, then run an untimed, validated warm-up batch.
     void preflight();
 
-    /// Time one batch. Every call still checks its fetched value, which costs a
-    /// compare against a round trip.
+    /// Time one batch; every call still checks its fetched value.
     RetrievalMetrics execute();
 
 private:
@@ -430,7 +425,8 @@ public:
 
     const char* name() const;
 
-    /// Create the workload's temporary table, then run validated warm-up operations.
+    /// Create the workload's temporary table, if any, then run validated warm-up
+    /// operations.
     void preflight();
 
     /// Time one sample of `operations_per_sample` validated operations.
