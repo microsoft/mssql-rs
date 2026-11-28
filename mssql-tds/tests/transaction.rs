@@ -6,11 +6,133 @@ mod common;
 #[cfg(test)]
 mod transactions {
     use crate::common::{
-        ExpectedQueryResultType, begin_connection, build_tcp_datasource,
+        ExpectedQueryResultType, begin_connection, build_tcp_datasource, get_first_row,
         run_query_and_check_results, validate_results,
     };
-    use mssql_tds::connection::tds_client::StatementResult;
+    use mssql_tds::connection::tds_client::{StatementResult, TdsClient};
+    use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::message::transaction_management::{CreateTxnParams, TransactionIsolationLevel};
+
+    /// `(@@TRANCOUNT, CURRENT_TRANSACTION_ID())` as seen by the session itself.
+    async fn session_transaction_state(connection: &mut TdsClient) -> (i32, i64) {
+        connection
+            .execute(
+                "SELECT @@TRANCOUNT, CURRENT_TRANSACTION_ID()".to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+        match get_first_row(connection).await.unwrap().1.as_slice() {
+            [ColumnValues::Int(count), ColumnValues::BigInt(id)] => (*count, *id),
+            other => panic!("unexpected transaction state row: {other:?}"),
+        }
+    }
+
+    async fn row_count(connection: &mut TdsClient, table: &str) -> i32 {
+        connection
+            .execute(format!("SELECT COUNT(*) FROM {table}"), ())
+            .await
+            .unwrap();
+        match get_first_row(connection).await.unwrap().1.as_slice() {
+            [ColumnValues::Int(count)] => *count,
+            other => panic!("unexpected COUNT(*) row: {other:?}"),
+        }
+    }
+
+    fn begin_unnamed_no_change() -> Option<CreateTxnParams> {
+        Some(CreateTxnParams {
+            level: TransactionIsolationLevel::NoChange,
+            name: None,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_req_commit_and_begin_leaves_one_new_transaction() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+        run_query_and_check_results(
+            &mut connection,
+            "CREATE TABLE #fbegin_commit(col int)".to_string(),
+            &[ExpectedQueryResultType::Update(0)],
+        )
+        .await;
+        connection
+            .begin_transaction(TransactionIsolationLevel::ReadCommitted, None)
+            .await
+            .unwrap();
+        run_query_and_check_results(
+            &mut connection,
+            "INSERT INTO #fbegin_commit VALUES(1)".to_string(),
+            &[ExpectedQueryResultType::Update(1)],
+        )
+        .await;
+        let (_, first_id) = session_transaction_state(&mut connection).await;
+
+        connection
+            .commit_transaction(None, begin_unnamed_no_change())
+            .await
+            .unwrap();
+
+        assert!(connection.has_active_transaction());
+        let (count, second_id) = session_transaction_state(&mut connection).await;
+        assert_eq!(count, 1);
+        assert_ne!(second_id, first_id);
+
+        run_query_and_check_results(
+            &mut connection,
+            "INSERT INTO #fbegin_commit VALUES(2)".to_string(),
+            &[ExpectedQueryResultType::Update(1)],
+        )
+        .await;
+        connection.rollback_transaction(None, None).await.unwrap();
+
+        assert!(!connection.has_active_transaction());
+        assert_eq!(session_transaction_state(&mut connection).await.0, 0);
+        assert_eq!(row_count(&mut connection, "#fbegin_commit").await, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_req_rollback_and_begin_leaves_one_new_transaction() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+        run_query_and_check_results(
+            &mut connection,
+            "CREATE TABLE #fbegin_rollback(col int)".to_string(),
+            &[ExpectedQueryResultType::Update(0)],
+        )
+        .await;
+        connection
+            .begin_transaction(TransactionIsolationLevel::ReadCommitted, None)
+            .await
+            .unwrap();
+        run_query_and_check_results(
+            &mut connection,
+            "INSERT INTO #fbegin_rollback VALUES(1)".to_string(),
+            &[ExpectedQueryResultType::Update(1)],
+        )
+        .await;
+        let (_, first_id) = session_transaction_state(&mut connection).await;
+
+        connection
+            .rollback_transaction(None, begin_unnamed_no_change())
+            .await
+            .unwrap();
+
+        assert!(connection.has_active_transaction());
+        let (count, second_id) = session_transaction_state(&mut connection).await;
+        assert_eq!(count, 1);
+        assert_ne!(second_id, first_id);
+
+        run_query_and_check_results(
+            &mut connection,
+            "INSERT INTO #fbegin_rollback VALUES(2)".to_string(),
+            &[ExpectedQueryResultType::Update(1)],
+        )
+        .await;
+        connection.commit_transaction(None, None).await.unwrap();
+
+        assert!(!connection.has_active_transaction());
+        assert_eq!(session_transaction_state(&mut connection).await.0, 0);
+        assert_eq!(row_count(&mut connection, "#fbegin_rollback").await, 1);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_sql_rollback_transaction() {
