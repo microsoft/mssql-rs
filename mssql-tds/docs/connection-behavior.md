@@ -247,6 +247,38 @@ before negotiating the TLS close. Drop abandons the connection instead and does
 not guarantee delivery of pending writes.
 Local cancellation does not guarantee immediate removal of a server-side session.
 
+## Idle session recovery
+
+`connect_retry_count` is the total number of reconnection attempts: zero disables
+recovery and one permits one attempt. `connect_retry_interval` applies between
+attempts, not before the first. Recovery is a pre-send check on an eligible idle
+session; it never replays an interrupted statement, result fetch or commit.
+Recovery and the subsequent request share the command timeout. Without one,
+recovery uses the connection timeout.
+
+The dead local transport is synchronously aborted before opening a replacement.
+Failed recovery logins also abort their replacement transport without awaiting
+graceful shutdown, so cleanup cannot consume the budget and replace a terminal
+authentication/configuration error or provider cancellation with a timeout.
+Recovery uses the same transient-error classification as initial connection
+opening. Cancellation and permanent login, TLS or configuration errors propagate
+without further retries or retry-exhaustion wrapping. Successful recovery invalidates
+session-bound prepared handles and restores only protocol-supported state.
+
+Pool-owned initialization, reset and return cleanup do not reconnect instead of
+validating the existing session. A dead session or missing reset acknowledgement
+requires discard. Application recovery retains its original pool slot and
+exclusive ownership through completion or discard. Applications do not need a
+separate maintenance or recovery API.
+
+Low-level pool implementers use `TdsClient::initialize_session` to apply a
+concrete isolation level and fully drain its response without reconnecting.
+Arm `prepare_reset_connection(false)` before that call on reuse; reset
+acknowledgement is mandatory. The operation does not alter recovery policy for
+later application commands. Any initialization error or interruption requires
+the pool to discard the client. Return draining and rollback already do not
+reconnect. There is no public recovery-suppression switch or guard.
+
 ## Execution stack usage
 
 Command execution keeps session-recovery state in a separately boxed future,

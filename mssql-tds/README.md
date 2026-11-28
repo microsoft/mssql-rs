@@ -66,6 +66,15 @@ results in a batch. See the [API reference](https://docs.rs/mssql-tds).
 `has_open_batch()`. Draining results with `close_query()` does not complete such
 a write; finish its parameters or cancel it before issuing another command.
 
+Idle session recovery uses `connect_retry_count` as the total attempt limit
+(`0` disables it); interrupted commands are never replayed. See
+[recovery behavior](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md#idle-session-recovery)
+for eligibility, timeouts and pool maintenance.
+
+Low-level pool implementers use `TdsClient::initialize_session` for the fixed
+isolation SET and complete response drain without reconnecting. It does not
+expose a recovery switch or change recovery for later application commands.
+
 ## Feature flags
 
 | Feature | Default | Purpose |

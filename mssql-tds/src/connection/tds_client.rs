@@ -967,18 +967,19 @@ impl TdsClient {
             Some(self.negotiated_settings.database_collation),
         );
 
-        // Close the dead transport (best-effort)
-        let _ = self.transport.close_transport().await;
-
         let deadline = Instant::now() + timeout;
+        // A replacement must not overlap the old local transport or wait for
+        // graceful TLS shutdown on a socket already known to be broken.
+        self.transport.abort_transport();
         let connect_retry_count = client_context.connect_retry_count;
         let connect_retry_interval =
             Duration::from_secs(client_context.connect_retry_interval as u64);
         let transport_context = client_context.transport_context.clone();
 
         let mut last_error: Option<Error> = None;
+        let mut attempts = 0;
 
-        for attempt in 0..=connect_retry_count {
+        for attempt in 0..connect_retry_count {
             // Wait before retry (not before first attempt)
             if attempt > 0 {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1021,6 +1022,7 @@ impl TdsClient {
                 .min(remaining.as_secs().max(1) as u32);
 
             info!(attempt, "Attempting reconnection");
+            attempts += 1;
             // `connect_timeout` above only bounds the TCP-connect step inside
             // `connect_with_transport_context`; DNS resolution ahead of it is
             // otherwise unbounded here. Wrap the whole attempt (DNS through
@@ -1053,8 +1055,8 @@ impl TdsClient {
                     {
                         // Close the new transport — it's unusable
                         let mut transport = new_transport;
-                        let _ = transport.close_transport().await;
-                        info!(error = %validation_err, "Reconnection validation failed");
+                        transport.abort_transport();
+                        info!("Reconnection validation failed");
                         return Err(validation_err);
                     }
 
@@ -1080,7 +1082,10 @@ impl TdsClient {
                     return Err(error);
                 }
                 Err(e) => {
-                    info!(attempt, error = %e, "Reconnection attempt failed");
+                    if !e.is_transient_connect_error() {
+                        return Err(e);
+                    }
+                    info!(attempt, "Reconnection attempt failed");
                     last_error = Some(e);
                 }
             }
@@ -1090,10 +1095,7 @@ impl TdsClient {
         let message = last_error
             .map(|e| e.to_string())
             .unwrap_or_else(|| "Deadline exceeded".to_string());
-        Err(Error::SessionRecoveryFailed {
-            attempts: connect_retry_count + 1,
-            message,
-        })
+        Err(Error::SessionRecoveryFailed { attempts, message })
     }
 
     /// Adopts a freshly recovered session: swaps in the new transport, settings,
@@ -1691,6 +1693,16 @@ impl TdsClient {
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<Duration> {
+        self.check_connection(timeout_sec, cancel_handle, true)
+            .await
+    }
+
+    async fn check_connection(
+        &mut self,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+        allow_recovery: bool,
+    ) -> TdsResult<Duration> {
         // Request boundary. `begin_command` misses the cursor RPCs (they never
         // call it) and this misses the transaction ops (they deliberately skip
         // recovery), so the settle lives in both; it is idempotent, so a path
@@ -1715,10 +1727,9 @@ impl TdsClient {
         // with recovery disabled (including intentionally closed clients and
         // clients retired after protocol desynchronization) would fall through
         // and write another request to the unusable transport.
+        let recovery_enabled = allow_recovery && self.recovery_context.session_recovery_negotiated;
         let known_dead = self.transport.connection_known_dead();
-        if known_dead
-            && (!self.recovery_context.session_recovery_negotiated || connect_retry_count == 0)
-        {
+        if known_dead && (!recovery_enabled || connect_retry_count == 0) {
             return Err(crate::error::Error::ConnectionClosed(
                 "Connection is dead and session recovery is unavailable".to_string(),
             ));
@@ -1726,7 +1737,7 @@ impl TdsClient {
 
         // Only attempt recovery when session recovery was negotiated and
         // the server supports retry (connect_retry_count > 0).
-        if !self.recovery_context.session_recovery_negotiated {
+        if !recovery_enabled {
             return Ok(self.admit(Duration::ZERO));
         }
         if connect_retry_count == 0 {
@@ -1911,9 +1922,80 @@ impl TdsClient {
         sql_command: String,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementResult> {
-        self.send_query_batch(sql_command, options.into()).await?;
+        self.execute_batch(sql_command, options.into(), true).await
+    }
+
+    async fn execute_batch(
+        &mut self,
+        sql_command: String,
+        options: ExecuteOptions<'_>,
+        allow_recovery: bool,
+    ) -> TdsResult<StatementResult> {
+        self.send_query_batch_inner(sql_command, options, allow_recovery)
+            .await?;
         let boundary = self.advance_to_result_boundary().await?;
         Ok(self.apply_result_boundary(boundary))
+    }
+
+    /// Applies a concrete isolation level and fully drains the response without
+    /// reconnecting. Intended for connection-pool initialization and checkout.
+    ///
+    /// On reuse, call [`prepare_reset_connection`](Self::prepare_reset_connection)
+    /// first; the carrier must receive its reset acknowledgement. `NoChange` and
+    /// active transactions are rejected. Statement-error continuation is ignored.
+    ///
+    /// Recovery policy for later application commands is unchanged. A pool must
+    /// discard the connection if this operation fails or is interrupted.
+    pub async fn initialize_session<'a>(
+        &mut self,
+        isolation_level: TransactionIsolationLevel,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<()> {
+        let sql = match isolation_level {
+            TransactionIsolationLevel::ReadUncommitted => {
+                "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED"
+            }
+            TransactionIsolationLevel::ReadCommitted => {
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+            }
+            TransactionIsolationLevel::RepeatableRead => {
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+            }
+            TransactionIsolationLevel::Serializable => {
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+            }
+            TransactionIsolationLevel::Snapshot => "SET TRANSACTION ISOLATION LEVEL SNAPSHOT",
+            TransactionIsolationLevel::NoChange => {
+                return Err(UsageError(
+                    "Session initialization requires a concrete isolation level".into(),
+                ));
+            }
+        };
+        if self.has_active_transaction() {
+            return Err(UsageError(
+                "Cannot initialize a session with an active transaction".into(),
+            ));
+        }
+        let mut options = options.into();
+        Self::note_on_error_ignored(options.on_error);
+        options.on_error = BatchErrorMode::Abort;
+        self.execute_batch(sql.to_owned(), options, false).await?;
+        self.close_query().await?;
+        if self.reset_pending() {
+            self.mark_connection_dead();
+            return Err(crate::error::Error::ConnectionResetNotAcknowledged);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn send_query_batch(
+        &mut self,
+        sql_command: String,
+        options: ExecuteOptions<'_>,
+    ) -> TdsResult<()> {
+        self.send_query_batch_inner(sql_command, options, true)
+            .await
     }
 
     /// Runs the batch-execution prologue and sends a SQL batch to the wire:
@@ -1921,10 +2003,11 @@ impl TdsClient {
     /// reconnects if needed, stores the timeout / cancel handle, and serializes
     /// the batch. The caller then consumes the response via
     /// [`advance_to_result_boundary`](Self::advance_to_result_boundary).
-    async fn send_query_batch(
+    async fn send_query_batch_inner(
         &mut self,
         sql_command: String,
         options: ExecuteOptions<'_>,
+        allow_recovery: bool,
     ) -> TdsResult<()> {
         let ExecuteOptions {
             timeout,
@@ -1941,7 +2024,9 @@ impl TdsClient {
         };
 
         self.begin_command();
-        let reconnect_elapsed = self.check_and_reconnect(timeout, cancel).await?;
+        let reconnect_elapsed = self
+            .check_connection(timeout, cancel, allow_recovery)
+            .await?;
         // After the request boundary, which puts the mode back to `Abort`.
         self.batch_error_mode = on_error;
         let budget = Self::deduct_timeout(timeout, reconnect_elapsed);
@@ -17833,6 +17918,197 @@ mod tests {
     // ── Reconnection orchestration tests ──
 
     #[tokio::test]
+    async fn initialize_session_applies_isolation_and_drains_without_changing_recovery() {
+        use crate::token::tokens::{EnvChangeContainer, EnvChangeToken};
+
+        for (level, suffix) in [
+            (
+                TransactionIsolationLevel::ReadUncommitted,
+                "READ UNCOMMITTED",
+            ),
+            (TransactionIsolationLevel::ReadCommitted, "READ COMMITTED"),
+            (TransactionIsolationLevel::RepeatableRead, "REPEATABLE READ"),
+            (TransactionIsolationLevel::Serializable, "SERIALIZABLE"),
+            (TransactionIsolationLevel::Snapshot, "SNAPSHOT"),
+        ] {
+            for reuse in [false, true] {
+                let mut tokens = Vec::new();
+                if reuse {
+                    tokens.push(Tokens::EnvChange(EnvChangeToken {
+                        sub_type: EnvChangeTokenSubType::ResetConnection,
+                        change_type: EnvChangeContainer::from((0u32, 0u32)),
+                    }));
+                }
+                tokens.extend([done_more_with_count(0), done_no_more()]);
+                let (mut client, sent) = create_capturing_client(tokens);
+                client.recovery_context.session_recovery_negotiated = true;
+                if reuse {
+                    client.prepare_reset_connection(false);
+                }
+                client.initialize_session(level.clone(), ()).await.unwrap();
+                assert!(client.is_session_recovery_enabled());
+                assert!(!client.reset_pending());
+                assert!(!client.command_is_busy());
+                let sql: Vec<_> = format!("SET TRANSACTION ISOLATION LEVEL {suffix}")
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                    .collect();
+                let wire = sent.lock().unwrap();
+                assert!(wire.windows(sql.len()).any(|bytes| bytes == sql));
+                assert_eq!(wire[1] & 0x08, if reuse { 0x08 } else { 0 });
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_session_rejects_invalid_isolation_and_active_transactions_before_io() {
+        for active in [false, true] {
+            let (mut client, sent) = create_capturing_client(vec![]);
+            client.recovery_context.session_recovery_negotiated = true;
+            let level = if active {
+                client.execution_context.set_transaction_descriptor(42);
+                TransactionIsolationLevel::ReadCommitted
+            } else {
+                TransactionIsolationLevel::NoChange
+            };
+            assert!(matches!(
+                client.initialize_session(level, ()).await,
+                Err(UsageError(_))
+            ));
+            assert!(sent.lock().unwrap().is_empty());
+            assert!(client.is_session_recovery_enabled());
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_session_requires_reset_ack_and_reports_delayed_errors() {
+        use crate::token::tokens::{EnvChangeContainer, EnvChangeToken};
+
+        for acknowledged in [false, true] {
+            let tokens = if acknowledged {
+                vec![
+                    Tokens::EnvChange(EnvChangeToken {
+                        sub_type: EnvChangeTokenSubType::ResetConnection,
+                        change_type: EnvChangeContainer::from((0u32, 0u32)),
+                    }),
+                    done_more_with_count(0),
+                    Tokens::Error(error_token_with_severity(16)),
+                    done_no_more(),
+                ]
+            } else {
+                vec![done_no_more()]
+            };
+            let mut client = create_test_client_with_tokens(tokens);
+            client.recovery_context.session_recovery_negotiated = true;
+            client.prepare_reset_connection(false);
+            let error = client
+                .initialize_session(
+                    TransactionIsolationLevel::ReadCommitted,
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .unwrap_err();
+            if acknowledged {
+                assert!(matches!(error, crate::error::Error::SqlServerError { .. }));
+            } else {
+                assert!(matches!(
+                    error,
+                    crate::error::Error::ConnectionResetNotAcknowledged
+                ));
+                assert!(client.is_connection_dead());
+            }
+            assert!(client.is_session_recovery_enabled());
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_sent_initialization_does_not_leave_recovery_suspended() {
+        let mut transport = TestTransport::new();
+        transport.receive_should_hang = true;
+        let sent = transport.sent.clone();
+        let mut client = create_test_client_with_transport(transport);
+        client.recovery_context.session_recovery_negotiated = true;
+        let mut initialization =
+            Box::pin(client.initialize_session(TransactionIsolationLevel::ReadCommitted, ()));
+        assert!(
+            initialization
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
+        assert!(!sent.lock().unwrap().is_empty());
+        drop(initialization);
+        assert!(client.is_session_recovery_enabled());
+    }
+
+    #[tokio::test]
+    async fn reconnect_aborts_old_transport_without_waiting_for_graceful_shutdown() {
+        let mut transport = TestTransport::new();
+        transport.close_should_hang = true;
+        let closes = transport.close_calls.clone();
+        let mut client = create_test_client_with_transport(transport);
+        client.recovery_context.session_recovery_negotiated = true;
+        let result = client.reconnect(Duration::ZERO, None).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::SessionRecoveryFailed { attempts: 0, .. })
+        ));
+        assert!(client.is_connection_dead());
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_reconnect_preserves_cancellation_instead_of_retrying() {
+        let mut client = create_test_client();
+        client.recovery_context.session_recovery_negotiated = true;
+        let cancel = CancelHandle::new();
+        cancel.cancel();
+        assert!(matches!(
+            client
+                .reconnect(Duration::from_secs(10), Some(&cancel))
+                .await,
+            Err(crate::error::Error::OperationCancelledError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconnect_count_is_the_total_number_of_attempts_not_additional_retries() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = async move {
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut byte = [0];
+                socket.read_exact(&mut byte).await.unwrap();
+                assert_eq!(byte[0], 0x12);
+            }
+        };
+        let mut client = create_test_client();
+        client.recovery_context.session_recovery_negotiated = true;
+        let context = client.recovery_context.client_context.as_mut().unwrap();
+        context
+            .prepare_datasource(&format!("tcp:{},{}", address.ip(), address.port()))
+            .unwrap();
+        context.connect_retry_count = 3;
+        context.connect_retry_interval = 1;
+        context.encryption_options.mode = crate::core::EncryptionSetting::PreferOff;
+        let (served, recovered) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(10), server),
+            client.reconnect(Duration::from_secs(10), None),
+        );
+        served.unwrap_or_else(|error| {
+            panic!("each recovery attempt must reach the listener: {error}; result: {recovered:?}")
+        });
+        assert!(matches!(
+            recovered,
+            Err(crate::error::Error::SessionRecoveryFailed { attempts: 3, .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn reconnect_fails_when_not_negotiated() {
         let mut client = create_test_client();
         client.recovery_context.session_recovery_negotiated = false;
@@ -17945,20 +18221,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconnect_returns_session_recovery_failed_on_connection_failure() {
+    async fn reconnect_preserves_invalid_connection_configuration() {
         let mut client = create_test_client();
         client.recovery_context.session_recovery_negotiated = true;
-        // Use a very short timeout — connect will fail (no server) and exhaust attempts
-        // connect_retry_count defaults to 1, connect_retry_interval defaults to 10
-        // With a 1-second timeout the first attempt fails and no time for retry
-        let result = client.reconnect(Duration::from_secs(1), None).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        // Should be SessionRecoveryFailed (not SessionNotRecoverable)
+        // The synthetic context has no resolved connection policy.
+        let err = client
+            .reconnect(Duration::from_secs(1), None)
+            .await
+            .unwrap_err();
         assert!(
-            err.to_string().contains("Session recovery failed")
-                || err.to_string().contains("attempt"),
-            "Expected SessionRecoveryFailed, got: {err}"
+            matches!(err, crate::error::Error::ImplementationError(_)),
+            "Expected the original configuration error, got: {err}"
         );
     }
 
@@ -18038,14 +18311,13 @@ mod tests {
         client.transport.close_transport().await.unwrap();
         // The closed TestTransport returns is_connection_dead() = true,
         // recovery is possible (no txn, no open batch, negotiated=true).
-        // reconnect() will fail because TestTransport can't actually connect,
-        // but it should be *attempted* — we'll get SessionRecoveryFailed.
+        // Recovery is attempted, then rejects the unresolved synthetic context.
         let result = client.check_and_reconnect(Some(1), None).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            err.to_string().contains("Session recovery failed"),
-            "Expected reconnect attempt resulting in SessionRecoveryFailed, got: {err}"
+            matches!(err, crate::error::Error::ImplementationError(_)),
+            "Expected a reconnect attempt's configuration error, got: {err}"
         );
         assert_eq!(client.requests_admitted(), 0);
     }
@@ -18065,7 +18337,7 @@ mod tests {
 
         let err = client.check_and_reconnect(Some(1), None).await.unwrap_err();
         assert!(
-            err.to_string().contains("Session recovery failed"),
+            matches!(err, crate::error::Error::ImplementationError(_)),
             "Expected a reconnect attempt, got: {err}"
         );
     }
