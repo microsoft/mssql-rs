@@ -94,6 +94,11 @@ pub enum TransactionIsolationLevel {
     Snapshot = 0x05,
 }
 
+/// `fBeginXact`, bit 0 of a commit/rollback request's `XACT_FLAGS` (MS-TDS
+/// 2.2.6.9); msodbcsql's `TM_BEGIN_NEW_XACT`. SQL Server 2022 treats any
+/// non-zero byte as a begin request, but the other bits are reserved.
+const TM_BEGIN_NEW_XACT: u8 = 0x01;
+
 pub(crate) struct TransactionManagementRequest {
     pub(crate) headers: Vec<TdsHeaders>,
     pub(crate) transaction_params: TransactionManagementType,
@@ -181,8 +186,7 @@ impl Request for TransactionManagementRequest {
                 }
                 match new_transaction_metadata {
                     Some(new_transaction_metadata) => {
-                        let flag: u8 = 1u8 << 7;
-                        packet_writer.write_byte_async(flag).await?;
+                        packet_writer.write_byte_async(TM_BEGIN_NEW_XACT).await?;
                         new_transaction_metadata.serialize(packet_writer).await?;
                     }
                     None => {
@@ -206,5 +210,88 @@ impl Request for TransactionManagementRequest {
         }
         packet_writer.finalize().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::packet_writer::tests::MockNetworkWriter;
+    use futures::executor::block_on;
+
+    const PACKET_HEADER_LEN: usize = 8;
+    const ALL_HEADERS_LEN: usize = 22;
+
+    /// The request body after the packet header and ALL_HEADERS.
+    fn request_body(transaction_params: TransactionManagementType) -> Vec<u8> {
+        let mut mock = MockNetworkWriter::new(4096);
+        let mut writer = PacketWriter::new(PacketType::TransactionManager, &mut mock, None, None);
+        let request =
+            TransactionManagementRequest::new(transaction_params, &ExecutionContext::new());
+        block_on(request.serialize(&mut writer)).unwrap();
+        drop(writer);
+        let headers = &mock.data[PACKET_HEADER_LEN..];
+        assert_eq!(&headers[..4], &(ALL_HEADERS_LEN as u32).to_le_bytes());
+        headers[ALL_HEADERS_LEN..].to_vec()
+    }
+
+    fn begin_new(name: Option<&str>) -> Option<CreateTxnParams> {
+        Some(CreateTxnParams {
+            level: TransactionIsolationLevel::ReadCommitted,
+            name: name.map(str::to_string),
+        })
+    }
+
+    #[test]
+    fn end_transaction_requests_set_begin_xact_as_bit_zero() {
+        // XACT_NAME, XACT_FLAGS, then ISOLATION_LEVEL and BEGIN_XACT_NAME only
+        // when fBeginXact is set.
+        let cases: [(Option<&str>, Option<CreateTxnParams>, &[u8]); 4] = [
+            (None, None, &[0x00, 0x00]),
+            (Some("ab"), None, &[0x04, b'a', 0, b'b', 0, 0x00]),
+            (None, begin_new(None), &[0x00, 0x01, 0x02, 0x00]),
+            (
+                Some("ab"),
+                begin_new(Some("c")),
+                &[0x04, b'a', 0, b'b', 0, 0x01, 0x02, 0x02, b'c', 0],
+            ),
+        ];
+        for (name, create_txn_params, payload) in cases {
+            for (request_type, params) in [
+                (
+                    7u16,
+                    TransactionManagementType::Commit {
+                        name: name.map(str::to_string),
+                        create_txn_params: create_txn_params.clone(),
+                    },
+                ),
+                (
+                    8u16,
+                    TransactionManagementType::Rollback {
+                        name: name.map(str::to_string),
+                        create_txn_params: create_txn_params.clone(),
+                    },
+                ),
+            ] {
+                let mut expected = request_type.to_le_bytes().to_vec();
+                expected.extend_from_slice(payload);
+                assert_eq!(
+                    request_body(params),
+                    expected,
+                    "request {request_type}, name {name:?}, begin {create_txn_params:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn begin_request_writes_isolation_then_name() {
+        assert_eq!(
+            request_body(TransactionManagementType::Begin(CreateTxnParams {
+                level: TransactionIsolationLevel::Snapshot,
+                name: Some("c".to_string()),
+            })),
+            [0x05, 0x00, 0x05, 0x02, b'c', 0]
+        );
     }
 }
