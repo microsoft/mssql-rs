@@ -280,11 +280,18 @@ reconnect; and the getter reports `HY092`. The `AutoBeginTxnTest` e2e cases asse
 these on both drivers.
 
 Idle connection resiliency does not recover a session that holds a transaction,
-and the replacement is one. On both drivers a session killed after `SQLEndTran`
-fails the next execute instead of reconnecting (msodbcsql `08S01`, this driver
-`HY000`, the same mapping difference every execute-path I/O error has), and with
-the attribute off it reconnects. Before this change, this driver reconnected in
-the first case, where msodbcsql did not.
+and the replacement is one, so this matches msodbcsql: a session killed after
+`SQLEndTran` (an idle pooled connection after its check-in rollback, or an Azure
+SQL connection past the gateway idle timeout) fails the next execute instead of
+reconnecting, and with the attribute off it reconnects. msodbcsql reports
+`08S01`; this driver reports `HY000`, the mapping every execute-path I/O error
+has today, until
+[AB#50903](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/50903)
+maps them to `08S01`. Before this change, this driver reconnected silently in the
+first case, where msodbcsql did not. msodbcsql defers to the server's session
+recoverability (`CheckOrRecoverConnection`, `connectionrecoverymanager.cpp`),
+which the measured behaviour shows is withheld while a transaction is open, and
+has no exception for an empty transaction; neither does this driver.
 
 ### 4.3 Autocommit transitions
 

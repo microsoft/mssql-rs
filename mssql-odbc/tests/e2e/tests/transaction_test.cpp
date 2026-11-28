@@ -1442,10 +1442,10 @@ TEST_F(AutoBeginTxnTest, ResetAfterEndTranLeavesTheBorrowerInATransaction) {
 
 // Idle connection resiliency does not reconnect a session that holds a
 // transaction, and the replacement is one: after EndTran a dropped session is
-// reported rather than silently replaced. With the replacement turned off there
-// is no transaction and the drop is recovered. The failure's SQLSTATE differs
-// between the drivers (msodbcsql 08S01, mssql-odbc HY000) on every execute
-// error of this kind, so only the outcome is compared.
+// reported rather than silently replaced, as on msodbcsql. With the replacement
+// turned off there is no transaction and the drop is recovered. Only the outcome
+// is compared: the SQLSTATE is 08S01 on msodbcsql and HY000 here until AB#50903
+// maps execute-path I/O failures to 08S01.
 TEST_F(AutoBeginTxnTest, DroppedSessionAfterEndTranIsNotRecovered) {
     DisconnectTested();
     ConnectTested(";ConnectRetryCount=1;ConnectRetryInterval=1");
