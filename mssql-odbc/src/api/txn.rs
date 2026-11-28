@@ -1603,6 +1603,28 @@ mod tests {
             let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
             assert!(!dbc.inner.lock().unwrap().local_tran_started);
             server.set_tm_end_delay(commit, Duration::ZERO);
+            // The connection carries new work after the timed-out end request,
+            // whatever became of the transaction it asked the server to begin.
+            server.register_query("SELECT 1", QueryResponse::select_one());
+            let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), sql.len().try_into().unwrap())
+            });
+            assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLFreeStmt(h.stmt, crate::api::odbc_types::SQL_CLOSE)
+            });
+            assert!(dbc.inner.lock().unwrap().local_tran_started);
+            assert_eq!(
+                unsafe {
+                    crate::api::SQLEndTran(
+                        SQL_HANDLE_DBC,
+                        h.dbc,
+                        if commit { SQL_COMMIT } else { SQL_ROLLBACK },
+                    )
+                },
+                SQL_SUCCESS
+            );
             assert_eq!(
                 set_attr(&h, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_ON),
                 SQL_SUCCESS
