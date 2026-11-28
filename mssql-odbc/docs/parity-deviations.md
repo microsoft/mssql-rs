@@ -1598,7 +1598,7 @@ msodbcsql build is measured.
     [AB#49106](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/49106);
     maintainer sign-off is pending review.
 
-46. **A commit or rollback that loses the connection reports `08007`;
+47. **A commit or rollback that loses the connection reports `08007`;
     msodbcsql reports `08S01`.** `SQLEndTran`, and switching
     `SQL_ATTR_AUTOCOMMIT` on while the application's transaction is open,
     report a connection lost during the request as `08007` ("Connection
@@ -1625,7 +1625,7 @@ msodbcsql build is measured.
     and `SQLSetConnectAttr(SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_ON)` with a
     transaction open, each returned `08S01` (`10054`); this driver returned
     `08007` for all three. `failed_autocommit_commit_does_not_strand_the_local_transaction_flag`
-    (`mssql-odbc/src/api/txn.rs`) pins this driver's state. Kept at the
-    product owner's direction for
-    [AB#50903](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/50903)
-    on 2026-11-28.
+    (`mssql-odbc/src/api/txn.rs`) pins this driver's state. Retained
+    pre-existing behaviour by the change author for
+    [AB#50903](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/50903);
+    maintainer sign-off is pending review.
