@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <functional>
 #include <string>
+#include <thread>
 
 // SQL_TXN_SS_SNAPSHOT lives in msodbcsql.h, which these tests do not include.
 #ifndef SQL_TXN_SS_SNAPSHOT
@@ -1127,4 +1128,343 @@ TEST_F(TransactionLiveTest, CursorBehaviorIsClose) {
                              sizeof(rollback_behavior), nullptr),
                   SQL_HANDLE_DBC, dbc_);
     EXPECT_EQ(SQL_CB_CLOSE, rollback_behavior);
+}
+
+// -------------------------------------------------------------------
+// SQL_COPT_SS_AUTOBEGINTXN: SQLEndTran begins the next transaction
+// -------------------------------------------------------------------
+
+#ifndef SQL_COPT_SS_AUTOBEGINTXN
+#define SQL_COPT_SS_AUTOBEGINTXN 1402
+#endif
+#ifndef SQL_COPT_SS_RESET_CONNECTION
+#define SQL_COPT_SS_RESET_CONNECTION 1246
+#endif
+
+// msodbcsql's SQLEndTran sends commit or rollback with TM_BEGIN_NEW_XACT while
+// SQL_COPT_SS_AUTOBEGINTXN is on, its default (sqlctran.cpp, CommitAbortTran).
+// The connection under test is a second DBC; the fixture's own connection
+// observes it through the DMVs, so no observation is sent on the tested
+// session. Reading another session's DMV rows needs VIEW SERVER STATE.
+//
+// Benefits-from-mock-tds: the Rust unit tests in src/api/txn.rs pin the
+// fBeginXact flag and the absence of a separate BEGIN request; these tests can
+// only see the server's transaction state.
+class AutoBeginTxnTest : public TransactionLiveTest {
+protected:
+    void SetUp() override {
+        TransactionLiveTest::SetUp();
+        if (IsSkipped() || HasFatalFailure()) {
+            return;
+        }
+        ConnectTested();
+    }
+
+    void TearDown() override {
+        DisconnectTested();
+        TransactionLiveTest::TearDown();
+    }
+
+    void ConnectTested(const std::string& extra = "") {
+        if (tested_ == SQL_NULL_HDBC) {
+            ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, env_, &tested_), SQL_HANDLE_ENV, env_);
+        }
+        SqlTString connstr = ODBCTestUtils::BuildConnectionString() + ODBCTestUtils::ToSqlTStr(extra);
+        SQLTCHAR outStr[1024] = {};
+        SQLSMALLINT outLen = 0;
+        ASSERT_SQL_OK(SQLDriverConnect(tested_, nullptr, const_cast<SQLTCHAR*>(connstr.c_str()),
+                                       static_cast<SQLSMALLINT>(connstr.size()), outStr,
+                                       static_cast<SQLSMALLINT>(sizeof(outStr) / sizeof(SQLTCHAR)),
+                                       &outLen, SQL_DRIVER_NOPROMPT),
+                      SQL_HANDLE_DBC, tested_);
+        ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, tested_, &tested_stmt_), SQL_HANDLE_DBC,
+                      tested_);
+        spid_ = Scalar(tested_stmt_, "SELECT @@SPID");
+    }
+
+    void DisconnectTested() {
+        if (tested_ == SQL_NULL_HDBC) {
+            return;
+        }
+        SQLEndTran(SQL_HANDLE_DBC, tested_, SQL_ROLLBACK);
+        SetAutocommit(tested_, SQL_AUTOCOMMIT_ON);
+        SQLDisconnect(tested_);
+        SQLFreeHandle(SQL_HANDLE_DBC, tested_);
+        tested_ = SQL_NULL_HDBC;
+        tested_stmt_ = SQL_NULL_HSTMT;
+    }
+
+    void TestedExec(const std::string& sql) {
+        ASSERT_SQL_OK(Run(tested_stmt_, sql), SQL_HANDLE_STMT, tested_stmt_);
+        SQLFreeStmt(tested_stmt_, SQL_CLOSE);
+    }
+
+    SQLRETURN EndTran(SQLSMALLINT completion) {
+        return SQLEndTran(SQL_HANDLE_DBC, tested_, completion);
+    }
+
+    static SQLRETURN SetAutoBegin(SQLHDBC dbc, SQLULEN value) {
+        return SQLSetConnectAttr(dbc, SQL_COPT_SS_AUTOBEGINTXN,
+                                 reinterpret_cast<SQLPOINTER>(value), SQL_IS_UINTEGER);
+    }
+
+    /// The tested session's transaction id, or 0 when it has none.
+    SQLBIGINT ObservedTransaction() {
+        const std::string sql =
+            "SELECT CAST(COALESCE(MAX(transaction_id), 0) AS bigint) "
+            "FROM sys.dm_tran_session_transactions WHERE session_id = " +
+            std::to_string(spid_);
+        SQLBIGINT value = -1;
+        SQLLEN indicator = 0;
+        EXPECT_SQL_OK(Run(stmt_, sql), SQL_HANDLE_STMT, stmt_);
+        EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SBIGINT, &value, sizeof(value), &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        SQLCloseCursor(stmt_);
+        return value;
+    }
+
+    SQLINTEGER ObservedLocks() {
+        return Scalar(
+            "SELECT COUNT(*) FROM sys.dm_tran_locks WHERE resource_type <> 'DATABASE' "
+            "AND request_session_id = " +
+            std::to_string(spid_));
+    }
+
+    SQLINTEGER ObservedIsolation() {
+        return Scalar(
+            "SELECT CAST(transaction_isolation_level AS int) FROM sys.dm_exec_sessions "
+            "WHERE session_id = " +
+            std::to_string(spid_));
+    }
+
+    /// KILLs the tested session and waits until the server has removed it.
+    void KillTested() {
+        Exec("KILL " + std::to_string(spid_));
+        const std::string alive =
+            "SELECT COUNT(*) FROM sys.dm_exec_sessions WHERE session_id = " +
+            std::to_string(spid_);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (Scalar(alive) != 0) {
+            ASSERT_LT(std::chrono::steady_clock::now(), deadline) << "session survived KILL";
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    SQLHDBC tested_ = SQL_NULL_HDBC;
+    SQLHSTMT tested_stmt_ = SQL_NULL_HSTMT;
+    SQLINTEGER spid_ = 0;
+};
+
+// Commit and rollback both leave a new, empty transaction open, and the next
+// statement runs inside it. EndTran with no work since is a no-op that keeps it.
+TEST_F(AutoBeginTxnTest, EndTranBeginsTheNextTransaction) {
+    const std::string table = GlobalTempTable("autobegin");
+    Exec("CREATE TABLE " + table + "(i int)");
+    ASSERT_SQL_OK(SetAutocommit(tested_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, tested_);
+    TestedExec("INSERT INTO " + table + " VALUES (1)");
+    const SQLBIGINT first = ObservedTransaction();
+    ASSERT_NE(0, first);
+
+    for (SQLSMALLINT completion : {SQL_COMMIT, SQL_ROLLBACK}) {
+        SCOPED_TRACE(completion == SQL_COMMIT ? "commit" : "rollback");
+        const SQLBIGINT before = ObservedTransaction();
+        ASSERT_SQL_OK(EndTran(completion), SQL_HANDLE_DBC, tested_);
+        const SQLBIGINT replacement = ObservedTransaction();
+        EXPECT_NE(0, replacement) << "the replacement transaction is open at once";
+        EXPECT_NE(before, replacement);
+        EXPECT_EQ(0, ObservedLocks()) << "the replacement holds nothing";
+
+        ASSERT_SQL_OK(EndTran(SQL_ROLLBACK), SQL_HANDLE_DBC, tested_);
+        ASSERT_SQL_OK(EndTran(SQL_COMMIT), SQL_HANDLE_DBC, tested_);
+        EXPECT_EQ(replacement, ObservedTransaction()) << "no work since, so no request";
+
+        TestedExec("INSERT INTO " + table + " VALUES (2)");
+        EXPECT_EQ(replacement, ObservedTransaction()) << "the statement ran in the replacement";
+    }
+    ASSERT_SQL_OK(EndTran(SQL_ROLLBACK), SQL_HANDLE_DBC, tested_);
+    EXPECT_EQ(1, RowCountOf(table)) << "only the first insert was committed";
+}
+
+// A SELECT-only checkout followed by the pool's check-in rollback still ends
+// the transaction and begins another: every manual-commit execution counts as
+// work (CheckOptions, sqlccmd.cpp).
+TEST_F(AutoBeginTxnTest, SelectOnlyRollbackBeginsAReplacement) {
+    ASSERT_SQL_OK(SetAutocommit(tested_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, tested_);
+    const SQLBIGINT before = ObservedTransaction();
+    ASSERT_NE(0, before);
+    EXPECT_EQ(1, Scalar(tested_stmt_, "SELECT 1"));
+    ASSERT_SQL_OK(EndTran(SQL_ROLLBACK), SQL_HANDLE_DBC, tested_);
+    const SQLBIGINT after = ObservedTransaction();
+    EXPECT_NE(0, after);
+    EXPECT_NE(before, after);
+}
+
+// Off, SQLEndTran only ends the transaction; the next statement begins one.
+TEST_F(AutoBeginTxnTest, OffLeavesTheBeginToTheNextStatement) {
+    ASSERT_SQL_OK(SetAutoBegin(tested_, 0), SQL_HANDLE_DBC, tested_);
+    ASSERT_SQL_OK(SetAutocommit(tested_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, tested_);
+    EXPECT_EQ(1, Scalar(tested_stmt_, "SELECT 1"));
+    ASSERT_SQL_OK(EndTran(SQL_COMMIT), SQL_HANDLE_DBC, tested_);
+    EXPECT_EQ(0, ObservedTransaction());
+    EXPECT_EQ(1, Scalar(tested_stmt_, "SELECT 1"));
+    EXPECT_NE(0, ObservedTransaction());
+}
+
+// The attribute is unchecked and write-only on both drivers: any value is
+// accepted, nonzero means on, and the getter reports HY092.
+TEST_F(AutoBeginTxnTest, AcceptsAnyValueAndIsWriteOnly) {
+    ASSERT_SQL_OK(SetAutoBegin(tested_, 0), SQL_HANDLE_DBC, tested_);
+    EXPECT_EQ(SQL_SUCCESS, SetAutoBegin(tested_, 7));
+    SQLUINTEGER value = 0;
+    EXPECT_SQL_ERROR(
+        SQLGetConnectAttr(tested_, SQL_COPT_SS_AUTOBEGINTXN, &value, SQL_IS_UINTEGER, nullptr));
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, tested_, "HY092");
+
+    ASSERT_SQL_OK(SetAutocommit(tested_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, tested_);
+    EXPECT_EQ(1, Scalar(tested_stmt_, "SELECT 1"));
+    ASSERT_SQL_OK(EndTran(SQL_COMMIT), SQL_HANDLE_DBC, tested_);
+    EXPECT_NE(0, ObservedTransaction());
+}
+
+// An explicitly set value outlives the connection, as msodbcsql's explicitly
+// set options do (ResetOptions, sqlcconn.cpp).
+TEST_F(AutoBeginTxnTest, SettingSurvivesReconnect) {
+    ASSERT_SQL_OK(SetAutoBegin(tested_, 0), SQL_HANDLE_DBC, tested_);
+    ASSERT_SQL_OK(SQLDisconnect(tested_), SQL_HANDLE_DBC, tested_);
+    ConnectTested();
+    ASSERT_SQL_OK(SetAutocommit(tested_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, tested_);
+    EXPECT_EQ(1, Scalar(tested_stmt_, "SELECT 1"));
+    ASSERT_SQL_OK(EndTran(SQL_COMMIT), SQL_HANDLE_DBC, tested_);
+    EXPECT_EQ(0, ObservedTransaction());
+}
+
+// The replacement holds no user work, so switching autocommit on rolls it back
+// without the 01000 a pending commit reports, and disconnect is allowed.
+TEST_F(AutoBeginTxnTest, ReplacementIsNotUserWork) {
+    ASSERT_SQL_OK(SetAutocommit(tested_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, tested_);
+    EXPECT_EQ(1, Scalar(tested_stmt_, "SELECT 1"));
+    ASSERT_SQL_OK(EndTran(SQL_COMMIT), SQL_HANDLE_DBC, tested_);
+    ASSERT_NE(0, ObservedTransaction());
+    EXPECT_EQ(SQL_SUCCESS, SetAutocommit(tested_, SQL_AUTOCOMMIT_ON));
+    EXPECT_EQ(0, ObservedTransaction());
+
+    ASSERT_SQL_OK(SetAutocommit(tested_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, tested_);
+    EXPECT_EQ(1, Scalar(tested_stmt_, "SELECT 1"));
+    ASSERT_SQL_OK(EndTran(SQL_ROLLBACK), SQL_HANDLE_DBC, tested_);
+    EXPECT_SQL_OK(SQLDisconnect(tested_), SQL_HANDLE_DBC, tested_);
+}
+
+// The level set after EndTran governs the next statement, which still runs in a
+// transaction. SNAPSHOT is excluded: it needs ALLOW_SNAPSHOT_ISOLATION.
+TEST_F(AutoBeginTxnTest, IsolationSetAfterEndTranAppliesToTheNextStatement) {
+    ASSERT_SQL_OK(SetAutocommit(tested_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, tested_);
+    const struct {
+        SQLUINTEGER odbc;
+        SQLINTEGER server;
+    } levels[] = {{SQL_TXN_READ_UNCOMMITTED, 1},
+                  {SQL_TXN_READ_COMMITTED, 2},
+                  {SQL_TXN_REPEATABLE_READ, 3},
+                  {SQL_TXN_SERIALIZABLE, 4},
+                  {SQL_TXN_READ_COMMITTED, 2}};
+    for (const auto& level : levels) {
+        SCOPED_TRACE("level " + std::to_string(level.odbc));
+        EXPECT_EQ(1, Scalar(tested_stmt_, "SELECT 1"));
+        ASSERT_SQL_OK(EndTran(SQL_COMMIT), SQL_HANDLE_DBC, tested_);
+        ASSERT_SQL_OK(SetIsolation(tested_, level.odbc), SQL_HANDLE_DBC, tested_);
+        EXPECT_EQ(level.server, ObservedIsolation());
+        EXPECT_EQ(1, Scalar(tested_stmt_, "SELECT 1"));
+        EXPECT_NE(0, ObservedTransaction());
+        EXPECT_EQ(level.server, ObservedIsolation());
+    }
+}
+
+// The server can end the replacement underneath the driver; the next statement
+// then begins another, so its work can still be rolled back.
+TEST_F(AutoBeginTxnTest, ReplacementEndedByTsqlIsReopened) {
+    const std::string table = GlobalTempTable("autobegin_tsql");
+    Exec("CREATE TABLE " + table + "(i int)");
+    ASSERT_SQL_OK(SetAutocommit(tested_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, tested_);
+    EXPECT_EQ(1, Scalar(tested_stmt_, "SELECT 1"));
+    ASSERT_SQL_OK(EndTran(SQL_COMMIT), SQL_HANDLE_DBC, tested_);
+    TestedExec("ROLLBACK TRANSACTION");
+    EXPECT_EQ(0, ObservedTransaction());
+    TestedExec("INSERT INTO " + table + " VALUES (1)");
+    EXPECT_NE(0, ObservedTransaction());
+    ASSERT_SQL_OK(EndTran(SQL_ROLLBACK), SQL_HANDLE_DBC, tested_);
+    EXPECT_EQ(0, RowCountOf(table));
+}
+
+// A prepared statement re-executes across EndTran, each time in the current
+// transaction.
+TEST_F(AutoBeginTxnTest, PreparedStatementIsReusedAcrossEndTran) {
+    const std::string table = GlobalTempTable("autobegin_prep");
+    Exec("CREATE TABLE " + table + "(i int)");
+    ASSERT_SQL_OK(SetAutocommit(tested_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, tested_);
+    SqlTString insert = ODBCTestUtils::ToSqlTStr("INSERT INTO " + table + " VALUES (?)");
+    ASSERT_SQL_OK(SQLPrepare(tested_stmt_, const_cast<SQLTCHAR*>(insert.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, tested_stmt_);
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(SQLBindParameter(tested_stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0,
+                                   0, &value, 0, nullptr),
+                  SQL_HANDLE_STMT, tested_stmt_);
+    for (SQLSMALLINT completion : {SQL_COMMIT, SQL_ROLLBACK, SQL_COMMIT}) {
+        ++value;
+        ASSERT_SQL_OK(SQLExecute(tested_stmt_), SQL_HANDLE_STMT, tested_stmt_);
+        const SQLBIGINT transaction = ObservedTransaction();
+        EXPECT_NE(0, transaction);
+        ASSERT_SQL_OK(EndTran(completion), SQL_HANDLE_DBC, tested_);
+        EXPECT_NE(transaction, ObservedTransaction());
+    }
+    ASSERT_SQL_OK(SQLFreeStmt(tested_stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, tested_stmt_);
+    EXPECT_EQ(2, RowCountOf(table));
+    EXPECT_EQ(0, Scalar("SELECT COUNT(*) FROM " + table + " WHERE i = 2"));
+}
+
+// A pool reset after check-in discards the replacement; the next statement
+// begins a transaction for the new borrower.
+TEST_F(AutoBeginTxnTest, ResetAfterEndTranLeavesTheBorrowerInATransaction) {
+    const std::string table = GlobalTempTable("autobegin_reset");
+    Exec("CREATE TABLE " + table + "(i int)");
+    ASSERT_SQL_OK(SetAutocommit(tested_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, tested_);
+    EXPECT_EQ(1, Scalar(tested_stmt_, "SELECT 1"));
+    ASSERT_SQL_OK(EndTran(SQL_ROLLBACK), SQL_HANDLE_DBC, tested_);
+    ASSERT_SQL_OK(SQLSetConnectAttr(tested_, SQL_COPT_SS_RESET_CONNECTION,
+                                    reinterpret_cast<SQLPOINTER>(static_cast<SQLULEN>(1)),
+                                    SQL_IS_UINTEGER),
+                  SQL_HANDLE_DBC, tested_);
+    TestedExec("INSERT INTO " + table + " VALUES (1)");
+    EXPECT_NE(0, ObservedTransaction());
+    ASSERT_SQL_OK(EndTran(SQL_ROLLBACK), SQL_HANDLE_DBC, tested_);
+    EXPECT_EQ(0, RowCountOf(table));
+}
+
+// Idle connection resiliency does not reconnect a session that holds a
+// transaction, and the replacement is one: after EndTran a dropped session is
+// reported rather than silently replaced, as on msodbcsql. With the replacement
+// turned off there is no transaction and the drop is recovered. Only the outcome
+// is compared: the SQLSTATE is 08S01 on msodbcsql and HY000 here until AB#50903
+// maps execute-path I/O failures to 08S01.
+TEST_F(AutoBeginTxnTest, DroppedSessionAfterEndTranIsNotRecovered) {
+    DisconnectTested();
+    ConnectTested(";ConnectRetryCount=1;ConnectRetryInterval=1");
+    ASSERT_SQL_OK(SetAutocommit(tested_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, tested_);
+    EXPECT_EQ(1, Scalar(tested_stmt_, "SELECT 1"));
+    ASSERT_SQL_OK(EndTran(SQL_COMMIT), SQL_HANDLE_DBC, tested_);
+    KillTested();
+    EXPECT_SQL_ERROR(Run(tested_stmt_, "SELECT 1"));
+    SQLFreeStmt(tested_stmt_, SQL_CLOSE);
+}
+
+TEST_F(AutoBeginTxnTest, DroppedSessionAfterEndTranWithoutReplacementIsRecovered) {
+    DisconnectTested();
+    ConnectTested(";ConnectRetryCount=1;ConnectRetryInterval=1");
+    ASSERT_SQL_OK(SetAutoBegin(tested_, 0), SQL_HANDLE_DBC, tested_);
+    ASSERT_SQL_OK(SetAutocommit(tested_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, tested_);
+    EXPECT_EQ(1, Scalar(tested_stmt_, "SELECT 1"));
+    ASSERT_SQL_OK(EndTran(SQL_COMMIT), SQL_HANDLE_DBC, tested_);
+    KillTested();
+    EXPECT_SQL_OK(Run(tested_stmt_, "SELECT 1"), SQL_HANDLE_STMT, tested_stmt_);
+    SQLFreeStmt(tested_stmt_, SQL_CLOSE);
 }

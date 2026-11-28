@@ -234,6 +234,11 @@ pub(crate) struct DbcState {
     /// driver-begun *piggyback* transactions that carry no user work. Only this
     /// flag blocks `SQLDisconnect` (25000) and `SQL_ATTR_TXN_ISOLATION` (HY011).
     pub(crate) local_tran_started: bool,
+    /// `SQL_COPT_SS_AUTOBEGINTXN`: `SQLEndTran` asks the server to begin the
+    /// next transaction in the same request (`TM_BEGIN_NEW_XACT`). On by
+    /// default and kept across disconnect, as msodbcsql's explicitly set
+    /// options are (`sqlcconn.cpp`, `ResetOptions`).
+    pub(crate) auto_begin_txn: bool,
     /// `SQL_ATTR_CURRENT_CATALOG`. Before connecting this holds the requested
     /// initial database (the connection string's `Database=` keyword wins if
     /// both are given, matching msodbcsql); afterwards the live name comes from
@@ -402,6 +407,7 @@ impl std::fmt::Debug for DbcState {
             .field("autocommit", &self.autocommit)
             .field("txn_isolation", &self.txn_isolation)
             .field("local_tran_started", &self.local_tran_started)
+            .field("auto_begin_txn", &self.auto_begin_txn)
             .field("current_catalog", &self.current_catalog)
             .field("stmt_query_timeout", &self.stmt_query_timeout)
             .field("identity", &self.identity)
@@ -492,6 +498,7 @@ impl DbcHandle {
                 autocommit: true,
                 txn_isolation: SQL_TXN_READ_COMMITTED,
                 local_tran_started: false,
+                auto_begin_txn: true,
                 server_isolation_unknown: false,
                 reset_generation: 0,
                 current_catalog: None,

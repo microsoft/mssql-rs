@@ -1191,7 +1191,12 @@ mod tests {
                     assert_eq!(state.autocommit, connection_autocommit && acknowledge);
                     assert_eq!(state.local_tran_started, !acknowledge);
                     if acknowledge {
-                        assert!(!state.wire.client().unwrap().has_active_transaction());
+                        // SQLEndTran begins the replacement transaction in the same
+                        // request (SQL_COPT_SS_AUTOBEGINTXN); autocommit ON does not.
+                        assert_eq!(
+                            state.wire.client().unwrap().has_active_transaction(),
+                            connection_end_tran
+                        );
                     }
                 }
                 assert_eq!(
