@@ -409,6 +409,13 @@ async fn bulk_arrow_decimal_destination_rounding() {
             ),
             (
                 10,
+                2,
+                4,
+                vec![Some(12449), Some(12450), Some(-12449), Some(-12450)],
+                vec![Some("1.24"), Some("1.25"), Some("-1.24"), Some("-1.25")],
+            ),
+            (
+                10,
                 0,
                 1,
                 vec![Some(15), Some(-15), Some(14), Some(-14), Some(995)],
