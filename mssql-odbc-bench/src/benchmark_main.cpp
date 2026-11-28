@@ -28,11 +28,19 @@ void set_counters(benchmark::State& state, const RetrievalMetrics& metrics) {
         static_cast<double>(metrics.cells) / metrics.total_seconds;
     state.counters["logical_bytes_per_second"] =
         static_cast<double>(metrics.logical_bytes) / metrics.total_seconds;
-    state.counters["execute_ms"] = metrics.execute_seconds * 1000.0;
-    if (metrics.metadata_bind_seconds >= 0.0) {
-        state.counters["metadata_bind_ms"] = metrics.metadata_bind_seconds * 1000.0;
+    if (metrics.calls != 0) {
+        // Batched small operations have no phase timestamps; per-call time is the
+        // headline instead.
+        state.counters["calls"] = static_cast<double>(metrics.calls);
+        state.counters["us_per_call"] =
+            metrics.total_seconds * 1e6 / static_cast<double>(metrics.calls);
+    } else {
+        state.counters["execute_ms"] = metrics.execute_seconds * 1000.0;
+        if (metrics.metadata_bind_seconds >= 0.0) {
+            state.counters["metadata_bind_ms"] = metrics.metadata_bind_seconds * 1000.0;
+        }
+        state.counters["fetch_ms"] = metrics.fetch_seconds * 1000.0;
     }
-    state.counters["fetch_ms"] = metrics.fetch_seconds * 1000.0;
     if (metrics.execute_calls != 0) {
         state.counters["execute_calls"] = static_cast<double>(metrics.execute_calls);
     }
@@ -44,9 +52,9 @@ void set_counters(benchmark::State& state, const RetrievalMetrics& metrics) {
     state.SetBytesProcessed(static_cast<std::int64_t>(metrics.logical_bytes));
 }
 
-// Register a write runner that owns its own timing; `execute()` is one sample.
+// Register a runner that owns its own timing; `execute()` is one sample.
 template <typename Runner>
-void register_write(Runner* runner, std::string& benchmark_error) {
+void register_runner(Runner* runner, std::string& benchmark_error) {
     benchmark::RegisterBenchmark(
         runner->name(),
         [runner, &benchmark_error](benchmark::State& state) {
@@ -129,7 +137,7 @@ int main(int argc, char** argv) {
                 std::make_unique<mssql::odbc::bench::ParameterArrayWriteRunner>(
                     session, config.write_mode);
             write_runner->preflight();
-            register_write(write_runner.get(), benchmark_error);
+            register_runner(write_runner.get(), benchmark_error);
         }
 
         std::vector<std::unique_ptr<mssql::odbc::bench::ExecuteManyWriteRunner>>
@@ -141,9 +149,32 @@ int main(int argc, char** argv) {
                 auto runner = std::make_unique<mssql::odbc::bench::ExecuteManyWriteRunner>(
                     session, shape);
                 runner->preflight();
-                register_write(runner.get(), benchmark_error);
+                register_runner(runner.get(), benchmark_error);
                 execute_many_runners.push_back(std::move(runner));
             }
+        }
+
+        std::vector<std::unique_ptr<mssql::odbc::bench::LatencyRunner>> latency_runners;
+        if (config.scenario.empty() || config.scenario == "latency") {
+            for (const auto& spec : mssql::odbc::bench::latency_workloads()) {
+                auto runner = std::make_unique<mssql::odbc::bench::LatencyRunner>(
+                    session, spec, config.calls_override);
+                runner->preflight();
+                register_runner(runner.get(), benchmark_error);
+                latency_runners.push_back(std::move(runner));
+            }
+        }
+
+        std::vector<std::unique_ptr<mssql::odbc::bench::PyCursorRunner>> py_cursor_runners;
+        for (const auto& spec : mssql::odbc::bench::py_cursor_workloads()) {
+            if (!config.scenario.empty() && config.scenario != spec.scenario) {
+                continue;
+            }
+            auto runner = std::make_unique<mssql::odbc::bench::PyCursorRunner>(
+                session, spec, config.calls_override);
+            runner->preflight();
+            register_runner(runner.get(), benchmark_error);
+            py_cursor_runners.push_back(std::move(runner));
         }
 
         benchmark::RunSpecifiedBenchmarks();

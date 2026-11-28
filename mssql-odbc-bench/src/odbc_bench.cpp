@@ -15,9 +15,11 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -59,9 +61,11 @@ struct ExecuteManyTarget {
 };
 
 constexpr ExecuteManyTarget kExecuteManyTargets[] = {
-    {"[dbo].[mssql_odbc_bench_pyshape_c3]", "write/insert_1000_c3_pyshape/executemany",
+    {"[dbo].[mssql_odbc_bench_pyshape_c3]",
+     "write/insert_1000_rows_c3_33kb/prepare_bind_execute",
      "[id] INT NOT NULL, [name] NVARCHAR(50) NOT NULL, [created] DATETIME2(6) NOT NULL"},
-    {"[dbo].[mssql_odbc_bench_pyshape_c10]", "write/insert_1000_c10_pyshape/executemany",
+    {"[dbo].[mssql_odbc_bench_pyshape_c10]",
+     "write/insert_1000_rows_c10_128kb/prepare_bind_execute",
      "[id] INT NOT NULL, [qty] INT NOT NULL, [ref] INT NOT NULL, "
      "[name] NVARCHAR(50) NOT NULL, [city] NVARCHAR(30) NOT NULL, "
      "[note] NVARCHAR(100) NOT NULL, [created] DATETIME2(6) NOT NULL, "
@@ -888,6 +892,45 @@ const std::array<WorkloadSpec, kWorkloadCount>& workloads() {
     return specs;
 }
 
+// Small calls where per-call driver overhead, not payload, decides latency. Batch
+// sizes put one sample at about 1-2 s on msodbcsql18 and mssql-odbc.
+const std::array<LatencySpec, kLatencyWorkloadCount>& latency_workloads() {
+    static const std::array<LatencySpec, kLatencyWorkloadCount> specs = {{
+        // The shortest unprepared round trip.
+        {"latency/exec_direct_select1", 0, 5'000},
+        // Statement text large enough that client-side scanning and UTF-16
+        // handling dominate; the trailing comment keeps server work trivial.
+        {"latency/exec_direct_16k_text", 16'384, 2'000},
+    }};
+    return specs;
+}
+
+// mssql-python `performance/scenarios/odbc_path_workloads.py` and `workloads.py`
+// workloads whose ODBC path no other benchmark here already measures. Sample sizes put one sample at 0.8-1.1 s on
+// msodbcsql18 18.7 against a local SQL Server 2022.
+const std::array<PyCursorSpec, kPyCursorWorkloadCount>& py_cursor_workloads() {
+    constexpr std::size_t kMiB = 1024 * 1024;
+    static const std::array<PyCursorSpec, kPyCursorWorkloadCount> specs = {{
+        {"param/bind_1_int_4b/execute_fetchone", "params", "query_scalar",
+         PyCursorWorkload::query_scalar, 1, 5'000},
+        {"param/bind_100_int_400b/execute_fetchone", "params", "param_count_int_100",
+         PyCursorWorkload::param_count_int, 100, 4'000},
+        {"param/bind_1000_int_4kb/execute_fetchone", "params", "param_count_int_1000",
+         PyCursorWorkload::param_count_int, 1'000, 1'200},
+        {"param/bind_100_nvarchar20_4kb/execute_fetchone", "params",
+         "param_count_nvarchar_100", PyCursorWorkload::param_count_nvarchar, 100, 3'500},
+        {"param/bind_10_mixed_types_100b/execute_fetchone", "params", "param_types_mixed_10",
+         PyCursorWorkload::param_types_mixed, 10, 4'000},
+        {"write/stream_varbinary_1mb/insert_putdata", "lobwrite",
+         "insert_lob_varbinary_1mb", PyCursorWorkload::insert_lob_varbinary, kMiB, 120},
+        {"write/stream_nvarchar_1mb/insert_putdata", "lobwrite",
+         "insert_lob_nvarchar_1mb", PyCursorWorkload::insert_lob_nvarchar, kMiB, 150},
+        {"fetch/mixed_1k_rows_c4_63kb/fetchmany_100", "cursorfetch",
+         "fetchmany_mixed_1000_batch100", PyCursorWorkload::fetchmany_mixed, 1'000, 800},
+    }};
+    return specs;
+}
+
 // Resolve one explicit configuration contract shared by both executables.
 Config Config::from_environment() {
     Config config;
@@ -946,15 +989,37 @@ Config Config::from_environment() {
         // Reject an unknown scenario instead of silently registering nothing: a
         // leg that measures zero benchmarks would fail the comparator's
         // benchmark-set check much further downstream.
-        const bool known = config.scenario == "write" ||
-                           config.scenario == kExecuteManyScenario || std::any_of(
-            workloads().begin(), workloads().end(), [&config](const WorkloadSpec& spec) {
-                return config.scenario == spec.scenario;
-            });
+        const bool known =
+            config.scenario == "write" || config.scenario == kExecuteManyScenario ||
+            config.scenario == "latency" ||
+            std::any_of(workloads().begin(), workloads().end(),
+                        [&config](const WorkloadSpec& spec) {
+                            return config.scenario == spec.scenario;
+                        }) ||
+            std::any_of(py_cursor_workloads().begin(), py_cursor_workloads().end(),
+                        [&config](const PyCursorSpec& spec) {
+                            return config.scenario == spec.scenario;
+                        });
         if (!known) {
             throw std::runtime_error(
                 "ODBC_BENCH_SCENARIO must be one of narrow, wide, rowset, varwidth, "
-                "getdata, write, pywrite, or unset");
+                "getdata, write, pywrite, latency, params, lobwrite, cursorfetch, or unset");
+        }
+    }
+    const auto calls_override = environment_value("ODBC_BENCH_CALLS");
+    if (!calls_override.empty()) {
+        if (calls_override.size() > 7 ||
+            !std::all_of(calls_override.begin(), calls_override.end(),
+                         [](unsigned char character) {
+                             return std::isdigit(character) != 0;
+                         })) {
+            throw std::runtime_error(
+                "ODBC_BENCH_CALLS must be an integer between 1 and 1000000");
+        }
+        config.calls_override = std::stoul(calls_override);
+        if (config.calls_override == 0 || config.calls_override > 1'000'000) {
+            throw std::runtime_error(
+                "ODBC_BENCH_CALLS must be an integer between 1 and 1000000");
         }
     }
     if (config.write_mode != "parameter_array" && config.write_mode != "sequential") {
@@ -1231,6 +1296,16 @@ void require_succeeded(SQLRETURN rc, const char* operation, SQLHSTMT stmt) {
     if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
         throw_odbc_error(operation, rc, SQL_HANDLE_STMT, stmt);
     }
+}
+
+// A statement whose prepared plan and bindings persist across samples. The
+// caller frees it; its runner is destroyed before the session disconnects.
+SQLHSTMT allocate_statement(OdbcSession& session) {
+    SQLHSTMT stmt = SQL_NULL_HSTMT;
+    require_exact_success(SQLAllocHandle(SQL_HANDLE_STMT, session.connection(), &stmt),
+                          "SQLAllocHandle(SQL_HANDLE_STMT)", SQL_HANDLE_DBC,
+                          session.connection());
+    return stmt;
 }
 
 // Fold whatever SQL_CA_SS_VARIANT_TYPE reports onto the C type the value is read
@@ -2627,6 +2702,163 @@ private:
     SQLLEN sequential_offset_ = 0;
 };
 
+class LatencyRunner::Impl {
+public:
+    Impl(OdbcSession& session, const LatencySpec& spec, std::size_t calls_override)
+        : spec_(spec),
+          calls_(calls_override != 0 ? calls_override : spec.calls_per_sample),
+          text_(statement_text(spec)),
+          stmt_(allocate_statement(session)) {
+        try {
+            // Bindings survive SQLCloseCursor, so binding once is what an
+            // application that reuses a cursor does.
+            require_exact_success(
+                SQLBindCol(stmt_, 1, SQL_C_SLONG, &value_, sizeof(value_), &indicator_),
+                "SQLBindCol(latency)", SQL_HANDLE_STMT, stmt_);
+        } catch (...) {
+            SQLFreeHandle(SQL_HANDLE_STMT, stmt_);
+            throw;
+        }
+    }
+
+    ~Impl() {
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt_);
+    }
+
+    Impl(const Impl&) = delete;
+    Impl& operator=(const Impl&) = delete;
+
+    const char* name() const {
+        return spec_.benchmark_name;
+    }
+
+    void preflight() {
+        verify_result_shape();
+        const auto metrics = run(std::min(kWarmupCalls, calls_));
+        std::cerr << "Preflight passed for " << name() << ": " << metrics.calls
+                  << " warm-up calls at "
+                  << metrics.total_seconds * 1e6 / static_cast<double>(metrics.calls)
+                  << " us/call; " << calls_ << " calls per sample, "
+                  << text_.size() - 1 << " statement characters\n";
+    }
+
+    RetrievalMetrics execute() {
+        return run(calls_);
+    }
+
+private:
+    // Enough to fault in driver code, settle the server plan cache, and warm the
+    // socket path before the first timed sample; capped at one sample.
+    static constexpr std::size_t kWarmupCalls = 500;
+
+    static std::vector<SQLWCHAR> statement_text(const LatencySpec& spec) {
+        std::string text = "SELECT 1";
+        if (spec.text_chars != 0) {
+            // The filler contains no '?', '{', or "*/", so the driver has nothing
+            // to rewrite and the server nothing to parse beyond `SELECT 1`.
+            constexpr std::string_view kFiller = "padding-text-0123456789abcdef ";
+            text += " /*";
+            while (text.size() < spec.text_chars - 2) {
+                text += kFiller;
+            }
+            text.resize(spec.text_chars - 2);
+            text += "*/";
+        }
+        std::vector<SQLWCHAR> wide;
+        wide.reserve(text.size() + 1);
+        for (const char character : text) {
+            wide.push_back(static_cast<SQLWCHAR>(static_cast<unsigned char>(character)));
+        }
+        wide.push_back(0);
+        return wide;
+    }
+
+    void submit() {
+        value_ = 0;
+        indicator_ = kIndicatorSentinel;
+        require_exact_success(SQLExecDirectW(stmt_, text_.data(), SQL_NTS),
+                              "SQLExecDirectW(latency)", SQL_HANDLE_STMT, stmt_);
+    }
+
+    void fetch_row() {
+        require_exact_success(SQLFetch(stmt_), "SQLFetch(latency)", SQL_HANDLE_STMT, stmt_);
+        if (value_ != 1 || indicator_ != static_cast<SQLLEN>(sizeof(value_))) {
+            std::ostringstream message;
+            message << name() << " fetched " << value_ << " (indicator " << indicator_
+                    << "); expected 1";
+            throw std::runtime_error(message.str());
+        }
+    }
+
+    void close_cursor() {
+        require_exact_success(SQLCloseCursor(stmt_), "SQLCloseCursor(latency)",
+                              SQL_HANDLE_STMT, stmt_);
+    }
+
+    // The timed loop fetches exactly one row and closes, so prove once that the
+    // result really is one INT column and one row on this driver.
+    void verify_result_shape() {
+        try {
+            submit();
+            SQLSMALLINT columns = 0;
+            require_exact_success(SQLNumResultCols(stmt_, &columns),
+                                  "SQLNumResultCols(latency)", SQL_HANDLE_STMT, stmt_);
+            SQLSMALLINT type = 0;
+            SQLULEN size = 0;
+            SQLSMALLINT digits = 0;
+            SQLSMALLINT nullable = 0;
+            require_exact_success(
+                SQLDescribeCol(stmt_, 1, nullptr, 0, nullptr, &type, &size, &digits,
+                               &nullable),
+                "SQLDescribeCol(latency)", SQL_HANDLE_STMT, stmt_);
+            if (columns != 1 || type != SQL_INTEGER) {
+                throw std::runtime_error(std::string(name()) +
+                                         " did not return one INT column");
+            }
+            fetch_row();
+            const SQLRETURN rc = SQLFetch(stmt_);
+            if (rc != SQL_NO_DATA) {
+                throw_odbc_error("SQLFetch(latency final)", rc, SQL_HANDLE_STMT, stmt_);
+            }
+            close_cursor();
+        } catch (...) {
+            SQLFreeStmt(stmt_, SQL_CLOSE);
+            throw;
+        }
+    }
+
+    RetrievalMetrics run(std::size_t calls) {
+        double total_seconds = 0.0;
+        try {
+            const auto start = std::chrono::steady_clock::now();
+            for (std::size_t call = 0; call < calls; ++call) {
+                submit();
+                fetch_row();
+                close_cursor();
+            }
+            total_seconds = seconds_between(start, std::chrono::steady_clock::now());
+        } catch (...) {
+            SQLFreeStmt(stmt_, SQL_CLOSE);
+            throw;
+        }
+        RetrievalMetrics metrics;
+        metrics.rows = calls;
+        metrics.cells = calls;
+        metrics.logical_bytes = calls * sizeof(SQLINTEGER);
+        metrics.total_seconds = total_seconds;
+        metrics.metadata_bind_seconds = -1.0;
+        metrics.calls = calls;
+        return metrics;
+    }
+
+    const LatencySpec& spec_;
+    std::size_t calls_;
+    std::vector<SQLWCHAR> text_;
+    SQLHSTMT stmt_;
+    SQLINTEGER value_ = 0;
+    SQLLEN indicator_ = kIndicatorSentinel;
+};
+
 namespace {
 
 // One generated `datetime.datetime` value and its exact distance from the
@@ -3076,6 +3308,1164 @@ private:
     SQLHSTMT stmt_ = SQL_NULL_HSTMT;
 };
 
+namespace {
+
+// Constants of mssql-python 239f79fd `ddbc_bindings.cpp` and `param_detect.hpp`.
+constexpr std::size_t kPyDaeChunkBytes = 8192;     // DAE_CHUNK_SIZE
+constexpr std::size_t kPyMaxInlineChars = 4000;    // MAX_INLINE_CHAR
+constexpr std::size_t kPyMaxInlineBinary = 8000;   // MAX_INLINE_BINARY
+constexpr SQLULEN kPyMaxLobSize = 8000;            // SQL_MAX_LOB_SIZE
+constexpr SQLLEN kPyNumericTextBytes = 64;         // MAX_DIGITS_IN_NUMERIC
+constexpr SQLULEN kPyZeroColumnSize = 4096;        // HandleZeroColumnSizeAtFetch
+constexpr std::size_t kPyFetchManyRows = 100;      // fetchmany_mixed batch
+
+std::vector<SQLWCHAR> wide_text(std::u16string_view text) {
+    std::vector<SQLWCHAR> wide(text.begin(), text.end());
+    wide.push_back(0);
+    return wide;
+}
+
+std::u16string ascii_u16(std::string_view text) {
+    return std::u16string(text.begin(), text.end());
+}
+
+// One Python argument after `DetectParamTypes` and `PrepareParamBuffer`.
+struct PyParameter {
+    SQLSMALLINT c_type = 0;
+    SQLSMALLINT sql_type = 0;
+    SQLULEN column_size = 0;
+    SQLSMALLINT decimal_digits = 0;
+    SQLLEN buffer_length = 0;
+    bool dae = false;
+    bool numeric = false;
+    // `None`: SQL_C_DEFAULT with a NULL data pointer; the SQL type comes from
+    // SQLDescribeParam (cached per prepare) or falls back to VARCHAR(1).
+    bool null = false;
+    // StrLen_or_IndPtr stays null for the fixed-size C types.
+    bool has_indicator = false;
+    SQLLEN indicator = 0;
+    // Two identical copies alternated per execute: mssql-python binds freshly
+    // allocated buffers on every call, so consecutive calls never share addresses.
+    std::array<std::vector<unsigned char>, 2> value;
+    std::array<SQLLEN, 2> indicators = {};
+    // A DAE parameter's payload, sent with SQLPutData in DAE_CHUNK_SIZE pieces.
+    std::vector<unsigned char> stream;
+};
+
+template <typename T>
+void store_py_value(PyParameter& parameter, const T& value) {
+    const auto* bytes = reinterpret_cast<const unsigned char*>(&value);
+    for (auto& copy : parameter.value) {
+        copy.assign(bytes, bytes + sizeof(T));
+    }
+}
+
+// Python `int`: the narrowest of TINYINT/SMALLINT/INTEGER/BIGINT that fits. The
+// two narrow types use an `int` buffer, the wide ones an `int64_t`.
+void assign_py_int(PyParameter& parameter, std::int64_t value) {
+    parameter.decimal_digits = 0;
+    if (value >= 0 && value <= 255) {
+        parameter.c_type = SQL_C_TINYINT;
+        parameter.sql_type = SQL_TINYINT;
+        parameter.column_size = 3;
+        store_py_value(parameter, static_cast<std::int32_t>(value));
+    } else if (value >= -32768 && value <= 32767) {
+        parameter.c_type = SQL_C_SHORT;
+        parameter.sql_type = SQL_SMALLINT;
+        parameter.column_size = 5;
+        store_py_value(parameter, static_cast<std::int32_t>(value));
+    } else if (value >= std::numeric_limits<std::int32_t>::min() &&
+               value <= std::numeric_limits<std::int32_t>::max()) {
+        parameter.c_type = SQL_C_LONG;
+        parameter.sql_type = SQL_INTEGER;
+        parameter.column_size = 10;
+        store_py_value(parameter, value);
+    } else {
+        parameter.c_type = SQL_C_SBIGINT;
+        parameter.sql_type = SQL_BIGINT;
+        parameter.column_size = 19;
+        store_py_value(parameter, value);
+    }
+}
+
+PyParameter py_int(std::int64_t value) {
+    PyParameter parameter;
+    assign_py_int(parameter, value);
+    return parameter;
+}
+
+// Python `str`, always SQL_C_WCHAR. ASCII text declares SQL_VARCHAR, anything
+// wider SQL_WVARCHAR; more than 4000 UTF-16 units streams with columnSize 0.
+PyParameter py_str(std::u16string_view text, bool unicode) {
+    PyParameter parameter;
+    parameter.c_type = SQL_C_WCHAR;
+    parameter.sql_type = unicode ? SQL_WVARCHAR : SQL_VARCHAR;
+    std::vector<unsigned char> bytes(text.size() * sizeof(SQLWCHAR));
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const auto unit = static_cast<SQLWCHAR>(text[index]);
+        std::memcpy(bytes.data() + index * sizeof(SQLWCHAR), &unit, sizeof(unit));
+    }
+    parameter.has_indicator = true;
+    if (text.size() > kPyMaxInlineChars) {
+        parameter.dae = true;
+        parameter.indicator = SQL_LEN_DATA_AT_EXEC(0);
+        parameter.stream = std::move(bytes);
+    } else {
+        parameter.column_size = text.size();
+        parameter.buffer_length = static_cast<SQLLEN>(bytes.size());
+        parameter.indicator = parameter.buffer_length;
+        parameter.value = {bytes, bytes};
+    }
+    return parameter;
+}
+
+// Python `bytes`: SQL_C_BINARY -> SQL_VARBINARY, streamed above 8000 bytes.
+PyParameter py_bytes(std::vector<unsigned char> bytes) {
+    PyParameter parameter;
+    parameter.c_type = SQL_C_BINARY;
+    parameter.sql_type = SQL_VARBINARY;
+    parameter.has_indicator = true;
+    if (bytes.size() > kPyMaxInlineBinary) {
+        parameter.dae = true;
+        parameter.indicator = SQL_LEN_DATA_AT_EXEC(0);
+        parameter.stream = std::move(bytes);
+    } else {
+        parameter.column_size = std::max<SQLULEN>(bytes.size(), 1);
+        parameter.buffer_length = static_cast<SQLLEN>(bytes.size());
+        parameter.indicator = parameter.buffer_length;
+        parameter.value = {bytes, bytes};
+    }
+    return parameter;
+}
+
+template <typename T>
+PyParameter py_fixed(SQLSMALLINT c_type, SQLSMALLINT sql_type, SQLULEN column_size,
+                     SQLSMALLINT decimal_digits, const T& value) {
+    PyParameter parameter;
+    parameter.c_type = c_type;
+    parameter.sql_type = sql_type;
+    parameter.column_size = column_size;
+    parameter.decimal_digits = decimal_digits;
+    store_py_value(parameter, value);
+    return parameter;
+}
+
+// Python `Decimal`: SQL_C_NUMERIC with its own precision and scale; the binder
+// then sets the APD record's type, precision, scale, and data pointer.
+PyParameter py_decimal(SQLCHAR precision, SQLSCHAR scale, std::uint64_t unscaled) {
+    SQL_NUMERIC_STRUCT numeric = {};
+    numeric.precision = precision;
+    numeric.scale = scale;
+    numeric.sign = 1;
+    for (std::size_t index = 0; index < sizeof(unscaled); ++index) {
+        numeric.val[index] = static_cast<SQLCHAR>(unscaled >> (8 * index));
+    }
+    auto parameter = py_fixed(SQL_C_NUMERIC, SQL_NUMERIC, precision, scale, numeric);
+    parameter.numeric = true;
+    return parameter;
+}
+
+PyParameter py_none() {
+    PyParameter parameter;
+    parameter.c_type = SQL_C_DEFAULT;
+    parameter.sql_type = SQL_UNKNOWN_TYPE;
+    parameter.column_size = 1;
+    parameter.null = true;
+    parameter.has_indicator = true;
+    parameter.indicator = SQL_NULL_DATA;
+    return parameter;
+}
+
+// One `fetchone` cell as `GetRowData` read it.
+struct PyCell {
+    SQLSMALLINT c_type = 0;
+    SQLLEN indicator = 0;
+    std::vector<unsigned char> data;
+
+    template <typename T>
+    T as() const {
+        T value{};
+        std::memcpy(&value, data.data(), std::min(sizeof(T), data.size()));
+        return value;
+    }
+};
+
+// One column bound by `SQLBindColums`, `rows` slots wide.
+struct PyBoundColumn {
+    SQLSMALLINT c_type = 0;
+    SQLLEN width = 0;
+    std::vector<unsigned char> data;
+    std::vector<SQLLEN> indicators;
+
+    const unsigned char* at(std::size_t row) const {
+        return data.data() + row * static_cast<std::size_t>(width);
+    }
+};
+
+struct PyColumn {
+    SQLSMALLINT type = 0;
+    SQLULEN size = 0;
+};
+
+// Decimal text in any driver's SQL_C_CHAR spelling ("1.5000", ".5000", "-2.1")
+// as an integer scaled by 10^scale.
+std::int64_t parse_scaled_decimal(const unsigned char* text, std::size_t length, int scale) {
+    std::size_t index = 0;
+    const bool negative = length != 0 && text[0] == '-';
+    index += negative ? 1 : 0;
+    std::int64_t value = 0;
+    int fraction_digits = -1;
+    for (; index < length; ++index) {
+        if (text[index] == '.') {
+            fraction_digits = 0;
+            continue;
+        }
+        if (text[index] < '0' || text[index] > '9') {
+            throw std::runtime_error("decimal text contains a non-digit");
+        }
+        if (fraction_digits >= scale) {
+            continue;
+        }
+        value = value * 10 + (text[index] - '0');
+        fraction_digits += fraction_digits >= 0 ? 1 : 0;
+    }
+    for (int pad = std::max(fraction_digits, 0); pad < scale; ++pad) {
+        value *= 10;
+    }
+    return negative ? -value : value;
+}
+
+bool wide_equals(const unsigned char* data, SQLLEN indicator, std::u16string_view expected) {
+    if (indicator != static_cast<SQLLEN>(expected.size() * sizeof(SQLWCHAR))) {
+        return false;
+    }
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        SQLWCHAR unit = 0;
+        std::memcpy(&unit, data + index * sizeof(SQLWCHAR), sizeof(unit));
+        if (unit != static_cast<SQLWCHAR>(expected[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The ODBC side of one mssql-python `Cursor` on one statement handle: the call
+// sequence, entry points, statement attributes, and buffer layouts of
+// `cursor.py` and `ddbc_bindings.cpp` at 239f79fd.
+class PyCursor {
+public:
+    explicit PyCursor(OdbcSession& session) : stmt_(allocate_statement(session)) {}
+
+    ~PyCursor() {
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt_);
+    }
+
+    PyCursor(const PyCursor&) = delete;
+    PyCursor& operator=(const PyCursor&) = delete;
+
+    SQLHSTMT handle() const {
+        return stmt_;
+    }
+
+    SQLLEN row_count() const {
+        return row_count_;
+    }
+
+    // `Cursor.execute`: soft reset; SQLExecDirectW without parameters, otherwise a
+    // cached prepare, bind, and SQLExecute with the DAE loop; then the row count
+    // and `description`.
+    void execute(const std::vector<SQLWCHAR>& sql, std::vector<PyParameter>& params) {
+        metadata_.clear();
+        metadata_complete_ = false;
+        check(SQLFreeStmt(stmt_, SQL_CLOSE), "SQLFreeStmt(SQL_CLOSE)");
+        check(SQLSetStmtAttrW(stmt_, SQL_ATTR_PARAMSET_SIZE, attribute_value(1), 0),
+              "SQLSetStmtAttrW(SQL_ATTR_PARAMSET_SIZE)");
+        const bool same_sql = !params.empty() && prepared_ && sql == last_sql_;
+        if (!same_sql) {
+            prepared_ = false;
+        }
+        if (params.empty()) {
+            apply_cursor_attrs();
+            if (params_bound_) {
+                reset_params();
+            }
+            check(SQLExecDirectW(stmt_, const_cast<SQLWCHAR*>(sql.data()), SQL_NTS),
+                  "SQLExecDirectW");
+        } else {
+            if (!prepared_) {
+                apply_cursor_attrs();
+                reset_params();
+                check(SQLPrepareW(stmt_, const_cast<SQLWCHAR*>(sql.data()), SQL_NTS),
+                      "SQLPrepareW");
+                describe_cache_.clear();
+                prepared_ = true;
+            }
+            bind_parameters(params);
+            SQLRETURN rc = SQLExecute(stmt_);
+            if (rc == SQL_NEED_DATA) {
+                rc = stream_parameters(params);
+            }
+            check(rc, "SQLExecute");
+        }
+        last_sql_ = sql;
+        check(SQLRowCount(stmt_, &row_count_), "SQLRowCount");
+        if (describe_columns(nullptr) == 0) {
+            check(SQLRowCount(stmt_, &row_count_), "SQLRowCount(no result)");
+        }
+    }
+
+    // `Cursor.fetchone` -> `FetchSingleRow` -> `GetRowData`.
+    bool fetchone(std::vector<PyCell>& row) {
+        if (!columns_unbound_) {
+            check(SQLFreeStmt(stmt_, SQL_UNBIND), "SQLFreeStmt(SQL_UNBIND)");
+            columns_unbound_ = true;
+        }
+        const SQLRETURN rc = SQLFetch(stmt_);
+        if (rc == SQL_NO_DATA) {
+            require_no_diagnostics();
+            return false;
+        }
+        check(rc, "SQLFetch");
+        const auto count = metadata_complete_ ? static_cast<SQLSMALLINT>(metadata_.size())
+                                              : num_result_cols();
+        row.resize(static_cast<std::size_t>(count));
+        std::vector<PyColumn> pending;
+        for (SQLSMALLINT column = 1; column <= count; ++column) {
+            PyColumn meta;
+            if (metadata_complete_) {
+                meta = metadata_[static_cast<std::size_t>(column - 1)];
+            } else {
+                meta = describe_column(column);
+                pending.push_back(meta);
+            }
+            read_cell(column, meta, row[static_cast<std::size_t>(column - 1)]);
+        }
+        if (!metadata_complete_) {
+            metadata_ = std::move(pending);
+            metadata_complete_ = true;
+        }
+        return true;
+    }
+
+    // `Cursor.fetchmany` -> `FetchMany_wrap` on a result with no LOB columns.
+    template <typename Sink>
+    std::size_t fetchmany(std::size_t size, Sink&& sink) {
+        if (!metadata_complete_) {
+            num_result_cols();
+            describe_columns(&metadata_);
+            metadata_complete_ = true;
+        }
+        auto columns = bind_columns(metadata_, size);
+        SQLULEN fetched = 0;
+        try {
+            configure_rowset(size, &fetched);
+            const SQLRETURN rc = SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0);
+            if (rc == SQL_NO_DATA) {
+                require_no_diagnostics();
+                fetched = 0;
+            } else {
+                check(rc, "SQLFetchScroll");
+                sink(columns, static_cast<std::size_t>(fetched));
+            }
+        } catch (...) {
+            close_rowset_noexcept();
+            throw;
+        }
+        close_rowset();
+        return static_cast<std::size_t>(fetched);
+    }
+
+    // Untimed: release the result so other statements on the connection can run.
+    void close() {
+        check(SQLFreeStmt(stmt_, SQL_CLOSE), "SQLFreeStmt(SQL_CLOSE)");
+    }
+
+    void close_noexcept() noexcept {
+        SQLFreeStmt(stmt_, SQL_CLOSE);
+    }
+
+    // After a raw statement issued outside the replay, the next execute re-prepares.
+    void forget_statement() {
+        close();
+        prepared_ = false;
+        last_sql_.clear();
+    }
+
+private:
+    void check(SQLRETURN rc, const char* operation) const {
+        require_exact_success(rc, operation, SQL_HANDLE_STMT, stmt_);
+    }
+
+    // `ApplyForwardOnlyCursorAttrs`: once per handle; failures are ignored.
+    void apply_cursor_attrs() {
+        if (cursor_attrs_applied_) {
+            return;
+        }
+        const SQLRETURN type_rc = SQLSetStmtAttrW(
+            stmt_, SQL_ATTR_CURSOR_TYPE, attribute_value(SQL_CURSOR_FORWARD_ONLY), 0);
+        const SQLRETURN concurrency_rc = SQLSetStmtAttrW(
+            stmt_, SQL_ATTR_CONCURRENCY, attribute_value(SQL_CONCUR_READ_ONLY), 0);
+        cursor_attrs_applied_ = SQL_SUCCEEDED(type_rc) && SQL_SUCCEEDED(concurrency_rc);
+    }
+
+    // `ResetParamBindings`.
+    void reset_params() {
+        bound_signature_.clear();
+        check(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), "SQLFreeStmt(SQL_RESET_PARAMS)");
+        params_bound_ = false;
+    }
+
+    // `PreResolveUnknownNullTypes` + `BindParameters(reuseMatchingBindings=true)`.
+    void bind_parameters(std::vector<PyParameter>& params) {
+        for (std::size_t index = 0; index < params.size(); ++index) {
+            auto& parameter = params[index];
+            if (!parameter.null) {
+                continue;
+            }
+            auto cached = describe_cache_.find(index);
+            if (cached == describe_cache_.end()) {
+                if (params_bound_) {
+                    reset_params();
+                }
+                SQLSMALLINT type = 0;
+                SQLULEN size = 0;
+                SQLSMALLINT digits = 0;
+                SQLSMALLINT nullable = 0;
+                const SQLRETURN rc =
+                    SQLDescribeParam(stmt_, static_cast<SQLUSMALLINT>(index + 1), &type,
+                                     &size, &digits, &nullable);
+                using Described = std::tuple<SQLSMALLINT, SQLULEN, SQLSMALLINT>;
+                const Described fallback(static_cast<SQLSMALLINT>(SQL_VARCHAR), SQLULEN{1},
+                                         SQLSMALLINT{0});
+                const Described resolved =
+                    SQL_SUCCEEDED(rc) ? Described(type, size, digits) : fallback;
+                cached = describe_cache_.emplace(index, resolved).first;
+            }
+            std::tie(parameter.sql_type, parameter.column_size, parameter.decimal_digits) =
+                cached->second;
+        }
+
+        std::vector<std::tuple<SQLSMALLINT, SQLSMALLINT, SQLULEN, SQLSMALLINT, bool>> signature;
+        signature.reserve(params.size());
+        for (const auto& parameter : params) {
+            signature.emplace_back(parameter.c_type, parameter.sql_type, parameter.column_size,
+                                   parameter.decimal_digits, parameter.dae);
+        }
+        if (params_bound_ && signature != bound_signature_) {
+            reset_params();
+        }
+        bound_signature_.clear();
+        params_bound_ = true;
+        buffer_set_ ^= 1;
+
+        for (std::size_t index = 0; index < params.size(); ++index) {
+            auto& parameter = params[index];
+            SQLPOINTER data = nullptr;
+            if (parameter.dae) {
+                data = &parameter;
+            } else if (!parameter.null) {
+                data = parameter.value[buffer_set_].data();
+            }
+            SQLLEN* indicator = nullptr;
+            if (parameter.has_indicator) {
+                parameter.indicators[buffer_set_] = parameter.indicator;
+                indicator = &parameter.indicators[buffer_set_];
+            }
+            const auto ordinal = static_cast<SQLUSMALLINT>(index + 1);
+            check(SQLBindParameter(stmt_, ordinal, SQL_PARAM_INPUT, parameter.c_type,
+                                   parameter.sql_type, parameter.column_size,
+                                   parameter.decimal_digits, data, parameter.buffer_length,
+                                   indicator),
+                  "SQLBindParameter");
+            if (parameter.numeric) {
+                const auto* numeric = static_cast<const SQL_NUMERIC_STRUCT*>(data);
+                SQLHDESC descriptor = SQL_NULL_HDESC;
+                check(SQLGetStmtAttrW(stmt_, SQL_ATTR_APP_PARAM_DESC, &descriptor, 0, nullptr),
+                      "SQLGetStmtAttrW(SQL_ATTR_APP_PARAM_DESC)");
+                const auto record = static_cast<SQLSMALLINT>(ordinal);
+                require_exact_success(
+                    SQLSetDescFieldW(descriptor, record, SQL_DESC_TYPE,
+                                     attribute_value(SQL_C_NUMERIC), 0),
+                    "SQLSetDescFieldW(SQL_DESC_TYPE)", SQL_HANDLE_DESC, descriptor);
+                require_exact_success(
+                    SQLSetDescFieldW(descriptor, record, SQL_DESC_PRECISION,
+                                     attribute_value(numeric->precision), 0),
+                    "SQLSetDescFieldW(SQL_DESC_PRECISION)", SQL_HANDLE_DESC, descriptor);
+                require_exact_success(
+                    SQLSetDescFieldW(descriptor, record, SQL_DESC_SCALE,
+                                     attribute_value(static_cast<SQLULEN>(numeric->scale)), 0),
+                    "SQLSetDescFieldW(SQL_DESC_SCALE)", SQL_HANDLE_DESC, descriptor);
+                require_exact_success(
+                    SQLSetDescFieldW(descriptor, record, SQL_DESC_DATA_PTR, data, 0),
+                    "SQLSetDescFieldW(SQL_DESC_DATA_PTR)", SQL_HANDLE_DESC, descriptor);
+            }
+        }
+        bound_signature_ = std::move(signature);
+    }
+
+    // The DAE loop: the token is the bound parameter, and its payload is sent in
+    // DAE_CHUNK_SIZE pieces.
+    SQLRETURN stream_parameters(std::vector<PyParameter>& params) {
+        for (;;) {
+            SQLPOINTER token = nullptr;
+            const SQLRETURN rc = SQLParamData(stmt_, &token);
+            if (rc != SQL_NEED_DATA) {
+                return rc;
+            }
+            const auto* parameter = static_cast<const PyParameter*>(token);
+            if (parameter < params.data() || parameter >= params.data() + params.size() ||
+                !parameter->dae) {
+                throw std::runtime_error("SQLParamData returned an unknown parameter token");
+            }
+            const auto& bytes = parameter->stream;
+            if (bytes.empty()) {
+                check(SQLPutData(stmt_, const_cast<unsigned char*>(bytes.data()), 0),
+                      "SQLPutData");
+            }
+            for (std::size_t offset = 0; offset < bytes.size(); offset += kPyDaeChunkBytes) {
+                const auto length = std::min(kPyDaeChunkBytes, bytes.size() - offset);
+                check(SQLPutData(stmt_, const_cast<unsigned char*>(bytes.data() + offset),
+                                 static_cast<SQLLEN>(length)),
+                      "SQLPutData");
+            }
+        }
+    }
+
+    SQLSMALLINT num_result_cols() {
+        SQLSMALLINT count = 0;
+        check(SQLNumResultCols(stmt_, &count), "SQLNumResultCols");
+        return count;
+    }
+
+    PyColumn describe_column(SQLSMALLINT column) {
+        SQLWCHAR name[256] = {};
+        SQLSMALLINT name_length = 0;
+        SQLSMALLINT type = 0;
+        SQLULEN size = 0;
+        SQLSMALLINT digits = 0;
+        SQLSMALLINT nullable = 0;
+        check(SQLDescribeColW(stmt_, static_cast<SQLUSMALLINT>(column), name,
+                              static_cast<SQLSMALLINT>(std::size(name)), &name_length, &type,
+                              &size, &digits, &nullable),
+              "SQLDescribeColW");
+        return {type, size};
+    }
+
+    // `DescribeColumns`: SQLNumResultCols, then SQLDescribeColW per column.
+    SQLSMALLINT describe_columns(std::vector<PyColumn>* sink) {
+        const SQLSMALLINT count = num_result_cols();
+        for (SQLSMALLINT column = 1; column <= count; ++column) {
+            const auto meta = describe_column(column);
+            if (sink != nullptr) {
+                sink->push_back(meta);
+            }
+        }
+        return count;
+    }
+
+    // `CaptureFetchDiagnostics` on SQL_NO_DATA reads the record count; records
+    // would be appended to `cursor.messages`, and none are expected here.
+    void require_no_diagnostics() {
+        SQLINTEGER count = -1;
+        const SQLRETURN rc = SQLGetDiagFieldW(SQL_HANDLE_STMT, stmt_, 0, SQL_DIAG_NUMBER,
+                                              &count, 0, nullptr);
+        if (rc != SQL_SUCCESS || count != 0) {
+            throw std::runtime_error("SQL_NO_DATA carried diagnostics: " +
+                                     diagnostics(SQL_HANDLE_STMT, stmt_));
+        }
+    }
+
+    // One `GetRowData` cell: the C type and buffer length the switch picks for
+    // the described SQL type. Text and binary above the inline limits would take
+    // `FetchLobColumnData`, which no workload here reaches.
+    void read_cell(SQLSMALLINT column, const PyColumn& meta, PyCell& cell) {
+        const bool lob = meta.size == static_cast<SQLULEN>(SQL_NO_TOTAL) || meta.size == 0;
+        SQLLEN length = 0;
+        std::size_t storage = 0;
+        switch (meta.type) {
+        case SQL_CHAR:
+        case SQL_VARCHAR:
+        case SQL_LONGVARCHAR:
+        case SQL_WCHAR:
+        case SQL_WVARCHAR:
+        case SQL_WLONGVARCHAR: {
+            const SQLULEN limit = (meta.type == SQL_CHAR || meta.type == SQL_VARCHAR ||
+                                   meta.type == SQL_LONGVARCHAR)
+                                      ? kPyMaxLobSize
+                                      : kPyMaxInlineChars;
+            if (lob || meta.size > limit) {
+                throw std::logic_error("py-cursor fetchone does not replay LOB text columns");
+            }
+            cell.c_type = SQL_C_WCHAR;
+            length = static_cast<SQLLEN>((meta.size + 1) * sizeof(SQLWCHAR));
+            storage = static_cast<std::size_t>(length);
+            break;
+        }
+        case SQL_INTEGER:
+            cell.c_type = SQL_C_LONG;
+            storage = sizeof(SQLINTEGER);
+            break;
+        case SQL_SMALLINT:
+            cell.c_type = SQL_C_SHORT;
+            storage = sizeof(SQLSMALLINT);
+            break;
+        case SQL_TINYINT:
+            cell.c_type = SQL_C_TINYINT;
+            storage = 1;
+            break;
+        case SQL_BIT:
+            cell.c_type = SQL_C_BIT;
+            storage = 1;
+            break;
+        case SQL_REAL:
+            cell.c_type = SQL_C_FLOAT;
+            storage = sizeof(SQLREAL);
+            break;
+        case SQL_DECIMAL:
+        case SQL_NUMERIC:
+            cell.c_type = SQL_C_CHAR;
+            length = kPyNumericTextBytes;
+            storage = static_cast<std::size_t>(length);
+            break;
+        case SQL_DOUBLE:
+        case SQL_FLOAT:
+            cell.c_type = SQL_C_DOUBLE;
+            storage = sizeof(SQLDOUBLE);
+            break;
+        case SQL_BIGINT:
+            cell.c_type = SQL_C_SBIGINT;
+            storage = sizeof(SQLBIGINT);
+            break;
+        case SQL_TYPE_DATE:
+            cell.c_type = SQL_C_TYPE_DATE;
+            length = sizeof(SQL_DATE_STRUCT);
+            storage = sizeof(SQL_DATE_STRUCT);
+            break;
+        case SQL_TIMESTAMP:
+        case SQL_TYPE_TIMESTAMP:
+        case SQL_DATETIME:
+            cell.c_type = SQL_C_TYPE_TIMESTAMP;
+            length = sizeof(SQL_TIMESTAMP_STRUCT);
+            storage = sizeof(SQL_TIMESTAMP_STRUCT);
+            break;
+        case SQL_BINARY:
+        case SQL_VARBINARY:
+        case SQL_LONGVARBINARY:
+            if (lob || meta.size > kPyMaxLobSize) {
+                throw std::logic_error("py-cursor fetchone does not replay LOB binary columns");
+            }
+            cell.c_type = SQL_C_BINARY;
+            length = static_cast<SQLLEN>(meta.size);
+            storage = static_cast<std::size_t>(length);
+            break;
+        default:
+            throw std::logic_error("py-cursor fetchone met an unmapped SQL type " +
+                                   std::to_string(meta.type));
+        }
+        cell.data.assign(storage, 0);
+        cell.indicator = kIndicatorSentinel;
+        check(SQLGetData(stmt_, static_cast<SQLUSMALLINT>(column), cell.c_type,
+                         cell.data.data(), length, &cell.indicator),
+              "SQLGetData");
+    }
+
+    // `SQLBindColums` for the column types the fetch workload binds: one freshly
+    // allocated column-wise array per column.
+    std::vector<PyBoundColumn> bind_columns(const std::vector<PyColumn>& metadata,
+                                            std::size_t rows) {
+        columns_unbound_ = false;
+        std::vector<PyBoundColumn> columns(metadata.size());
+        for (std::size_t index = 0; index < metadata.size(); ++index) {
+            const auto& meta = metadata[index];
+            auto& column = columns[index];
+            const SQLULEN size = meta.size == 0 ? kPyZeroColumnSize : meta.size;
+            switch (meta.type) {
+            case SQL_CHAR:
+            case SQL_VARCHAR:
+            case SQL_LONGVARCHAR:
+            case SQL_WCHAR:
+            case SQL_WVARCHAR:
+            case SQL_WLONGVARCHAR:
+                column.c_type = SQL_C_WCHAR;
+                column.width = static_cast<SQLLEN>((size + 1) * sizeof(SQLWCHAR));
+                break;
+            case SQL_INTEGER:
+                column.c_type = SQL_C_SLONG;
+                column.width = sizeof(SQLINTEGER);
+                break;
+            case SQL_DECIMAL:
+            case SQL_NUMERIC:
+                column.c_type = SQL_C_CHAR;
+                column.width = kPyNumericTextBytes;
+                break;
+            case SQL_BINARY:
+            case SQL_VARBINARY:
+            case SQL_LONGVARBINARY:
+                column.c_type = SQL_C_BINARY;
+                column.width = static_cast<SQLLEN>(size);
+                break;
+            default:
+                throw std::logic_error("py-cursor bound fetch met an unmapped SQL type " +
+                                       std::to_string(meta.type));
+            }
+            column.data.assign(rows * static_cast<std::size_t>(column.width), 0);
+            column.indicators.assign(rows, kIndicatorSentinel);
+            check(SQLBindCol(stmt_, static_cast<SQLUSMALLINT>(index + 1), column.c_type,
+                             column.data.data(), column.width, column.indicators.data()),
+                  "SQLBindCol");
+        }
+        return columns;
+    }
+
+    // `FetchStateGuard::configure`.
+    void configure_rowset(std::size_t rows, SQLULEN* fetched) {
+        check(SQLSetStmtAttrW(stmt_, SQL_ATTR_ROW_ARRAY_SIZE, attribute_value(rows), 0),
+              "SQLSetStmtAttrW(SQL_ATTR_ROW_ARRAY_SIZE)");
+        check(SQLSetStmtAttrW(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, fetched, 0),
+              "SQLSetStmtAttrW(SQL_ATTR_ROWS_FETCHED_PTR)");
+    }
+
+    // `FetchStateGuard::close`.
+    void close_rowset() {
+        check(SQLSetStmtAttrW(stmt_, SQL_ATTR_ROW_ARRAY_SIZE, attribute_value(1), 0),
+              "SQLSetStmtAttrW(SQL_ATTR_ROW_ARRAY_SIZE reset)");
+        check(SQLSetStmtAttrW(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, nullptr, 0),
+              "SQLSetStmtAttrW(SQL_ATTR_ROWS_FETCHED_PTR reset)");
+        check(SQLFreeStmt(stmt_, SQL_UNBIND), "SQLFreeStmt(SQL_UNBIND)");
+        columns_unbound_ = true;
+    }
+
+    void close_rowset_noexcept() noexcept {
+        SQLSetStmtAttrW(stmt_, SQL_ATTR_ROW_ARRAY_SIZE, attribute_value(1), 0);
+        SQLSetStmtAttrW(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, nullptr, 0);
+        SQLFreeStmt(stmt_, SQL_UNBIND);
+    }
+
+    SQLHSTMT stmt_;
+    std::vector<SQLWCHAR> last_sql_;
+    bool prepared_ = false;
+    bool cursor_attrs_applied_ = false;
+    bool params_bound_ = false;
+    bool columns_unbound_ = false;
+    std::size_t buffer_set_ = 0;
+    std::vector<std::tuple<SQLSMALLINT, SQLSMALLINT, SQLULEN, SQLSMALLINT, bool>>
+        bound_signature_;
+    std::map<std::size_t, std::tuple<SQLSMALLINT, SQLULEN, SQLSMALLINT>> describe_cache_;
+    std::vector<PyColumn> metadata_;
+    bool metadata_complete_ = false;
+    SQLLEN row_count_ = 0;
+};
+
+}  // namespace
+
+// Each operation is one Python `run()`/loop body; `before_operation` and
+// `validate` steps that the Python workload keeps outside its timer stay untimed.
+class PyCursorRunner::Impl {
+public:
+    Impl(OdbcSession& session, const PyCursorSpec& spec, std::size_t operations_override)
+        : session_(session),
+          spec_(spec),
+          operations_(operations_override != 0 ? operations_override
+                                               : spec.operations_per_sample),
+          cursor_(session),
+          table_(std::string("#mssql_odbc_bench_") + spec.python_name) {
+        build();
+    }
+
+    const char* name() const {
+        return spec_.benchmark_name;
+    }
+
+    void preflight() {
+        create_table();
+        verify_everything_ = true;
+        run(1);
+        if (is_lob()) {
+            verify_lob_content();
+        }
+        verify_everything_ = false;
+        const std::size_t warmup = std::clamp<std::size_t>(operations_ / 10, 1, 500);
+        const auto metrics = run(warmup);
+        std::cerr << "Preflight passed for " << name() << " (mssql-python "
+                  << spec_.python_name << "): " << warmup << " warm-up operations at "
+                  << metrics.total_seconds * 1e6 / static_cast<double>(warmup)
+                  << " us/operation; " << operations_ << " operations per sample\n";
+    }
+
+    RetrievalMetrics execute() {
+        return run(operations_);
+    }
+
+private:
+    bool is_lob() const {
+        return spec_.kind == PyCursorWorkload::insert_lob_varbinary ||
+               spec_.kind == PyCursorWorkload::insert_lob_nvarchar;
+    }
+
+    void build() {
+        switch (spec_.kind) {
+        case PyCursorWorkload::query_scalar:
+            sql_ = wide_text(u"SELECT CAST(? AS INT)");
+            params_.push_back(py_int(0));
+            break;
+        case PyCursorWorkload::param_count_int:
+        case PyCursorWorkload::param_count_nvarchar: {
+            const bool text = spec_.kind == PyCursorWorkload::param_count_nvarchar;
+            std::string statement = text ? "SELECT SUM(LEN(v)) FROM (VALUES "
+                                         : "SELECT SUM(v) FROM (VALUES ";
+            for (std::size_t index = 0; index < spec_.size; ++index) {
+                statement += index == 0 ? "(?)" : ", (?)";
+                if (text) {
+                    char value[32] = {};
+                    std::snprintf(value, sizeof(value), "value-%014zu", index);
+                    params_.push_back(py_str(ascii_u16(value), false));
+                    expected_ += static_cast<std::int64_t>(std::strlen(value));
+                } else {
+                    params_.push_back(py_int(static_cast<std::int64_t>(index)));
+                    expected_ += static_cast<std::int64_t>(index);
+                }
+            }
+            statement += ") AS t(v)";
+            sql_ = wide_text(ascii_u16(statement));
+            break;
+        }
+        case PyCursorWorkload::param_types_mixed: {
+            SQL_TIMESTAMP_STRUCT stamp = {2024, 2, 29, 23, 59, 58, 123456000};
+            SQL_DATE_STRUCT day = {2024, 2, 29};
+            params_.push_back(py_int(2'147'483'647));
+            params_.push_back(py_int(9'007'199'254'740'993));
+            params_.push_back(py_fixed(SQL_C_DOUBLE, SQL_DOUBLE, 15, 0, 1.5));
+            params_.push_back(py_decimal(9, 4, 123456789));
+            params_.push_back(py_str(u"unicode-\u00fc-\u5024", true));
+            params_.push_back(py_bytes(kMixedBytes));
+            params_.push_back(py_fixed(SQL_C_BIT, SQL_BIT, 1, 0, static_cast<unsigned char>(1)));
+            params_.push_back(py_fixed(SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIMESTAMP, 26, 6, stamp));
+            params_.push_back(py_fixed(SQL_C_TYPE_DATE, SQL_TYPE_DATE, 10, 0, day));
+            params_.push_back(py_none());
+            sql_ = wide_text(u"SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?");
+            break;
+        }
+        case PyCursorWorkload::insert_lob_varbinary: {
+            std::vector<unsigned char> payload(spec_.size);
+            for (std::size_t index = 0; index < payload.size(); ++index) {
+                payload[index] = static_cast<unsigned char>(index % 251);
+            }
+            params_.push_back(py_bytes(std::move(payload)));
+            sql_ = wide_text(ascii_u16("INSERT INTO " + table_ + " (v) VALUES (?)"));
+            break;
+        }
+        case PyCursorWorkload::insert_lob_nvarchar: {
+            std::u16string text(spec_.size / sizeof(SQLWCHAR), u'A');
+            for (std::size_t index = 0; index < text.size(); ++index) {
+                text[index] = static_cast<char16_t>(u'A' + index % 26);
+            }
+            params_.push_back(py_str(text, false));
+            sql_ = wide_text(ascii_u16("INSERT INTO " + table_ + " (v) VALUES (?)"));
+            break;
+        }
+        case PyCursorWorkload::fetchmany_mixed:
+            sql_ = wide_text(ascii_u16("SELECT id, amount, label, payload FROM " + table_ +
+                                       " ORDER BY id"));
+            break;
+        }
+        if (is_lob()) {
+            truncate_sql_ = wide_text(ascii_u16("TRUNCATE TABLE " + table_));
+            check_sql_ = wide_text(ascii_u16("SELECT COUNT_BIG(*), MAX(DATALENGTH(v)) FROM " +
+                                             table_));
+        }
+        // Throughput counters: values and bytes one operation binds, streams, or
+        // fetches. Fetched bytes are SQL Server storage sizes of the generated values.
+        switch (spec_.kind) {
+        case PyCursorWorkload::insert_lob_varbinary:
+        case PyCursorWorkload::insert_lob_nvarchar:
+            cells_per_operation_ = 1;
+            bytes_per_operation_ = spec_.size;
+            break;
+        case PyCursorWorkload::fetchmany_mixed:
+            cells_per_operation_ = spec_.size * 4;
+            for (std::size_t id = 0; id < spec_.size; ++id) {
+                bytes_per_operation_ +=
+                    4 + 9 + 2 * std::to_string(id).size() + 2 * std::strlen("value-") + 32;
+            }
+            break;
+        default:
+            cells_per_operation_ = params_.size();
+            for (const auto& parameter : params_) {
+                bytes_per_operation_ += parameter.value[0].size();
+            }
+            // `fetchone` makes one SQLGetData per result column.
+            get_data_per_operation_ =
+                spec_.kind == PyCursorWorkload::param_types_mixed ? params_.size() : 1;
+            break;
+        }
+    }
+
+    // The Python workloads build these tables in `_prepare` on the same
+    // connection; here the generators are set-based T-SQL with the same values.
+    void create_table() {
+        if (!is_lob() && spec_.kind != PyCursorWorkload::fetchmany_mixed) {
+            return;
+        }
+        session_.execute_non_query("DROP TABLE IF EXISTS " + table_);
+        switch (spec_.kind) {
+        case PyCursorWorkload::insert_lob_varbinary:
+            session_.execute_non_query("CREATE TABLE " + table_ +
+                                       " (v VARBINARY(MAX) NOT NULL)");
+            break;
+        case PyCursorWorkload::insert_lob_nvarchar:
+            session_.execute_non_query("CREATE TABLE " + table_ +
+                                       " (v NVARCHAR(MAX) NOT NULL)");
+            break;
+        case PyCursorWorkload::fetchmany_mixed:
+            session_.execute_non_query(
+                "CREATE TABLE " + table_ +
+                " (id INT NOT NULL, amount DECIMAL(18, 4) NOT NULL, "
+                "label NVARCHAR(100) NOT NULL, payload VARBINARY(64) NOT NULL)");
+            session_.execute_non_query(
+                "INSERT INTO " + table_ +
+                " (id, amount, label, payload) SELECT value, "
+                "CAST(value AS DECIMAL(18, 4)) / 10, CONCAT(N'value-', value), "
+                "CAST(REPLICATE(CAST(CAST(value % 251 AS BINARY(1)) AS VARBINARY(64)), 32) "
+                "AS VARBINARY(64)) FROM GENERATE_SERIES(0, " +
+                std::to_string(spec_.size - 1) + ")");
+            break;
+        default:
+            break;
+        }
+    }
+
+    RetrievalMetrics run(std::size_t operations) {
+        double timed = 0.0;
+        std::uint64_t rows = 0;
+        std::uint64_t bytes = 0;
+        try {
+            for (std::size_t operation = 0; operation < operations; ++operation) {
+                if (is_lob()) {
+                    cursor_.execute(truncate_sql_, no_params_);
+                }
+                const auto start = std::chrono::steady_clock::now();
+                rows += run_one(operation);
+                timed += seconds_between(start, std::chrono::steady_clock::now());
+                // `query_scalar` widens to an eight-byte buffer past SMALLINT.
+                bytes += spec_.kind == PyCursorWorkload::query_scalar
+                             ? params_[0].value[0].size()
+                             : bytes_per_operation_;
+                if (is_lob()) {
+                    validate_lob_row();
+                }
+            }
+            cursor_.close();
+        } catch (...) {
+            cursor_.close_noexcept();
+            throw;
+        }
+        RetrievalMetrics metrics;
+        metrics.rows = rows;
+        metrics.cells = operations * cells_per_operation_;
+        metrics.logical_bytes = bytes;
+        metrics.get_data_calls = operations * get_data_per_operation_;
+        metrics.total_seconds = timed;
+        metrics.metadata_bind_seconds = -1.0;
+        metrics.calls = operations;
+        return metrics;
+    }
+
+    std::uint64_t run_one(std::size_t operation) {
+        switch (spec_.kind) {
+        case PyCursorWorkload::query_scalar:
+            // `for value in range(loops)` restarts at 0 every sample, so the
+            // binding narrows from TINYINT to SMALLINT partway through, as in Python.
+            assign_py_int(params_[0], static_cast<std::int64_t>(operation));
+            cursor_.execute(sql_, params_);
+            expect_int(static_cast<std::int64_t>(operation));
+            return 1;
+        case PyCursorWorkload::param_count_int:
+        case PyCursorWorkload::param_count_nvarchar:
+            cursor_.execute(sql_, params_);
+            expect_int(expected_);
+            return 1;
+        case PyCursorWorkload::param_types_mixed:
+            cursor_.execute(sql_, params_);
+            expect_mixed_row();
+            return 1;
+        case PyCursorWorkload::insert_lob_varbinary:
+        case PyCursorWorkload::insert_lob_nvarchar:
+            cursor_.execute(sql_, params_);
+            if (cursor_.row_count() != 1) {
+                throw std::runtime_error(std::string(name()) + " inserted " +
+                                         std::to_string(cursor_.row_count()) + " rows");
+            }
+            return 1;
+        case PyCursorWorkload::fetchmany_mixed:
+            return fetchmany_all();
+        }
+        throw std::logic_error("unknown py-cursor workload");
+    }
+
+    void fail(const std::string& what) const {
+        throw std::runtime_error(std::string(name()) + " correctness check failed: " + what);
+    }
+
+    void expect_int(std::int64_t expected) {
+        if (!cursor_.fetchone(row_) || row_.size() != 1 ||
+            row_[0].indicator == SQL_NULL_DATA) {
+            fail("expected one non-NULL value");
+        }
+        const auto& cell = row_[0];
+        const std::int64_t actual = cell.c_type == SQL_C_SBIGINT
+                                        ? cell.as<SQLBIGINT>()
+                                        : static_cast<std::int64_t>(cell.as<SQLINTEGER>());
+        if (actual != expected) {
+            fail("fetched " + std::to_string(actual) + ", expected " + std::to_string(expected));
+        }
+    }
+
+    void expect_mixed_row() {
+        if (!cursor_.fetchone(row_) || row_.size() != params_.size()) {
+            fail("expected one ten-column row");
+        }
+        const auto timestamp = row_[7].as<SQL_TIMESTAMP_STRUCT>();
+        const auto day = row_[8].as<SQL_DATE_STRUCT>();
+        const bool matches =
+            row_[0].as<SQLINTEGER>() == 2'147'483'647 &&
+            row_[1].as<SQLBIGINT>() == 9'007'199'254'740'993 &&
+            row_[2].as<SQLDOUBLE>() == 1.5 &&
+            parse_scaled_decimal(row_[3].data.data(),
+                                 static_cast<std::size_t>(row_[3].indicator), 4) == 123456789 &&
+            wide_equals(row_[4].data.data(), row_[4].indicator, u"unicode-\u00fc-\u5024") &&
+            row_[5].indicator == static_cast<SQLLEN>(kMixedBytes.size()) &&
+            std::equal(kMixedBytes.begin(), kMixedBytes.end(), row_[5].data.begin()) &&
+            row_[6].as<unsigned char>() == 1 && timestamp.year == 2024 &&
+            timestamp.month == 2 && timestamp.day == 29 && timestamp.hour == 23 &&
+            timestamp.minute == 59 && timestamp.second == 58 &&
+            timestamp.fraction == 123456000 && day.year == 2024 && day.month == 2 &&
+            day.day == 29 && row_[9].indicator == SQL_NULL_DATA;
+        if (!matches) {
+            fail("a mixed-type value did not round-trip");
+        }
+    }
+
+    std::uint64_t fetchmany_all() {
+        cursor_.execute(sql_, no_params_);
+        std::int32_t next = 0;
+        auto sink = [this, &next](const std::vector<PyBoundColumn>& columns, std::size_t rows) {
+            for (std::size_t row = 0; row < rows; ++row, ++next) {
+                // All columns are NOT NULL; the sentinel also catches unwritten cells.
+                for (const auto& column : columns) {
+                    if (column.indicators[row] <= 0) {
+                        fail("row " + std::to_string(next) + " has a NULL or unwritten value");
+                    }
+                }
+                SQLINTEGER id = 0;
+                std::memcpy(&id, columns[0].at(row), sizeof(id));
+                if (id != next) {
+                    fail("rows out of id order");
+                }
+                if (!verify_everything_) {
+                    continue;
+                }
+                char label[32] = {};
+                std::snprintf(label, sizeof(label), "value-%d", id);
+                const bool payload_ok =
+                    columns[3].indicators[row] == 32 &&
+                    std::all_of(columns[3].at(row), columns[3].at(row) + 32,
+                                [id](unsigned char byte) { return byte == id % 251; });
+                if (parse_scaled_decimal(columns[1].at(row),
+                                         static_cast<std::size_t>(columns[1].indicators[row]),
+                                         4) != static_cast<std::int64_t>(id) * 1000 ||
+                    !wide_equals(columns[2].at(row), columns[2].indicators[row],
+                                 ascii_u16(label)) ||
+                    !payload_ok) {
+                    fail("row " + std::to_string(id) + " differs from its generator");
+                }
+            }
+        };
+        std::uint64_t total = 0;
+        while (const auto fetched = cursor_.fetchmany(kPyFetchManyRows, sink)) {
+            total += fetched;
+        }
+        if (total != spec_.size) {
+            fail("fetched " + std::to_string(total) + " rows");
+        }
+        return total;
+    }
+
+    // The Python `validate` is untimed and runs on the same cursor; its SHA-256
+    // is replaced by this length check plus the preflight byte comparison.
+    void validate_lob_row() {
+        cursor_.execute(check_sql_, no_params_);
+        if (!cursor_.fetchone(row_) || row_.size() != 2 ||
+            row_[0].as<SQLBIGINT>() != 1 ||
+            row_[1].as<SQLBIGINT>() != static_cast<SQLBIGINT>(spec_.size)) {
+            fail("stored value has the wrong row count or length");
+        }
+    }
+
+    // Read the stored value back in chunks and compare every byte with what was
+    // streamed. Outside the replay, so the cursor forgets its prepared state.
+    void verify_lob_content() {
+        const bool text = spec_.kind == PyCursorWorkload::insert_lob_nvarchar;
+        const auto& expected = params_[0].stream;
+        const SQLHSTMT stmt = cursor_.handle();
+        auto query = wide_text(ascii_u16("SELECT v FROM " + table_));
+        std::vector<unsigned char> actual;
+        actual.reserve(expected.size());
+        std::vector<unsigned char> chunk(1 << 20);
+        try {
+            require_exact_success(SQLExecDirectW(stmt, query.data(), SQL_NTS),
+                                  "SQLExecDirectW(LOB readback)", SQL_HANDLE_STMT, stmt);
+            require_exact_success(SQLFetch(stmt), "SQLFetch(LOB readback)", SQL_HANDLE_STMT,
+                                  stmt);
+            const SQLLEN capacity = static_cast<SQLLEN>(chunk.size()) -
+                                    (text ? static_cast<SQLLEN>(sizeof(SQLWCHAR)) : 0);
+            for (;;) {
+                SQLLEN indicator = 0;
+                const SQLRETURN rc =
+                    SQLGetData(stmt, 1, text ? SQL_C_WCHAR : SQL_C_BINARY, chunk.data(),
+                               static_cast<SQLLEN>(chunk.size()), &indicator);
+                if (rc == SQL_NO_DATA) {
+                    break;
+                }
+                require_succeeded(rc, "SQLGetData(LOB readback)", stmt);
+                const SQLLEN got =
+                    (indicator == SQL_NO_TOTAL || indicator > capacity) ? capacity : indicator;
+                actual.insert(actual.end(), chunk.begin(), chunk.begin() + got);
+                if (rc == SQL_SUCCESS) {
+                    break;
+                }
+            }
+        } catch (...) {
+            cursor_.forget_statement();
+            throw;
+        }
+        cursor_.forget_statement();
+        if (actual != expected) {
+            fail("streamed value was not stored intact (" + std::to_string(actual.size()) +
+                 " of " + std::to_string(expected.size()) + " bytes read back)");
+        }
+    }
+
+    inline static const std::vector<unsigned char> kMixedBytes = {
+        0x00, 0x01, 'b', 'i', 'n', 'a', 'r', 'y', 0xFF};
+
+    OdbcSession& session_;
+    const PyCursorSpec& spec_;
+    std::size_t operations_;
+    PyCursor cursor_;
+    std::string table_;
+    std::vector<SQLWCHAR> sql_;
+    std::vector<SQLWCHAR> truncate_sql_;
+    std::vector<SQLWCHAR> check_sql_;
+    std::vector<PyParameter> params_;
+    std::vector<PyParameter> no_params_;
+    std::vector<PyCell> row_;
+    std::int64_t expected_ = 0;
+    std::uint64_t cells_per_operation_ = 0;
+    std::uint64_t bytes_per_operation_ = 0;
+    std::uint64_t get_data_per_operation_ = 0;
+    bool verify_everything_ = false;
+};
+
 // Allocate descriptors once per catalog workload; each iteration still rebinds.
 WorkloadRunner::WorkloadRunner(OdbcSession& session, const WorkloadSpec& spec)
     : impl_(std::make_unique<Impl>(session, spec)) {}
@@ -3129,6 +4519,42 @@ void ExecuteManyWriteRunner::preflight() {
 }
 
 RetrievalMetrics ExecuteManyWriteRunner::execute() {
+    return impl_->execute();
+}
+
+LatencyRunner::LatencyRunner(OdbcSession& session, const LatencySpec& spec,
+                             std::size_t calls_override)
+    : impl_(std::make_unique<Impl>(session, spec, calls_override)) {}
+
+LatencyRunner::~LatencyRunner() = default;
+
+const char* LatencyRunner::name() const {
+    return impl_->name();
+}
+
+void LatencyRunner::preflight() {
+    impl_->preflight();
+}
+
+RetrievalMetrics LatencyRunner::execute() {
+    return impl_->execute();
+}
+
+PyCursorRunner::PyCursorRunner(OdbcSession& session, const PyCursorSpec& spec,
+                               std::size_t operations_override)
+    : impl_(std::make_unique<Impl>(session, spec, operations_override)) {}
+
+PyCursorRunner::~PyCursorRunner() = default;
+
+const char* PyCursorRunner::name() const {
+    return impl_->name();
+}
+
+void PyCursorRunner::preflight() {
+    impl_->preflight();
+}
+
+RetrievalMetrics PyCursorRunner::execute() {
     return impl_->execute();
 }
 
