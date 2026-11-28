@@ -494,7 +494,7 @@ mod tests {
 
     use super::*;
     use crate::api::odbc_types::{SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO};
-    use crate::api::sqlstate::ERR_NO_ACTIVE_TDS_CLIENT;
+    use crate::api::sqlstate::{ERR_NO_ACTIVE_TDS_CLIENT, SQLSTATE_08S01};
     use crate::handles::dbc::DbcHandle;
     use crate::test_support::TestHandles;
     use crate::test_support::assert_last_diag;
@@ -672,7 +672,7 @@ mod tests {
                 state
                     .diag_records
                     .iter()
-                    .any(|d| d.sql_state == SQLSTATE_HY000 && d.native_error == 0)
+                    .any(|d| d.sql_state == SQLSTATE_08S01 && d.native_error == 0)
             );
         }
         let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
@@ -1160,7 +1160,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert_eq!(
             stmt.inner.lock().unwrap().diag_records[0].sql_state,
-            SQLSTATE_HY000
+            SQLSTATE_08S01
         );
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());

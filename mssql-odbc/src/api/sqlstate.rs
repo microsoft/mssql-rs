@@ -372,9 +372,10 @@ pub(crate) fn claim_error_diag(error: ClaimError) -> DiagMsg {
 /// The override applies **only** to errors the engine raised. A transport or
 /// protocol failure is not the server rejecting the value, so labelling a
 /// dropped connection mid-`USE` as `HY024` would send the caller hunting for a
-/// bad catalog name. Those take `HY000`, the general error state every other
-/// execution path ([`exec_common`](super::exec_common), [`fetch`](super::fetch))
-/// already uses for a failure that is not the engine's.
+/// bad catalog name. Those take [`post_tds_error`]'s general mapping instead:
+/// `08S01` for a lost connection, otherwise `HY000`. msodbcsql does relabel
+/// them, as `IDS_HY_024_01` "Database is invalid or cannot be accessed"
+/// (`sqlcmisc.cpp:1873-1898`); this driver deliberately does not.
 pub(crate) fn post_tds_error_as(
     state: &mut impl HasDiagnostics,
     err: &TdsError,
@@ -710,6 +711,34 @@ fn sqlstate_for_severity(class: i32) -> [u8; 5] {
     }
 }
 
+/// Whether `err` means the session's link is gone.
+///
+/// msodbcsql posts `08S01` ("Communication link failure") for every network
+/// read or write failure that is not its own timeout (`Parse.cpp:1449`, `:3103`;
+/// `TdsSend.cpp:989`, `:1246`, `:1272`; `sql_ums.cpp:1059`), whichever API was
+/// running. A failed or impossible session recovery posts its `IMC0x` detail
+/// record plus the same `08S01` "for Backcompat"
+/// (`connectionrecoverymanager.cpp:619-627`), and `08S01` (resource 40119)
+/// sorts ahead of every `IMC0x` (40420+), so it is record 1 there too. This
+/// driver posts only the `08S01`, carrying the recovery failure in its text.
+fn is_dead_connection(err: &TdsError) -> bool {
+    matches!(
+        err,
+        TdsError::Io(_)
+            | TdsError::ConnectionClosed(_)
+            | TdsError::SessionRecoveryFailed { .. }
+            | TdsError::SessionNotRecoverable(_)
+            | TdsError::ReconnectionValidationFailed(_)
+    )
+}
+
+/// A caller's `08xxx` default (`08001` while connecting, `08007` when a commit
+/// or rollback fails) already names the connection failure more precisely for
+/// its context than `08S01` would.
+fn is_connection_exception(state: [u8; 5]) -> bool {
+    state.starts_with(b"08")
+}
+
 /// Post one ODBC diagnostic record per server error in `err`.
 ///
 /// For [`TdsError::SqlServerError`], iterates the server-reported errors in
@@ -723,7 +752,9 @@ fn sqlstate_for_severity(class: i32) -> [u8; 5] {
 ///
 /// For any non-`SqlServerError` variant (transport, TLS, redirect, protocol,
 /// timeout, …), pushes a single record with `default`, native error 0, and
-/// the error's `Display` text.
+/// the error's `Display` text. A lost connection overrides a non-`08xxx`
+/// `default` with `08S01`, and timeouts, cancellation, and encoded-length
+/// overflows carry their own states.
 ///
 /// `default` therefore describes the caller's context for failures the engine
 /// did *not* raise — typically `08001` for connect-time failures and `HY000`
@@ -782,6 +813,7 @@ pub(crate) fn post_tds_error_with_info(
         TdsError::TimeoutError(_) => SQLSTATE_HYT00,
         TdsError::EncodedValueTooLong { .. } => SQLSTATE_22001,
         TdsError::OperationCancelledError(_) => SQLSTATE_HY008,
+        cause if is_dead_connection(cause) && !is_connection_exception(default) => SQLSTATE_08S01,
         _ => default,
     };
     post_sql_error(state, sqlstate, 0, err.to_string());
@@ -1237,6 +1269,47 @@ mod tests {
         post_tds_error(&mut s, &err, SQLSTATE_HY000);
         assert_eq!(s.records.len(), 1);
         assert_eq!(s.records[0].sql_state, SQLSTATE_HY008);
+    }
+
+    fn dead_connection_errors() -> [TdsError; 5] {
+        [
+            TdsError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "An existing connection was forcibly closed by the remote host. (os error 10054)",
+            )),
+            TdsError::ConnectionClosed(
+                "Connection is dead and session state does not allow recovery".into(),
+            ),
+            TdsError::SessionRecoveryFailed {
+                attempts: 1,
+                message: "refused".into(),
+            },
+            TdsError::SessionNotRecoverable("Session state does not allow recovery".into()),
+            TdsError::ReconnectionValidationFailed("TDS version changed".into()),
+        ]
+    }
+
+    #[test]
+    fn dead_connection_maps_to_08s01_over_a_generic_default() {
+        for err in dead_connection_errors() {
+            let mut s = FakeState::default();
+            post_tds_error(&mut s, &err, SQLSTATE_HY000);
+            assert_eq!(s.records.len(), 1, "{err:?}");
+            assert_eq!(s.records[0].sql_state, SQLSTATE_08S01, "{err:?}");
+            assert_eq!(s.records[0].native_error, 0, "{err:?}");
+            assert!(s.records[0].message.ends_with(&err.to_string()), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn dead_connection_keeps_a_connection_exception_default() {
+        for default in [SQLSTATE_08001, SQLSTATE_08007] {
+            for err in dead_connection_errors() {
+                let mut s = FakeState::default();
+                post_tds_error(&mut s, &err, default);
+                assert_eq!(s.records[0].sql_state, default, "{err:?}");
+            }
+        }
     }
 
     #[test]

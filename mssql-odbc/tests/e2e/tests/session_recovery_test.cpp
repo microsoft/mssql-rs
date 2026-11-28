@@ -12,11 +12,19 @@
 // driver already requests recovery via the default connect_retry_count = 1.
 
 #include "odbc_test_fixture.h"
+#include "odbc_concurrent_test.h"
 
 #include <chrono>
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifndef SQL_ATTR_CONNECTION_DEAD
+#define SQL_ATTR_CONNECTION_DEAD 1209
+#endif
+#ifndef SQL_CD_TRUE
+#define SQL_CD_TRUE 1
+#endif
 
 class SessionRecoveryLiveTest : public ODBCTest {
 protected:
@@ -167,16 +175,11 @@ TEST_F(SessionRecoveryLiveTest, StaleHandleAfterReconnectIsInvalidatedAndReprepa
 // client back to the connection, so the next execute sees a dead socket and
 // recovers through the same check_and_reconnect path every other command uses.
 TEST_F(SessionRecoveryLiveTest, ConnectionRecoversAfterDataAtExecutionDiesOnTheWire) {
-    // Measured divergence. Against msodbcsql this scenario ends differently
-    // twice over: the failed call reports 08S01 where mssql-odbc reports
-    // HY000, and a fresh statement on the same connection keeps failing 08S01
-    // instead of reconnecting, where mssql-odbc reconnects.
-    //
-    // The first is error mapping -- mssql-odbc routes the whole exec path
-    // through fail_with_tds, which posts HY000 for every TDS error, so a lost
-    // socket is not distinguished from a server-side error. The second is
-    // recovery policy, where mssql-odbc is the more forgiving of the two.
-    // Neither is specific to data-at-execution, so both are out of scope here.
+    // Measured divergence. Against msodbcsql a fresh statement on the same
+    // connection keeps failing 08S01 instead of reconnecting, where mssql-odbc
+    // reconnects. That is recovery policy, where mssql-odbc is the more
+    // forgiving of the two, and is not specific to data-at-execution, so it is
+    // out of scope here. The failed call itself reports 08S01 on both drivers.
     SKIP_IF_COMPARING_MSODBCSQL();
 
     const std::string kConnectTimeSql =
@@ -223,11 +226,10 @@ TEST_F(SessionRecoveryLiveTest, ConnectionRecoversAfterDataAtExecutionDiesOnTheW
     }
     ASSERT_EQ(SQL_ERROR, rc);
 
-    // Both calls route an I/O failure through fail_with_tds, which posts
-    // SQLSTATE_HY000, so this holds whichever one failed. 22026 or HY010 would
-    // mean the driver rejected the call locally and the aborted-transport path
-    // this test exists for never ran.
-    EXPECT_EQ("HY000", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
+    // A lost socket is a communication link failure whichever call saw it.
+    // 22026 or HY010 would mean the driver rejected the call locally and the
+    // aborted-transport path this test exists for never ran.
+    EXPECT_EQ("08S01", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
 
     // The sequence is over and the client is back on the connection. A fresh
     // statement must reconnect transparently rather than inheriting the dead
@@ -241,4 +243,75 @@ TEST_F(SessionRecoveryLiveTest, ConnectionRecoversAfterDataAtExecutionDiesOnTheW
     EXPECT_NE(original_connect_time, recovered_connect_time)
         << "expected a fresh physical login after the aborted streamed write";
     SQLFreeHandle(SQL_HANDLE_STMT, probe);
+}
+
+// With session recovery off, a session the server has killed leaves the client
+// a dead socket. The next execute is a communication link failure, 08S01, as on
+// msodbcsql, not a general HY000 (AB#50903); the execute after it finds the
+// connection already known dead and reports the same.
+ODBC_TEST_F(SessionRecoveryLiveTest, KilledSessionWithoutRecoveryReports08S01) {
+    struct Victim {
+        SQLHDBC dbc = SQL_NULL_HDBC;
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        bool connected = false;
+        ~Victim() {
+            if (stmt != SQL_NULL_HSTMT) SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+            if (connected) SQLDisconnect(dbc);
+            if (dbc != SQL_NULL_HDBC) SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+        }
+    } victim;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, env_, &victim.dbc), SQL_HANDLE_ENV, env_);
+    // A repeated keyword takes its first value, so this wins over any
+    // ConnectRetryCount in the configured connection string.
+    SqlTString connstr = ODBCTestUtils::ToSqlTStr("ConnectRetryCount=0;") +
+                         ODBCTestUtils::BuildConnectionString();
+    SQLTCHAR outStr[1024] = {};
+    SQLSMALLINT outLen = 0;
+    ASSERT_SQL_OK(
+        SQLDriverConnect(victim.dbc, nullptr, const_cast<SQLTCHAR*>(connstr.c_str()),
+                         static_cast<SQLSMALLINT>(connstr.size()), outStr,
+                         static_cast<SQLSMALLINT>(sizeof(outStr) / sizeof(SQLTCHAR)),
+                         &outLen, SQL_DRIVER_NOPROMPT),
+        SQL_HANDLE_DBC, victim.dbc);
+    victim.connected = true;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, victim.dbc, &victim.stmt), SQL_HANDLE_DBC,
+                  victim.dbc);
+
+    const std::string spid = GetStringScalar(victim.stmt, "SELECT @@SPID");
+    ASSERT_FALSE(spid.empty());
+    const std::string connect_time = GetStringScalar(
+        victim.stmt,
+        "SELECT CONVERT(varchar(30), connect_time, 121) "
+        "FROM sys.dm_exec_connections WHERE session_id = @@SPID");
+    ASSERT_FALSE(connect_time.empty());
+
+    ExecDirect("KILL " + spid);
+    SQLFreeStmt(stmt_, SQL_CLOSE);
+    // KILL returns before the session is gone. Wait for the server to drop
+    // this physical connection (SPIDs are reused, so match its connect_time).
+    const std::string remaining_sql =
+        "SELECT COUNT(*) FROM sys.dm_exec_connections WHERE session_id = " + spid +
+        " AND CONVERT(varchar(30), connect_time, 121) = '" + connect_time + "'";
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    std::string remaining;
+    while ((remaining = GetStringScalar(stmt_, remaining_sql)) != "0" &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_EQ("0", remaining) << "the killed session's connection is still open";
+
+    const SqlTString select = ODBCTestUtils::ToSqlTStr("SELECT 1");
+    for (const char* call : {"first execute", "second execute"}) {
+        SCOPED_TRACE(call);
+        EXPECT_EQ(SQL_ERROR,
+                  SQLExecDirect(victim.stmt, const_cast<SQLTCHAR*>(select.c_str()), SQL_NTS));
+        EXPECT_EQ("08S01", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, victim.stmt));
+        SQLFreeStmt(victim.stmt, SQL_CLOSE);
+    }
+
+    SQLUINTEGER dead = 0;
+    EXPECT_SQL_OK(SQLGetConnectAttr(victim.dbc, SQL_ATTR_CONNECTION_DEAD, &dead, SQL_IS_UINTEGER,
+                                    nullptr),
+                  SQL_HANDLE_DBC, victim.dbc);
+    EXPECT_EQ(static_cast<SQLUINTEGER>(SQL_CD_TRUE), dead);
 }

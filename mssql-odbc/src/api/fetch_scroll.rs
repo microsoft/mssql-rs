@@ -3076,7 +3076,9 @@ mod tests {
         SQL_INTEGER, SQL_WVARCHAR,
     };
     use crate::api::sqlstate::SQLSTATE_HY106;
-    use crate::api::sqlstate::{ERR_CONNECTION_BUSY, SQLSTATE_24000, SQLSTATE_HY000};
+    use crate::api::sqlstate::{
+        ERR_CONNECTION_BUSY, SQLSTATE_08S01, SQLSTATE_24000, SQLSTATE_HY000,
+    };
     use crate::handles::dbc::DbcHandle;
     use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
     use crate::test_support::TestHandles;
@@ -7148,6 +7150,7 @@ mod tests {
         }
         assert_eq!(fetch_next(&h), SQL_ERROR);
         assert!(!posted_native(&h, 8134));
+        assert_eq!(last_state(&h), SQLSTATE_08S01, "the link is gone");
         assert_eq!(fetch_next(&h), SQL_ERROR);
         assert_eq!(last_state(&h), SQLSTATE_24000, "nothing resumes after it");
     }
