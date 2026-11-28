@@ -354,8 +354,8 @@ As in the Python workloads, the `TRUNCATE` before each LOB insert and the stored
 row check after it run on the same cursor but outside the timer, so every insert
 re-prepares. Each sample closes the cursor outside the timer, so other
 benchmarks can use the connection. Every operation checks its result: fetched
-values, the insert's row count and the stored length, and row order and NULL
-count for the fetch workloads. Preflight additionally compares every fetched
+values, the insert's row count and the stored length, and row order and every
+indicator for the fetch workload. Preflight additionally compares every fetched
 cell with its generator and reads each streamed value back byte for byte, where
 the Python suite checks a SHA-256.
 

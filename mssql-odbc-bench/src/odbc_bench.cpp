@@ -4350,6 +4350,12 @@ private:
         std::int32_t next = 0;
         auto sink = [this, &next](const std::vector<PyBoundColumn>& columns, std::size_t rows) {
             for (std::size_t row = 0; row < rows; ++row, ++next) {
+                // All columns are NOT NULL; the sentinel also catches unwritten cells.
+                for (const auto& column : columns) {
+                    if (column.indicators[row] <= 0) {
+                        fail("row " + std::to_string(next) + " has a NULL or unwritten value");
+                    }
+                }
                 SQLINTEGER id = 0;
                 std::memcpy(&id, columns[0].at(row), sizeof(id));
                 if (id != next) {
