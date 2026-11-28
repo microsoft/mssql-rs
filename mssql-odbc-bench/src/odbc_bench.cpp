@@ -16,6 +16,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -231,21 +232,20 @@ std::string brace_connection_value(std::string_view value) {
 
 using SqlString = std::basic_string<SQLTCHAR>;
 
-#ifdef UNICODE
-// Append a Unicode scalar using the UTF-16 representation SQLTCHAR expects.
-void append_code_point(SqlString& output, std::uint32_t code_point) {
+// Append a Unicode scalar as UTF-16.
+void append_code_point(std::u16string& output, std::uint32_t code_point) {
     if (code_point <= 0xFFFF) {
-        output.push_back(static_cast<SQLTCHAR>(code_point));
+        output.push_back(static_cast<char16_t>(code_point));
         return;
     }
     code_point -= 0x10000;
-    output.push_back(static_cast<SQLTCHAR>(0xD800 + (code_point >> 10)));
-    output.push_back(static_cast<SQLTCHAR>(0xDC00 + (code_point & 0x3FF)));
+    output.push_back(static_cast<char16_t>(0xD800 + (code_point >> 10)));
+    output.push_back(static_cast<char16_t>(0xDC00 + (code_point & 0x3FF)));
 }
 
-// Validate UTF-8 while converting pipeline-provided text to the ODBC wide API.
-SqlString to_sql_string(std::string_view input) {
-    SqlString output;
+// Validate pipeline-provided UTF-8 while converting it to UTF-16.
+std::u16string utf8_to_utf16(std::string_view input) {
+    std::u16string output;
     output.reserve(input.size());
     for (std::size_t index = 0; index < input.size();) {
         const auto first = static_cast<unsigned char>(input[index]);
@@ -289,6 +289,12 @@ SqlString to_sql_string(std::string_view input) {
         index += count;
     }
     return output;
+}
+
+#ifdef UNICODE
+SqlString to_sql_string(std::string_view input) {
+    const auto wide = utf8_to_utf16(input);
+    return SqlString(wide.begin(), wide.end());
 }
 #else
 // The narrow build intentionally passes the UTF-8 byte sequence unchanged.
@@ -931,6 +937,19 @@ const std::array<PyCursorSpec, kPyCursorWorkloadCount>& py_cursor_workloads() {
     return specs;
 }
 
+// SQLAlchemy and Django operations, each the ODBC call sequence mssql-python 1.18
+// was traced issuing for it. Sample sizes put one sample at roughly 1 s on
+// msodbcsql18 against a local SQL Server 2022.
+const std::array<OrmSpec, kOrmWorkloadCount>& orm_workloads() {
+    static const std::array<OrmSpec, kOrmWorkloadCount> specs = {{
+        {"orm/select1_4b/sqlalchemy_checkout_rollback", "orm",
+         OrmWorkload::sqlalchemy_checkout_select1, 2'000},
+        {"orm/get_by_pk_1_row_c2_8b/django_get", "orm", OrmWorkload::django_get_by_pk, 2'000},
+        {"connect/sql_login_tls/connect_close", "connect", OrmWorkload::connect_close, 100},
+    }};
+    return specs;
+}
+
 // Resolve one explicit configuration contract shared by both executables.
 Config Config::from_environment() {
     Config config;
@@ -999,11 +1018,16 @@ Config Config::from_environment() {
             std::any_of(py_cursor_workloads().begin(), py_cursor_workloads().end(),
                         [&config](const PyCursorSpec& spec) {
                             return config.scenario == spec.scenario;
+                        }) ||
+            std::any_of(orm_workloads().begin(), orm_workloads().end(),
+                        [&config](const OrmSpec& spec) {
+                            return config.scenario == spec.scenario;
                         });
         if (!known) {
             throw std::runtime_error(
                 "ODBC_BENCH_SCENARIO must be one of narrow, wide, rowset, varwidth, "
-                "getdata, write, pywrite, latency, params, lobwrite, cursorfetch, or unset");
+                "getdata, write, pywrite, latency, params, lobwrite, cursorfetch, orm, "
+                "connect, or unset");
         }
     }
     const auto calls_override = environment_value("ODBC_BENCH_CALLS");
@@ -1122,6 +1146,10 @@ void OdbcSession::release() noexcept {
         SQLFreeHandle(SQL_HANDLE_ENV, env_);
         env_ = SQL_NULL_HENV;
     }
+}
+
+SQLHENV OdbcSession::environment() const {
+    return env_;
 }
 
 SQLHDBC OdbcSession::connection() const {
@@ -3557,11 +3585,21 @@ public:
     explicit PyCursor(OdbcSession& session) : stmt_(allocate_statement(session)) {}
 
     ~PyCursor() {
-        SQLFreeHandle(SQL_HANDLE_STMT, stmt_);
+        if (stmt_ != SQL_NULL_HSTMT) {
+            SQLFreeHandle(SQL_HANDLE_STMT, stmt_);
+        }
     }
 
     PyCursor(const PyCursor&) = delete;
     PyCursor& operator=(const PyCursor&) = delete;
+
+    // `Cursor.close`: SQLFreeHandle with the result left open, as mssql-python
+    // frees it; checked here because the ORM replays time it.
+    void free_handle() {
+        const SQLHSTMT stmt = std::exchange(stmt_, SQLHSTMT{SQL_NULL_HSTMT});
+        require_exact_success(SQLFreeHandle(SQL_HANDLE_STMT, stmt),
+                              "SQLFreeHandle(SQL_HANDLE_STMT)", SQL_HANDLE_STMT, stmt);
+    }
 
     SQLHSTMT handle() const {
         return stmt_;
@@ -4450,6 +4488,240 @@ private:
     bool verify_everything_ = false;
 };
 
+namespace {
+
+constexpr std::size_t kDjangoChunkRows = 100;   // django GET_ITERATOR_CHUNK_SIZE
+constexpr std::int64_t kWorldRows = 10'000;
+
+// TechEmpower `World.randomNumber`, in a closed form setup T-SQL also computes.
+std::int64_t world_random_number(std::int64_t id) {
+    return id * 7919 % 10000 + 1;
+}
+
+}  // namespace
+
+// Each operation is one framework call, replayed with the ODBC calls mssql-python
+// 1.18 makes for it under SQLAlchemy 2.1.9 `mssql+mssqlpython` or Django 6.1 with
+// mssql-django 2.0 `python_driver="mssql_python"`. A `PyCursor` per framework
+// cursor reproduces the per-cursor handle lifecycle; the transaction end is what
+// the framework issues on the connection.
+class OrmRunner::Impl {
+public:
+    Impl(OdbcSession& session, const OrmSpec& spec, const Config& config)
+        : session_(session),
+          spec_(spec),
+          operations_(config.calls_override != 0 ? config.calls_override
+                                                 : spec.operations_per_sample),
+          table_("#mssql_odbc_bench_orm_" + std::to_string(static_cast<int>(spec.kind))) {
+        switch (spec_.kind) {
+        case OrmWorkload::sqlalchemy_checkout_select1:
+            sql_ = wide_text(u"SELECT 1");
+            bytes_per_operation_ = sizeof(SQLINTEGER);
+            cells_per_operation_ = 1;
+            break;
+        case OrmWorkload::django_get_by_pk:
+            sql_ = wide_text(ascii_u16("SELECT TOP 21 [world].[id], [world].[randomnumber] FROM [" +
+                                       table_ + "] AS [world] WHERE [world].[id] = ?"));
+            bytes_per_operation_ = 2 * sizeof(SQLINTEGER);
+            cells_per_operation_ = 2;
+            // A fixed list per process, as the Python harness draws its ids once.
+            for (std::size_t k = 0; k < operations_; ++k) {
+                ids_.push_back(1 + static_cast<std::int64_t>(
+                                       splitmix64(k) % static_cast<std::uint64_t>(kWorldRows)));
+            }
+            break;
+        case OrmWorkload::connect_close: {
+            const auto wide = utf8_to_utf16(config.connection_string());
+            connection_string_.assign(wide.begin(), wide.end());
+            connection_string_.push_back(0);
+            break;
+        }
+        }
+    }
+
+    const char* name() const {
+        return spec_.benchmark_name;
+    }
+
+    void preflight() {
+        create_table();
+        run(1);
+        const std::size_t warmup = std::clamp<std::size_t>(operations_ / 10, 1, 200);
+        const auto metrics = run(warmup);
+        std::cerr << "Preflight passed for " << name() << ": " << warmup
+                  << " warm-up operations at "
+                  << metrics.total_seconds * 1e6 / static_cast<double>(warmup)
+                  << " us/operation; " << operations_ << " operations per sample\n";
+    }
+
+    RetrievalMetrics execute() {
+        return run(operations_);
+    }
+
+private:
+    void create_table() {
+        if (spec_.kind != OrmWorkload::django_get_by_pk) {
+            return;
+        }
+        session_.execute_non_query("DROP TABLE IF EXISTS " + table_);
+        session_.execute_non_query("CREATE TABLE " + table_ +
+                                   " (id INT NOT NULL PRIMARY KEY, randomnumber INT NOT NULL)");
+        session_.execute_non_query("INSERT INTO " + table_ +
+                                   " SELECT value, value * 7919 % 10000 + 1 FROM "
+                                   "GENERATE_SERIES(1, " + std::to_string(kWorldRows) + ")");
+    }
+
+    RetrievalMetrics run(std::size_t operations) {
+        // SQLAlchemy connections run with mssql-python's default autocommit=False;
+        // Django switches its connection to autocommit.
+        std::optional<AutocommitOffScope> manual_commit;
+        if (spec_.kind == OrmWorkload::sqlalchemy_checkout_select1) {
+            manual_commit.emplace(session_);
+        }
+        double timed = 0.0;
+        std::uint64_t rows = 0;
+        for (std::size_t operation = 0; operation < operations; ++operation) {
+            const auto start = std::chrono::steady_clock::now();
+            rows += run_one(operation);
+            timed += seconds_between(start, std::chrono::steady_clock::now());
+        }
+        RetrievalMetrics metrics;
+        metrics.rows = rows;
+        metrics.cells = operations * cells_per_operation_;
+        metrics.logical_bytes = operations * bytes_per_operation_;
+        metrics.total_seconds = timed;
+        metrics.metadata_bind_seconds = -1.0;
+        metrics.calls = operations;
+        return metrics;
+    }
+
+    std::uint64_t run_one(std::size_t operation) {
+        switch (spec_.kind) {
+        case OrmWorkload::sqlalchemy_checkout_select1: {
+            PyCursor cursor(session_);
+            cursor.execute(sql_, no_params_);
+            expect_scalar(cursor, 1);
+            cursor.free_handle();
+            // The pool's reset-on-return.
+            require_exact_success(
+                SQLEndTran(SQL_HANDLE_DBC, session_.connection(), SQL_ROLLBACK),
+                "SQLEndTran(SQL_ROLLBACK)", SQL_HANDLE_DBC, session_.connection());
+            return 1;
+        }
+        case OrmWorkload::django_get_by_pk: {
+            const auto id = ids_[operation % ids_.size()];
+            PyCursor cursor(session_);
+            params_.assign(1, py_int(id));
+            cursor.execute(sql_, params_);
+            std::size_t rows = 0;
+            auto sink = [this, id, &rows](const std::vector<PyBoundColumn>& columns,
+                                          std::size_t fetched) {
+                rows += fetched;
+                if (fetched != 0) {
+                    expect_world_row(columns, id);
+                }
+            };
+            while (cursor.fetchmany(kDjangoChunkRows, sink) != 0) {
+            }
+            if (rows != 1) {
+                fail("get returned " + std::to_string(rows) + " rows");
+            }
+            // Frees a prepared statement: the driver releases the server handle.
+            cursor.free_handle();
+            return 1;
+        }
+        case OrmWorkload::connect_close:
+            connect_close();
+            return 0;
+        }
+        throw std::logic_error("unknown ORM workload");
+    }
+
+    void expect_world_row(const std::vector<PyBoundColumn>& columns, std::int64_t id) {
+        SQLINTEGER actual_id = 0;
+        SQLINTEGER number = 0;
+        std::memcpy(&actual_id, columns[0].at(0), sizeof(actual_id));
+        std::memcpy(&number, columns[1].at(0), sizeof(number));
+        if (actual_id != id || number != world_random_number(id)) {
+            fail("world " + std::to_string(id) + " returned (" + std::to_string(actual_id) +
+                 ", " + std::to_string(number) + ")");
+        }
+    }
+
+    void expect_scalar(PyCursor& cursor, std::int64_t expected) {
+        if (!cursor.fetchone(row_) || row_.size() != 1 || row_[0].indicator == SQL_NULL_DATA) {
+            fail("expected one non-NULL value");
+        }
+        const auto actual = static_cast<std::int64_t>(row_[0].as<SQLINTEGER>());
+        if (actual != expected) {
+            fail("fetched " + std::to_string(actual) + ", expected " + std::to_string(expected));
+        }
+    }
+
+    // `mssql_python.connect()` then `close()`: AUTOCOMMIT is set before connecting
+    // and read back twice; close rolls back, disconnects, and frees.
+    void connect_close() {
+        SQLHDBC dbc = SQL_NULL_HDBC;
+        require_exact_success(SQLAllocHandle(SQL_HANDLE_DBC, session_.environment(), &dbc),
+                              "SQLAllocHandle(SQL_HANDLE_DBC)", SQL_HANDLE_ENV,
+                              session_.environment());
+        bool connected = false;
+        try {
+            require_exact_success(
+                SQLSetConnectAttrW(dbc, SQL_ATTR_AUTOCOMMIT,
+                                   attribute_value(SQL_AUTOCOMMIT_OFF), SQL_IS_INTEGER),
+                "SQLSetConnectAttrW(SQL_ATTR_AUTOCOMMIT)", SQL_HANDLE_DBC, dbc);
+            const SQLRETURN rc =
+                SQLDriverConnectW(dbc, nullptr, connection_string_.data(), SQL_NTS, nullptr, 0,
+                                  nullptr, SQL_DRIVER_NOPROMPT);
+            if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
+                throw_odbc_error("SQLDriverConnectW", rc, SQL_HANDLE_DBC, dbc);
+            }
+            connected = true;
+            for (int read = 0; read < 2; ++read) {
+                SQLUINTEGER autocommit = SQL_AUTOCOMMIT_ON;
+                SQLINTEGER length = 0;
+                require_exact_success(SQLGetConnectAttrW(dbc, SQL_ATTR_AUTOCOMMIT, &autocommit,
+                                                         sizeof(autocommit), &length),
+                                      "SQLGetConnectAttrW(SQL_ATTR_AUTOCOMMIT)",
+                                      SQL_HANDLE_DBC, dbc);
+                if (autocommit != SQL_AUTOCOMMIT_OFF) {
+                    fail("new connection reports autocommit on");
+                }
+            }
+            require_exact_success(SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_ROLLBACK),
+                                  "SQLEndTran(SQL_ROLLBACK)", SQL_HANDLE_DBC, dbc);
+            connected = false;
+            require_exact_success(SQLDisconnect(dbc), "SQLDisconnect", SQL_HANDLE_DBC, dbc);
+        } catch (...) {
+            if (connected) {
+                SQLDisconnect(dbc);
+            }
+            SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+            throw;
+        }
+        require_exact_success(SQLFreeHandle(SQL_HANDLE_DBC, dbc),
+                              "SQLFreeHandle(SQL_HANDLE_DBC)", SQL_HANDLE_DBC, dbc);
+    }
+
+    [[noreturn]] void fail(const std::string& what) const {
+        throw std::runtime_error(std::string(name()) + " correctness check failed: " + what);
+    }
+
+    OdbcSession& session_;
+    const OrmSpec& spec_;
+    std::size_t operations_;
+    std::string table_;
+    std::vector<SQLWCHAR> sql_;
+    std::vector<SQLWCHAR> connection_string_;
+    std::vector<PyParameter> params_;
+    std::vector<PyParameter> no_params_;
+    std::vector<std::int64_t> ids_;
+    std::vector<PyCell> row_;
+    std::uint64_t bytes_per_operation_ = 0;
+    std::uint64_t cells_per_operation_ = 0;
+};
+
 // Allocate descriptors once per catalog workload; each iteration still rebinds.
 WorkloadRunner::WorkloadRunner(OdbcSession& session, const WorkloadSpec& spec)
     : impl_(std::make_unique<Impl>(session, spec)) {}
@@ -4539,6 +4811,23 @@ void PyCursorRunner::preflight() {
 }
 
 RetrievalMetrics PyCursorRunner::execute() {
+    return impl_->execute();
+}
+
+OrmRunner::OrmRunner(OdbcSession& session, const OrmSpec& spec, const Config& config)
+    : impl_(std::make_unique<Impl>(session, spec, config)) {}
+
+OrmRunner::~OrmRunner() = default;
+
+const char* OrmRunner::name() const {
+    return impl_->name();
+}
+
+void OrmRunner::preflight() {
+    impl_->preflight();
+}
+
+RetrievalMetrics OrmRunner::execute() {
     return impl_->execute();
 }
 
