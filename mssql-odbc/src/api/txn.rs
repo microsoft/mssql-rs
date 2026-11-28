@@ -876,13 +876,13 @@ pub(super) mod test_hooks {
 ///
 /// The eager begin is deliberate parity with msodbcsql rather than an
 /// optimization, and it is not free: it costs a round trip at the switch and
-/// leaves an empty transaction pinning the log and version store until the
-/// application commits, rolls back, or disconnects. On a pooled connection that
-/// can be the life of the pool entry. `set_txn_isolation` and
-/// `rollback_before_disconnect` dispose of an open transaction with
-/// `local_tran_started == false` for this reason; `end_transaction` leaves it
-/// in place, since msodbcsql issues no transaction-manager request when nothing
-/// was started.
+/// leaves an empty transaction open until the application commits, rolls back,
+/// or disconnects. On a pooled connection that can be the life of the pool
+/// entry. `set_txn_isolation` disposes of an open transaction with
+/// `local_tran_started == false` before changing the level; `end_transaction`
+/// leaves it in place, since msodbcsql issues no transaction-manager request
+/// when nothing was started; and disconnect leaves it to the server, as
+/// msodbcsql does.
 fn switch_to_manual_commit(dbc: &DbcHandle, op: &str) -> SqlReturn {
     if close_all_cursors(dbc) == SQL_ERROR {
         return fail_cursor_close(dbc, op);
@@ -1008,8 +1008,8 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
     // the transaction did not start under SNAPSHOT. msodbcsql sends only the SET
     // and so reports that 3951 on the next statement (measured on 18.7.1); this
     // driver closes the empty transaction, applies the change, and reopens it so
-    // manual-commit mode is left with a transaction pending under the new level.
-    // Rolling back loses nothing because there is nothing in it.
+    // manual-commit mode is left with a transaction pending under the new level
+    // (parity entry 46). Rolling back loses nothing because there is nothing in it.
     let reopen = client.has_active_transaction();
     let mut result = if reopen {
         debug!("{OP}: rolling back empty driver-begun transaction to apply isolation");
@@ -1061,10 +1061,15 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
     .unwrap_or_else(|ret| ret)
 }
 
-/// Rolls back a driver-begun transaction that carries no user work, so the
-/// session is not left holding locks when the socket drops. Best-effort: every
-/// failure is logged and swallowed, and no diagnostic is posted, because the
-/// caller is already tearing the connection down.
+/// Closes cursors before teardown and, only if user work started after
+/// `SQLDisconnect`'s 25000 check (another thread's statement), rolls it back.
+/// A driver-begun transaction with no user work — from the autocommit switch or
+/// `SQLEndTran` — is left to the server, which rolls it back when the socket
+/// closes; it holds no locks. msodbcsql sends nothing at disconnect either
+/// (`sqlcconn.cpp`, `SQLDisconnect`: "all server side resources associated with
+/// the connection will be released by server"). Best-effort: every failure is
+/// logged and swallowed, and no diagnostic is posted, because the caller is
+/// already tearing the connection down.
 ///
 /// Skipped entirely once the process is exiting — see the round-trip guard
 /// below. `SQLDisconnect` sits between `SQLFreeHandle(SQL_HANDLE_STMT)` and
@@ -1088,11 +1093,15 @@ fn rollback_before_disconnect_inner(dbc: &DbcHandle, process_is_shutting_down: b
         return;
     }
 
-    let client = match dbc.inner.lock() {
-        Ok(mut state) => state
-            .wire
-            .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
-            .ok(),
+    // Read with the claim, which shuts out further executes.
+    let (client, user_work) = match dbc.inner.lock() {
+        Ok(mut state) => (
+            state
+                .wire
+                .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+                .ok(),
+            state.local_tran_started,
+        ),
         Err(_) => {
             error!("{OP}: dbc mutex poisoned");
             return;
@@ -1109,7 +1118,9 @@ fn rollback_before_disconnect_inner(dbc: &DbcHandle, process_is_shutting_down: b
     // (AB#47510). Skipping costs nothing the exit does not already cost: this
     // transaction carries no user work, and the server rolls it back when the
     // socket closes — the same fallback the cursor-sweep bail-out above takes.
-    if process_is_shutting_down {
+    if !user_work {
+        debug!("{OP}: no user work — the server will roll back on disconnect");
+    } else if process_is_shutting_down {
         debug!("{OP}: process is exiting — the server will roll back on disconnect");
     } else if client.has_active_transaction()
         && let Err(e) = ConnectionTimeout::new(dbc).and_then(|timeout| {
@@ -1670,6 +1681,9 @@ mod tests {
         assert!(!dbc.inner.lock().unwrap().server_isolation_unknown);
     }
 
+    /// Only user work that started after `SQLDisconnect`'s 25000 check is
+    /// rolled back at disconnect, so this drives that path directly; a plain
+    /// disconnect sends nothing (`auto_begin::disconnect_*`).
     #[test]
     fn connection_timeout_bounds_disconnect_rollback() {
         let h = TestHandles::with_env_dbc();
@@ -1684,10 +1698,13 @@ mod tests {
             set_attr(&h, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF),
             SQL_SUCCESS
         );
+        dbc.inner.lock().unwrap().local_tran_started = true;
         let started = Instant::now();
-        assert_eq!(unsafe { crate::api::SQLDisconnect(h.dbc) }, SQL_SUCCESS);
+        rollback_before_disconnect_inner(dbc, false);
         let elapsed = started.elapsed();
         assert!((Duration::from_millis(500)..Duration::from_secs(3)).contains(&elapsed));
+        dbc.inner.lock().unwrap().local_tran_started = false;
+        assert_eq!(unsafe { crate::api::SQLDisconnect(h.dbc) }, SQL_SUCCESS);
         assert_eq!(get_attr(&h, SQL_ATTR_CONNECTION_DEAD), SQL_CD_TRUE);
         drop(server);
     }
@@ -3452,16 +3469,26 @@ mod tests {
         }
 
         #[test]
-        fn disconnect_after_end_tran_is_allowed_and_begins_nothing() {
-            let (h, server) = fixture();
-            begin_user_transaction(&h);
-            assert_eq!(end_tran(&h, false), SQL_SUCCESS);
-            let from = server.transaction_manager_requests().len();
-            assert_eq!(unsafe { crate::api::SQLDisconnect(h.dbc) }, SQL_SUCCESS);
-            assert_eq!(
-                requests_since(&server, from),
-                [(TM_ROLLBACK_XACT, NO_BEGIN)]
-            );
+        fn disconnect_after_end_tran_is_allowed_and_sends_nothing() {
+            for (switch_only, commit) in [(false, false), (false, true), (true, false)] {
+                let (h, server) = fixture();
+                if switch_only {
+                    assert_eq!(
+                        set_attr(&h, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF),
+                        SQL_SUCCESS
+                    );
+                } else {
+                    begin_user_transaction(&h);
+                    assert_eq!(end_tran(&h, commit), SQL_SUCCESS);
+                }
+                assert_eq!(txn_state(&h), (false, true));
+                let from = server.transaction_manager_requests().len();
+                assert_eq!(unsafe { crate::api::SQLDisconnect(h.dbc) }, SQL_SUCCESS);
+                assert!(
+                    requests_since(&server, from).is_empty(),
+                    "the server rolls the empty transaction back at socket close"
+                );
+            }
         }
 
         #[test]

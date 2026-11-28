@@ -1597,3 +1597,34 @@ msodbcsql build is measured.
     and a CP932 locale would close it. Chosen by the change author for
     [AB#49106](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/49106);
     maintainer sign-off is pending review.
+
+46. **Changing isolation while a driver-begun transaction is open reopens that
+    transaction under the new level.** In manual-commit mode a transaction is
+    open with no user work after the autocommit OFF switch and, since
+    `SQLEndTran` folds the next begin into the commit or rollback request
+    (`SQL_COPT_SS_AUTOBEGINTXN`), after every `SQLEndTran`. msodbcsql's
+    isolation setter (`sqlcmisc.cpp`, `SQL_ATTR_TXN_ISOLATION`) sends only
+    `SET TRANSACTION ISOLATION LEVEL` inside that transaction. For SNAPSHOT,
+    SQL Server accepts the SET but fails the next data access with error 3951
+    (`42000`), because the transaction did not start under snapshot isolation,
+    and ends the transaction. This driver's `set_txn_isolation`
+    (`mssql-odbc/src/api/txn.rs`) rolls the empty transaction back, sends the
+    SET, and begins a new one, so the next statement succeeds under SNAPSHOT.
+    For the four ODBC-standard levels the observable outcome is the same on both
+    drivers (the next statement runs in a transaction under the new level); the
+    reopen costs two extra round trips.
+    The deviation predates the `SQLEndTran` fold: it was already reachable after
+    the autocommit switch. Before the fold no transaction was open after
+    `SQLEndTran`, so the SET applied to the next lazily begun transaction on both
+    drivers; the fold makes the SNAPSHOT difference reachable after every
+    `SQLEndTran` in manual-commit mode, which is msodbcsql's state there too.
+    Measured locally on msodbcsql 18.7.1 (`SQL_DRIVER_VER` 18.07.0001) against
+    SQL Server 2022 with `ALLOW_SNAPSHOT_ISOLATION ON`: autocommit OFF, then
+    `SQL_COPT_SS_TXN_ISOLATION = SQL_TXN_SS_SNAPSHOT`, then a `SELECT` returns
+    `42000`/3951 on msodbcsql and succeeds on this driver, both before and after
+    the fold; the same after an insert and `SQLEndTran(SQL_COMMIT)`. Not asserted
+    in e2e, which cannot assume a snapshot-enabled database; the CI-pinned
+    18.6.2.1 build is unmeasured. Recorded by user decision while implementing
+    the `SQLEndTran` fold
+    ([AB#50902](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/50902));
+    maintainer sign-off is pending review.

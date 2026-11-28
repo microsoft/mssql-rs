@@ -87,9 +87,12 @@ without applying the level. See [parity entry 38](parity-deviations.md) and
 
 `SQLDisconnect` with a user-started transaction open posts SQLSTATE `25000` and
 returns `SQL_ERROR` (`sqlcconn.cpp:1234-1238`). A driver-started *piggyback*
-transaction — one auto-begun because autocommit is OFF but carrying no
-user-visible uncommitted work — is rolled back best-effort before teardown, so
-no transaction is ever left dangling on a pooled server session.
+transaction — one auto-begun because autocommit is OFF, at the switch or by
+`SQLEndTran` (§4.2), but carrying no user-visible uncommitted work — is not
+rolled back by the driver. Like msodbcsql (`SQLDisconnect`, `sqlcconn.cpp`:
+"all server side resources associated with the connection will be released by
+server"), the driver closes the socket and SQL Server rolls the transaction
+back. It holds no locks, so nothing is left behind on the server session.
 
 ### G5 — `SQLGetInfo` transaction capabilities
 
@@ -332,20 +335,24 @@ differs: SQL Server accepts the SET inside the transaction but fails the next da
 access with 3951 because the transaction did not start under SNAPSHOT, which is
 what msodbcsql reports, while this driver's reopened transaction starts under
 SNAPSHOT and the statement succeeds. That difference predates §4.2: before it, no
-transaction was open after `SQLEndTran`, so the SET applied to the next one.
+transaction was open after `SQLEndTran`, so the SET applied to the next one. It is
+[parity entry 46](parity-deviations.md).
 
 ### 4.6 Disconnect
 
 ```
 if local_tran_started            → post 25000, return SQL_ERROR   (sqlcconn.cpp:1234)
-else if has_active_transaction() → best-effort rollback, ignore failure
+close cursors
+if user work started since (another thread) → best-effort rollback, ignore failure
 free child statements; drop client; state = Disconnected
 ```
 
-The best-effort rollback also covers the transaction `SQLEndTran` begins (§4.2),
-so a manual-commit connection closed after a commit pays one round trip here.
-msodbcsql sends nothing and leaves the rollback to the server when the socket
-closes.
+A driver-begun transaction with no user work, from the autocommit switch or
+`SQLEndTran` (§4.2), gets no request: the server rolls it back when the socket
+closes, as it does for msodbcsql. A manual-commit commit-then-close therefore
+costs the commit round trip only. The rollback remains for user work another
+thread's statement started after the 25000 check, where it runs with the claimed
+connection under `SQL_ATTR_CONNECTION_TIMEOUT`.
 
 ---
 
@@ -442,7 +449,7 @@ and mssql-odbc-only cases use `SKIP_IF_COMPARING_MSODBCSQL()`.
 | 42 | SELECT-only checkout + rollback replaces the transaction | e2e |
 | 43 | `SQL_COPT_SS_AUTOBEGINTXN` off: no begin in the end request; the next statement begins | unit + e2e |
 | 44 | `SQL_COPT_SS_AUTOBEGINTXN` accepts any value before or after connect, reads the low 32 bits, survives reconnect, getter `HY092` | unit + e2e |
-| 45 | Autocommit ON after `SQLEndTran` rolls the replacement back without `01000`; disconnect is allowed | unit + e2e |
+| 45 | Autocommit ON after `SQLEndTran` rolls the replacement back without `01000`; disconnect is allowed and sends no rollback (G4) | unit + e2e |
 | 46 | Every ODBC-standard isolation level set after `SQLEndTran` applies to the next statement | unit + e2e |
 | 47 | Replacement ended by raw T-SQL is reopened by the next statement; prepared statements and pool reset work across `SQLEndTran` | e2e |
 | 48 | Session killed after `SQLEndTran` is not recovered; with the attribute off it is | e2e |
