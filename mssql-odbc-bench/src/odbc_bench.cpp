@@ -4193,6 +4193,9 @@ private:
             for (const auto& parameter : params_) {
                 bytes_per_operation_ += parameter.value[0].size();
             }
+            // `fetchone` makes one SQLGetData per result column.
+            get_data_per_operation_ =
+                spec_.kind == PyCursorWorkload::param_types_mixed ? params_.size() : 1;
             break;
         }
     }
@@ -4234,6 +4237,7 @@ private:
     RetrievalMetrics run(std::size_t operations) {
         double timed = 0.0;
         std::uint64_t rows = 0;
+        std::uint64_t bytes = 0;
         try {
             for (std::size_t operation = 0; operation < operations; ++operation) {
                 if (is_lob()) {
@@ -4242,6 +4246,10 @@ private:
                 const auto start = std::chrono::steady_clock::now();
                 rows += run_one(operation);
                 timed += seconds_between(start, std::chrono::steady_clock::now());
+                // `query_scalar` widens to an eight-byte buffer past SMALLINT.
+                bytes += spec_.kind == PyCursorWorkload::query_scalar
+                             ? params_[0].value[0].size()
+                             : bytes_per_operation_;
                 if (is_lob()) {
                     validate_lob_row();
                 }
@@ -4254,7 +4262,8 @@ private:
         RetrievalMetrics metrics;
         metrics.rows = rows;
         metrics.cells = operations * cells_per_operation_;
-        metrics.logical_bytes = operations * bytes_per_operation_;
+        metrics.logical_bytes = bytes;
+        metrics.get_data_calls = operations * get_data_per_operation_;
         metrics.total_seconds = timed;
         metrics.metadata_bind_seconds = -1.0;
         metrics.calls = operations;
@@ -4447,6 +4456,7 @@ private:
     std::int64_t expected_ = 0;
     std::uint64_t cells_per_operation_ = 0;
     std::uint64_t bytes_per_operation_ = 0;
+    std::uint64_t get_data_per_operation_ = 0;
     bool verify_everything_ = false;
 };
 
