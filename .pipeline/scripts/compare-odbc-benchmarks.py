@@ -833,7 +833,7 @@ def summary_markdown(
             "- Write workload modes: for `write/insert_2000_c3/executemany`, candidate "
             "and Microsoft use one parameter-array `SQLExecute`; the pinned Rust "
             "baseline runs the runner-selected sequential mode (2,000 prepared "
-            "`SQLExecute` calls). The `*_pyshape` write workloads use one "
+            "`SQLExecute` calls). The `write/insert_1000_rows_*` workloads use one "
             "parameter-array `SQLExecute` on every driver."
         )
     if reference_paths:

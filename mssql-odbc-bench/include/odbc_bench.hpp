@@ -55,7 +55,7 @@ struct Config {
     std::string packet_size_keyword;
     std::string scenario;
     std::string write_mode;
-    /// Calls per `latency`/`py*` sample; 0 keeps each workload's catalog size.
+    /// Calls per `latency`/`params`/`lobwrite`/`cursorfetch` sample; 0 keeps each workload's catalog size.
     std::size_t calls_override = 0;
 
     /// Read and validate the cross-platform perf-lab environment contract.
@@ -202,7 +202,7 @@ enum class PyCursorWorkload {
 /// One `mssql-python` benchmark workload and the ODBC calls its sample repeats.
 struct PyCursorSpec {
     const char* benchmark_name;
-    /// `pyparam`, `pylob`, or `pyfetch`.
+    /// `params`, `lobwrite`, or `cursorfetch`.
     const char* scenario;
     /// The `mssql-python` `performance/` workload this replays.
     const char* python_name;
@@ -215,7 +215,7 @@ struct PyCursorSpec {
 
 inline constexpr std::size_t kPyCursorWorkloadCount = 11;
 
-/// Return the fixed `pyparam`/`pylob`/`pyfetch` catalog.
+/// Return the fixed `params`/`lobwrite`/`cursorfetch` catalog.
 const std::array<PyCursorSpec, kPyCursorWorkloadCount>& py_cursor_workloads();
 
 /// Owns one ODBC handle chain so every workload uses the same connection lifecycle.

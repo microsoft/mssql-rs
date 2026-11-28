@@ -61,9 +61,11 @@ struct ExecuteManyTarget {
 };
 
 constexpr ExecuteManyTarget kExecuteManyTargets[] = {
-    {"[dbo].[mssql_odbc_bench_pyshape_c3]", "write/insert_1000_c3_pyshape/executemany",
+    {"[dbo].[mssql_odbc_bench_pyshape_c3]",
+     "write/insert_1000_rows_c3_33kb/prepare_bind_execute",
      "[id] INT NOT NULL, [name] NVARCHAR(50) NOT NULL, [created] DATETIME2(6) NOT NULL"},
-    {"[dbo].[mssql_odbc_bench_pyshape_c10]", "write/insert_1000_c10_pyshape/executemany",
+    {"[dbo].[mssql_odbc_bench_pyshape_c10]",
+     "write/insert_1000_rows_c10_128kb/prepare_bind_execute",
      "[id] INT NOT NULL, [qty] INT NOT NULL, [ref] INT NOT NULL, "
      "[name] NVARCHAR(50) NOT NULL, [city] NVARCHAR(30) NOT NULL, "
      "[note] NVARCHAR(100) NOT NULL, [created] DATETIME2(6) NOT NULL, "
@@ -913,27 +915,27 @@ const std::array<LatencySpec, kLatencyWorkloadCount>& latency_workloads() {
 const std::array<PyCursorSpec, kPyCursorWorkloadCount>& py_cursor_workloads() {
     constexpr std::size_t kMiB = 1024 * 1024;
     static const std::array<PyCursorSpec, kPyCursorWorkloadCount> specs = {{
-        {"param/scalar_int_pyshape/execute_fetchone", "pyparam", "query_scalar",
+        {"param/bind_1_int_4b/execute_fetchone", "params", "query_scalar",
          PyCursorWorkload::query_scalar, 1, 5'000},
-        {"param/count_int_10_pyshape/execute_fetchone", "pyparam", "param_count_int_10",
+        {"param/bind_10_int_40b/execute_fetchone", "params", "param_count_int_10",
          PyCursorWorkload::param_count_int, 10, 5'000},
-        {"param/count_int_100_pyshape/execute_fetchone", "pyparam", "param_count_int_100",
+        {"param/bind_100_int_400b/execute_fetchone", "params", "param_count_int_100",
          PyCursorWorkload::param_count_int, 100, 4'000},
-        {"param/count_int_1000_pyshape/execute_fetchone", "pyparam", "param_count_int_1000",
+        {"param/bind_1000_int_4kb/execute_fetchone", "params", "param_count_int_1000",
          PyCursorWorkload::param_count_int, 1'000, 1'200},
-        {"param/count_nvarchar_100_pyshape/execute_fetchone", "pyparam",
+        {"param/bind_100_nvarchar20_4kb/execute_fetchone", "params",
          "param_count_nvarchar_100", PyCursorWorkload::param_count_nvarchar, 100, 3'500},
-        {"param/types_mixed_10_pyshape/execute_fetchone", "pyparam", "param_types_mixed_10",
+        {"param/bind_10_mixed_types_100b/execute_fetchone", "params", "param_types_mixed_10",
          PyCursorWorkload::param_types_mixed, 10, 4'000},
-        {"write/insert_lob_varbinary_1mb_pyshape/execute_dae", "pylob",
+        {"write/stream_varbinary_1mb/insert_putdata", "lobwrite",
          "insert_lob_varbinary_1mb", PyCursorWorkload::insert_lob_varbinary, kMiB, 120},
-        {"write/insert_lob_varbinary_10mb_pyshape/execute_dae", "pylob",
+        {"write/stream_varbinary_10mb/insert_putdata", "lobwrite",
          "insert_lob_varbinary_10mb", PyCursorWorkload::insert_lob_varbinary, 10 * kMiB, 15},
-        {"write/insert_lob_nvarchar_1mb_pyshape/execute_dae", "pylob",
+        {"write/stream_nvarchar_1mb/insert_putdata", "lobwrite",
          "insert_lob_nvarchar_1mb", PyCursorWorkload::insert_lob_nvarchar, kMiB, 150},
-        {"fetch/mixed_1000_c4_pyshape/fetchmany_100", "pyfetch",
+        {"fetch/mixed_1k_rows_c4_63kb/fetchmany_100", "cursorfetch",
          "fetchmany_mixed_1000_batch100", PyCursorWorkload::fetchmany_mixed, 1'000, 800},
-        {"fetch/arrow_10000_c8_pyshape/arrow_8192", "pyfetch", "fetch_arrow_mixed8_10000",
+        {"fetch/mixed_10k_rows_c8_730kb/arrow_8192", "cursorfetch", "fetch_arrow_mixed8_10000",
          PyCursorWorkload::fetch_arrow_mixed, 10'000, 65},
     }};
     return specs;
@@ -1011,7 +1013,7 @@ Config Config::from_environment() {
         if (!known) {
             throw std::runtime_error(
                 "ODBC_BENCH_SCENARIO must be one of narrow, wide, rowset, varwidth, "
-                "getdata, write, pywrite, latency, pyparam, pylob, pyfetch, or unset");
+                "getdata, write, pywrite, latency, params, lobwrite, cursorfetch, or unset");
         }
     }
     const auto calls_override = environment_value("ODBC_BENCH_CALLS");
@@ -3978,7 +3980,7 @@ private:
                                       ? kPyMaxLobSize
                                       : kPyMaxInlineChars;
             if (lob || meta.size > limit) {
-                throw std::logic_error("pyshape fetchone does not replay LOB text columns");
+                throw std::logic_error("py-cursor fetchone does not replay LOB text columns");
             }
             cell.c_type = SQL_C_WCHAR;
             length = static_cast<SQLLEN>((meta.size + 1) * sizeof(SQLWCHAR));
@@ -4036,14 +4038,14 @@ private:
         case SQL_VARBINARY:
         case SQL_LONGVARBINARY:
             if (lob || meta.size > kPyMaxLobSize) {
-                throw std::logic_error("pyshape fetchone does not replay LOB binary columns");
+                throw std::logic_error("py-cursor fetchone does not replay LOB binary columns");
             }
             cell.c_type = SQL_C_BINARY;
             length = static_cast<SQLLEN>(meta.size);
             storage = static_cast<std::size_t>(length);
             break;
         default:
-            throw std::logic_error("pyshape fetchone met an unmapped SQL type " +
+            throw std::logic_error("py-cursor fetchone met an unmapped SQL type " +
                                    std::to_string(meta.type));
         }
         cell.data.assign(storage, 0);
@@ -4123,7 +4125,7 @@ private:
                 column.width = static_cast<SQLLEN>(size);
                 break;
             default:
-                throw std::logic_error("pyshape bound fetch met an unmapped SQL type " +
+                throw std::logic_error("py-cursor bound fetch met an unmapped SQL type " +
                                        std::to_string(meta.type));
             }
             column.data.assign(rows * static_cast<std::size_t>(column.width), 0);
@@ -4188,7 +4190,7 @@ public:
           cursor_(session),
           table_(std::string("#mssql_odbc_bench_") + spec.python_name) {
         if (operations_ == 0) {
-            throw std::logic_error("pyshape workload has no operations per sample");
+            throw std::logic_error("py-cursor workload has no operations per sample");
         }
         build();
     }
@@ -4408,7 +4410,7 @@ private:
         case PyCursorWorkload::fetch_arrow_mixed:
             return arrow_all();
         }
-        throw std::logic_error("unknown pyshape workload");
+        throw std::logic_error("unknown py-cursor workload");
     }
 
     void fail(const std::string& what) const {
