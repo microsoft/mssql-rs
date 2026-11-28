@@ -115,9 +115,16 @@ pub use query::{DebugParams, ExecuteResult, QueryResult, ToSql};
 pub use row::{ColumnIndex, FromSql, Row};
 
 // Re-export mssql-tds types that consumers might need for advanced use.
+/// Implement this trait to acquire a token for a FedAuth challenge with
+/// [`AuthMethod::entra_token_factory`].
+pub use mssql_tds::connection::client_context::EntraIdTokenFactory;
+/// Native authentication mode passed to an [`EntraIdTokenFactory`].
+pub use mssql_tds::connection::client_context::TdsAuthenticationMethod;
 /// The underlying mssql-tds client type, exposed for advanced operations
 /// via [`Client::inner_mut()`].
 pub use mssql_tds::connection::tds_client::TdsClient;
+/// Result type for [`EntraIdTokenFactory::create_token`].
+pub use mssql_tds::core::TdsResult;
 /// Raw column values from mssql-tds, exposed for low-level access
 /// via [`Row::raw_value()`].
 /// Spatial values remain `ColumnValues::Bytes`; their identity is exposed
@@ -126,3 +133,5 @@ pub use mssql_tds::datatypes::column_values::ColumnValues;
 /// Decimal/Numeric value representation from mssql-tds.
 /// Returned inside `ColumnValues::Decimal` and `ColumnValues::Numeric`.
 pub use mssql_tds::datatypes::decoder::DecimalParts;
+/// Native driver error type used by [`EntraIdTokenFactory`].
+pub use mssql_tds::error::Error as TdsError;
