@@ -210,14 +210,17 @@ def test_native_pool_validation_runs_after_sql_ready_and_reports_both_runs():
     run = next(
         step for step in steps
         if isinstance(step, dict)
-        and step.get("displayName") == "Run pool contracts and live SQL tests (mssql-py-core)"
+        and step.get("displayName") == "Run pool contracts, stack regression and live SQL tests (mssql-py-core)"
     )
     assert steps.index(run) > steps.index("${{ parameters.beforeTestSteps }}")
     command = run["script"]
     assert command.startswith("cargo fetch && cargo nextest run --frozen ")
     assert '--lib -E "test(pool::)" --profile ci' in command
     assert " && cargo nextest run " in command
-    assert '--test pool_sql -E "test(live_)" --run-ignored only --profile pool-sql' in command
+    assert (
+        '--test pool_sql -E "test(live_) | test(mock_recovery_keeps)" '
+        '--run-ignored all --profile pool-sql'
+    ) in command
     assert run["workingDirectory"] == "$(Build.SourcesDirectory)/mssql-py-core"
     assert run["condition"] == _PR
     assert run["env"] == {

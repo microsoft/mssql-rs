@@ -146,6 +146,7 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     #[cfg(debug_assertions)]
     {
+        m.add_class::<pool::auth::RecoveryAuthHarness>()?;
         m.add_function(wrap_pyfunction!(
             async_fetch::_arm_fetch_publication_pause,
             m

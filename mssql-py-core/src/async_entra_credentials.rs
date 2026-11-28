@@ -79,12 +79,7 @@ impl BuiltInEntraCredential {
         scope: &str,
         sts_url: &str,
     ) -> PyResult<(Py<PyAny>, Option<String>)> {
-        if scope != "https://database.windows.net/.default" {
-            return Err(PyValueError::new_err(
-                "Built-in async Entra authentication supports only the Azure Public SQL scope",
-            ));
-        }
-        let tenant = public_tenant(py, sts_url)?;
+        let tenant = validate_public_target(py, scope, sts_url)?;
         let kwargs = PyDict::new(py);
         let class_name = match self {
             Self::Default => {
@@ -112,6 +107,19 @@ impl BuiltInEntraCredential {
             .unbind();
         Ok((provider, matches!(self, Self::Default).then_some(tenant)))
     }
+}
+
+pub(crate) fn validate_public_target(
+    py: Python<'_>,
+    scope: &str,
+    sts_url: &str,
+) -> PyResult<String> {
+    if scope != "https://database.windows.net/.default" {
+        return Err(PyValueError::new_err(
+            "Built-in async Entra authentication supports only the Azure Public SQL scope",
+        ));
+    }
+    public_tenant(py, sts_url)
 }
 
 fn public_tenant(py: Python<'_>, sts_url: &str) -> PyResult<String> {

@@ -26,14 +26,17 @@ For native SQL initialization and reuse, see
 | `PoolKey` in [connection.rs](connection.rs) | Opaque fingerprint that partitions reuse. The Rust preparation adapter must supply a fingerprint, never a raw connection string or token; this type only rejects empty input, not noncanonical keys. |
 | `PreparedSqlConnection` in [connection_key.rs](../connection_key.rs) | Private Rust SQL-auth key authority above the scheduler. Validates Python-adapted options, freezes native endpoint policy, and derives a process-private HMAC key and authentication binding paired with the same immutable `ConnectSpec`. Not exported to Python or called by direct/pooled connect. |
 | `AuthBinding` in [connection.rs](connection.rs) | Separate opaque identity/credential-version fingerprint expected for a physical open. Equality is not proof of a real login principal. |
+| `RecoveryAuth` / `OperationAuth` in [auth.rs](auth.rs) | Per-physical-context weak TDS callback and caller-owned strong operation scope. The scope owns the trusted binding reader and checks it at activation, before/after token acquisition, on each tracked-work poll and at completion. The current-loop adapter validates Azure Public authority/tenant/resource and captures expiry per login attempt. Completion checks UTC/monotonic margin. No Python references survive in the inactive callback. |
 | `TokenExpiry` and `AuthMetadata` in [connection.rs](connection.rs) | Distinguish non-token authentication, known UTC expiry and unknown raw-token expiry. Metadata carries the binding to compare with the expected one; it does not implement credential refresh or reuse policy. |
-| `ConnectSpec` in [connection.rs](connection.rs) | Immutable per-call effective options and expected authentication binding. Native checkout calls `validate_pool()` before reservation to validate the context and reject nonzero recovery counts, unsupported authentication and Always Encrypted. |
+| `ConnectSpec` in [connection.rs](connection.rs) | Immutable per-call effective options and expected authentication binding. Native checkout calls `validate_pool()` before reservation to validate the context and reject unsupported authentication and Always Encrypted. SQL-password recovery uses the effective retry settings. |
 | `ConnectionFactory` in [connection.rs](connection.rs) | Object-safe physical-open interface receiving the current call's specification and TDS cancellation handle explicitly. |
 | `SqlConnectionFactory` in [connection.rs](connection.rs) | Opens a SQL-password connection through `TdsConnectionProvider::create_client` using the current call's specification. After successful login, returns the expected binding and non-token authentication metadata. |
 | `OpenedConnection` in [connection.rs](connection.rs) | Owns one `TdsClient` and its authentication metadata by value. `into_parts()` moves both to the next owner; no shared raw-client owner escapes this handoff. |
 | `Isolation` in [session.rs](session.rs) | Selects one concrete transaction isolation SET; rejects `NoChange` before checkout. |
 | `AsyncPoolManager::acquire` in [session.rs](session.rs) | Validates pooled options, reserves a Deadpool slot, initializes a fresh connection or resets a cached candidate, and publishes only after authentication checks and fully drained, quiescent initialization. |
 | `PoolLease` in [session.rs](session.rs) | Uniquely owns the client and capacity guard. Client access is borrowed from the lease; Drop discards rather than returning a reusable session. |
+| `PoolLease::run` in [session.rs](session.rs) | Supplies TDS execution options carrying cancellation and the remaining command budget, rounded up to whole seconds under the original absolute timer. Retains the same slot through recovery and execution. Untimed commands use connection timeout only for recovery. Successful work and TDS-synchronized SQL-server errors may retain a live client; all other execution errors irreversibly mark discard, even without a cached dead flag or open-batch marker. |
+| `PoolLease::activate_auth` / `run_authenticated` in [session.rs](session.rs) | Activate the leased physical context's callback with the current-loop adapter and trusted binding reader, then own that scope through tracked work. Reject a scope from another physical context. Check binding before resuming work and before publication, and record successful recovery expiry. A command deadline is optional; cancellation and runtime checks are not. |
 | `PoolLease::release` / `release_with_deadline` in [session.rs](session.rs) | Drain before residual rollback under one capped cleanup deadline, then atomically return only a quiescent client to its accepting generation. Cancellation or failure discards before slot return. |
 | `PoolResult`, `PoolError` and `OpenError` in [error.rs](error.rs) | Typed outcomes, including preserved TDS/provider causes. Routine `Display`/`Debug` excludes source messages; Python error mapping is later integration work. |
 
@@ -96,8 +99,8 @@ Routine diagnostics redact both prepared objects and opaque fingerprints.
 
 No lease settings are accepted by this physical-spec seam. Future integration
 must prove their reset/reapplication contract before reusing a session across
-such settings. Recovery values remain in the fingerprint; native checkout rejects
-nonzero recovery counts before admission. Connecting this preparation to checkout,
+such settings. Recovery values remain in the fingerprint; native SQL-password
+checkout permits configured recovery. Connecting this preparation to checkout,
 production check-in, public API and authentication beyond SQL password remain
 separate work. There is no change to the direct connection paths.
 
@@ -166,9 +169,15 @@ including on otherwise unrelated Rust PRs. There is no older-version fallback.
   cleanup error and discards before rollback or capacity return.
 - Rust's key authority constructs canonical keys and expected authentication
   bindings; its integration with native checkout remains unwired.
-  Native checkout owns pooled-context validation, including the zero-recovery
-  restriction; it also checks returned metadata for binding equality and
+  Native checkout owns pooled-context validation and checks returned metadata for
+  binding equality and
   non-token authentication before using a client.
+- Pool initialization/reset uses TDS `initialize_session`, whose private
+  per-operation path never reconnects or changes application recovery policy.
+  Return drains and rolls back through operations that already never reconnect.
+  Recovery is application pre-send work, never a substitute for reset acknowledgement
+  or a reason to reconnect during return. AQE must use tracked lease operations;
+  a raw client borrow alone does not enforce operation deadlines or discard on abandonment.
 - Detached assigned-slot retirement rechecks acceptance and its original
   generation before return. Closure discards cached clients off-lock while
   retaining their capacity and shutdown-settlement accounting.
@@ -178,11 +187,45 @@ including on otherwise unrelated Rust PRs. There is no older-version fallback.
 - An acquisition cancellation token and a TDS `CancelHandle` serve different
   layers. SQL opening and initialization own operation guards that cancel TDS
   handles on interruption. Parallel TCP attempts are caller-owned and drop
-  synchronously before capacity is released. Python callback cancellation and
-  settlement remain future integration work.
+  synchronously before capacity is released. Operation auth reuses the async
+  adapter's tracked Python Task cancellation, late-result suppression and owned
+  credential teardown. AQE must still activate scopes and track operation/close
+  settlement in its logical ownership layer.
+- Normally settled application work disarms its cancellation guard: TDS retains
+  a child handle for later result reads and return-time draining. Interrupted or
+  abandoned work still cancels its handle and irreversibly discards the lease.
 - Treat fingerprints as opaque input and keep sensitive source messages out of
   routine diagnostics. Authentication adapters must supply verified metadata;
   these types do not authenticate a connection.
 - The fit experiment tests the fixed-capacity, non-I/O slot-hook contract.
   Do not assume its accounting remains valid with asynchronous/fallible hooks,
   live resizing or raw library-object access.
+
+## Authentication rollout boundary
+
+Pooled admission remains SQL-password-only. `OperationAuth` implements the
+physical-open seam for the supported async Entra adapter, but does not enable
+token pools or establish identity from token contents. Its caller supplies the
+verified tenant/binding, creates the adapter on the current running loop, keeps
+the scope through login/result delivery, and calls `complete` with a freshly
+verified binding before publication. Application operations use
+`run_authenticated`; an inactive callback always fails rather than invoking an
+old loop. Expiry detected after completed application work discards the session
+and emits a redacted diagnostic without replacing that work's result. Identity
+changes still block successful result delivery; original operation failures remain
+primary. Raw exact-token and trusted modes remain explicitly gated pending
+canonical preparation, AQE wiring and live/platform evidence. No cross-platform
+or live Entra recovery claim follows from bridge tests.
+
+## Internal test and maintenance APIs
+
+The Python `_EntraRecoveryAuth` harness is compiled and registered only in debug
+builds, matching the existing fetch-publication test hooks. Build the extension
+without `--release` to run its focused bridge tests; those cases skip in release
+builds, where the harness is absent. Other credential tests still run.
+
+The public TDS `initialize_session` operation accepts a concrete isolation level
+and existing execution options, applies the fixed isolation SET and fully drains
+its response without reconnecting. A reset armed before the call must be
+acknowledged. No public recovery-suppression helper, policy option or guard is
+exposed; ordinary query recovery and execution-option fields are unchanged.

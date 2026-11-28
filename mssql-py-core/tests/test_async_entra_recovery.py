@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Provider cancellation across an actual native session-recovery handshake."""
+"""Provider cancellation and terminal errors during native session recovery."""
 
 import asyncio
 import warnings
@@ -14,7 +14,7 @@ import pytest
 @pytest.mark.parametrize("operation", ["execute", "executemany"])
 @pytest.mark.parametrize("retry_count", [1, 3])
 @pytest.mark.parametrize(
-    "outcome", ["cancel-once", "cancel-always", "cancel-on-final-attempt", "success"]
+    "outcome", ["cancel-once", "cancel-always", "provider-failure", "success"]
 )
 @pytest.mark.parametrize("owned", [False, True])
 @pytest.mark.parametrize("use_prepare", [False, True])
@@ -34,7 +34,7 @@ def test_provider_cancellation_stops_recovery_before_query_submission(
         mock_tds_server.close_connection_after(closing_query)
         calls = []
         closed = []
-        expected_calls = retry_count + 2 if outcome == "cancel-on-final-attempt" else 2
+        expected_calls = 2
 
         async def wait_for_request(recovery_login):
             while not any(
@@ -60,11 +60,8 @@ def test_provider_cancellation_stops_recovery_before_query_submission(
             async def get_token(self, scope, **kwargs):
                 assert kwargs == ({"tenant_id": "test-tenant"} if owned else {})
                 calls.append(scope)
-                if outcome == "cancel-on-final-attempt" and len(calls) > 1:
-                    if len(calls) < expected_calls:
-                        raise RuntimeError("Controlled recovery acquisition failure")
-                    if len(calls) == expected_calls:
-                        raise asyncio.CancelledError()
+                if outcome == "provider-failure" and len(calls) > 1:
+                    raise RuntimeError("Controlled recovery acquisition failure")
                 elif outcome != "success" and (
                     len(calls) == 2 or (outcome == "cancel-always" and len(calls) > 2)
                 ):
@@ -114,6 +111,12 @@ def test_provider_cancellation_stops_recovery_before_query_submission(
                     )
                 if outcome == "success":
                     await asyncio.wait_for(pending, 5)
+                elif outcome == "provider-failure":
+                    with pytest.raises(
+                        mssql_py_core.OperationalError,
+                        match="Async Entra token acquisition failed",
+                    ):
+                        await asyncio.wait_for(pending, 5)
                 else:
                     with pytest.raises(asyncio.CancelledError):
                         await asyncio.wait_for(pending, 5)
