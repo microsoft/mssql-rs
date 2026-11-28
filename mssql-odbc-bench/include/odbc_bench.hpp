@@ -208,6 +208,34 @@ inline constexpr std::size_t kPyCursorWorkloadCount = 8;
 /// Return the fixed `params`/`lobwrite`/`cursorfetch` catalog.
 const std::array<PyCursorSpec, kPyCursorWorkloadCount>& py_cursor_workloads();
 
+/// One SQLAlchemy 2.1 (`mssql+mssqlpython`) or Django (`mssql-django`,
+/// `python_driver="mssql_python"`) operation, as the ODBC calls mssql-python 1.18
+/// makes for it.
+enum class OrmWorkload {
+    /// Pool checkout, `SELECT 1` scalar, reset-on-return rollback on a
+    /// manual-commit connection.
+    sqlalchemy_checkout_select1,
+    /// `Model.objects.get(pk=...)` on an autocommit connection: prepare per
+    /// execute and the release of the prepared handle on cursor close.
+    django_get_by_pk,
+    /// `mssql_python.connect()` and `close()` on a new connection handle.
+    connect_close,
+};
+
+struct OrmSpec {
+    const char* benchmark_name;
+    /// `orm` or `connect`.
+    const char* scenario;
+    OrmWorkload kind;
+    /// Framework operations per sample.
+    std::size_t operations_per_sample;
+};
+
+inline constexpr std::size_t kOrmWorkloadCount = 3;
+
+/// Return the fixed `orm`/`connect` catalog.
+const std::array<OrmSpec, kOrmWorkloadCount>& orm_workloads();
+
 /// Owns one ODBC handle chain so every workload uses the same connection lifecycle.
 class OdbcSession {
 public:
@@ -217,6 +245,9 @@ public:
 
     OdbcSession(const OdbcSession&) = delete;
     OdbcSession& operator=(const OdbcSession&) = delete;
+
+    /// Environment handle for runners that allocate their own connections.
+    SQLHENV environment() const;
 
     /// Connection handle for runners that allocate and free their own statements.
     SQLHDBC connection() const;
@@ -411,6 +442,33 @@ public:
 
     PyCursorRunner(const PyCursorRunner&) = delete;
     PyCursorRunner& operator=(const PyCursorRunner&) = delete;
+
+    const char* name() const;
+
+    /// Create the workload's temporary table, if any, then run validated warm-up
+    /// operations.
+    void preflight();
+
+    /// Time one sample of `operations_per_sample` validated operations.
+    RetrievalMetrics execute();
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+/// Replays SQLAlchemy and Django operations as mssql-python issues them: a new
+/// statement handle per `cursor()`, prepare per parameterized execute, rowset
+/// `fetchmany`, and the transaction end of the framework.
+class OrmRunner {
+public:
+    /// `config` supplies the operation override and, for `connect_close`, the
+    /// connection string.
+    OrmRunner(OdbcSession& session, const OrmSpec& spec, const Config& config);
+    ~OrmRunner();
+
+    OrmRunner(const OrmRunner&) = delete;
+    OrmRunner& operator=(const OrmRunner&) = delete;
 
     const char* name() const;
 
