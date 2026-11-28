@@ -19,7 +19,7 @@ use arrow::array::{
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
     TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::datatypes::{DataType, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use async_trait::async_trait;
 use mssql_tds::connection::bulk_copy::{BulkLoadRow, ResolvedColumnMapping};
 use mssql_tds::core::TdsResult;
@@ -161,6 +161,7 @@ pub fn build_column_plans(
                     dest.len()
                 ))
             })?;
+            validate_json_field(field, dest_meta)?;
             let kind = resolve_kind(field.data_type(), dest_meta).map_err(|e| {
                 Error::UsageError(format!(
                     "Cannot map Arrow column '{}' ({:?}) to SQL column '{}' ({:?}): {}",
@@ -178,6 +179,67 @@ pub fn build_column_plans(
             })
         })
         .collect()
+}
+
+fn validate_json_field(field: &Field, dest: &BulkCopyColumnMetadata) -> TdsResult<()> {
+    if dest.sql_type != SqlDbType::Json {
+        return Ok(());
+    }
+    let name = field.metadata().get("ARROW:extension:name");
+    let metadata = field.metadata().get("ARROW:extension:metadata");
+    if name.is_none() && metadata.is_none() {
+        return Ok(());
+    }
+    // Canonical arrow.json metadata is empty or an object with optional future fields.
+    // Only extension metadata is parsed here, never the document payload.
+    let valid_metadata = metadata.is_none_or(|value| {
+        value.is_empty()
+            || serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value).is_ok()
+    });
+    if name.is_none_or(|name| name != "arrow.json")
+        || !matches!(
+            field.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        )
+        || !valid_metadata
+    {
+        return Err(Error::UsageError(format!(
+            "Arrow JSON column '{}' has unsupported extension annotations; supply plain strings or canonical arrow.json string storage",
+            field.name()
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_batch_schema(
+    expected: &Schema,
+    actual: &Schema,
+    plans: &[ColumnPlan],
+    dest: &[BulkCopyColumnMetadata],
+) -> TdsResult<()> {
+    for plan in plans {
+        let expected_field = expected.fields().get(plan.source_index);
+        let actual_field = actual.fields().get(plan.source_index);
+        let (Some(expected_field), Some(actual_field)) = (expected_field, actual_field) else {
+            return Err(Error::UsageError(format!(
+                "Mapped Arrow source column {} is missing from batch schema",
+                plan.source_index
+            )));
+        };
+        if expected_field.name() != actual_field.name()
+            || expected_field.data_type() != actual_field.data_type()
+        {
+            return Err(Error::UsageError(format!(
+                "Mapped Arrow source column {} changed name or physical type between batches",
+                plan.source_index
+            )));
+        }
+        let dest_meta = dest.get(plan.destination_index).ok_or_else(|| {
+            Error::UsageError("Mapped Arrow destination metadata is missing".into())
+        })?;
+        validate_json_field(actual_field, dest_meta)?;
+    }
+    Ok(())
 }
 
 fn resolve_kind(arrow_ty: &DataType, dest: &BulkCopyColumnMetadata) -> TdsResult<ColumnPlanKind> {
@@ -886,6 +948,107 @@ mod tests {
         }];
         let plans = build_column_plans(&schema, std::slice::from_ref(dest), &mappings).unwrap();
         plans.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn canonical_json_extension_uses_string_plan() {
+        let mappings = [ResolvedColumnMapping {
+            source_index: 0,
+            destination_index: 0,
+            destination_name: "doc".into(),
+            destination_type: SqlDbType::Json,
+        }];
+        let dest = [meta("doc", SqlDbType::Json, true)];
+        for ty in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            for metadata in [
+                None,
+                Some(""),
+                Some("{}"),
+                Some(" { } "),
+                Some("{\"future\":1}"),
+            ] {
+                let mut annotations = std::collections::HashMap::from([(
+                    "ARROW:extension:name".into(),
+                    "arrow.json".into(),
+                )]);
+                if let Some(metadata) = metadata {
+                    annotations.insert("ARROW:extension:metadata".into(), metadata.into());
+                }
+                let field = Field::new("doc", ty.clone(), true).with_metadata(annotations);
+                let schema = Schema::new(vec![field]);
+                let plans = build_column_plans(&schema, &dest, &mappings).unwrap();
+                assert!(matches!(plans[0].kind, ColumnPlanKind::Json));
+                validate_batch_schema(&schema, &schema, &plans, &dest).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn json_extension_rejects_invalid_storage_and_metadata() {
+        let dest = meta("doc", SqlDbType::Json, true);
+        for ty in [DataType::Null, DataType::Int32, DataType::Binary] {
+            let field = Field::new("doc", ty, true)
+                .with_metadata([("ARROW:extension:name".into(), "arrow.json".into())].into());
+            assert!(validate_json_field(&field, &dest).is_err());
+        }
+        for value in ["bad", "null", "123", "[]", "\"\"", "{"] {
+            let field = Field::new("doc", DataType::Utf8, true).with_metadata(
+                [
+                    ("ARROW:extension:name".into(), "arrow.json".into()),
+                    ("ARROW:extension:metadata".into(), value.into()),
+                ]
+                .into(),
+            );
+            assert!(validate_json_field(&field, &dest).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn mapped_json_schema_checks_ignore_unmapped_fields_and_ordinary_metadata() {
+        let dest = [meta("doc", SqlDbType::Json, true)];
+        let mappings = [ResolvedColumnMapping {
+            source_index: 0,
+            destination_index: 0,
+            destination_name: "doc".into(),
+            destination_type: SqlDbType::Json,
+        }];
+        for ty in [
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Utf8View,
+            DataType::Null,
+        ] {
+            let field = Field::new("doc", ty, true);
+            let expected = Schema::new(vec![field.clone()]);
+            let plans = build_column_plans(&expected, &dest, &mappings).unwrap();
+            let ordinary = field
+                .clone()
+                .with_metadata([("application".into(), "text".into())].into());
+            let hidden = Field::new("hidden", DataType::Utf8, true)
+                .with_metadata([("ARROW:extension:name".into(), "unknown".into())].into());
+            let actual = Schema::new(vec![ordinary, hidden]);
+            validate_batch_schema(&expected, &actual, &plans, &dest).unwrap();
+            for metadata in [
+                [("ARROW:extension:name".into(), "unknown.extension".into())].into(),
+                [("ARROW:extension:name".into(), "".into())].into(),
+                [("ARROW:extension:metadata".into(), "malformed".into())].into(),
+                [
+                    ("ARROW:extension:name".into(), "arrow.json".into()),
+                    ("ARROW:extension:metadata".into(), "malformed".into()),
+                ]
+                .into(),
+            ] {
+                let annotated = Schema::new(vec![field.clone().with_metadata(metadata)]);
+                assert!(validate_batch_schema(&expected, &annotated, &plans, &dest).is_err());
+            }
+            for drift in [
+                Schema::empty(),
+                Schema::new(vec![Field::new("renamed", field.data_type().clone(), true)]),
+                Schema::new(vec![Field::new("doc", DataType::Int32, true)]),
+            ] {
+                assert!(validate_batch_schema(&expected, &drift, &plans, &dest).is_err());
+            }
+        }
     }
 
     #[test]

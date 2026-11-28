@@ -3730,6 +3730,7 @@ impl TdsClient {
     /// count changes from triggers on the destination table.
     #[instrument(skip(self, rows), level = "info")]
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) async fn execute_bulk_load_streaming_zerocopy<R>(
         &mut self,
         table_name: String,
@@ -3738,6 +3739,33 @@ impl TdsClient {
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
         rows: impl Iterator<Item = R>,
+        resolved_mappings: &[ResolvedColumnMapping],
+    ) -> TdsResult<u64>
+    where
+        R: BulkLoadRow,
+    {
+        self.try_execute_bulk_load_streaming_zerocopy(
+            table_name,
+            column_metadata,
+            options,
+            timeout_sec,
+            cancel_handle,
+            rows.map(Ok),
+            resolved_mappings,
+        )
+        .await
+    }
+
+    #[instrument(skip(self, rows), level = "info")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn try_execute_bulk_load_streaming_zerocopy<R>(
+        &mut self,
+        table_name: String,
+        column_metadata: Vec<BulkCopyColumnMetadata>,
+        options: BulkCopyOptions,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+        rows: impl Iterator<Item = TdsResult<R>>,
         resolved_mappings: &[ResolvedColumnMapping],
     ) -> TdsResult<u64>
     where
@@ -3887,6 +3915,7 @@ impl TdsClient {
         let write_result: TdsResult<()> = async {
             writer.begin().await?;
             for row in rows {
+                let row = row?;
                 writer.write_row_zerocopy(&row).await?;
             }
             Ok(())
@@ -17492,6 +17521,46 @@ mod tests {
             assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
             assert_eq!(sent.lock().unwrap().len(), length_before_retry, "{phase}");
         }
+    }
+
+    #[tokio::test]
+    async fn bulk_load_source_error_aborts_before_finish_without_resuming_source() {
+        use crate::datatypes::bulk_copy_metadata::{SqlDbType, TypeLength};
+        use crate::datatypes::sqldatatypes::TdsDataType;
+
+        let transport = TestTransport::with_tokens(vec![done_no_more(), done_no_more()]);
+        let attentions = Arc::clone(&transport.attentions);
+        let mut client = create_test_client_with_transport(transport);
+        let columns = vec![
+            BulkCopyColumnMetadata::new("id", SqlDbType::Int, TdsDataType::Int4 as u8)
+                .with_length(4, TypeLength::Fixed(4)),
+        ];
+        let mut calls = 0;
+        let rows = std::iter::from_fn(|| {
+            calls += 1;
+            match calls {
+                1 => Some(Ok(IntRow(1))),
+                2 => Some(Err(UsageError("source failed".into()))),
+                _ => panic!("source resumed after failure"),
+            }
+        });
+        let error = client
+            .try_execute_bulk_load_streaming_zerocopy(
+                "#source_error".into(),
+                columns,
+                BulkCopyOptions::default(),
+                Some(1),
+                None,
+                rows,
+                &[],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, UsageError(message) if message == "source failed"));
+        assert_eq!(calls, 2);
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!client.is_connection_dead());
+        client.execute("SELECT 1".to_string(), ()).await.unwrap();
     }
 
     #[tokio::test]

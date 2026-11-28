@@ -2,6 +2,14 @@
 set -e
 source ~/.cargo/env
 
+echo '==> Preparing PyArrow for embedded Python tests...'
+python3 -m venv /tmp/pycore-rust-venv
+export PYO3_PYTHON=/tmp/pycore-rust-venv/bin/python
+"$PYO3_PYTHON" -m pip install --quiet 'pyarrow>=19.0.1'
+# Embedded PyO3 initializes the base interpreter, not the venv's package paths.
+PYTHONPATH="$("$PYO3_PYTHON" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+
 # mssql-py-core is excluded from the Cargo workspace, so its Rust unit tests
 # need a dedicated run here.
 echo '==> Running mssql-py-core Rust unit tests with coverage...'

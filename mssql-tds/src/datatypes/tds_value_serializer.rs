@@ -1322,7 +1322,7 @@ impl TdsValueSerializer {
 
     /// Serialize a JSON value using PLP encoding.
     ///
-    /// JSON type (0xF4) uses UTF-8 encoding and PLP (Partially Length Prefixed) structure.
+    /// Bulk JSON uses NVARCHAR(MAX) UTF-16LE and PLP framing.
     /// Format: PLP_UNKNOWN_LEN (8 bytes) + chunk_len (4 bytes) + data + terminator (4 bytes)
     async fn serialize_json<'a, 'b>(
         writer: &'a mut PacketWriter<'b>,
@@ -1340,7 +1340,7 @@ impl TdsValueSerializer {
 
         // Encode as UTF-16LE (no BOM needed for NVARCHAR)
         let utf16_data: Vec<u16> = json_str.encode_utf16().collect();
-        let byte_len = utf16_data.len() * 2; // Each u16 is 2 bytes
+        let byte_len = Self::json_plp_chunk_length(utf16_data.len())?;
 
         // JSON uses PLP encoding with UTF-16LE for NVARCHAR type
         // Write PLP_UNKNOWN_LEN (0xFFFFFFFFFFFFFFFE)
@@ -1349,7 +1349,7 @@ impl TdsValueSerializer {
         // Skip empty chunk: chunk_len=0 IS the PLP terminator (see MS-TDS).
         if byte_len > 0 {
             // Write chunk length (4 bytes)
-            writer.write_u32_async(byte_len as u32).await?;
+            writer.write_u32_async(byte_len).await?;
 
             // Write UTF-16LE encoded data
             for code_unit in utf16_data {
@@ -1361,6 +1361,17 @@ impl TdsValueSerializer {
         writer.write_u32_async(PLP_TERMINATOR).await?;
 
         Ok(())
+    }
+
+    fn json_plp_chunk_length(code_units: usize) -> TdsResult<u32> {
+        code_units
+            .checked_mul(2)
+            .and_then(|len| u32::try_from(len).ok())
+            .ok_or_else(|| {
+                Error::TypeConversionError(
+                    "JSON UTF-16 payload exceeds the single PLP chunk limit".into(),
+                )
+            })
     }
 
     /// Serialize an XML value for bulk copy using PLP encoding.
@@ -4019,6 +4030,19 @@ mod serializer_tests {
     }
 
     // ── JSON and XML ──
+
+    #[test]
+    fn json_plp_length_checks_wire_units_and_overflow() {
+        assert_eq!(TdsValueSerializer::json_plp_chunk_length(0).unwrap(), 0);
+        assert_eq!(TdsValueSerializer::json_plp_chunk_length(2).unwrap(), 4);
+        let max_units = (u32::MAX / 2) as usize;
+        assert_eq!(
+            TdsValueSerializer::json_plp_chunk_length(max_units).unwrap(),
+            u32::MAX - 1
+        );
+        assert!(TdsValueSerializer::json_plp_chunk_length(max_units + 1).is_err());
+        assert!(TdsValueSerializer::json_plp_chunk_length(usize::MAX).is_err());
+    }
 
     #[test]
     fn json_value() {

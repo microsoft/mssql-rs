@@ -24,6 +24,7 @@ mod bulkcopy;
 mod connection;
 mod connection_key;
 mod cursor;
+mod json;
 mod odbc_auth;
 #[cfg_attr(
     not(test),
@@ -117,6 +118,7 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<connection::PyCoreConnection>()?;
     m.add_function(wrap_pyfunction!(set_default_multi_subnet_failover, m)?)?;
     m.add_class::<cursor::PyCoreCursor>()?;
+    m.add_class::<json::BulkCopyJson>()?;
     m.add_class::<async_connection::PyAsyncConnection>()?;
     m.add_class::<async_cursor::PyAsyncCursor>()?;
     m.add_class::<async_parameters::PyTableValuedParameter>()?;

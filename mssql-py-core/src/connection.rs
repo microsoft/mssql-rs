@@ -24,8 +24,7 @@ const DEFAULT_LIBRARY_NAME: &str = "MS-PYTHON";
 /// Python Connection class for Core TDS backend
 #[pyclass]
 pub struct PyCoreConnection {
-    #[allow(dead_code)] // Used for async operations in cursor execute
-    runtime: Runtime,
+    runtime: Option<Runtime>,
     tds_client: Option<Arc<Mutex<TdsClient>>>,
     is_closed: bool,
 }
@@ -81,7 +80,7 @@ impl PyCoreConnection {
             Ok(client) => {
                 tracing::info!("Successfully connected to SQL Server");
                 Ok(PyCoreConnection {
-                    runtime,
+                    runtime: Some(runtime),
                     tds_client: Some(Arc::new(Mutex::new(client))),
                     is_closed: false,
                 })
@@ -99,7 +98,7 @@ impl PyCoreConnection {
         if !self.is_closed {
             // Send TDS close to the server and shut down the TCP connection
             if let Some(client) = self.tds_client.take() {
-                self.runtime.block_on(async {
+                self.runtime().block_on(async {
                     let mut guard = client.lock().await;
                     if let Err(e) = guard.close_connection().await {
                         tracing::warn!("Error closing connection: {}", e);
@@ -118,7 +117,7 @@ impl PyCoreConnection {
 
         if let Some(client) = &self.tds_client {
             // Pass runtime handle to cursor so it can use the same runtime
-            let handle = self.runtime.handle().clone();
+            let handle = self.runtime().handle().clone();
             Ok(crate::cursor::PyCoreCursor::new(client.clone(), handle))
         } else {
             Err(PyRuntimeError::new_err("No active connection"))
@@ -156,7 +155,25 @@ impl PyCoreConnection {
     }
 }
 
+impl Drop for PyCoreConnection {
+    fn drop(&mut self) {
+        // Python GC can finalize a previous connection from a bulk producer's
+        // callback, while another Tokio runtime is entered on this thread.
+        if let Some(runtime) = self.runtime.take()
+            && tokio::runtime::Handle::try_current().is_ok()
+        {
+            runtime.shutdown_background();
+        }
+    }
+}
+
 impl PyCoreConnection {
+    fn runtime(&self) -> &Runtime {
+        self.runtime
+            .as_ref()
+            .expect("runtime is present until drop")
+    }
+
     /// Convert Python dict (ClientContext fields) to Rust ClientContext
     pub(crate) fn dict_to_client_context(dict: &Bound<'_, PyDict>) -> PyResult<ClientContext> {
         tracing::debug!("Extracting connection parameters from Python dict");
@@ -571,6 +588,16 @@ impl PyCoreConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connection_can_be_collected_during_a_bulk_source_callback() {
+        let connection = PyCoreConnection {
+            runtime: Some(Runtime::new().unwrap()),
+            tds_client: None,
+            is_closed: true,
+        };
+        drop(connection);
+    }
 
     #[test]
     fn missing_msf_preserves_inheritance() {

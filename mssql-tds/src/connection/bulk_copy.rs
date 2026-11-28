@@ -74,6 +74,30 @@ use crate::sql_identifier::parse_bulk_copy_target_identifier;
 use async_trait::async_trait;
 use std::time::{Duration, Instant};
 
+// A named adapter preserves Send for futures consuming borrowed rows; Map<_, Ok>
+// can introduce an insufficiently general function lifetime in spawned futures.
+struct InfallibleRows<I>(I);
+
+impl<I: Iterator> Iterator for InfallibleRows<I> {
+    type Item = TdsResult<I::Item>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(Ok)
+    }
+}
+
+fn check_source_error<I, R>(rows: &mut std::iter::Peekable<I>) -> TdsResult<()>
+where
+    I: Iterator<Item = TdsResult<R>>,
+{
+    if matches!(rows.peek(), Some(Err(_)))
+        && let Some(Err(error)) = rows.next()
+    {
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Options for configuring bulk copy operations.
 ///
 /// These options control various aspects of the bulk copy behavior,
@@ -931,6 +955,19 @@ impl<'a> BulkCopy<'a> {
         I: IntoIterator<Item = R>,
         R: BulkLoadRow,
     {
+        self.try_write_to_server_zerocopy(InfallibleRows(rows.into_iter()))
+            .await
+    }
+
+    /// Write a fallible source without treating a source error as end-of-input.
+    ///
+    /// A source error aborts the current batch through the normal bulk cleanup
+    /// path. Previously committed internal batches are not rolled back.
+    pub async fn try_write_to_server_zerocopy<I, R>(&mut self, rows: I) -> TdsResult<BulkCopyResult>
+    where
+        I: IntoIterator<Item = TdsResult<R>>,
+        R: BulkLoadRow,
+    {
         let start_time = Instant::now();
         let mut total_rows = 0u64;
 
@@ -963,6 +1000,7 @@ impl<'a> BulkCopy<'a> {
             .destination_metadata
             .as_ref()
             .ok_or_else(|| Error::UsageError("Destination metadata not available".to_string()))?;
+        check_source_error(&mut rows)?;
 
         // If no column mappings are configured, peek at first row to determine source column count
         // and create ordinal mappings for min(source_columns, destination_columns)
@@ -1053,7 +1091,7 @@ impl<'a> BulkCopy<'a> {
         start_time: Instant,
     ) -> TdsResult<()>
     where
-        I: Iterator<Item = R>,
+        I: Iterator<Item = TdsResult<R>>,
         R: BulkLoadRow,
     {
         // Determine batch size (0 means all rows in one batch)
@@ -1094,6 +1132,11 @@ impl<'a> BulkCopy<'a> {
         let mut accumulated_cp_loss = false;
 
         loop {
+            if let Err(error) = check_source_error(&mut rows) {
+                let _ = self.client.take_info_messages();
+                self.client.extend_info_messages(accumulated_info);
+                return Err(error);
+            }
             if rows.peek().is_none() {
                 break;
             }
@@ -1159,7 +1202,7 @@ impl<'a> BulkCopy<'a> {
             // Execute streaming bulk load with zero-copy path
             let batch_result = self
                 .client
-                .execute_bulk_load_streaming_zerocopy(
+                .try_execute_bulk_load_streaming_zerocopy(
                     self.table_name.clone(),
                     dest_column_metadata.clone(),
                     self.options.clone(),
@@ -1389,6 +1432,28 @@ mod tests {
     use super::*;
 
     struct LossyTextRow;
+
+    #[tokio::test]
+    async fn source_error_before_first_row_sends_nothing() {
+        let (mut client, sent) =
+            crate::test_client_support::tds_client_from_tokens_capturing(vec![]);
+        let mut copy = BulkCopy::new(&mut client, "#source_error").use_internal_transaction(true);
+        copy.destination_metadata = Some(vec![BulkCopyColumnMetadata::new(
+            "id",
+            SqlDbType::Int,
+            SqlDbType::Int.to_tds_type(),
+        )]);
+        let error = copy
+            .try_write_to_server_zerocopy([Err::<LossyTextRow, _>(Error::UsageError(
+                "source failed".into(),
+            ))])
+            .await
+            .unwrap_err();
+        drop(copy);
+        assert!(error.to_string().contains("source failed"));
+        assert!(sent.lock().unwrap().is_empty());
+        assert!(!client.has_active_transaction());
+    }
 
     #[async_trait::async_trait]
     impl BulkLoadRow for LossyTextRow {
