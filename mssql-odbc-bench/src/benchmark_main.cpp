@@ -177,6 +177,17 @@ int main(int argc, char** argv) {
             py_cursor_runners.push_back(std::move(runner));
         }
 
+        std::vector<std::unique_ptr<mssql::odbc::bench::OrmRunner>> orm_runners;
+        for (const auto& spec : mssql::odbc::bench::orm_workloads()) {
+            if (!config.scenario.empty() && config.scenario != spec.scenario) {
+                continue;
+            }
+            auto runner = std::make_unique<mssql::odbc::bench::OrmRunner>(session, spec, config);
+            runner->preflight();
+            register_runner(runner.get(), benchmark_error);
+            orm_runners.push_back(std::move(runner));
+        }
+
         benchmark::RunSpecifiedBenchmarks();
         benchmark::Shutdown();
         if (!benchmark_error.empty()) {

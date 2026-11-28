@@ -25,9 +25,9 @@ Manager; the harness never links to the Rust driver.
 | `ODBC_BENCH_ENCRYPT` | `Mandatory` | `Encrypt` value |
 | `ODBC_BENCH_PACKET_SIZE` | `16192` | Cross-platform encrypted-lab value honored exactly by Microsoft ODBC 18.6.2.1 and both Rust builds; set through both ODBC attribute and connection keyword, then read back |
 | `ODBC_BENCH_PACKET_SIZE_KEYWORD` | `PacketSize` | `PacketSize` or Microsoft driver spelling `Packet Size` |
-| `ODBC_BENCH_SCENARIO` | all | Run only `narrow`, `wide`, `rowset`, `varwidth`, `getdata`, `write`, `pywrite`, `latency`, `params`, `lobwrite`, or `cursorfetch` |
+| `ODBC_BENCH_SCENARIO` | all | Run only `narrow`, `wide`, `rowset`, `varwidth`, `getdata`, `write`, `pywrite`, `latency`, `params`, `lobwrite`, `cursorfetch`, `orm`, or `connect` |
 | `ODBC_BENCH_WRITE_MODE` | `parameter_array` | Use one parameter-array execute, or `sequential` for a driver without array support. Applies to `write` only; `pywrite` always uses one parameter-array execute |
-| `ODBC_BENCH_CALLS` | catalog size | Override calls/operations per `latency`, `params`, `lobwrite`, and `cursorfetch` sample (1-1000000) for short local runs; the perf lab leaves it unset |
+| `ODBC_BENCH_CALLS` | catalog size | Override calls/operations per `latency`, `params`, `lobwrite`, `cursorfetch`, `orm`, and `connect` sample (1-1000000) for short local runs; the perf lab leaves it unset |
 
 Missing required values, connection errors, absent/invalid tables, ODBC
 warnings during retrieval, and correctness failures make the process fail.
@@ -109,10 +109,11 @@ After both legs:
 
 ## Workloads
 
-Twenty-six measurements, all of them C++ calls into the driver: sixteen over
-eleven tables, two `latency` ones that need no table, and eight `params`/
+Twenty-nine measurements, all of them C++ calls into the driver: sixteen over
+eleven tables, two `latency` ones that need no table, eight `params`/
 `lobwrite`/`cursorfetch` ones, three of them on temporary tables of the
-measuring connection.
+measuring connection, two `orm` ones (one on a temporary table), and one`
+`connect` one.
 Every id encodes the data shape, the row and column counts, and the access shape,
 and is identical on all three driver legs. The shapes are drawn from what
 `mssql-python` asks a driver to do; nothing here runs Python.
@@ -364,11 +365,56 @@ in `mssql-python` but make no driver call. The `SQLGetDiagFieldW` record count
 that `mssql-python` reads on `SQL_NO_DATA` is replayed, and any record found
 fails the run.
 
+### `orm`, `connect` — SQLAlchemy and Django on `mssql-python`
+
+Each benchmark replays one SQLAlchemy or Django operation as the ODBC calls
+`mssql-python` 1.18 makes for it. The sequences were captured from SQLAlchemy
+2.1.9 (`mssql+mssqlpython`) and Django 6.1.3 with mssql-django 2.0.0
+(`python_driver="mssql_python"`) through a call-logging proxy driver, and
+`mssql-python` issued the same sequence to msodbcsql18 and mssql-odbc. The
+replay reuses the `params` cursor model above. Each benchmark covers one driver
+path that no other benchmark times:
+
+| Benchmark | Framework operation | One operation | Path no other benchmark times |
+|---|---|---|---|
+| `orm/select1_4b/sqlalchemy_checkout_rollback` | pool checkout, `conn.execute(text("SELECT 1")).scalar()`, checkin | new cursor, `SQLExecDirectW("SELECT 1")`, `fetchone`, `SQLFreeHandle`, `SQLEndTran(SQL_ROLLBACK)` | `SQLEndTran` on a manual-commit connection, and the transaction the next statement begins; statement allocate and free per execute |
+| `orm/get_by_pk_1_row_c2_8b/django_get` | `World.objects.get(id=...)` | new cursor, `SQLPrepareW` of `SELECT TOP 21 ... WHERE id = ?`, one narrowed `int` key, `SQLExecute`, `fetchmany(100)` until empty, `SQLFreeHandle`; autocommit | prepare per execute, and `SQLFreeHandle` of a prepared statement, which sends `sp_unprepare` |
+| `connect/sql_login_tls/connect_close` | `mssql_python.connect()` + `close()` | `SQLAllocHandle(SQL_HANDLE_DBC)`, `SQL_ATTR_AUTOCOMMIT` off, `SQLDriverConnectW`, two `SQLGetConnectAttrW(SQL_ATTR_AUTOCOMMIT)`, `SQL_ROLLBACK`, `SQLDisconnect`, `SQLFreeHandle` | login, TLS, and disconnect |
+
+A framework cursor close is a bare `SQLFreeHandle`. SQLAlchemy connections run
+with autocommit off, as `mssql-python` connects by default, so the rollback is a
+real request; Django switches its connection to autocommit. The connect workload
+uses the measuring configuration's connection string but, as `mssql-python`
+does, sets no packet size attribute; the driver stays loaded because the
+measuring connection is open.
+
+Other common framework operations reach paths that other benchmarks already
+time, so they are not repeated here:
+
+- single-row `INSERT` and commit (SQLAlchemy `OUTPUT inserted.id`, Django
+  `SCOPE_IDENTITY()`): the prepare, free, and transaction-end paths above. The
+  new key comes back as a one-row result set, not an output parameter;
+- TechEmpower updates and multi-query gets: repeated gets plus prepared DML;
+- TechEmpower fortunes and large result reads: bound rowset fetch
+  (`fetchmany_100`, `bound_rowset_1000`);
+- insertmanyvalues (pandas `to_sql`, Django `bulk_create`): many text markers
+  (`bind_100_nvarchar20_4kb`, `bind_1000_int_4kb`);
+- `executemany` and ORM bulk `UPDATE`: one column-wise parameter-array execute
+  (`write/insert_1000_rows_*`);
+- Django `count()`: the `select1` shape without the rollback.
+
+`World` is a 10,000-row temporary table of the measuring connection. Every get
+checks the fetched key and value and that exactly one row came back; every
+`SELECT 1` checks its value.
+
+Not replayed: Python-side object construction, SQL compilation, and pool
+bookkeeping, and anything SQLAlchemy or Django runs once per process, such as
+dialect initialization queries.
 ## Measurement boundaries
 
 Each Google Benchmark sample is one full result-set retrieval
 (`Iterations(1)`), or one fixed batch of calls or operations for `latency` and
-the `params`, `lobwrite`, and `cursorfetch` scenarios.
+the `params`, `lobwrite`, `cursorfetch`, `orm`, and `connect` scenarios.
 `--benchmark_repetitions` controls the sample count.
 Steady-clock timing starts immediately before `SQLExecDirect` and ends after the
 result is exhausted and the row count is checked. What is inside depends on the
@@ -383,6 +429,7 @@ access shape:
 | `write/insert_1000_rows_*/*` | the whole `executemany` call: statement free and allocate, prepare, bind, one parameter-array `SQLExecute`, diagnostics, and row/column counts |
 | `latency/*` | the whole batch: per call `SQLExecDirectW`, `SQLFetch`, the value check, and `SQLCloseCursor`; no per-phase timestamps |
 | `param/*`, `write/stream_*`, `fetch/mixed_*_rows_*` | each operation's `execute` and fetch calls listed above, summed over the sample; the LOB `TRUNCATE` and stored-row check are excluded |
+| `orm/*`, `connect/*` | each operation's calls listed above, from the first handle allocation to the transaction end or last handle free, summed over the sample |
 
 The per-cell `SQLDescribeCol` in the row-at-a-time shape is not an accident: it
 mirrors `SQLGetData_wrap`, which re-describes every column on every row, so it is
@@ -399,8 +446,8 @@ execute, metadata-plus-bind (absent for `bind_cycle_*`), and fetch phase
 counters, plus rows/s, cells/s, and logical bytes/s. Logical bytes are the
 generator's own byte total, so all three drivers are credited with identical
 payload regardless of representation. `latency/*`, `param/*`, `write/stream_*`,
-and `fetch/mixed_*_rows_*` emit `calls` and `us_per_call` (per operation)
-instead of the phase counters.
+`fetch/mixed_*_rows_*`, and the `orm` and `connect` workloads emit
+`calls` and `us_per_call` (per operation) instead of the phase counters.
 
 Preflight checks all indicators, row identity/coverage, an order-independent
 checksum, representative values for every generated type, the exact generated
