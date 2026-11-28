@@ -7428,6 +7428,19 @@ mod test {
             }
         }
 
+        #[tokio::test]
+        async fn time_scale_7() {
+            let md = scale_metadata(TdsDataType::TimeN, 5, 7);
+            let buf = vec![5, 1, 0, 0, 0, 0]; // length + one 100-ns tick
+            match assert_decode_equivalence(buf, &md).await {
+                ColumnValues::Time(t) => {
+                    assert_eq!(t.time_nanoseconds, 1);
+                    assert_eq!(t.scale, 7);
+                }
+                other => panic!("expected Time, got {other:?}"),
+            }
+        }
+
         // ── DateTime2 / DateTimeOffset error paths ─────────────────────
 
         #[tokio::test]

@@ -105,7 +105,7 @@ pub const DEFAULT_VARTIME_SCALE: u8 = 7;
 /// TDS `time` value with configurable fractional-seconds precision.
 #[derive(Debug, PartialEq, Clone)]
 pub struct SqlTime {
-    /// Nanoseconds since midnight.
+    /// 100-nanosecond ticks since midnight (independent of `scale`).
     pub time_nanoseconds: u64,
     /// Fractional-seconds scale (0–7).
     pub scale: u8,
