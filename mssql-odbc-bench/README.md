@@ -109,9 +109,10 @@ After both legs:
 
 ## Workloads
 
-Thirty measurements, all of them C++ calls into the driver: sixteen over eleven
-tables, three `latency` ones that need no table, and eleven `params`/`lobwrite`/
-`cursorfetch` ones on temporary tables of the measuring connection.
+Twenty-six measurements, all of them C++ calls into the driver: sixteen over
+eleven tables, two `latency` ones that need no table, and eight `params`/
+`lobwrite`/`cursorfetch` ones, three of them on temporary tables of the
+measuring connection.
 Every id encodes the data shape, the row and column counts, and the access shape,
 and is identical on all three driver legs. The shapes are drawn from what
 `mssql-python` asks a driver to do; nothing here runs Python.
@@ -280,19 +281,16 @@ can resolve; `us_per_call` in the JSON is the per-call figure.
 
 - `latency/exec_direct_select1` — 5,000 × `SQLExecDirectW("SELECT 1")`,
   `SQLFetch`, `SQLCloseCursor`.
-- `latency/prepared_select_param` — `SQLPrepareW("SELECT ?")` once with one bound
-  `SQL_C_SLONG` parameter, then 5,000 × a new parameter value, `SQLExecute`,
-  `SQLFetch`, `SQLCloseCursor`. The ORM shape.
 - `latency/exec_direct_16k_text` — 2,000 × the `exec_direct_select1` cycle with
   `SELECT 1` padded by a block comment to 16,384 UTF-16 characters, so
   client-side statement-text scanning and conversion dominate while the server
   does no extra work.
 
 Statement text goes through the W entry points on Linux too, matching
-`mssql-python`. Each workload uses its own statement handle, so the prepared
-plan and the column and parameter bindings persist across samples as they do in
-an application. Every call checks the fetched value and indicator; the prepared
-workload sends a different value each call, so a stale buffer cannot pass.
+`mssql-python`. Each workload uses its own statement handle, so the column
+binding persists across samples as it does in an application. Every call checks
+the fetched value and indicator. The prepare-once, execute-with-a-new-value shape
+is `param/bind_1_int_4b/execute_fetchone`.
 Preflight checks the result shape (one `INT` column, exactly one row) and then
 runs 500 untimed, validated warm-up calls.
 
@@ -309,7 +307,7 @@ make for it, on one statement handle per benchmark, so mssql-odbc can be
 compared with msodbcsql18 on that suite without Python in the measurement.
 
 Each id names what is bound, streamed, or fetched, and the payload one operation
-moves, rounded (`4b` … `730kb` … `10mb`), so small-call and bulk-data costs read
+moves, rounded (`4b` … `63kb` … `1mb`), so small-call and bulk-data costs read
 apart at a glance. That size is what `logical_bytes` reports per operation:
 bound parameter buffer bytes, streamed bytes, or the SQL Server storage size of
 fetched values, not TDS bytes on the wire.
@@ -317,13 +315,12 @@ fetched values, not TDS bytes on the wire.
 | Benchmark | `mssql-python` workload | One operation |
 |---|---|---|
 | `param/bind_1_int_4b/execute_fetchone` | `query_scalar` | `SELECT CAST(? AS INT)` with the next `int`, `fetchone` |
-| `param/bind_{10,100,1000}_int_{40b,400b,4kb}/execute_fetchone` | `param_count_int_*` | `SELECT SUM(v) FROM (VALUES (?), ...)` with 10/100/1,000 `int` markers, `fetchone` |
+| `param/bind_{100,1000}_int_{400b,4kb}/execute_fetchone` | `param_count_int_{100,1000}` | `SELECT SUM(v) FROM (VALUES (?), ...)` with 100/1,000 `int` markers, `fetchone` |
 | `param/bind_100_nvarchar20_4kb/execute_fetchone` | `param_count_nvarchar_100` | 100 20-character ASCII `str` markers, `SUM(LEN(v))`, `fetchone` |
 | `param/bind_10_mixed_types_100b/execute_fetchone` | `param_types_mixed_10` | `int`, big `int`, `float`, `Decimal`, non-ASCII `str`, `bytes`, `bool`, `datetime`, `date`, `None`; `fetchone` of all ten |
-| `write/stream_varbinary_{1,10}mb/insert_putdata` | `insert_lob_varbinary_*` | `INSERT` of one `bytes` value streamed with `SQLParamData`/`SQLPutData` |
+| `write/stream_varbinary_1mb/insert_putdata` | `insert_lob_varbinary_1mb` | `INSERT` of one `bytes` value streamed with `SQLParamData`/`SQLPutData` |
 | `write/stream_nvarchar_1mb/insert_putdata` | `insert_lob_nvarchar_1mb` | the same with a 1 MiB (UTF-16) ASCII `str` |
 | `fetch/mixed_1k_rows_c4_63kb/fetchmany_100` | `fetchmany_mixed_1000_batch100` | `SELECT` of 1,000 `INT`/`DECIMAL(18,4)`/`NVARCHAR(100)`/`VARBINARY(64)` rows, `fetchmany(100)` until empty |
-| `fetch/mixed_10k_rows_c8_730kb/arrow_8192` | `fetch_arrow_mixed8_10000` | `SELECT` of 10,000 eight-type rows, `cursor.arrow()` |
 
 The replayed sequence, per Python call:
 
@@ -348,12 +345,10 @@ The replayed sequence, per Python call:
 - **`fetchone`**: `SQLFetch`, `SQLNumResultCols`, then per column
   `SQLDescribeColW` and one `SQLGetData` with the C type and buffer `GetRowData`
   picks.
-- **`fetchmany`** and **`arrow`**: per call, column-wise `SQLBindCol` into newly
-  allocated arrays, `SQL_ATTR_ROW_ARRAY_SIZE` and `SQL_ATTR_ROWS_FETCHED_PTR`,
-  then `SQLFetchScroll` (one 100-row rowset) or repeated `SQLFetch` with 64-row
-  rowsets up to 8,192 rows, then both attributes reset and
-  `SQLFreeStmt(SQL_UNBIND)`. `fetchmany` describes the result once; every
-  `arrow` batch describes it again.
+- **`fetchmany`**: the result described once; per call, column-wise
+  `SQLBindCol` into newly allocated arrays, `SQL_ATTR_ROW_ARRAY_SIZE` and
+  `SQL_ATTR_ROWS_FETCHED_PTR`, one 100-row `SQLFetchScroll`, then both
+  attributes reset and `SQLFreeStmt(SQL_UNBIND)`.
 
 As in the Python workloads, the `TRUNCATE` before each LOB insert and the stored
 row check after it run on the same cursor but outside the timer, so every insert
@@ -364,10 +359,10 @@ count for the fetch workloads. Preflight additionally compares every fetched
 cell with its generator and reads each streamed value back byte for byte, where
 the Python suite checks a SHA-256.
 
-Not replayed: Python-side type detection, value conversion, and Arrow buffer
-construction. These cost CPU in `mssql-python` but make no driver call. The
-`SQLGetDiagFieldW` record count that `mssql-python` reads on `SQL_NO_DATA` is
-replayed, and any record found fails the run.
+Not replayed: Python-side type detection and value conversion. These cost CPU
+in `mssql-python` but make no driver call. The `SQLGetDiagFieldW` record count
+that `mssql-python` reads on `SQL_NO_DATA` is replayed, and any record found
+fails the run.
 
 ## Measurement boundaries
 
@@ -386,7 +381,7 @@ access shape:
 | `getdata/*` | `SQLExecDirect`, the initial describe, then per row: `SQLFetch`, and per column a `SQLDescribeCol` plus its `SQLGetData` calls (including LOB continuations and the variant probe/`SQLColAttribute` pair) |
 | `write/insert_2000_c3/*` | one parameter-array `SQLExecute`, or 2,000 sequential `SQLExecute` calls on the pinned Rust baseline |
 | `write/insert_1000_rows_*/*` | the whole `executemany` call: statement free and allocate, prepare, bind, one parameter-array `SQLExecute`, diagnostics, and row/column counts |
-| `latency/*` | the whole batch: per call `SQLExecDirectW` or `SQLExecute`, `SQLFetch`, the value check, and `SQLCloseCursor`; no per-phase timestamps |
+| `latency/*` | the whole batch: per call `SQLExecDirectW`, `SQLFetch`, the value check, and `SQLCloseCursor`; no per-phase timestamps |
 | `param/*`, `write/stream_*`, `fetch/mixed_*_rows_*` | each operation's `execute` and fetch calls listed above, summed over the sample; the LOB `TRUNCATE` and stored-row check are excluded |
 
 The per-cell `SQLDescribeCol` in the row-at-a-time shape is not an accident: it

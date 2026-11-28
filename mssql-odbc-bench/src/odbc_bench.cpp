@@ -893,30 +893,26 @@ const std::array<WorkloadSpec, kWorkloadCount>& workloads() {
 }
 
 // Small calls where per-call driver overhead, not payload, decides latency. Batch
-// sizes put one sample at 0.9-2.4 s locally on msodbcsql18 and mssql-odbc.
+// sizes put one sample at about 1-2 s on msodbcsql18 and mssql-odbc.
 const std::array<LatencySpec, kLatencyWorkloadCount>& latency_workloads() {
     static const std::array<LatencySpec, kLatencyWorkloadCount> specs = {{
-        // The shortest non-prepared round trip.
-        {"latency/exec_direct_select1", LatencyCall::exec_direct, 0, 5'000},
-        // The ORM shape: prepare once, then execute with a new parameter each call.
-        {"latency/prepared_select_param", LatencyCall::prepared_param, 0, 5'000},
+        // The shortest unprepared round trip.
+        {"latency/exec_direct_select1", 0, 5'000},
         // Statement text large enough that client-side scanning and UTF-16
         // handling dominate; the trailing comment keeps server work trivial.
-        {"latency/exec_direct_16k_text", LatencyCall::exec_direct, 16'384, 2'000},
+        {"latency/exec_direct_16k_text", 16'384, 2'000},
     }};
     return specs;
 }
 
-// mssql-python `performance/scenarios/odbc_path_workloads.py` and `workloads.py`,
-// one entry per Python workload. Sample sizes put one sample at 0.8-1.1 s on
+// mssql-python `performance/scenarios/odbc_path_workloads.py` and `workloads.py`
+// workloads whose ODBC path no other benchmark here already measures. Sample sizes put one sample at 0.8-1.1 s on
 // msodbcsql18 18.7 against a local SQL Server 2022.
 const std::array<PyCursorSpec, kPyCursorWorkloadCount>& py_cursor_workloads() {
     constexpr std::size_t kMiB = 1024 * 1024;
     static const std::array<PyCursorSpec, kPyCursorWorkloadCount> specs = {{
         {"param/bind_1_int_4b/execute_fetchone", "params", "query_scalar",
          PyCursorWorkload::query_scalar, 1, 5'000},
-        {"param/bind_10_int_40b/execute_fetchone", "params", "param_count_int_10",
-         PyCursorWorkload::param_count_int, 10, 5'000},
         {"param/bind_100_int_400b/execute_fetchone", "params", "param_count_int_100",
          PyCursorWorkload::param_count_int, 100, 4'000},
         {"param/bind_1000_int_4kb/execute_fetchone", "params", "param_count_int_1000",
@@ -927,14 +923,10 @@ const std::array<PyCursorSpec, kPyCursorWorkloadCount>& py_cursor_workloads() {
          PyCursorWorkload::param_types_mixed, 10, 4'000},
         {"write/stream_varbinary_1mb/insert_putdata", "lobwrite",
          "insert_lob_varbinary_1mb", PyCursorWorkload::insert_lob_varbinary, kMiB, 120},
-        {"write/stream_varbinary_10mb/insert_putdata", "lobwrite",
-         "insert_lob_varbinary_10mb", PyCursorWorkload::insert_lob_varbinary, 10 * kMiB, 15},
         {"write/stream_nvarchar_1mb/insert_putdata", "lobwrite",
          "insert_lob_nvarchar_1mb", PyCursorWorkload::insert_lob_nvarchar, kMiB, 150},
         {"fetch/mixed_1k_rows_c4_63kb/fetchmany_100", "cursorfetch",
          "fetchmany_mixed_1000_batch100", PyCursorWorkload::fetchmany_mixed, 1'000, 800},
-        {"fetch/mixed_10k_rows_c8_730kb/arrow_8192", "cursorfetch", "fetch_arrow_mixed8_10000",
-         PyCursorWorkload::fetch_arrow_mixed, 10'000, 65},
     }};
     return specs;
 }
@@ -2723,15 +2715,6 @@ public:
             require_exact_success(
                 SQLBindCol(stmt_, 1, SQL_C_SLONG, &value_, sizeof(value_), &indicator_),
                 "SQLBindCol(latency)", SQL_HANDLE_STMT, stmt_);
-            if (spec_.call == LatencyCall::prepared_param) {
-                require_exact_success(SQLPrepareW(stmt_, text_.data(), SQL_NTS),
-                                      "SQLPrepareW(latency)", SQL_HANDLE_STMT, stmt_);
-                require_exact_success(
-                    SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
-                                     0, 0, &parameter_, sizeof(parameter_),
-                                     &parameter_indicator_),
-                    "SQLBindParameter(latency)", SQL_HANDLE_STMT, stmt_);
-            }
         } catch (...) {
             SQLFreeHandle(SQL_HANDLE_STMT, stmt_);
             throw;
@@ -2769,8 +2752,7 @@ private:
     static constexpr std::size_t kWarmupCalls = 500;
 
     static std::vector<SQLWCHAR> statement_text(const LatencySpec& spec) {
-        std::string text =
-            spec.call == LatencyCall::prepared_param ? "SELECT ?" : "SELECT 1";
+        std::string text = "SELECT 1";
         if (spec.text_chars != 0) {
             // The filler contains no '?', '{', or "*/", so the driver has nothing
             // to rewrite and the server nothing to parse beyond `SELECT 1`.
@@ -2791,27 +2773,19 @@ private:
         return wide;
     }
 
-    SQLINTEGER submit() {
+    void submit() {
         value_ = 0;
         indicator_ = kIndicatorSentinel;
-        if (spec_.call == LatencyCall::exec_direct) {
-            require_exact_success(SQLExecDirectW(stmt_, text_.data(), SQL_NTS),
-                                  "SQLExecDirectW(latency)", SQL_HANDLE_STMT, stmt_);
-            return 1;
-        }
-        // A new value per call, so a stale buffer or a reused result cannot pass.
-        parameter_ = next_parameter_++;
-        require_exact_success(SQLExecute(stmt_), "SQLExecute(latency)", SQL_HANDLE_STMT,
-                              stmt_);
-        return parameter_;
+        require_exact_success(SQLExecDirectW(stmt_, text_.data(), SQL_NTS),
+                              "SQLExecDirectW(latency)", SQL_HANDLE_STMT, stmt_);
     }
 
-    void fetch_row(SQLINTEGER expected) {
+    void fetch_row() {
         require_exact_success(SQLFetch(stmt_), "SQLFetch(latency)", SQL_HANDLE_STMT, stmt_);
-        if (value_ != expected || indicator_ != static_cast<SQLLEN>(sizeof(value_))) {
+        if (value_ != 1 || indicator_ != static_cast<SQLLEN>(sizeof(value_))) {
             std::ostringstream message;
             message << name() << " fetched " << value_ << " (indicator " << indicator_
-                    << "); expected " << expected;
+                    << "); expected 1";
             throw std::runtime_error(message.str());
         }
     }
@@ -2825,7 +2799,7 @@ private:
     // result really is one INT column and one row on this driver.
     void verify_result_shape() {
         try {
-            const SQLINTEGER expected = submit();
+            submit();
             SQLSMALLINT columns = 0;
             require_exact_success(SQLNumResultCols(stmt_, &columns),
                                   "SQLNumResultCols(latency)", SQL_HANDLE_STMT, stmt_);
@@ -2841,7 +2815,7 @@ private:
                 throw std::runtime_error(std::string(name()) +
                                          " did not return one INT column");
             }
-            fetch_row(expected);
+            fetch_row();
             const SQLRETURN rc = SQLFetch(stmt_);
             if (rc != SQL_NO_DATA) {
                 throw_odbc_error("SQLFetch(latency final)", rc, SQL_HANDLE_STMT, stmt_);
@@ -2858,7 +2832,8 @@ private:
         try {
             const auto start = std::chrono::steady_clock::now();
             for (std::size_t call = 0; call < calls; ++call) {
-                fetch_row(submit());
+                submit();
+                fetch_row();
                 close_cursor();
             }
             total_seconds = seconds_between(start, std::chrono::steady_clock::now());
@@ -2882,9 +2857,6 @@ private:
     SQLHSTMT stmt_;
     SQLINTEGER value_ = 0;
     SQLLEN indicator_ = kIndicatorSentinel;
-    SQLINTEGER parameter_ = 0;
-    SQLLEN parameter_indicator_ = sizeof(SQLINTEGER);
-    SQLINTEGER next_parameter_ = 1;
 };
 
 namespace {
@@ -3345,8 +3317,6 @@ constexpr std::size_t kPyMaxInlineBinary = 8000;   // MAX_INLINE_BINARY
 constexpr SQLULEN kPyMaxLobSize = 8000;            // SQL_MAX_LOB_SIZE
 constexpr SQLLEN kPyNumericTextBytes = 64;         // MAX_DIGITS_IN_NUMERIC
 constexpr SQLULEN kPyZeroColumnSize = 4096;        // HandleZeroColumnSizeAtFetch
-constexpr std::size_t kPyArrowFetchRows = 64;      // FetchArrowBatch_wrap fetchSize
-constexpr std::size_t kPyArrowBatchRows = 8192;    // Cursor.arrow batch_size
 constexpr std::size_t kPyFetchManyRows = 100;      // fetchmany_mixed batch
 
 std::vector<SQLWCHAR> wide_text(std::u16string_view text) {
@@ -3705,41 +3675,6 @@ public:
         return static_cast<std::size_t>(fetched);
     }
 
-    // `Cursor.arrow_batch` -> `FetchArrowBatch_wrap` on a result with no LOB columns.
-    template <typename Sink>
-    std::size_t arrow_batch(std::size_t batch_rows, Sink&& sink) {
-        num_result_cols();
-        std::vector<PyColumn> metadata;
-        describe_columns(&metadata);
-        auto columns = bind_columns(metadata, kPyArrowFetchRows);
-        SQLULEN fetched = 0;
-        std::size_t rows = 0;
-        try {
-            configure_rowset(kPyArrowFetchRows, &fetched);
-            while (rows < batch_rows) {
-                const std::size_t space = batch_rows - rows;
-                if (kPyArrowFetchRows > space) {
-                    check(SQLSetStmtAttrW(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
-                                          attribute_value(space), 0),
-                          "SQLSetStmtAttrW(SQL_ATTR_ROW_ARRAY_SIZE)");
-                }
-                const SQLRETURN rc = SQLFetch(stmt_);
-                if (rc == SQL_NO_DATA) {
-                    require_no_diagnostics();
-                    break;
-                }
-                check(rc, "SQLFetch(arrow)");
-                sink(columns, static_cast<std::size_t>(fetched));
-                rows += static_cast<std::size_t>(fetched);
-            }
-        } catch (...) {
-            close_rowset_noexcept();
-            throw;
-        }
-        close_rowset();
-        return rows;
-    }
-
     // Untimed: release the result so other statements on the connection can run.
     void close() {
         check(SQLFreeStmt(stmt_, SQL_CLOSE), "SQLFreeStmt(SQL_CLOSE)");
@@ -4034,7 +3969,8 @@ private:
               "SQLGetData");
     }
 
-    // `SQLBindColums`: one freshly allocated column-wise array per column.
+    // `SQLBindColums` for the column types the fetch workload binds: one freshly
+    // allocated column-wise array per column.
     std::vector<PyBoundColumn> bind_columns(const std::vector<PyColumn>& metadata,
                                             std::size_t rows) {
         columns_unbound_ = false;
@@ -4057,45 +3993,10 @@ private:
                 column.c_type = SQL_C_SLONG;
                 column.width = sizeof(SQLINTEGER);
                 break;
-            case SQL_SMALLINT:
-                column.c_type = SQL_C_SSHORT;
-                column.width = sizeof(SQLSMALLINT);
-                break;
-            case SQL_TINYINT:
-                column.c_type = SQL_C_TINYINT;
-                column.width = 1;
-                break;
-            case SQL_BIT:
-                column.c_type = SQL_C_BIT;
-                column.width = 1;
-                break;
-            case SQL_REAL:
-                column.c_type = SQL_C_FLOAT;
-                column.width = sizeof(SQLREAL);
-                break;
             case SQL_DECIMAL:
             case SQL_NUMERIC:
                 column.c_type = SQL_C_CHAR;
                 column.width = kPyNumericTextBytes;
-                break;
-            case SQL_DOUBLE:
-            case SQL_FLOAT:
-                column.c_type = SQL_C_DOUBLE;
-                column.width = sizeof(SQLDOUBLE);
-                break;
-            case SQL_TIMESTAMP:
-            case SQL_TYPE_TIMESTAMP:
-            case SQL_DATETIME:
-                column.c_type = SQL_C_TYPE_TIMESTAMP;
-                column.width = sizeof(SQL_TIMESTAMP_STRUCT);
-                break;
-            case SQL_BIGINT:
-                column.c_type = SQL_C_SBIGINT;
-                column.width = sizeof(SQLBIGINT);
-                break;
-            case SQL_TYPE_DATE:
-                column.c_type = SQL_C_TYPE_DATE;
-                column.width = sizeof(SQL_DATE_STRUCT);
                 break;
             case SQL_BINARY:
             case SQL_VARBINARY:
@@ -4266,10 +4167,6 @@ private:
             sql_ = wide_text(ascii_u16("SELECT id, amount, label, payload FROM " + table_ +
                                        " ORDER BY id"));
             break;
-        case PyCursorWorkload::fetch_arrow_mixed:
-            sql_ = wide_text(ascii_u16("SELECT id, big, ratio, amount, label, stamp, flag, "
-                                       "payload FROM " + table_ + " ORDER BY id"));
-            break;
         }
         if (is_lob()) {
             truncate_sql_ = wide_text(ascii_u16("TRUNCATE TABLE " + table_));
@@ -4291,14 +4188,6 @@ private:
                     4 + 9 + 2 * std::to_string(id).size() + 2 * std::strlen("value-") + 32;
             }
             break;
-        case PyCursorWorkload::fetch_arrow_mixed:
-            cells_per_operation_ = spec_.size * 8;
-            for (std::size_t id = 0; id < spec_.size; ++id) {
-                bytes_per_operation_ += 4 + 8 + 8 + 9 + 2 * std::strlen("label-") +
-                                        2 * std::to_string(id).size() + 8 + 1 +
-                                        (id % 17 == 0 ? 0 : 16);
-            }
-            break;
         default:
             cells_per_operation_ = params_.size();
             for (const auto& parameter : params_) {
@@ -4311,8 +4200,7 @@ private:
     // The Python workloads build these tables in `_prepare` on the same
     // connection; here the generators are set-based T-SQL with the same values.
     void create_table() {
-        if (!is_lob() && spec_.kind != PyCursorWorkload::fetchmany_mixed &&
-            spec_.kind != PyCursorWorkload::fetch_arrow_mixed) {
+        if (!is_lob() && spec_.kind != PyCursorWorkload::fetchmany_mixed) {
             return;
         }
         session_.execute_non_query("DROP TABLE IF EXISTS " + table_);
@@ -4337,22 +4225,6 @@ private:
                 "CAST(REPLICATE(CAST(CAST(value % 251 AS BINARY(1)) AS VARBINARY(64)), 32) "
                 "AS VARBINARY(64)) FROM GENERATE_SERIES(0, " +
                 std::to_string(spec_.size - 1) + ")");
-            break;
-        case PyCursorWorkload::fetch_arrow_mixed:
-            session_.execute_non_query(
-                "CREATE TABLE " + table_ +
-                " (id INT NOT NULL, big BIGINT NOT NULL, ratio FLOAT NOT NULL, "
-                "amount DECIMAL(18, 4) NOT NULL, label NVARCHAR(50) NOT NULL, "
-                "stamp DATETIME2(6) NOT NULL, flag BIT NOT NULL, payload VARBINARY(32) NULL)");
-            session_.execute_non_query(
-                "INSERT INTO " + table_ +
-                " SELECT value, CAST(value AS BIGINT) * 1000003, CAST(value AS FLOAT) / 7, "
-                "CAST(value AS DECIMAL(18, 4)) / 100, CONCAT(N'label-', value), "
-                "DATETIME2FROMPARTS(2024, 1, 1, value % 24, value % 60, value % 60, value, 6), "
-                "CAST(CASE WHEN value % 2 = 0 THEN 1 ELSE 0 END AS BIT), "
-                "CASE WHEN value % 17 = 0 THEN NULL ELSE CAST(REPLICATE(CAST(CAST(value % 251 "
-                "AS BINARY(1)) AS VARBINARY(32)), 16) AS VARBINARY(32)) END "
-                "FROM GENERATE_SERIES(0, " + std::to_string(spec_.size - 1) + ")");
             break;
         default:
             break;
@@ -4417,8 +4289,6 @@ private:
             return 1;
         case PyCursorWorkload::fetchmany_mixed:
             return fetchmany_all();
-        case PyCursorWorkload::fetch_arrow_mixed:
-            return arrow_all();
         }
         throw std::logic_error("unknown py-cursor workload");
     }
@@ -4501,70 +4371,6 @@ private:
         }
         if (total != spec_.size) {
             fail("fetched " + std::to_string(total) + " rows");
-        }
-        return total;
-    }
-
-    std::uint64_t arrow_all() {
-        cursor_.execute(sql_, no_params_);
-        std::int32_t next = 0;
-        std::size_t nulls = 0;
-        auto sink = [this, &next, &nulls](const std::vector<PyBoundColumn>& columns,
-                                          std::size_t rows) {
-            for (std::size_t row = 0; row < rows; ++row, ++next) {
-                SQLINTEGER id = 0;
-                std::memcpy(&id, columns[0].at(row), sizeof(id));
-                const bool null_payload = columns[7].indicators[row] == SQL_NULL_DATA;
-                nulls += null_payload ? 1 : 0;
-                if (id != next) {
-                    fail("rows out of id order");
-                }
-                if (!verify_everything_) {
-                    continue;
-                }
-                SQLBIGINT big = 0;
-                SQLDOUBLE ratio = 0;
-                SQL_TIMESTAMP_STRUCT stamp = {};
-                std::memcpy(&big, columns[1].at(row), sizeof(big));
-                std::memcpy(&ratio, columns[2].at(row), sizeof(ratio));
-                std::memcpy(&stamp, columns[5].at(row), sizeof(stamp));
-                char label[32] = {};
-                std::snprintf(label, sizeof(label), "label-%d", id);
-                const bool payload_ok =
-                    (id % 17 == 0)
-                        ? null_payload
-                        : columns[7].indicators[row] == 16 &&
-                              std::all_of(columns[7].at(row), columns[7].at(row) + 16,
-                                          [id](unsigned char byte) { return byte == id % 251; });
-                const bool matches =
-                    big == static_cast<SQLBIGINT>(id) * 1000003 &&
-                    ratio == static_cast<double>(id) / 7 &&
-                    parse_scaled_decimal(columns[3].at(row),
-                                         static_cast<std::size_t>(columns[3].indicators[row]),
-                                         4) == static_cast<std::int64_t>(id) * 100 &&
-                    wide_equals(columns[4].at(row), columns[4].indicators[row],
-                                ascii_u16(label)) &&
-                    stamp.year == 2024 && stamp.month == 1 && stamp.day == 1 &&
-                    stamp.hour == id % 24 && stamp.minute == id % 60 &&
-                    stamp.second == id % 60 &&
-                    stamp.fraction == static_cast<SQLUINTEGER>(id) * 1000 &&
-                    *columns[6].at(row) == (id % 2 == 0 ? 1 : 0) && payload_ok;
-                if (!matches) {
-                    fail("row " + std::to_string(id) + " differs from its generator");
-                }
-            }
-        };
-        std::uint64_t total = 0;
-        for (;;) {
-            const auto batch = cursor_.arrow_batch(kPyArrowBatchRows, sink);
-            total += batch;
-            if (batch < kPyArrowBatchRows) {
-                break;
-            }
-        }
-        if (total != spec_.size || nulls != (spec_.size + 16) / 17) {
-            fail("fetched " + std::to_string(total) + " rows, " + std::to_string(nulls) +
-                 " NULL payloads");
         }
         return total;
     }

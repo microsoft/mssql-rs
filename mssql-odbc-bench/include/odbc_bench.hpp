@@ -152,30 +152,21 @@ const std::array<TableSpec, kTableCount>& tables();
 /// Return the fixed workload catalog used by validation and measurement.
 const std::array<WorkloadSpec, kWorkloadCount>& workloads();
 
-/// How a latency workload submits its one-row, one-`INT` query.
-enum class LatencyCall {
-    /// `SQLExecDirectW`, `SQLFetch`, `SQLCloseCursor` per call.
-    exec_direct,
-    /// `SQLPrepareW("SELECT ?")` once; per call a new bound `SQL_C_SLONG` value,
-    /// `SQLExecute`, `SQLFetch`, `SQLCloseCursor`.
-    prepared_param,
-};
-
-/// A small call whose cost is per-call driver overhead rather than payload.
+/// A small unprepared call whose cost is per-call driver overhead rather than
+/// payload: `SQLExecDirectW` of `SELECT 1`, `SQLFetch`, `SQLCloseCursor`.
 ///
 /// A sample is a fixed batch of complete call cycles on one held connection, so
 /// microsecond-scale differences accumulate into a wall time the comparator's
 /// ratios can resolve.
 struct LatencySpec {
     const char* benchmark_name;
-    LatencyCall call;
     /// Statement length in UTF-16 units. 0 sends plain `SELECT 1`; a larger value
-    /// pads `SELECT 1` with a trailing block comment to exactly this length.
+    /// pads it with a trailing block comment to exactly this length.
     std::size_t text_chars;
     std::size_t calls_per_sample;
 };
 
-inline constexpr std::size_t kLatencyWorkloadCount = 3;
+inline constexpr std::size_t kLatencyWorkloadCount = 2;
 
 /// Return the fixed small-call latency catalog (scenario `latency`).
 const std::array<LatencySpec, kLatencyWorkloadCount>& latency_workloads();
@@ -196,8 +187,6 @@ enum class PyCursorWorkload {
     insert_lob_nvarchar,
     /// `fetchmany_mixed_1000_batch100`.
     fetchmany_mixed,
-    /// `fetch_arrow_mixed8_10000`: `cursor.arrow()`.
-    fetch_arrow_mixed,
 };
 
 /// One `mssql-python` benchmark workload and the ODBC calls its sample repeats.
@@ -214,7 +203,7 @@ struct PyCursorSpec {
     std::size_t operations_per_sample;
 };
 
-inline constexpr std::size_t kPyCursorWorkloadCount = 11;
+inline constexpr std::size_t kPyCursorWorkloadCount = 8;
 
 /// Return the fixed `params`/`lobwrite`/`cursorfetch` catalog.
 const std::array<PyCursorSpec, kPyCursorWorkloadCount>& py_cursor_workloads();
@@ -410,7 +399,7 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-/// Replays `mssql-python` `Cursor.execute`/`fetchone`/`fetchmany`/`arrow` on one
+/// Replays `mssql-python` `Cursor.execute`/`fetchone`/`fetchmany` on one
 /// statement handle with the ODBC calls, entry points, and binding rules of
 /// `cursor.py` and `ddbc_bindings.cpp`. Python-side conversion is not measured.
 class PyCursorRunner {
