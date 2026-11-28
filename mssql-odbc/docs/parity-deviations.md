@@ -1602,10 +1602,13 @@ msodbcsql build is measured.
     msodbcsql reports `08S01`.** `SQLEndTran`, and switching
     `SQL_ATTR_AUTOCOMMIT` on while the application's transaction is open,
     report a connection lost during the request as `08007` ("Connection
-    failure during transaction"). Every other call reports a lost connection
-    as `08S01` in both drivers (AB#50903). msodbcsql has no `08007` resource:
-    its transaction-manager request fails in the network layer and posts
-    `IDS_08_S01` like any other request (`tds/TdsSend.cpp:1246`,
+    failure during transaction"). After connecting, other calls that reach the
+    server report a lost connection as `08S01`, as msodbcsql does (AB#50903).
+    The exception is `SQL_ATTR_CURRENT_CATALOG`, where msodbcsql reports
+    `HY024`; `post_tds_error_as` in `mssql-odbc/src/api/sqlstate.rs`
+    explains that single-function difference. msodbcsql has no `08007`
+    resource: its transaction-manager request fails in the network layer and
+    posts `IDS_08_S01` like any other request (`tds/TdsSend.cpp:1246`,
     `tds/Parse.cpp:1449`). Both states are connection-exception class `08`.
 
     ODBC defines `08007` for exactly this case: the connection failed during
