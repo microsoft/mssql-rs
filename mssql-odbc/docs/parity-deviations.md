@@ -1597,3 +1597,35 @@ msodbcsql build is measured.
     and a CP932 locale would close it. Chosen by the change author for
     [AB#49106](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/49106);
     maintainer sign-off is pending review.
+
+47. **A commit or rollback that loses the connection reports `08007`;
+    msodbcsql reports `08S01`.** `SQLEndTran`, and switching
+    `SQL_ATTR_AUTOCOMMIT` on while the application's transaction is open,
+    report a connection lost during the request as `08007` ("Connection
+    failure during transaction"). After connecting, other calls that reach the
+    server report a lost connection as `08S01`, as msodbcsql does (AB#50903).
+    The exception is `SQL_ATTR_CURRENT_CATALOG`, where msodbcsql reports
+    `HY024`; `post_tds_error_as` in `mssql-odbc/src/api/sqlstate.rs`
+    explains that single-function difference. msodbcsql has no `08007`
+    resource: its transaction-manager request fails in the network layer and
+    posts `IDS_08_S01` like any other request (`tds/TdsSend.cpp:1246`,
+    `tds/Parse.cpp:1449`). Both states are connection-exception class `08`.
+
+    ODBC defines `08007` for exactly this case: the connection failed during
+    the call, and whether the server committed or rolled back cannot be
+    determined. `08S01` does not tell the application that its transaction's
+    outcome is unknown. A failed driver-begun rollback when autocommit is
+    switched on with no application transaction is not covered, and reports
+    `08S01`.
+
+    **Evidence level: measured.** Windows msodbcsql 18.07.0001 against SQL
+    Server 2022 (`16.0.1220.3`) through pyodbc 5.2.0, `ConnectRetryCount=0`,
+    after the session was `KILL`ed from a second connection and its
+    `sys.dm_exec_connections` row was gone: `SQLEndTran` commit and rollback,
+    and `SQLSetConnectAttr(SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_ON)` with a
+    transaction open, each returned `08S01` (`10054`); this driver returned
+    `08007` for all three. `failed_autocommit_commit_does_not_strand_the_local_transaction_flag`
+    (`mssql-odbc/src/api/txn.rs`) pins this driver's state. Retained
+    pre-existing behaviour by the change author for
+    [AB#50903](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/50903);
+    maintainer sign-off is pending review.

@@ -180,7 +180,10 @@ on the `master` branch.
     `42000`, else `01000`, matching msodbcsql's `sqlcerr.cpp:1385-1401`); for
     other variants it posts a single record using `default_sqlstate`. Pick
     `08001` for connect-time failures and `HY000` for execution/fetch
-    failures. Do not add rows to `SERVER_ERROR_TO_SQL_STATE_MAP` to correct a
+    failures; a lost connection (I/O failure, closed connection, failed or
+    impossible session recovery) overrides any non-`08xxx` default with
+    `08S01`, as msodbcsql does for every network failure. Do not add rows to
+    `SERVER_ERROR_TO_SQL_STATE_MAP` to correct a
     single error's SQLSTATE — entries there are a permanent compatibility
     commitment, and the severity fallback already covers unmapped errors.
   Never hand-roll `post_sql_error` over a `TdsError` — you lose the

@@ -354,9 +354,8 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
             error!(%e, "{op}: transaction-manager request failed");
             // 08007 is ODBC's specific state for "connection failure during
             // transaction": the commit or rollback did not reach the server, so its
-            // outcome is unknown to the application. Neither 08007 nor HY000 puts
-            // the connection into the suspended state, so this is a strictly more
-            // precise diagnostic, not a behavioural change.
+            // outcome is unknown to the application. msodbcsql reports 08S01 here
+            // (parity deviation 47).
             post_tds_error(state, &e, SQLSTATE_08007);
             return SQL_ERROR;
         }
