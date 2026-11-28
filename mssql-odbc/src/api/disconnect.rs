@@ -87,8 +87,8 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
     }
 
     // Manual-commit mode leaves a driver-begun transaction open between
-    // statements. It holds no user work, so roll it back explicitly instead of
-    // relying on the server's cleanup when the socket closes.
+    // statements. It holds no user work, so, like msodbcsql, the driver leaves
+    // it to the server's rollback when the socket closes.
     rollback_before_disconnect(dbc);
 
     let Ok(mut state) = dbc.inner.lock() else {

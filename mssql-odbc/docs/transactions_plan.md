@@ -87,9 +87,12 @@ without applying the level. See [parity entry 38](parity-deviations.md) and
 
 `SQLDisconnect` with a user-started transaction open posts SQLSTATE `25000` and
 returns `SQL_ERROR` (`sqlcconn.cpp:1234-1238`). A driver-started *piggyback*
-transaction — one auto-begun because autocommit is OFF but carrying no
-user-visible uncommitted work — is rolled back best-effort before teardown, so
-no transaction is ever left dangling on a pooled server session.
+transaction — one auto-begun because autocommit is OFF, at the switch or by
+`SQLEndTran` (§4.2), but carrying no user-visible uncommitted work — is not
+rolled back by the driver. Like msodbcsql (`SQLDisconnect`, `sqlcconn.cpp`:
+"all server side resources associated with the connection will be released by
+server"), the driver closes the socket and SQL Server rolls the transaction
+back. It holds no locks, so nothing is left behind on the server session.
 
 ### G5 — `SQLGetInfo` transaction capabilities
 
@@ -188,7 +191,7 @@ the binding.
 | N5 | **Explicit `BEGIN TRANSACTION` API** | — | Neither ODBC nor msodbcsql exposes one. Transactions begin implicitly from autocommit-OFF mode. |
 | N6 | **Nested transactions** | — | SQL Server has no true nesting; `@@TRANCOUNT` nesting is a T-SQL concern the application drives itself. |
 | N7 | **`SQL_COPT_SS_PRESERVE_CURSORS`** | `msodbcsql.h:181`, `sqlctran.cpp:302-323` | SQL Server-specific extension letting cursors survive commit. We hardcode the default `SQL_PC_OFF` behavior (`SQL_CB_CLOSE`) and reject the attribute with `HYC00`. |
-| N8 | **`SQL_COPT_SS_AUTOBEGINTXN`** | `msodbcsql.h:275` | Round-trip optimization that folds "begin next transaction" into the commit TM request (`TM_BEGIN_NEW_XACT`). We instead auto-begin lazily before the next statement — identical observable behavior (see §4.4), one extra round trip in the worst case. |
+| N8 | *(Implemented — see §4.2.)* **`SQL_COPT_SS_AUTOBEGINTXN`** | `msodbcsql.h:275` | No longer a non-goal. `SQLEndTran` folds "begin next transaction" into the commit/rollback TM request (`TM_BEGIN_NEW_XACT`) as msodbcsql does, and the attribute is settable. Kept in this table so the numbering stays stable. |
 | N9 | **Pre-Yukon (SQL Server ≤ 2000) fallbacks** — `SET IMPLICIT_TRANSACTIONS ON/OFF`, `IF @@TRANCOUNT > 0 COMMIT TRAN` | `sqlcstr.cpp:69-70`, `sqlcconn.cpp:3639-3688` | `mssql-tds` targets TDS 7.4+. The Yukon+ TDS transaction-manager path is the only one implemented. |
 | N10 | **`SQL_ATTR_RESET_CONNECTION` / connection pooling reset** | `sqlcmisc.cpp:2373-2463` | Pooling is not implemented in this driver yet. mssql-python's `Connection::reset` (`connection.cpp:478-524`) needs it, but it is a separate work item; the isolation-reset half of it is already covered by G3. |
 | N11 | **DM-faking `SQL_CB_PRESERVE` first-call trick** | `sqlcinfo.cpp:1139-1154` | Windows Driver Manager work-around that returns `SQL_CB_PRESERVE` on the *first* `SQL_CURSOR_COMMIT_BEHAVIOR` call to suppress statement re-preparation. We always return the truthful `SQL_CB_CLOSE`. Deliberate, documented divergence. |
@@ -240,12 +243,55 @@ if handle_type == SQL_HANDLE_ENV: fan out over child DBCs, promote worst rc
 if !local_tran_started:                                  → SQL_SUCCESS (silent no-op)
 close all open cursors on the connection                  (SQL_CB_CLOSE)
 if client.has_active_transaction():
-    commit_transaction(None, None) | rollback_transaction(None, None)
+    commit_transaction | rollback_transaction, with begin = (NoChange, unnamed)
+                                               if SQL_COPT_SS_AUTOBEGINTXN is on
 local_tran_started = false
 ```
 
 The `!local_tran_started` early return reproduces `sqlctran.cpp:293` exactly —
 committing with nothing open is a silent success, never a warning or error.
+
+**Begin folded into the end request (`SQL_COPT_SS_AUTOBEGINTXN`).** Matching
+`CommitAbortTran` (`sqlctran.cpp:345-351`), the commit or rollback request sets
+`fBeginXact` while the attribute is on, its default (`sqlcfunc.cpp:3484`). The
+server answers with the end ENVCHANGE and then the begin ENVCHANGE, so the new
+transaction descriptor rides the next request. A manual-commit cycle therefore
+costs one round trip less than ending and then beginning separately: the next
+statement finds a transaction open and only records `local_tran_started`
+(§4.4). `local_tran_started` is still cleared — the new transaction holds no user
+work — so a second `SQLEndTran` with no statement in between sends nothing and
+keeps it, and disconnect and autocommit ON treat it as driver-begun (§4.3, §4.6).
+
+The attribute is accepted with any value, before or after connect, with no I/O,
+and survives disconnect, as msodbcsql's explicitly set options do
+(`sqlcmisc.cpp`, "Options which have no checking"; `ResetOptions`,
+`sqlcconn.cpp`). `CommitAbortTran` reads it as `(BOOL)` of the stored `UINT_PTR`,
+so only the low 32 bits count: `1 << 32` is off. The getter stays unsupported
+(`HY092`), as it is on msodbcsql. Autocommit OFF→ON never begins a replacement
+(`SetCommitModeOption` passes `FALSE`), nor do reset or disconnect.
+
+Measured on msodbcsql 18.7.1 (`SQL_DRIVER_VER` 18.07.0001) against SQL Server
+2022, with transaction state read from a second connection
+(`sys.dm_tran_session_transactions`): after commit or rollback the session holds a
+new transaction with no locks; an `SQLEndTran` with no statement since leaves the
+same transaction id; a SELECT-only checkout followed by rollback ends and replaces
+the transaction; value 7 is on, `1 << 32` and 0 are off; the setting survives
+reconnect; and the getter reports `HY092`. The `AutoBeginTxnTest` e2e cases assert
+these on both drivers.
+
+Idle connection resiliency does not recover a session that holds a transaction,
+and the replacement is one, so this matches msodbcsql: a session killed after
+`SQLEndTran` (an idle pooled connection after its check-in rollback, or an Azure
+SQL connection past the gateway idle timeout) fails the next execute instead of
+reconnecting, and with the attribute off it reconnects. msodbcsql reports
+`08S01`; this driver reports `HY000`, the mapping every execute-path I/O error
+has today, until
+[AB#50903](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/50903)
+maps them to `08S01`. Before this change, this driver reconnected silently in the
+first case, where msodbcsql did not. msodbcsql defers to the server's session
+recoverability (`CheckOrRecoverConnection`, `connectionrecoverymanager.cpp`),
+which the measured behaviour shows is withheld while a transaction is open, and
+has no exception for an empty transaction; neither does this driver.
 
 ### 4.3 Autocommit transitions
 
@@ -263,9 +309,10 @@ msodbcsql's `CheckOptions` (`sqlccmd.cpp:10572-10585`) re-issues `TM_BEGIN_XACT`
 before every statement when autocommit is OFF and no server transaction is
 active. This recovers from a transaction the server aborted (`XACT_ABORT`,
 deadlock victim, timeout) or one the user rolled back with raw T-SQL. We
-replicate it in the shared execute path, which also makes N8 unobservable:
-after `SQLEndTran(SQL_COMMIT)`, the next statement re-begins the transaction, so
-`SELECT @@TRANCOUNT` reports the same value it would under msodbcsql.
+replicate it in the shared execute path. After `SQLEndTran` the transaction is
+normally already open (§4.2), so this costs no round trip; it sends a begin only
+when the attribute is off, the server ended the transaction, a pool reset
+discarded it, or the begin half of the end request failed.
 
 `local_tran_started` is set at the same point.
 
@@ -283,13 +330,36 @@ connected, wire idle            → SET TRANSACTION ISOLATION LEVEL <level>
 `SQLGetConnectAttr` returns the cached value — no server round trip, matching
 `sqlcmisc.cpp:3426-3433`.
 
+**Changing isolation with a driver-begun transaction open.** That is the state
+after the autocommit OFF switch and, since §4.2, after every `SQLEndTran` in
+manual-commit mode. msodbcsql sends only the SET, inside the open transaction.
+This driver rolls the empty transaction back, sends the SET, and begins a new one
+(two extra round trips). For the four ODBC-standard levels the outcome is the same
+on both drivers: the next statement runs in a transaction under the new level
+(measured from a second connection on msodbcsql 18.7.1 and asserted by
+`AutoBeginTxnTest.IsolationSetAfterEndTranAppliesToTheNextStatement`). SNAPSHOT
+differs: SQL Server accepts the SET inside the transaction but fails the next data
+access with 3951 because the transaction did not start under SNAPSHOT, which is
+what msodbcsql reports, while this driver's reopened transaction starts under
+SNAPSHOT and the statement succeeds. That difference predates §4.2: before it, no
+transaction was open after `SQLEndTran`, so the SET applied to the next one. It is
+[parity entry 46](parity-deviations.md).
+
 ### 4.6 Disconnect
 
 ```
 if local_tran_started            → post 25000, return SQL_ERROR   (sqlcconn.cpp:1234)
-else if has_active_transaction() → best-effort rollback, ignore failure
+close cursors
+if user work started since (another thread) → best-effort rollback, ignore failure
 free child statements; drop client; state = Disconnected
 ```
+
+A driver-begun transaction with no user work, from the autocommit switch or
+`SQLEndTran` (§4.2), gets no request: the server rolls it back when the socket
+closes, as it does for msodbcsql. A manual-commit commit-then-close therefore
+costs the commit round trip only. The rollback remains for user work another
+thread's statement started after the 25000 check, where it runs with the claimed
+connection under `SQL_ATTR_CONNECTION_TIMEOUT`.
 
 ---
 
@@ -381,6 +451,15 @@ and mssql-odbc-only cases use `SKIP_IF_COMPARING_MSODBCSQL()`.
 | 37 | Isolation changes with unread rows return `HY000`; rows and diagnostics survive close/retry (both aliases) | unit + e2e |
 | 38 | Isolation changes after exhausting only the first result return `HY000`; the second result remains fetchable and close/retry succeeds (both aliases) | unit + e2e |
 | 39 | Isolation getters after busy rejection retain the applied level here and report the requested level on msodbcsql; the server stays unchanged and retry applies the level (both aliases, parity entry 38) | e2e |
+| 40 | `SQLEndTran` commit/rollback (DBC and ENV) sets `fBeginXact`; the next statement sends no BEGIN and carries the new descriptor | unit |
+| 41 | After `SQLEndTran` a new empty transaction is open; a second `SQLEndTran` with no work sends nothing; the next statement runs in it | unit + e2e |
+| 42 | SELECT-only checkout + rollback replaces the transaction | e2e |
+| 43 | `SQL_COPT_SS_AUTOBEGINTXN` off: no begin in the end request; the next statement begins | unit + e2e |
+| 44 | `SQL_COPT_SS_AUTOBEGINTXN` accepts any value before or after connect, reads the low 32 bits, survives reconnect, getter `HY092` | unit + e2e |
+| 45 | Autocommit ON after `SQLEndTran` rolls the replacement back without `01000`; disconnect is allowed and sends no rollback (G4) | unit + e2e |
+| 46 | Every ODBC-standard isolation level set after `SQLEndTran` applies to the next statement | unit + e2e |
+| 47 | Replacement ended by raw T-SQL is reopened by the next statement; prepared statements and pool reset work across `SQLEndTran` | e2e |
+| 48 | Session killed after `SQLEndTran` is not recovered; with the attribute off it is | e2e |
 
 ### 7.1 What the Driver Manager decides for us
 

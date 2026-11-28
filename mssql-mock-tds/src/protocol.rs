@@ -841,6 +841,35 @@ pub fn parse_transaction_manager_request(packet_body: &[u8]) -> Option<u16> {
 /// Done token. The returned bytes are the raw tokens and still need to be
 /// wrapped in a TabularResult packet by the caller.
 pub fn build_transaction_manager_response(request_type: u16) -> BytesMut {
+    build_transaction_manager_response_for(request_type, false)
+}
+
+/// Transaction descriptor of a transaction begun by a commit or rollback that
+/// set `fBeginXact`. Distinct from the one a plain begin hands out, so a test can
+/// tell which transaction a later request's ALL_HEADERS names.
+pub const BEGIN_NEXT_XACT_DESCRIPTOR: u64 = 2;
+
+/// `fBeginXact` (MS-TDS 2.2.6.9), bit 0 of a commit or rollback request's
+/// `XACT_FLAGS`.
+pub const TM_BEGIN_NEW_XACT: u8 = 0x01;
+
+/// The `XACT_FLAGS` byte of a commit or rollback TransactionManager request, or
+/// `None` for any other request type or a truncated body.
+pub fn parse_transaction_manager_flags(packet_body: &[u8]) -> Option<u8> {
+    let request_type = parse_transaction_manager_request(packet_body)?;
+    if request_type != TM_COMMIT_XACT && request_type != TM_ROLLBACK_XACT {
+        return None;
+    }
+    let all_headers_len = u32::from_le_bytes(packet_body.get(..4)?.try_into().ok()?) as usize;
+    let name_at = all_headers_len + 2;
+    let name_len = usize::from(*packet_body.get(name_at)?);
+    packet_body.get(name_at + 1 + name_len).copied()
+}
+
+/// [`build_transaction_manager_response`], followed for a commit or rollback
+/// with `begin_next` set by the begin EnvChange SQL Server sends after the end
+/// one, carrying [`BEGIN_NEXT_XACT_DESCRIPTOR`].
+pub fn build_transaction_manager_response_for(request_type: u16, begin_next: bool) -> BytesMut {
     let mut tokens = BytesMut::new();
 
     // Fixed 8-byte transaction descriptor handed to the client. Any non-zero
@@ -875,6 +904,18 @@ pub fn build_transaction_manager_response(request_type: u16) -> BytesMut {
         tokens.put_u8(TokenType::EnvChange as u8);
         tokens.put_u16_le(payload.len() as u16);
         tokens.extend_from_slice(&payload);
+
+        if begin_next && env_type != 8 {
+            let descriptor = BEGIN_NEXT_XACT_DESCRIPTOR.to_le_bytes();
+            let mut payload = BytesMut::new();
+            payload.put_u8(8);
+            payload.put_u8(descriptor.len() as u8);
+            payload.put_slice(&descriptor);
+            payload.put_u8(0);
+            tokens.put_u8(TokenType::EnvChange as u8);
+            tokens.put_u16_le(payload.len() as u16);
+            tokens.extend_from_slice(&payload);
+        }
     }
 
     tokens.extend_from_slice(&build_done_token(0));
@@ -1802,6 +1843,54 @@ mod tests {
         // An unrecognized request type yields just a Done token (no EnvChange).
         let tokens = build_transaction_manager_response(0);
         assert_eq!(tokens[0], TokenType::Done as u8);
+    }
+
+    fn end_request(request_type: u16, flags: u8) -> BytesMut {
+        let mut body = BytesMut::new();
+        body.put_u32_le(4);
+        body.put_u16_le(request_type);
+        body.put_u8(0);
+        body.put_u8(flags);
+        body
+    }
+
+    #[test]
+    fn test_parse_transaction_manager_flags() {
+        for request_type in [TM_COMMIT_XACT, TM_ROLLBACK_XACT] {
+            assert_eq!(
+                parse_transaction_manager_flags(&end_request(request_type, 0x01)),
+                Some(0x01)
+            );
+            assert_eq!(
+                parse_transaction_manager_flags(&end_request(request_type, 0)),
+                Some(0)
+            );
+        }
+        assert_eq!(
+            parse_transaction_manager_flags(&end_request(TM_BEGIN_XACT, 0x01)),
+            None
+        );
+        assert_eq!(
+            parse_transaction_manager_flags(&end_request(TM_COMMIT_XACT, 0)[..7]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_end_and_begin_answer_ends_then_begins() {
+        let tokens = build_transaction_manager_response_for(TM_COMMIT_XACT, true);
+        assert_eq!(tokens[0], TokenType::EnvChange as u8);
+        assert_eq!(tokens[3], 9);
+        let begin = 3 + usize::from(u16::from_le_bytes([tokens[1], tokens[2]]));
+        assert_eq!(tokens[begin], TokenType::EnvChange as u8);
+        assert_eq!(tokens[begin + 3], 8);
+        assert_eq!(
+            &tokens[begin + 5..begin + 13],
+            &BEGIN_NEXT_XACT_DESCRIPTOR.to_le_bytes()
+        );
+        let done =
+            begin + 3 + usize::from(u16::from_le_bytes([tokens[begin + 1], tokens[begin + 2]]));
+        assert_eq!(tokens[done], TokenType::Done as u8);
     }
 
     #[test]

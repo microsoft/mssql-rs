@@ -5,13 +5,14 @@
 
 use crate::protocol::{
     FEATURE_EXT_DATA_CLASSIFICATION, FEATURE_EXT_ENHANCED_ROUTING, FEATURE_EXT_SESSION_RECOVERY,
-    PACKET_HEADER_SIZE, PacketHeader, PacketStatus, PacketType, ProtocolError, TM_BEGIN_XACT,
-    TM_COMMIT_XACT, TM_ROLLBACK_XACT, build_attention_ack_packet, build_done_token,
+    PACKET_HEADER_SIZE, PacketHeader, PacketStatus, PacketType, ProtocolError, TM_BEGIN_NEW_XACT,
+    TM_BEGIN_XACT, TM_COMMIT_XACT, TM_ROLLBACK_XACT, build_attention_ack_packet, build_done_token,
     build_error_response, build_feature_ext_ack, build_feature_ext_ack_fedauth,
     build_fedauth_challenge_response, build_login_ack, build_prelogin_response,
     build_prelogin_response_with_fedauth, build_query_results, build_routing_login_response,
-    build_transaction_manager_response, parse_fedauth_token, parse_login7, parse_login7_auth,
-    parse_sql_batch, parse_transaction_descriptor_header, parse_transaction_manager_request,
+    build_transaction_manager_response_for, parse_fedauth_token, parse_login7, parse_login7_auth,
+    parse_sql_batch, parse_transaction_descriptor_header, parse_transaction_manager_flags,
+    parse_transaction_manager_request,
 };
 use crate::query_response::{
     ATTENTION_DELAY_KEY, DataClassificationAck, LOGIN_DELAY_KEY, QueryRegistry, RPC_DELAY_KEY,
@@ -142,6 +143,9 @@ pub struct ConnectionProcessor {
     /// this connection has sent, in order. See
     /// [`ConnectionInfo::transaction_descriptor_headers`].
     transaction_descriptor_headers: Vec<(u64, u32)>,
+    /// Every TransactionManager request, in order. See
+    /// [`ConnectionInfo::transaction_manager_requests`].
+    transaction_manager_requests: Vec<(u16, Option<u8>)>,
     login_details: LoginDetails,
     /// Set after answering a query registered with
     /// [`QueryRegistry::close_connection_after`]; the connection loop then
@@ -185,6 +189,7 @@ impl ConnectionProcessor {
             redirection,
             connection_store,
             transaction_descriptor_headers: Vec::new(),
+            transaction_manager_requests: Vec::new(),
             login_details: LoginDetails::default(),
             close_after_response: false,
         }
@@ -263,6 +268,12 @@ impl ConnectionProcessor {
     /// `SqlBatch`/`RpcRequest` this connection has sent so far, in order.
     pub fn transaction_descriptor_headers(&self) -> &[(u64, u32)] {
         &self.transaction_descriptor_headers
+    }
+
+    /// Every TransactionManager request this connection has sent so far, in
+    /// order, as `(RequestType, XACT_FLAGS)`.
+    pub fn transaction_manager_requests(&self) -> &[(u16, Option<u8>)] {
+        &self.transaction_manager_requests
     }
 
     /// Upsert this connection's current state into the shared store.
@@ -796,10 +807,14 @@ impl ConnectionProcessor {
                 // connection setup can complete instead of blocking forever.
                 let packet_body = &packet_data[PACKET_HEADER_SIZE..];
                 let request_type = parse_transaction_manager_request(packet_body).unwrap_or(0);
+                let flags = parse_transaction_manager_flags(packet_body);
                 debug!(
                     "Handling TransactionManager request (type {}) from {}",
                     request_type, self.addr
                 );
+                self.transaction_manager_requests
+                    .push((request_type, flags));
+                self.record_to_store().await;
 
                 let delay_key = match request_type {
                     TM_BEGIN_XACT => Some(TM_BEGIN_DELAY_KEY),
@@ -821,7 +836,10 @@ impl ConnectionProcessor {
                     }
                 }
 
-                let mut tokens = build_transaction_manager_response(request_type);
+                let mut tokens = build_transaction_manager_response_for(
+                    request_type,
+                    flags.is_some_and(|flags| flags & TM_BEGIN_NEW_XACT != 0),
+                );
                 let mut packet_id = 1;
                 if request_type == TM_BEGIN_XACT {
                     let delay = self
@@ -950,6 +968,11 @@ pub struct ConnectionInfo {
     /// (`TransactionDescriptor == 0`) must carry `OutstandingRequestCount ==
     /// 1` — without the mock server itself enforcing it.
     pub transaction_descriptor_headers: Vec<(u64, u32)>,
+    /// Every TransactionManager request this connection has sent, in order, as
+    /// `(RequestType, XACT_FLAGS)`. The flags byte is present only for commit
+    /// and rollback, so a test can tell whether one asked the server to begin
+    /// the next transaction (`fBeginXact`).
+    pub transaction_manager_requests: Vec<(u16, Option<u8>)>,
 }
 
 impl ConnectionInfo {
@@ -993,6 +1016,7 @@ impl ConnectionStore {
             requested_feature_ids: processor.requested_feature_ids().to_vec(),
             fedauth_workflow: processor.fedauth_workflow(),
             transaction_descriptor_headers: processor.transaction_descriptor_headers().to_vec(),
+            transaction_manager_requests: processor.transaction_manager_requests().to_vec(),
         };
         self.connections.insert(processor.conn_id(), info);
         self.login_details
@@ -1820,7 +1844,11 @@ async fn handle_connection(
                         request_type
                     );
 
-                    let tokens = build_transaction_manager_response(request_type);
+                    let tokens = build_transaction_manager_response_for(
+                        request_type,
+                        parse_transaction_manager_flags(packet_body)
+                            .is_some_and(|flags| flags & TM_BEGIN_NEW_XACT != 0),
+                    );
 
                     let total_length = (PACKET_HEADER_SIZE + tokens.len()) as u16;
                     let mut packet = BytesMut::with_capacity(total_length as usize);
