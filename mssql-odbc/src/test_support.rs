@@ -467,6 +467,32 @@ impl MockServer {
         );
     }
 
+    /// Every TransactionManager request the server has received, as
+    /// `(RequestType, XACT_FLAGS)`, in connection order.
+    pub(crate) fn transaction_manager_requests(&self) -> Vec<(u16, Option<u8>)> {
+        self.server_runtime.block_on(async {
+            let store = self.connection_store.lock().await;
+            store
+                .all()
+                .values()
+                .flat_map(|info| info.transaction_manager_requests.iter().copied())
+                .collect()
+        })
+    }
+
+    /// The ALL_HEADERS transaction descriptor of every batch and RPC the
+    /// server has received, in connection order.
+    pub(crate) fn request_transaction_descriptors(&self) -> Vec<u64> {
+        self.server_runtime.block_on(async {
+            let store = self.connection_store.lock().await;
+            store
+                .all()
+                .values()
+                .flat_map(|info| info.transaction_descriptor_headers.iter().map(|h| h.0))
+                .collect()
+        })
+    }
+
     /// Registers a delay for the server's answer to any RPC request that
     /// matched no specific registration.
     ///

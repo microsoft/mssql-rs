@@ -246,7 +246,7 @@ recovery.
 | SQL execution | No SQL engine or persistent data. Batch matching is case-insensitive and exact after parsing; no regex or wildcard matching. |
 | Unregistered requests | Unmatched SQL batches and RPCs return an empty DONE response, not an unknown-query error. Register expected responses explicitly. |
 | RPC | Matches registered text as uppercase UTF-16LE bytes within the raw request; send uppercase SQL on this path. No general parameter decoder, stored-procedure execution, or cursor engine. |
-| Transactions | Begin/commit/rollback messages are acknowledged; isolation and data changes are not enforced. |
+| Transactions | Begin/commit/rollback messages are acknowledged; a commit or rollback that sets `fBeginXact` is also answered with the begin ENVCHANGE that starts the next transaction. Each connection's requests are recorded in `ConnectionInfo::transaction_manager_requests`. Isolation and data changes are not enforced. |
 | Types and metadata | Only the types above are exposed; metadata is simplified, not a full SQL Server schema model. |
 | Packet sizes | Responses are not fragmented. Keep each complete response within the advertised 4096-byte packet size, including the 8-byte header and all tokens; clients such as `TdsClient` reject larger packets. SQL batch requests spanning several packets are reassembled before matching; other multi-packet requests are not. |
 | Authentication | Login flows and token inspection are test aids, not credential verification. |

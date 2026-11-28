@@ -84,6 +84,7 @@ pub const DATACLASSIFICATION_VERSION_DEFAULT: u8 = 1;
 /// msodbcsql `DATACLASSIFICATION_VERSION_MAX`: version 2 adds sensitivity rank.
 pub const DATACLASSIFICATION_VERSION_MAX: u8 = 2;
 
+pub const SQL_COPT_SS_AUTOBEGINTXN: SqlInteger = 1402;
 pub const SQL_COPT_SS_LONGASMAX: SqlInteger = 1403;
 pub const SQL_XL_OFF: usize = 0;
 pub const SQL_XL_ON: usize = 1;
